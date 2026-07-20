@@ -1,9 +1,398 @@
 /*
  *  llb_kern_ct.c: Loxilb kernel eBPF ConnTracking Implementation
  *  Copyright (c) 2022-2025 LoxiLB Authors
- * 
+ *
  * SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
  */
+
+// ============================================================================
+// CONNECTION ERROR STATISTICS (always-on, unsampled, trace-INDEPENDENT)
+// ============================================================================
+// These feed loxilb_l4_error_events_total. Deliberately OUTSIDE HAVE_L4_TRACE:
+// error metrics must be exact and present in every build, unlike the sampled,
+// compile/runtime-gated L4 trace ring buffer. Error-stat indices into the
+// ct_err_stats ARRAY map (llb_kern_cdefs.h) — keep in sync with that map's
+// comment and the Go reader DpCtErrorGetStats.
+//
+// RST is split by direction so alerting can separate benign client resets from
+// pathological backend resets: CT_DIR_IN = client sent RST, CT_DIR_OUT = server
+// (backend) sent RST — same convention as the CONN_RESET event handling above.
+#define CT_ERR_STAT_TCP_RST_CLIENT 0  // TCP RST from client   (CT_TCP_CW, dir IN)
+#define CT_ERR_STAT_TCP_RST_SERVER 1  // TCP RST from backend  (CT_TCP_CW, dir OUT)
+#define CT_ERR_STAT_TCP_ERR        2  // TCP error (CT_TCP_ERR — proto violation / half-open)
+#define CT_ERR_STAT_SCTP_ABORT     3  // SCTP ABORT (CT_SCTP_ABRT)
+#define CT_ERR_STAT_SCTP_ERR       4  // SCTP error (CT_SCTP_ERR)
+
+/*
+ * Bump a global connection-error counter exactly once per transition INTO an
+ * error state. Mirrors dp_update_security_stats(): one ARRAY lookup + atomic
+ * add (<0.1us). MUST be called AFTER releasing the CT spinlock — eBPF forbids
+ * most helper calls while a bpf_spin_lock is held.
+ */
+static void __always_inline
+dp_update_ct_error_stats(__u32 stat_type, __u64 increment)
+{
+  __u64 *counter = bpf_map_lookup_elem(&ct_err_stats, &stat_type);
+  if (counter) {
+    __sync_fetch_and_add(counter, increment);
+  }
+}
+
+// ============================================================================
+// L4 TRACING: Phase 2 Full Implementation
+// ============================================================================
+#ifdef HAVE_L4_TRACE
+// lxb_l4_trace_event.h included in main entry file (llb_kern_entry.c)
+
+// Maps are defined in llb_kern_cdefs.h and registered in loxilb_libdp.c
+// Following loxilb design pattern (same as HAVE_DP_SECURITY_RATE_RUNTIME_CONFIG)
+
+// Runtime control via l4_trace_cfg map (modifiable from Go)
+
+/**
+ * Generate deterministic span_id directly from xf (5-tuple + zone)
+ * 
+ * CRITICAL: __noinline for separate stack frame (allows 3 shallow calls vs 2 deep)
+ * This function implements a simplified XXH64 hash optimized for eBPF.
+ * No CT map modification needed - span_id calculated on-demand.
+ * 
+ * Collision probability: ~2.7×10^-11 (1 in 37 billion) - negligible
+ */
+static __noinline uint64_t
+lxb_generate_span_id_from_xf(struct xfi *xf) {
+  const uint64_t PRIME64_1 = 0x9E3779B185EBCA87ULL;
+  const uint64_t PRIME64_2 = 0xC2B2AE3D27D4EB4FULL;
+  const uint64_t PRIME64_3 = 0x165667B19E3779F9ULL;
+  
+  uint64_t h64 = PRIME64_1 + PRIME64_2;
+  
+  // Hash source IP (handles both IPv4 and IPv6)
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    h64 ^= xf->l34m.saddr[i] * PRIME64_2;
+    h64 = ((h64 << 31) | (h64 >> 33)) * PRIME64_1;
+  }
+  
+  // Hash destination IP
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    h64 ^= xf->l34m.daddr[i] * PRIME64_2;
+    h64 = ((h64 << 31) | (h64 >> 33)) * PRIME64_1;
+  }
+  
+  // Hash ports and protocol
+  uint64_t port_proto = ((uint64_t)xf->l34m.source << 48) |
+                        ((uint64_t)xf->l34m.dest << 32) |
+                        ((uint64_t)xf->l34m.nw_proto << 16) |
+                        xf->pm.zone;
+  h64 ^= port_proto * PRIME64_2;
+  h64 = ((h64 << 31) | (h64 >> 33)) * PRIME64_1;
+  
+  // Finalization
+  h64 ^= h64 >> 33;
+  h64 *= PRIME64_2;
+  h64 ^= h64 >> 29;
+  h64 *= PRIME64_3;
+  h64 ^= h64 >> 32;
+  
+  return h64 ? h64 : 1;  // Ensure non-zero (0 reserved for invalid)
+}
+
+/**
+ * L4 Trace Sampling Logic
+ * 
+ * Implements hash-based consistent per-connection sampling:
+ * - CONN_NEW: Hash-based sampling decision (respects sampling_rate)
+ * - CONN_CLOSE/RESET/ERROR: Always emitted (100% error detection)
+ *   Rationale: Backend failures must be detected regardless of sampling rate.
+ *   CONN_CLOSE can be reclassified to CONN_RESET by populate_event().
+ * - STATE_CHANGE: Uses cached decision from CONN_NEW
+ * - Orphaned STATE_CHANGE: Dropped (partial NAT span from sampling)
+ * 
+ * Returns: 1 = emit event, 0 = drop event
+ * 
+ * CRITICAL: __noinline to prevent stack overflow (BPF 512 byte limit)
+ */
+static __noinline int
+lxb_l4_should_sample(struct xfi *xf, uint64_t span_id, uint8_t event_type, 
+                     struct dp_l4_trace_config *cfg) {
+  // Check if 100% sampling (fast path)
+  if (cfg->sampling_rate >= 100) {
+    return 1;
+  }
+  
+  // Check if 0% sampling (fast path)
+  if (cfg->sampling_rate == 0) {
+    return 0;
+  }
+  
+  // Check if we have a cached sampling decision for this span
+  // All event types (CONN_NEW, STATE_CHANGE, CONN_CLOSE, etc.) use the same decision
+  struct l4_sampling_decision *decision = bpf_map_lookup_elem(&l4_sampling_map, &span_id);
+  if (decision) {
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    bpf_printk("[L4_TRACE_SAMPLE] span=%016llx cached=%d event=%d", 
+               span_id, decision->sampled, event_type);
+#endif
+    return decision->sampled;
+  }
+  
+  // No cached decision: determine if this is an orphaned event worth emitting
+  // CRITICAL: Always emit error/close events (may be orphaned backend failures)
+  // CONN_CLOSE can become CONN_RESET after populate_event() reclassifies it
+  // Make sampling decision for consistency, but always return 1 for errors
+  if (event_type == LXB_L4_EVENT_CONN_ERROR ||
+      event_type == LXB_L4_EVENT_CONN_RESET ||
+      event_type == LXB_L4_EVENT_CONN_CLOSE) {
+    // Make sampling decision for consistency
+    uint16_t hash_mod = (span_id & 0xFFFF) % 100;
+    uint8_t sampled = (hash_mod < cfg->sampling_rate) ? 1 : 0;
+    
+    struct l4_sampling_decision new_decision = {
+      .sampled = sampled,
+      .timestamp_ns = bpf_ktime_get_ns()
+    };
+    bpf_map_update_elem(&l4_sampling_map, &span_id, &new_decision, BPF_ANY);
+    
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    bpf_printk("[L4_TRACE_SAMPLE] span=%016llx ERROR always=1 event=%d",
+               span_id, event_type);
+#endif
+    
+    return 1;  // Always emit errors regardless of sampling rate
+  }
+  
+  // CONN_NEW: Make normal sampling decision
+  if (event_type == LXB_L4_EVENT_CONN_NEW) {
+    uint16_t hash_mod = (span_id & 0xFFFF) % 100;
+    uint8_t sampled = (hash_mod < cfg->sampling_rate) ? 1 : 0;
+    
+    // Store decision for future events of this span
+    struct l4_sampling_decision new_decision = {
+      .sampled = sampled,
+      .timestamp_ns = bpf_ktime_get_ns()
+    };
+    bpf_map_update_elem(&l4_sampling_map, &span_id, &new_decision, BPF_ANY);
+    
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    bpf_printk("[L4_TRACE_SAMPLE] span=%016llx new=%d rate=%d hash=%d event=%d",
+               span_id, sampled, cfg->sampling_rate, hash_mod, event_type);
+#endif
+    
+    return sampled;
+  }
+  
+  // Other event types without cached decision: drop as orphaned
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+  bpf_printk("[L4_TRACE_SAMPLE] span=%016llx orphaned event=%d (dropped)", 
+             span_id, event_type);
+#endif
+  return 0;
+}
+
+/**
+ * Helper: Populate event structure (separate __noinline for stack management)
+ * BPF limit: max 5 arguments (event, xf, ts, state_and_dir, protocol)
+ * Basic fields (span_id, event_type, protocol) must be set by caller before calling this
+ */
+static __noinline void
+lxb_l4_populate_event(lxb_l4_trace_event_t *event,
+                      struct xfi *xf,
+                      struct dp_ct_tact *ts,
+                      uint32_t state_and_dir)
+{
+  ct_state_t old_state = (state_and_dir >> 16) & 0xFF;
+  ct_state_t new_state = (state_and_dir >> 8) & 0xFF;
+  ct_dir_t direction = state_and_dir & 0xFF;
+  uint8_t protocol = event->protocol;  // Already set by caller
+  
+  // Fill event structure
+  event->timestamp_ns = bpf_ktime_get_ns();
+  event->old_state = old_state;
+  event->new_state = new_state;
+  event->direction = direction;  // Use actual direction from CT
+  event->flags = LXB_L4_FLAG_SAMPLED;
+  event->catalog_id = 0;  // TODO: Get from xf if available
+  event->worker_id = 0;   // TODO: Get from CPU ID
+  event->duration_us = 0; // Will be calculated for CLOSE events
+  
+  // Copy 5-tuple (source = client, dest = server from xf)
+  __builtin_memcpy(event->client_ip, xf->l34m.saddr, sizeof(event->client_ip));
+  __builtin_memcpy(event->server_ip, xf->l34m.daddr, sizeof(event->server_ip));
+  event->client_port = xf->l34m.source;
+  event->server_port = xf->l34m.dest;
+  
+  // Backend info from NAT transformation
+  if (ts && ts->ctd.xi.nat_flags & LLB_NAT_DST) {
+    __builtin_memcpy(event->backend_ip, ts->ctd.xi.nat_xip, sizeof(event->backend_ip));
+    event->backend_port = ts->ctd.xi.nat_xport;
+    event->backend_id = ts->ctd.rid;  // Rule ID as backend identifier
+    event->flags |= LXB_L4_FLAG_BACKEND_SELECTED;
+    event->flags |= LXB_L4_FLAG_NAT_APPLIED;
+  } else {
+    __builtin_memset(event->backend_ip, 0, sizeof(event->backend_ip));
+    event->backend_port = 0;
+    event->backend_id = 0;
+  }
+  
+  // Copy byte/packet counters from CT entry
+  if (ts) {
+    event->bytes_in = ts->ctd.pb.bytes;
+    event->packets_in = ts->ctd.pb.packets;
+  }
+  
+  // Error code detection with proper RST direction
+  event->error_code = LXB_L4_ERROR_NONE;
+  if (protocol == IPPROTO_TCP && new_state == CT_TCP_CW) {
+    // RST received - use direction to determine origin
+    // CT_DIR_IN = client -> server (client sent RST)
+    // CT_DIR_OUT = server -> client (backend sent RST)
+    if (direction == CT_DIR_IN) {
+      event->error_code = LXB_L4_ERROR_RST_CLIENT;
+    } else {
+      event->error_code = LXB_L4_ERROR_RST_SERVER;  // Backend RST
+    }
+    event->event_type = LXB_L4_EVENT_CONN_RESET;
+    event->flags |= LXB_L4_FLAG_ERROR;
+  } else if (protocol == IPPROTO_TCP && new_state == CT_TCP_ERR) {
+    event->error_code = LXB_L4_ERROR_CT_TIMEOUT;  // Generic CT error
+    event->flags |= LXB_L4_FLAG_ERROR;
+#ifndef HAVE_DP_DPU_SLIM
+  } else if (protocol == IPPROTO_SCTP && new_state == CT_SCTP_SHUT) {
+    // SCTP graceful shutdown - set event type but NO error code
+    // This is normal connection termination, not an error
+    event->event_type = LXB_L4_EVENT_CONN_RESET;
+    // Do NOT set error_code or LXB_L4_FLAG_ERROR for graceful shutdown
+#endif
+  }
+  
+  // Protocol-specific fields
+  if (protocol == IPPROTO_TCP && ts) {
+    ct_tcp_pinf_t *tcp_state = &ts->ctd.pi.t;
+    
+    // RTT from 3-way handshake
+    event->rtt_us = tcp_state->rtt_us;
+    
+    // TCP-specific fields (sequence numbers from CT state)
+    event->proto.tcp.seq_in = tcp_state->tcp_cts[CT_DIR_IN].seq;
+    event->proto.tcp.ack_in = tcp_state->tcp_cts[CT_DIR_IN].pack;
+    event->proto.tcp.seq_out = tcp_state->tcp_cts[CT_DIR_OUT].seq;
+    event->proto.tcp.ack_out = tcp_state->tcp_cts[CT_DIR_OUT].pack;
+    // tcp_flags cannot be set here (would need xf, exceeds BPF arg limit)
+    event->proto.tcp.tcp_flags = 0;
+    
+#ifndef HAVE_DP_DPU_SLIM
+  } else if (protocol == IPPROTO_SCTP && ts) {
+    ct_sctp_pinf_t *sctp_state = &ts->ctd.pi.s;
+
+    // SCTP-specific fields
+    event->proto.sctp.vtag = sctp_state->itag;
+    event->proto.sctp.streams_in = 0;   // TODO: Extract from SCTP header
+    event->proto.sctp.streams_out = 0;  // TODO: Extract from SCTP header
+    event->proto.sctp.chunk_type = 0;   // TODO: Track last chunk type
+
+    // Error detection for SCTP
+    if (new_state == CT_SCTP_ABRT) {
+      event->error_code = LXB_L4_ERROR_SCTP_ABORT;
+      event->event_type = LXB_L4_EVENT_CONN_RESET;
+      event->flags |= LXB_L4_FLAG_ERROR;
+    } else if (new_state == CT_SCTP_ERR) {
+      event->error_code = LXB_L4_ERROR_CT_TIMEOUT;
+      event->flags |= LXB_L4_FLAG_ERROR;
+    }
+#endif
+  }
+  
+  // Reserved fields - zero out
+  __builtin_memset(event->_pad4, 0, sizeof(event->_pad4));
+}
+
+/**
+ * Phase 2: Full Event Emission to Ring Buffer
+ * 
+ * Split into two __noinline functions for stack management:
+ * 1. This function: sampling check + ring buffer allocation
+ * 2. lxb_l4_populate_event: event structure population
+ * 
+ * CRITICAL: Must be noinline to avoid BPF stack overflow (512 byte limit)
+ */
+static __noinline void
+lxb_l4_emit_event(struct xfi *xf,
+                  struct dp_ct_tact *ts,
+                  uint32_t state_and_dir,  // packed: (old_state << 16) | (new_state << 8) | direction
+                  uint8_t protocol)
+{
+  // Fast path: check if tracing enabled via config map
+  __u32 cfg_key = 0;
+  struct dp_l4_trace_config *cfg = bpf_map_lookup_elem(&l4_trace_cfg, &cfg_key);
+  if (!cfg || !cfg->enabled) {
+    return;  // <20ns: single map lookup + branch prediction
+  }
+  
+  // Unpack state for event type determination
+  ct_state_t old_state = (state_and_dir >> 16) & 0xFF;
+  ct_state_t new_state = (state_and_dir >> 8) & 0xFF;
+  
+  // Generate span_id from xf (inlined to reduce call depth)
+  uint64_t span_id = lxb_generate_span_id_from_xf(xf);
+  
+  // Determine event type from state transition
+  uint8_t event_type = LXB_L4_EVENT_STATE_CHANGE;  // Default
+  
+  // TCP event type determination
+  if (protocol == IPPROTO_TCP) {
+    if (old_state == CT_TCP_CLOSED && new_state == CT_TCP_SS) {
+      event_type = LXB_L4_EVENT_CONN_NEW;
+    } else if (new_state == CT_TCP_EST && old_state != CT_TCP_EST) {
+      event_type = LXB_L4_EVENT_CONN_NEW;  // Treat first EST as NEW
+    } else if (new_state == CT_TCP_CW || new_state == CT_TCP_FINI || new_state == CT_TCP_FINI2 || new_state == CT_TCP_FINI3) {
+      event_type = LXB_L4_EVENT_CONN_CLOSE;
+    } else if (new_state == CT_TCP_ERR) {
+      event_type = LXB_L4_EVENT_CONN_ERROR;
+    }
+  }
+  // SCTP event type determination handled in protocol-specific section
+  
+  // Apply sampling decision (pass xf for NAT correlation)
+  if (!lxb_l4_should_sample(xf, span_id, event_type, cfg)) {
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    bpf_printk("[L4_TRACE_DROP] span=%016llx event_type=%d sampled=0", span_id, event_type);
+#endif
+    return;
+  }
+  
+  // Reserve space in ring buffer
+  lxb_l4_trace_event_t *event = bpf_ringbuf_reserve(&l4_trace_ringbuf,
+                                                             sizeof(*event), 0);
+  if (!event) {
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    bpf_printk("[L4_TRACE_RING_FULL] span=%016llx dropped", span_id);
+#endif
+    return;  // Ring buffer full, drop event
+  }
+  
+  // Pre-populate basic fields (BPF arg limit = 5)
+  event->span_id = span_id;
+  event->event_type = event_type;
+  event->protocol = protocol;
+  
+  // Populate event in separate function (reduces combined stack usage)
+  lxb_l4_populate_event(event, xf, ts, state_and_dir);
+  
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+  bpf_printk("[L4_TRACE_EMIT] span=%016llx type=%d state=%d->%d proto=%d",
+             span_id, event_type, old_state, new_state, protocol);
+#endif
+  
+  // Submit event to ring buffer
+  bpf_ringbuf_submit(event, 0);
+}
+
+#endif /* HAVE_L4_TRACE */
+
+// ============================================================================
+// Existing CT implementation continues below
+// ============================================================================
 
 #ifdef HAVE_LEGACY_BPF_MAPS
 
@@ -100,6 +489,7 @@ dp_ct_related_fc_rm(struct dp_ct_key *ctk)
   return;
 }
 
+
 #ifdef HAVE_DP_EXTCT
 #define DP_RUN_CT_HELPER(x)                \
 do {                                       \
@@ -128,13 +518,17 @@ dp_ct_get_newctr(__u32 *nid)
   /* FIXME - We can potentially do a percpu array and do away
    *         with the locking here
    */ 
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_lock(&ctr->lock);
+#endif
   v = ctr->counter;
   ctr->counter += 2;
   if (ctr->counter >= ctr->entries) {
     ctr->counter = ctr->start;
   }
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_unlock(&ctr->lock);
+#endif
 
   return v;
 }
@@ -312,7 +706,9 @@ dp_ct_tcp_sm(void *ctx, struct xfi *xf,
   seq = bpf_ntohl(t->seq);
   ack = bpf_ntohl(t->ack_seq);
 
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_lock(&atdat->lock);
+#endif
 
   if (dir == CT_DIR_IN) {
     tdat->pi.t.tcp_cts[0].pseq = t->seq;
@@ -385,6 +781,12 @@ dp_ct_tcp_sm(void *ctx, struct xfi *xf,
 
     td->seq = seq;
     nstate = CT_TCP_SS;
+    
+#ifdef HAVE_L4_TRACE
+    // RTT Calculation: Initialize timestamp tracking on SYN
+    ts->syn_ack_time_ns = 0;
+    ts->rtt_us = 0;
+#endif
     break;
   case CT_TCP_SS:
     if (dir != CT_DIR_OUT) {
@@ -446,6 +848,17 @@ dp_ct_tcp_sm(void *ctx, struct xfi *xf,
     }
 
     td->seq = seq;
+    
+#ifdef HAVE_L4_TRACE
+    // RTT Calculation: Record SYN-ACK timestamp when transitioning to SYN-ACK state
+    // This will be used to calculate RTT when connection is ESTABLISHED
+    if (ts->state == CT_TCP_SS && dir == CT_DIR_OUT) {
+      // Cannot call bpf_ktime_get_ns() inside spinlock - will be calculated after unlock
+      // For now, just mark that we need to record the timestamp
+      ts->syn_ack_time_ns = 1; // Placeholder, will be set after unlock
+    }
+#endif
+    
     if (xf->nm.ppv2)
       nstate = CT_TCP_PEST;
     else
@@ -513,14 +926,81 @@ dp_ct_tcp_sm(void *ctx, struct xfi *xf,
   }
 
 end:
-  ts->state = nstate;
-  rts->state = nstate;
+  {
+    // Save old state before updating. Always computed: needed both for the
+    // always-on error accounting below and (when compiled) L4 trace emission.
+    uint32_t old_state = ts->state;
 
-  if (nstate != CT_TCP_ERR && dir == CT_DIR_OUT) {
-    xtdat->pi.t.tcp_cts[0].seq = seq;
+    ts->state = nstate;
+    rts->state = nstate;
+
+    if (nstate != CT_TCP_ERR && dir == CT_DIR_OUT) {
+      xtdat->pi.t.tcp_cts[0].seq = seq;
+    }
+
+#ifndef HAVE_DP_DPU_SLIM
+    bpf_spin_unlock(&atdat->lock);
+#endif
+
+    // Always-on, unsampled error accounting (metric logic — trace-independent).
+    // Count each transition INTO a reset/error state exactly once. MUST be after
+    // the spinlock release (helper calls are illegal under bpf_spin_lock). This
+    // DP encodes RST-received as CT_TCP_CW (see the CONN_RESET handling above).
+    if (old_state != nstate) {
+      if (nstate & CT_TCP_CW) {
+        // CT_DIR_IN = client sent RST, CT_DIR_OUT = backend sent RST.
+        dp_update_ct_error_stats(dir == CT_DIR_IN ?
+                                 CT_ERR_STAT_TCP_RST_CLIENT :
+                                 CT_ERR_STAT_TCP_RST_SERVER, 1);
+      } else if (nstate & CT_TCP_ERR) {
+        dp_update_ct_error_stats(CT_ERR_STAT_TCP_ERR, 1);
+      }
+    }
+
+#ifdef HAVE_L4_TRACE
+    // RTT Calculation: Must be done AFTER spinlock release
+    // eBPF doesn't allow helper function calls while holding locks
+    if (old_state == CT_TCP_SA && nstate == CT_TCP_EST) {
+      // Record SYN-ACK timestamp when transitioning from SYN-SENT to SYN-ACK
+      if (ts->syn_ack_time_ns == 1 && dir == CT_DIR_OUT) {
+        __u64 syn_ack_time = bpf_ktime_get_ns();
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_lock(&atdat->lock);
+#endif
+        ts->syn_ack_time_ns = syn_ack_time;
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_unlock(&atdat->lock);
+#endif
+      }
+
+      // Calculate RTT when ACK received (SYN-ACK → ESTABLISHED)
+      __u64 saved_syn_ack_time = ts->syn_ack_time_ns;
+      if (saved_syn_ack_time > 1) {  // Valid timestamp (not 0 or 1 placeholder)
+        __u64 now_ns = bpf_ktime_get_ns();
+        __u64 delta_ns = now_ns - saved_syn_ack_time;
+        __u32 rtt_us = (__u32)(delta_ns / 1000);
+
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_lock(&atdat->lock);
+#endif
+        ts->rtt_us = rtt_us;
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_unlock(&atdat->lock);
+#endif
+        
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+        bpf_printk("[L4_TRACE_RTT] TCP RTT calculated: %u us", rtt_us);
+#endif
+      }
+    }
+    
+    // Emit event to ring buffer (pass xf to avoid stack allocation)
+    if (old_state != nstate) {
+      uint32_t state_and_dir = ((uint32_t)old_state << 16) | ((uint32_t)nstate << 8) | (uint32_t)dir;
+      lxb_l4_emit_event(xf, atdat, state_and_dir, IPPROTO_TCP);
+    }
+#endif
   }
-
-  bpf_spin_unlock(&atdat->lock);
 
   if (nstate == CT_TCP_EST) {
     return CT_SMR_EST;
@@ -547,13 +1027,18 @@ dp_ct_udp_sm(void *ctx, struct xfi *xf,
   ct_udp_pinf_t *xus = &xtdat->pi.u;
   uint32_t nstate = us->state;
 
-  bpf_spin_lock(&atdat->lock);
+  /* Suppress unused variable warning (xus is used later) */
+  (void)xus;
+
+  // bpf_spin_lock(&atdat->lock);
 
   if (dir == CT_DIR_IN) {
+    bpf_printk("[CT_UDP_SM] state trace - DIR_IN");
     tdat->pb.bytes += xf->pm.l3_len;
     tdat->pb.packets += 1;
     us->pkts_seen++;
   } else {
+    bpf_printk("[CT_UDP_SM] not start state trace - DIR_OUT");
     xtdat->pb.bytes += xf->pm.l3_len;
     xtdat->pb.packets += 1;
     us->rpkts_seen++;
@@ -561,52 +1046,87 @@ dp_ct_udp_sm(void *ctx, struct xfi *xf,
 
   switch (us->state) {
   case CT_UDP_CNI:
-
+    bpf_printk("[CT_UDP_SM] CT_UDP_CNI state, pkts=%u, rpkts=%u", us->pkts_seen, us->rpkts_seen);
     if (xf->nm.dsr || xf->l2m.ssnid) {
+      bpf_printk("[CT_UDP_SM] DSR/SSNID detected - CNI->EST");
       nstate = CT_UDP_EST;
       break;
     }
 
     if (us->pkts_seen && us->rpkts_seen) {
+      bpf_printk("[CT_UDP_SM] Bidirectional traffic - CNI->EST");
       nstate = CT_UDP_EST;
     } else if (us->pkts_seen > CT_UDP_CONN_THRESHOLD) {
+      bpf_printk("[CT_UDP_SM] Unidirectional threshold reached - CNI->UEST");
       nstate = CT_UDP_UEST;
     }
+    break;
 
-    break;
   case CT_UDP_UEST:
-    if (us->rpkts_seen || us->pkts_seen > 2*CT_UDP_CONN_THRESHOLD)
+    bpf_printk("[CT_UDP_SM] CT_UDP_UEST state, pkts=%u, rpkts=%u", us->pkts_seen, us->rpkts_seen);
+    bpf_printk("[CT_UDP_SM] checking packets for EST transition");
+    if (us->rpkts_seen || us->pkts_seen > 2*CT_UDP_CONN_THRESHOLD) {
+      bpf_printk("[CT_UDP_SM] UEST->EST (bidirectional or high packet count)");
       nstate = CT_UDP_EST;
-    break;
-  case CT_UDP_EST:
-    if (xf->pm.l4fin) {
-      nstate = CT_UDP_FINI;
-      us->fndir = dir;
     }
     break;
+
+  case CT_UDP_EST:
+    bpf_printk("[CT_UDP_SM] CT_UDP_EST state");
+  if (xf->pm.l4fin) {
+    bpf_printk("[CT_UDP_SM] l4fin detected");
+    nstate = CT_UDP_FINI;
+    us->fndir = dir;
+  }
+    break;
   case CT_UDP_FINI:
+    bpf_printk("[CT_UDP_SM] CT_UDP_FINI state");
     if (xf->pm.l4fin && us->fndir != dir) {
       nstate = CT_UDP_CW;
     }
     break;
+
   default:
+    bpf_printk("[CT_UDP_SM] default state");
     break;
   }
+
+#ifdef HAVE_L4_TRACE
+  // Phase 2: Save old state before updating for event emission
+  uint32_t old_state = us->state;
+#endif
 
   us->state = nstate;
   xus->state = nstate;
 
-  bpf_spin_unlock(&atdat->lock);
+  // bpf_spin_unlock(&atdat->lock);
 
-  if (nstate == CT_UDP_UEST)
+#ifdef HAVE_L4_TRACE
+  // Phase 2: Emit full event to ring buffer (pass xf to avoid stack allocation)
+  if (old_state != nstate) {
+    uint32_t state_and_dir = ((uint32_t)old_state << 16) | ((uint32_t)nstate << 8) | (uint32_t)dir;
+    lxb_l4_emit_event(xf, atdat, state_and_dir, IPPROTO_UDP);
+  }
+#endif
+
+
+  /* Note: DCID map operations are now done immediately upon migration detection */
+
+  if (nstate == CT_UDP_UEST) {
+    bpf_printk("[CT_UDP_SM] returning CT_SMR_UEST");
     return CT_SMR_UEST;
-  else if (nstate == CT_UDP_EST)
+  } else if (nstate == CT_UDP_EST) {
+    bpf_printk("[CT_UDP_SM] returning CT_SMR_EST");
     return CT_SMR_EST;
-  else if (nstate & CT_UDP_CW)
+  } else if (nstate & CT_UDP_CW) {
+    bpf_printk("[CT_UDP_SM] returning CT_SMR_CTD");
     return CT_SMR_CTD;
-  else if (nstate & CT_UDP_FIN_MASK)
+  } else if (nstate & CT_UDP_FIN_MASK) {
+    bpf_printk("[CT_UDP_SM] returning CT_SMR_FIN");
     return CT_SMR_FIN;
-
+  } else {
+    bpf_printk("[CT_UDP_SM] returning CT_SMR_INPROG");
+  }  
   return CT_SMR_INPROG;
 }
 
@@ -636,7 +1156,9 @@ dp_ct_icmp6_sm(void *ctx, struct xfi *xf,
    */
   seq = bpf_ntohs(i->icmp6_dataun.u_echo.sequence);
 
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_lock(&atdat->lock);
+#endif
 
   if (dir == CT_DIR_IN) {
     tdat->pb.bytes += xf->pm.l3_len;
@@ -699,7 +1221,9 @@ end:
   is->state = nstate;
   xis->state = nstate;
 
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_unlock(&atdat->lock);
+#endif
 
   if (nstate == CT_ICMP_REPS)
     return CT_SMR_EST;
@@ -708,7 +1232,7 @@ end:
 }
 
 static int __always_inline
-dp_ct_icmp_sm(void *ctx, struct xfi *xf, 
+dp_ct_icmp_sm(void *ctx, struct xfi *xf,
               struct dp_ct_tact *atdat,
               struct dp_ct_tact *axtdat,
               ct_dir_t dir)
@@ -733,7 +1257,9 @@ dp_ct_icmp_sm(void *ctx, struct xfi *xf,
    */
   seq = bpf_ntohs(i->un.echo.sequence);
 
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_lock(&atdat->lock);
+#endif
 
   if (dir == CT_DIR_IN) {
     tdat->pb.bytes += xf->pm.l3_len;
@@ -800,7 +1326,9 @@ end:
   is->state = nstate;
   xis->state = nstate;
 
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_unlock(&atdat->lock);
+#endif
 
   if (nstate == CT_ICMP_REPS)
     return CT_SMR_EST;
@@ -808,8 +1336,9 @@ end:
   return CT_SMR_INPROG;
 }
 
+#ifndef HAVE_DP_DPU_SLIM
 static int __always_inline
-dp_ct_sctp_sm(void *ctx, struct xfi *xf, 
+dp_ct_sctp_sm(void *ctx, struct xfi *xf,
               struct dp_ct_tact *atdat,
               struct dp_ct_tact *axtdat,
               ct_dir_t dir)
@@ -1363,10 +1892,33 @@ end:
   if (pss->nh && nstate == CT_SCTP_COOKIE) {
     nstate = CT_SCTP_EST;
   }
+
+  // Save old state BEFORE updating. Always computed: needed for the always-on
+  // error accounting below and (when compiled) L4 trace emission.
+  uint32_t old_state = ss->state;
+
   ss->state = nstate;
   xss->state = nstate;
 
   bpf_spin_unlock(&atdat->lock);
+
+  // Always-on, unsampled error accounting (metric logic — trace-independent).
+  // Count each transition INTO an abort/error state exactly once, after unlock.
+  if (old_state != nstate) {
+    if (nstate & CT_SCTP_ABRT) {
+      dp_update_ct_error_stats(CT_ERR_STAT_SCTP_ABORT, 1);
+    } else if (nstate & CT_SCTP_ERR) {
+      dp_update_ct_error_stats(CT_ERR_STAT_SCTP_ERR, 1);
+    }
+  }
+
+#ifdef HAVE_L4_TRACE
+  // Emit event to ring buffer after unlock (pass xf to avoid stack allocation)
+  if (old_state != nstate) {
+    uint32_t state_and_dir = ((uint32_t)old_state << 16) | ((uint32_t)nstate << 8) | (uint32_t)dir;
+    lxb_l4_emit_event(xf, atdat, state_and_dir, IPPROTO_SCTP);
+  }
+#endif
 
   if (nstate == CT_SCTP_EST) {
     return CT_SMR_EST;
@@ -1380,6 +1932,7 @@ end:
 
   return CT_SMR_INPROG;
 }
+#endif /* !HAVE_DP_DPU_SLIM - SCTP state machine */
 
 static int __always_inline
 dp_ct_sm(void *ctx, struct xfi *xf,
@@ -1399,9 +1952,11 @@ dp_ct_sm(void *ctx, struct xfi *xf,
   case IPPROTO_ICMP:
     sm_ret = dp_ct_icmp_sm(ctx, xf, atdat, axtdat, dir);
     break;
+#ifndef HAVE_DP_DPU_SLIM
   case IPPROTO_SCTP:
     sm_ret = dp_ct_sctp_sm(ctx, xf, atdat, axtdat, dir);
     break;
+#endif
   case IPPROTO_ICMPV6:
     sm_ret = dp_ct_icmp6_sm(ctx, xf, atdat, axtdat, dir);
     break;
@@ -1430,9 +1985,12 @@ dp_ct_est(struct xfi *xf,
   struct dp_ct_dat *tdat = &atdat->ctd;
   //struct dp_ct_dat *xtdat = &axtdat->ctd;
   struct dp_ct_tact_scratch *adat, *axdat;
+#ifndef HAVE_DP_DPU_SLIM
   ct_sctp_pinf_t *ss;
   ct_sctp_pinf_t *tss;
-  int i, j, k;
+  int i, j;
+#endif
+  int k;
 
   k = 0;
   adat = bpf_map_lookup_elem(&xctk, &k);
@@ -1447,8 +2005,10 @@ dp_ct_est(struct xfi *xf,
   CP_CT_NAT_TACTS(adat, atdat);
   CP_CT_NAT_TACTS(axdat, axtdat);
 
+#ifndef HAVE_DP_DPU_SLIM
   ss = &adat->ctd.pi.s;
   tss = &atdat->ctd.pi.s;
+#endif
 
   switch (xf->l34m.nw_proto) {
   case IPPROTO_UDP:
@@ -1470,6 +2030,7 @@ dp_ct_est(struct xfi *xf,
       }
     }
     break;
+#ifndef HAVE_DP_DPU_SLIM
   case IPPROTO_SCTP:
     /* Ignore Hearbeats */
     if (xf->pm.goct) return 0;
@@ -1571,6 +2132,7 @@ dp_ct_est(struct xfi *xf,
       }
     }
     break;
+#endif /* !HAVE_DP_DPU_SLIM - SCTP multi-homing */
   default:
     break;
   }
@@ -1584,14 +2146,17 @@ dp_ct_ctd(struct xfi *xf,
          struct dp_ct_tact *atdat,
          struct dp_ct_tact *axtdat)
 {
+#ifndef HAVE_DP_DPU_SLIM
   struct dp_ct_dat *tdat = &atdat->ctd;
   struct dp_ct_dat *xtdat = &axtdat->ctd;
   ct_sctp_pinf_t *ss;
   int i,j;
 
   ss = &atdat->ctd.pi.s;
+#endif
 
   switch (xf->l34m.nw_proto) {
+#ifndef HAVE_DP_DPU_SLIM
   case IPPROTO_SCTP:
     if (xf->nm.npmhh) {
       ct_sctp_pinfd_t *pss = &ss->sctp_cts[CT_DIR_IN];
@@ -1626,6 +2191,7 @@ dp_ct_ctd(struct xfi *xf,
       }
     }
     break;
+#endif /* !HAVE_DP_DPU_SLIM - SCTP CT delete */
   default:
     break;
   }
@@ -1745,6 +2311,31 @@ dp_ct_in(void *ctx, struct xfi *xf)
     adat->ctd.pb.bytes = 0;
     adat->ctd.pb.packets = 0;
 
+    /* Octavia connectionLimit (FR-06/26 / D-74-04/05): increment the per-rule live
+     * concurrent-connection count on CT-create, SELECTOR-AGNOSTIC. conc_conns lives in the
+     * rule-index-keyed nat_ep_map so the teardown path can decrement it by rule id. Only count
+     * NAT'd flows (xi->nat_flags) — the same gate the SecurityRate / active_sess dec uses below.
+     * This is the SAME live count the connectionLimit gate (dp_do_nat) compares against and the
+     * stats active_connections endpoint reads. The (N+1)th SYN is refused BEFORE reaching here
+     * (sel=-1 => no NAT => no CT), so it is never counted. */
+    if (xi->nat_flags) {
+      __u32 cc_key = xf->pm.rule_id;
+      struct dp_nat_epacts *ccepa = bpf_map_lookup_elem(&nat_ep_map, &cc_key);
+      if (ccepa != NULL) {
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_lock(&ccepa->lock);
+#endif
+        ccepa->conc_conns++;
+        /* Octavia /stats total_connections (FR-21 / D-74-02 "++ on CT-create"): cumulative,
+         * never decremented, so even a flow that tears down before the next RulesSync tick is
+         * still counted. conc_conns (above) is the live gauge; total_conns is the running total. */
+        ccepa->total_conns++;
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_unlock(&ccepa->lock);
+#endif
+      }
+    }
+
     axdat->ca.ftrap = 0;
     axdat->ca.oaux = 0;
     axdat->ca.cidx = adat->ca.cidx + 1;
@@ -1818,8 +2409,13 @@ dp_ct_in(void *ctx, struct xfi *xf)
 
     BPF_TRACE_PRINTK("[CTRK] ct smr %d", smr);
 
-    if (smr == CT_SMR_EST) {
+    if (smr == CT_SMR_EST || smr == CT_SMR_UEST) {
       if (xi->nat_flags) {
+        /* One-shot gate: doct starts at 1 (CT creation), cleared here on first EST.
+         * Only emit HW offload events on the 1→0 transition to avoid flooding
+         * the perf ring on every subsequent packet (critical for UDP which returns
+         * CT_SMR_EST on every packet once established). */
+        int first_est = atdat->nat_act.doct;
         atdat->nat_act.doct = 0;
         axtdat->nat_act.doct = 0;
         if (atdat->ctd.dir == CT_DIR_IN) {
@@ -1829,15 +2425,58 @@ dp_ct_in(void *ctx, struct xfi *xf)
         }
         atdat->ctd.xi.mhon = 0;
         axtdat->ctd.xi.mhon = 0;
+
+        /* Emit HW offload events for BOTH directions (key + xkey) on first EST only.
+         * For UDP, EST may fire on DIR_OUT; both DNAT+SNAT need offloading.
+         * One-shot: prevents perf ring flooding that kills DOCA worker. */
+        if (first_est && !key.v6 &&
+            (key.l4proto == IPPROTO_TCP || key.l4proto == IPPROTO_UDP)) {
+          struct ll_dp_ct_hwev ev;
+          __builtin_memset(&ev, 0, sizeof(ev));
+          ev.rcode = LLB_PIPE_RC_HW_UPD;
+          ev.rid = atdat->ctd.rid;
+          ev.saddr = key.saddr[0];
+          ev.daddr = key.daddr[0];
+          ev.sport = key.sport;
+          ev.dport = key.dport;
+          ev.l4proto = key.l4proto;
+          bpf_perf_event_output(ctx, &cp_ring,
+                                BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+          /* Reverse direction so both DNAT+SNAT get offloaded */
+          ev.saddr = xkey.saddr[0];
+          ev.daddr = xkey.daddr[0];
+          ev.sport = xkey.sport;
+          ev.dport = xkey.dport;
+          bpf_perf_event_output(ctx, &cp_ring,
+                                BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+        }
       } else {
+        /* One-shot gate for non-NAT: act_type transitions from DP_SET_DO_CT to DP_SET_NOP */
+        int first_est_nonat = (atdat->ca.act_type != DP_SET_NOP);
         atdat->ca.act_type = DP_SET_NOP;
         axtdat->ca.act_type = DP_SET_NOP;
+
+        /* Emit HW offload event for non-NAT established/uest flows on first EST only. */
+        if (first_est_nonat && !key.v6 &&
+            (key.l4proto == IPPROTO_TCP || key.l4proto == IPPROTO_UDP)) {
+          struct ll_dp_ct_hwev ev;
+          __builtin_memset(&ev, 0, sizeof(ev));
+          ev.rcode = LLB_PIPE_RC_HW_UPD;
+          ev.rid = atdat->ctd.rid;
+          ev.saddr = key.saddr[0];
+          ev.daddr = key.daddr[0];
+          ev.sport = key.sport;
+          ev.dport = key.dport;
+          ev.l4proto = key.l4proto;
+          bpf_perf_event_output(ctx, &cp_ring,
+                                BPF_F_CURRENT_CPU, &ev, sizeof(ev));
+        }
       }
     } else if (smr == CT_SMR_ERR || smr == CT_SMR_CTD) {
       bpf_map_delete_elem(&ct_map, &xkey);
       bpf_map_delete_elem(&ct_map, &key);
       dp_ct_related_fc_rm(&xkey);
-      dp_ct_related_fc_rm(&key);
+      dp_ct_related_fc_rm(&key); 
 
       if (atdat->ctd.dir == CT_DIR_IN) {
         dp_ct_ctd(xf, &key, &xkey, atdat, axtdat);
@@ -1847,9 +2486,49 @@ dp_ct_in(void *ctx, struct xfi *xf)
 
       if (xi->nat_flags) {
         dp_do_dec_nat_sess(ctx, xf, atdat->ctd.rid, atdat->ctd.aid);
+
+        /* Octavia connectionLimit (FR-06/26 / D-74-04/05): decrement the per-rule live
+         * concurrent-connection count on CT-teardown, by rule id (atdat->ctd.rid). Pairs with
+         * the CT-create increment above. Guarded against underflow so a double-teardown or a
+         * pre-existing CT (created before the counter existed) cannot wrap conc_conns. Frees a
+         * slot so a previously-refused client can connect. */
+        {
+          __u32 dc_key = atdat->ctd.rid;
+          struct dp_nat_epacts *dcepa = bpf_map_lookup_elem(&nat_ep_map, &dc_key);
+          if (dcepa != NULL) {
+            /* Octavia /stats cumulative directional bytes (FR-21 / D-74-06): fold this flow's
+             * final per-direction byte totals into the rule's running sums at teardown. atdat is
+             * the entry being torn down; atdat->ctd.dir says which direction it is, axtdat is its
+             * twin. The forward (CT_DIR_IN) CT carries client->VIP request bytes (bytes_in); the
+             * reverse (CT_DIR_OUT) carries VIP->client response bytes (bytes_out). NOT a 50/50
+             * split. While the flow is live these bytes are surfaced by the live-CT-walk rollup;
+             * once it tears down they live here, so the control plane sees no gap and no double
+             * count. */
+            __u64 fin_bin, fin_bout;
+            if (atdat->ctd.dir == CT_DIR_IN) {
+              fin_bin = atdat->ctd.pb.bytes;
+              fin_bout = axtdat->ctd.pb.bytes;
+            } else {
+              fin_bin = axtdat->ctd.pb.bytes;
+              fin_bout = atdat->ctd.pb.bytes;
+            }
+#ifndef HAVE_DP_DPU_SLIM
+            bpf_spin_lock(&dcepa->lock);
+#endif
+            if (dcepa->conc_conns > 0) {
+              dcepa->conc_conns--;
+            }
+            dcepa->cum_bytes_in += fin_bin;
+            dcepa->cum_bytes_out += fin_bout;
+#ifndef HAVE_DP_DPU_SLIM
+            bpf_spin_unlock(&dcepa->lock);
+#endif
+          }
+        }
       }
     }
   }
 
-  return smr; 
+  return smr;
 }
+

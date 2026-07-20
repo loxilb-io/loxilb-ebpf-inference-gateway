@@ -26,7 +26,7 @@ typedef struct map_update_data {
     char value[MAX_VALUE_SIZE];
 } map_update_data;
 
-#ifdef DOCKER_BUILDX_ARM64
+#if defined(DOCKER_BUILDX_ARM64) && !defined(__VMLINUX_H__)
 struct user_pt_regs {
         __u64 regs[31];
         __u64 sp;

@@ -9,6 +9,7 @@
 #define PBUF_STACK_SZ (16)
 #define HAVE_CSUM_NDPA
 
+#ifndef HAVE_DP_DPU_SLIM
 static __u32 __always_inline
 get_crc32c_map(__u32 off)
 {
@@ -22,6 +23,7 @@ get_crc32c_map(__u32 off)
 
   return *val;
 }
+#endif /* !HAVE_DP_DPU_SLIM - get_crc32c_map */
 
 #ifndef HAVE_CSUM_NDPA
 static int __always_inline
@@ -52,6 +54,7 @@ dp_pktbuf_read_wrap(void *md, __u32 off, void *buf, __u32 sz)
 #define dp_pktbuf_read_wrap dp_pktbuf_read
 #endif
 
+#ifndef HAVE_DP_DPU_SLIM
 static int __always_inline
 dp_sctp_csum(void *ctx, struct xfi *xf)
 {
@@ -153,3 +156,4 @@ drop:
   xf->pm.rcode |= LLB_PIPE_RC_PLCS_ERR;
   return DP_DROP;
 }
+#endif /* !HAVE_DP_DPU_SLIM - SCTP CRC32c checksum */

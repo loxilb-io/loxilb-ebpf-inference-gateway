@@ -15,12 +15,23 @@
 #include "../common/common_pdi.h"
 #include "../common/llb_dpapi.h"
 
+#ifdef HAVE_L4_TRACE
+#include "../common/lxb_l4_trace_event.h"
+#endif
+
 #include "llb_kern_cdefs.h"
 #include "llb_kern_sum.c"
 #include "llb_kern_compose.c"
 #include "llb_kern_policer.c"
 #include "llb_kern_sessfwd.c"
 #include "llb_kern_fw.c"
+#ifdef HAVE_DP_IP_FILTER
+#include "llb_kern_ipfilter.c"
+#endif
+#ifdef HAVE_DP_SECURITY_RATE_LIMIT
+#include "llb_kern_synflood.c"  /* P0-5 + P0-6: Unified security rate limiting */
+                                 /* Provides: dp_do_security_rate_main_xdp() for XDP layer */
+#endif
 #include "llb_kern_natlbfwd.c"
 #include "llb_kern_ct.c"
 #include "llb_kern_l3fwd.c"
@@ -68,7 +79,33 @@ int  xdp_packet_func(struct xdp_md *ctx)
   }
   memset(xf, 0, sizeof *xf);
 
-  dp_parse_depth0(ctx, xf, 1);
+  int parse_ret = dp_parse_depth0(ctx, xf, 1);
+  (void)parse_ret; /* Used only in debug builds */
+  BPF_DBG_PRINTK("[XDP-DEBUG] Parse result: ret=%d, dl_type=0x%x, valid=%d, saddr4=0x%x",
+                 parse_ret, bpf_ntohs(xf->l2m.dl_type), xf->l34m.valid, xf->l34m.saddr4);
+
+#ifdef HAVE_DP_IP_FILTER
+  /* IP Filter at XDP layer - early drop for DDoS protection */
+  int filter_action = dp_do_ipfilter_main_xdp(ctx, xf);
+  if (filter_action == XDP_DROP) {
+    BPF_TRACE_PRINTK("[XDP] IP filter dropped packet");
+    return XDP_DROP;  /* Drop immediately at XDP layer */
+  }
+#endif
+
+#ifdef HAVE_DP_SECURITY_RATE_LIMIT
+  /* SYN Flood protection - runs AFTER IP filter
+   * Pattern: Following P0-7 XDP integration
+   * Performance: <2µs per SYN packet, <0.5µs for non-SYN
+   */
+  BPF_DBG_PRINTK("[XDP-DEBUG] Before security check: saddr4=0x%x, valid=%d",
+                 xf->l34m.saddr4, xf->l34m.valid);
+  int syn_action = dp_do_security_rate_main_xdp(ctx, xf);
+  if (syn_action == XDP_DROP) {
+    BPF_TRACE_PRINTK("[XDP] SYN flood protection dropped packet");
+    return XDP_DROP;  /* Drop excessive SYNs at XDP layer */
+  }
+#endif
 
 #ifdef HAVE_DP_RSS
   if (xf->l2m.dl_type == bpf_ntohs(ETH_P_IP) &&
@@ -93,7 +130,7 @@ int  xdp_packet_func(struct xdp_md *ctx)
   }
 #endif
 
-  return DP_PASS;
+  return DP_PASS;  /* Pass to TC layer for firewall/CT processing */
 }
 
 SEC("xdp_pass")
@@ -196,6 +233,7 @@ int tc_packet_func_fw(struct __sk_buff *ctx)
   return dp_do_fw_main(ctx, xf);
 }
 
+#ifndef HAVE_DP_DPU_SLIM
 SEC("tc_packet_hook4")
 int tc_csum_func1(struct __sk_buff *md)
 {
@@ -233,6 +271,7 @@ int tc_csum_func2(struct __sk_buff *md)
   }
   return val;
 }
+#endif /* !HAVE_DP_DPU_SLIM - SCTP CRC32c tail-call programs */
 
 SEC("tc_packet_hook6")
 int tc_slow_unp_func(struct __sk_buff *md)

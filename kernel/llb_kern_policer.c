@@ -38,7 +38,9 @@ do_dp_policer(void *ctx, struct xfi *xf, int egr)
 
   inbytes = xf->pm.l3_len;
 
+#ifndef HAVE_DP_DPU_SLIM
   bpf_spin_lock(&pla->lock);
+#endif
 
   /* Calculate and add tokens to CBS */
   ts_last = pla->pol.lastc_uts;
@@ -136,7 +138,9 @@ out:
   } else {
     pla->pol.ps.pass_packets += 1;
   }
-  bpf_spin_unlock(&pla->lock); 
- 
+#ifndef HAVE_DP_DPU_SLIM
+  bpf_spin_unlock(&pla->lock);
+#endif
+
   return ret;
 }

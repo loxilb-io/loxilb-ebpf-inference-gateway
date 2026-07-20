@@ -457,7 +457,7 @@ proc_inl3:
   }
 
   return ret;
-} 
+}
 
 static int __always_inline
 dp_parse_gtp_ehdr(void *nh, void *dend)
@@ -646,7 +646,7 @@ dp_parse_outer_udp(struct parser *p,
                    struct xfi *xf)
 {
   struct vxlanhdr *vx;
-  struct gtp_v1_hdr *gh; 
+  struct gtp_v1_hdr *gh;
   void *dend = DP_TC_PTR(DP_PDATA_END(md)); 
   void *vx_next;
 
@@ -1059,12 +1059,15 @@ dp_unparse_packet_always(void *ctx,  struct xfi *xf)
   }
 
   if (xf->tm.tun_decap) {
+#ifndef HAVE_DP_DPU_SLIM
     if (xf->tm.tun_type == LLB_TUN_GTP) {
       if (dp_do_strip_gtp(ctx, xf, xf->pm.tun_off) != 0) {
         return DP_DROP;
       }
     }
+#endif
   } else if (xf->tm.new_tunnel_id) {
+#ifndef HAVE_DP_DPU_SLIM
     if (xf->tm.tun_type == LLB_TUN_GTP) {
       if (dp_do_ins_gtp(ctx, xf,
                         xf->tm.tun_rip,
@@ -1075,6 +1078,7 @@ dp_unparse_packet_always(void *ctx,  struct xfi *xf)
         return DP_DROP;
       }
     }
+#endif
   }
 
   return 0;

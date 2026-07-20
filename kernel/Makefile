@@ -11,6 +11,13 @@ XDP_DEPS := llb_kern_devif.c      \
             llb_kern_ct.c
 
 XDP_TARGETS  := llb_xdp_main
+# DPU builds skip XDP (BF2 has no XDP HW mode, BF3 skips XDP too)
+ifdef HAVE_DP_DPU_SLIM
+XDP_TARGETS :=
+endif
+ifdef HAVE_DP_DPU_BF3
+XDP_TARGETS :=
+endif
 TC_TARGETS   := llb_ebpf_main
 TC_ETARGETS  := llb_ebpf_emain
 MON_TARGETS  := llb_kern_mon

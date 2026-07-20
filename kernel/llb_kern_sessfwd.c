@@ -12,6 +12,7 @@
 
 #include "../common/parsing_helpers.h"
 
+#ifndef HAVE_DP_DPU_SLIM
 static int __always_inline
 dp_pipe_set_rm_gtp_tun(void *ctx, struct xfi *xf)
 {
@@ -20,6 +21,7 @@ dp_pipe_set_rm_gtp_tun(void *ctx, struct xfi *xf)
   xf->tm.tun_type = LLB_TUN_GTP;
   return 0;
 }
+#endif
 
 static int __always_inline
 dp_pipe_set_rm_ipip_tun(void *ctx, struct xfi *xf)
@@ -69,19 +71,23 @@ dp_do_sess4_lkup(void *ctx, struct xfi *xf)
   if (act->ca.act_type == DP_SET_DROP) {
     xf->pm.rcode |= LLB_PIPE_RC_ACT_DROP;
     goto drop;
+#ifndef HAVE_DP_DPU_SLIM
   } else if (act->ca.act_type == DP_SET_RM_GTP) {
     dp_pipe_set_rm_gtp_tun(ctx, xf);
     xf->qm.qfi = act->qfi;
     xf->pm.phit |= LLB_DP_TMAC_HIT;
+#endif
   } else if (act->ca.act_type == DP_SET_RM_IPIP) {
     dp_pipe_set_rm_ipip_tun(ctx, xf);
     xf->pm.phit |= LLB_DP_TMAC_HIT;
   } else {
+#ifndef HAVE_DP_DPU_SLIM
     xf->tm.new_tunnel_id = act->teid;
     xf->tm.tun_type = LLB_TUN_GTP;
     xf->qm.qfi = act->qfi;
     xf->tm.tun_rip = act->rip;
     xf->tm.tun_sip = act->sip;
+#endif
   }
 
   return 0;

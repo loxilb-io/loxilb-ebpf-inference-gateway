@@ -62,6 +62,7 @@ struct ebpfcfg {
   int egr_hooks;
   int have_sockrwr;
   int have_sockmap;
+  int have_ktls;
   int have_noebpf;
 };
 

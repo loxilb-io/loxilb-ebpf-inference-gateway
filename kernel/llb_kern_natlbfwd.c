@@ -10,11 +10,15 @@ dp_do_dec_nat_sess(void *ctx, struct xfi *xf, __u32 rule, __u16 aid)
   struct dp_nat_epacts *epa;
   epa = bpf_map_lookup_elem(&nat_ep_map, &rule);
   if (epa != NULL && epa->ca.act_type == DP_SET_NACT_SESS) {
+#ifndef HAVE_DP_DPU_SLIM
     bpf_spin_lock(&epa->lock);
+#endif
     if (aid < LLB_MAX_NXFRMS) {
       epa->active_sess[aid]--;
     }
+#ifndef HAVE_DP_DPU_SLIM
     bpf_spin_unlock(&epa->lock);
+#endif
   }
 }
 
@@ -28,8 +32,11 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
   __u16 rule_num = act->ca.cidx;
 
   if (act->sel_type == NAT_LB_SEL_RR) {
+    BPF_TRACE_PRINTK("[NAT-LB] Round Robin selection");
+#ifndef HAVE_DP_DPU_SLIM
     bpf_spin_lock(&act->lock);
-    i = act->sel_hint; 
+#endif
+    i = act->sel_hint;
 
     while (n < LLB_MAX_NXFRMS) {
       if (i >= 0 && i < LLB_MAX_NXFRMS) {
@@ -44,12 +51,15 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
       if (i >= LLB_MAX_NXFRMS)  i = 0;
       n++;
     }
+#ifndef HAVE_DP_DPU_SLIM
     bpf_spin_unlock(&act->lock);
+#endif
   } else if (act->sel_type == NAT_LB_SEL_HASH) {
     sel = dp_get_pkt_hash(ctx) % act->nxfrm;
     if (sel >= 0 && sel < LLB_MAX_NXFRMS) {
       /* Fall back if hash selection gives us a deadend */
       if (act->nxfrms[sel].inactive) {
+        sel = (uint16_t)(-1);  // Reset to indicate no active found
         for (i = 0; i < LLB_MAX_NXFRMS; i++) {
           if (act->nxfrms[i].inactive == 0) {
             sel = i;
@@ -58,6 +68,7 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
         }
       }
     }
+#ifndef HAVE_DP_DPU_SLIM
   } else if (act->sel_type == NAT_LB_SEL_N3) {
     if (xf->tm.tun_type == LLB_TUN_GTP) {
       sel = dp_get_tun_hash(xf) % act->nxfrm;
@@ -73,12 +84,15 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
         }
       }
     }
+#endif
   } else if (act->sel_type == NAT_LB_SEL_RR_PERSIST) {
     __u64 now = bpf_ktime_get_ns();
     __u64 base;
     __u64 tfc = 0;
 
+#ifndef HAVE_DP_DPU_SLIM
     bpf_spin_lock(&act->lock);
+#endif
     if (act->base_to == 0 || now - act->lts > act->pto) {
       act->base_to = now;
     }
@@ -96,7 +110,9 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
 #endif
     sel %= act->nxfrm;
     act->lts = now;
+#ifndef HAVE_DP_DPU_SLIM
     bpf_spin_unlock(&act->lock);
+#endif
     if (sel >= 0 && sel < LLB_MAX_NXFRMS) {
       if (act->nxfrms[sel].inactive) {
 #ifdef HAVE_DP_PERSIST_TFC
@@ -125,7 +141,9 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
     epa = bpf_map_lookup_elem(&nat_ep_map, &key);
     if (epa != NULL) {
       epa->ca.act_type = DP_SET_NACT_SESS;
+#ifndef HAVE_DP_DPU_SLIM
       bpf_spin_lock(&epa->lock);
+#endif
       for (i = 0; i < LLB_MAX_NXFRMS/2; i++) {
         nxfrm_act = &act->nxfrms[i];
         if (nxfrm_act->inactive == 0) {
@@ -139,7 +157,9 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
       if (sel >= 0 && sel < LLB_MAX_NXFRMS/2) {
         epa->active_sess[sel]++;
       }
+#ifndef HAVE_DP_DPU_SLIM
       bpf_spin_unlock(&epa->lock);
+#endif
     }
   }
 
@@ -176,7 +196,7 @@ dp_do_nat(void *ctx, struct xfi *xf)
       key.v6 = 1;
     }
 
-    if (key.mark & LLB_MARK_SNAT_EGR) {
+    if (key.mark & (LLB_MARK_SRC | LLB_MARK_SNAT_EGR | LLB_MARK_NAT)) {
       key.mark = 0;
     }
   }
@@ -209,6 +229,25 @@ dp_do_nat(void *ctx, struct xfi *xf)
       act->ca.act_type == DP_SET_DNAT) {
     sel = dp_sel_nat_ep(ctx, xf, act);
 
+    /* Octavia connectionLimit gate (FR-06/26 / D-74-05): refuse-by-drop at SYN time.
+     * act->conn_limit == 0 means unlimited (legacy / back-compat). The live per-rule
+     * concurrent-connection count (conc_conns) lives in the rule-index-keyed nat_ep_map
+     * and is maintained selector-agnostically on CT-create/teardown (llb_kern_ct.c). When
+     * it has reached the configured ceiling, force sel = -1 so control falls into the no-EP
+     * refuse branch below (xf->pm.nf = 0): the SYN is not NAT'd, not forwarded, and NO CT is
+     * created — so conc_conns is NOT incremented for the refused SYN and the N in-flight
+     * connections are untouched. A slot frees on the next CT-teardown decrement. This is the
+     * SAME live count the stats active_connections endpoint reads (D-74-04). */
+    if (act->conn_limit != 0) {
+      __u32 climit_key = act->ca.cidx;
+      struct dp_nat_epacts *cepa = bpf_map_lookup_elem(&nat_ep_map, &climit_key);
+      if (cepa != NULL && cepa->conc_conns >= act->conn_limit) {
+        sel = (uint16_t)(-1);
+        BPF_TRACE_PRINTK("[NAT] conn-limit hit: conc=%u limit=%u",
+                         cepa->conc_conns, act->conn_limit);
+      }
+    }
+
     xf->nm.dsr = act->ca.oaux ? 1: 0;
     xf->nm.cdis = act->cdis ? 1: 0;
     xf->nm.ppv2 = act->ppv2 ? 1: 0;
@@ -239,6 +278,7 @@ dp_do_nat(void *ctx, struct xfi *xf)
         xf->nm.nxip4 = 0;
       }
     } else {
+      /* Backend selection failed - no L4 trace here, will be caught in CT */
       xf->pm.nf = 0;
     }
 

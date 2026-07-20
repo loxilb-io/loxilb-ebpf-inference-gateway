@@ -164,7 +164,11 @@ struct pdi_key {
   PDI_TYPEDEF(16)    zone;
   PDI_TYPEDEF(16)    bd;
   PDI_TYPEDEF(8)     protocol;
-  PDI_TYPEDEF(8)     nr;
+  /* nr carries the total installed rule count in the idx-0 entry and is the
+   * kernel's scan bound; 8 bits truncated at 256 rules leaving later rules
+   * silently unevaluated (default-allow). Must be able to hold
+   * LLB_FW4_MAP_ENTRIES (8K). Not part of PDI_PKEY_EQ matching. */
+  PDI_TYPEDEF(16)    nr;
 };
 
 struct pdi6_key {
@@ -176,7 +180,8 @@ struct pdi6_key {
   PDI_TYPEDEF(16)    zone;
   PDI_TYPEDEF(16)    bd;
   PDI_TYPEDEF(8)     protocol;
-  PDI_TYPEDEF(8)     nr;
+  /* See pdi_key.nr — same 16-bit scan-bound requirement. */
+  PDI_TYPEDEF(16)    nr;
 };
 
 #endif

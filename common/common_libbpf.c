@@ -13,6 +13,23 @@
 #include "log.h"
 #include "common_libbpf.h"
 
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
+{
+  char buf[512];
+  vsnprintf(buf, sizeof(buf), format, args);
+  if (level <= LIBBPF_WARN)
+    log_warn("libbpf: %s", buf);
+  else
+    log_debug("libbpf: %s", buf);
+  return 0;
+}
+
+__attribute__((constructor))
+static void init_libbpf_print(void)
+{
+  libbpf_set_print(libbpf_print_fn);
+}
+
 static int
 setup_tail_calls(struct bpf_object *obj, struct libbpf_cfg *cfg)
 {
@@ -41,7 +58,9 @@ setup_tail_calls(struct bpf_object *obj, struct libbpf_cfg *cfg)
     int fd = bpf_program__fd(prog);
 
     section = bpf_program__section_name(prog);
-    if (strcmp(section, "tc_packet_hook7") == 0) {
+    if (strcmp(section, "tc_packet_hook8") == 0) {
+      key = 8;
+    } else if (strcmp(section, "tc_packet_hook7") == 0) {
       key = 7;
     } else if (strcmp(section, "tc_packet_hook6") == 0) {
       key = 6;
@@ -130,6 +149,14 @@ libbpf_tc_attach(struct libbpf_cfg *cfg, int egr)
   bpf_obj = bpf_object__open(cfg->filename);
 
   bpf_object__for_each_map(map, bpf_obj) {
+    /* Skip internal maps (.rodata, .data, .bss, .kconfig) — these are
+     * per-object and must not be reused from pins. On kernel 6.8+,
+     * reuse_fd on internal maps corrupts the map state and causes
+     * bpf_object__load() to fail. Let libbpf create them fresh. */
+    if (bpf_map__is_internal(map)) {
+      continue;
+    }
+
     len = snprintf(pinpbuf, PINPATH_MAX_LEN, "%s/%s", cfg->pin_dir, bpf_map__name(map));
     if (len < 0 || len >= PINPATH_MAX_LEN) {
       log_error("tc: pinpath buffer error");
@@ -155,7 +182,8 @@ libbpf_tc_attach(struct libbpf_cfg *cfg, int egr)
         strcmp(bpf_program__section_name(p), "tc_packet_hook4") == 0 ||
         strcmp(bpf_program__section_name(p), "tc_packet_hook5") == 0 ||
         strcmp(bpf_program__section_name(p), "tc_packet_hook6") == 0 ||
-        strcmp(bpf_program__section_name(p), "tc_packet_hook7") == 0) &&
+        strcmp(bpf_program__section_name(p), "tc_packet_hook7") == 0 || 
+        strcmp(bpf_program__section_name(p), "tc_packet_hook8") == 0) &&
         strcmp(bpf_program__section_name(p), cfg->progsec)) {
 
       log_debug("tc: autoload sec %s prog %s",
@@ -180,7 +208,7 @@ libbpf_tc_attach(struct libbpf_cfg *cfg, int egr)
   }
 
   if (bpf_object__load(bpf_obj)) {
-    log_error("tc: obj load failed");
+    log_error("tc: obj load failed: %s (errno=%d)", strerror(errno), errno);
     return NULL;
   }
 
@@ -302,6 +330,11 @@ reuse_maps_from_pinned_path(struct bpf_object *obj, const char *path)
     int len, err;
     int pinned_map_fd;
     char buf[PINPATH_MAX_LEN];
+
+    /* Skip internal maps (.rodata, .data, .bss) — per-object, not shared */
+    if (bpf_map__is_internal(map)) {
+      continue;
+    }
 
     len = snprintf(buf, PINPATH_MAX_LEN, "%s/%s", path, bpf_map__name(map));
     if (len < 0 || len >= PINPATH_MAX_LEN) {

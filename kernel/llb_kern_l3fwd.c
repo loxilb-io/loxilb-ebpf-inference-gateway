@@ -83,12 +83,15 @@ dp_rtv4_get_ipkey(struct xfi *xf)
         ipkey = xf->l34m.daddr4;
       }
     } else {
+#ifndef HAVE_DP_DPU_SLIM
       if (xf->tm.new_tunnel_id && xf->tm.tun_type == LLB_TUN_GTP) {
-        /* In case of GTP, there is no interface created in OS 
+        /* In case of GTP, there is no interface created in OS
          * which has a specific route through it. So, this hack !!
          */
         ipkey = xf->tm.tun_rip;
-      } else {
+      } else
+#endif
+      {
         ipkey = xf->l34m.daddr4;
       }
     }
@@ -406,7 +409,11 @@ dp_do_ipv4_fwd(void *ctx,  struct xfi *xf, void *fa_, int dir)
   if (dir == 1) {
     if (xf->l2m.dl_type == bpf_htons(ETH_P_IP)) {
       /* Check tunnel initiation */
-      if (xf->tm.tunnel_id == 0 ||  xf->tm.tun_type != LLB_TUN_GTP) {
+      if (xf->tm.tunnel_id == 0
+#ifndef HAVE_DP_DPU_SLIM
+          || xf->tm.tun_type != LLB_TUN_GTP
+#endif
+         ) {
         dp_do_sess4_lkup(ctx, xf);
         if (xf->tm.new_tunnel_id == 0 && !(xf->pm.nf & (LLB_NAT_DST|LLB_NAT_SRC))) {
           return;
@@ -482,7 +489,11 @@ dp_ingress_l3(void *ctx,  struct xfi *xf, void *fa)
   if (xf->l2m.dl_type == bpf_htons(ETH_P_IP)) {
     /* Check termination */
     if (xf->tm.tunnel_id &&
-        (xf->tm.tun_type == LLB_TUN_GTP || xf->tm.tun_type == LLB_TUN_IPIP)) {
+        (
+#ifndef HAVE_DP_DPU_SLIM
+         xf->tm.tun_type == LLB_TUN_GTP ||
+#endif
+         xf->tm.tun_type == LLB_TUN_IPIP)) {
       dp_do_sess4_lkup(ctx, xf);
     }
   }
