@@ -75,7 +75,8 @@ extern int is_tracing_enabled(void);
 // ============================================================================
 int proxy_select_ep(proxy_fd_ent_t *pfe, void *inbuf, size_t insz, int *ep);
 int proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
-                            void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe);
+                            void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
+                            const void *pp2hdr, int pp2len);
 int is_endpoint_healthy(proxy_epval_t *tepval, int ep_idx);
 int find_next_healthy_endpoint(proxy_epval_t *tepval, int start_idx);
 int select_healthy_endpoint(proxy_epval_t *tepval, int algorithm_selection);
@@ -2770,8 +2771,27 @@ h2_have_tepval:
     
     // Use proxy_setup_ep_connect to create backend connection
     extern int proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
-                                       void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe);
-    
+                                       void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
+                                       const void *pp2hdr, int pp2len);
+
+    /* PROXY protocol v2 (L7 fullproxy, HTTP/2 backend path): emit the client's
+     * real 4-tuple ahead of the backend stream when the rule enables ppv2. The
+     * client fd (pfe->fd) yields client via getpeername and the dialed VIP via
+     * getsockname — the same tuple setup_proxy_path derives from the sockmap key. */
+    uint8_t pp2buf[28];
+    int pp2len = 0;
+    if (ent->val.ppv2 && ep_proto == IPPROTO_TCP) {
+      struct sockaddr_in cli, vip;
+      socklen_t cl = sizeof(cli), vl = sizeof(vip);
+      if (getpeername(pfe->fd, (struct sockaddr *)&cli, &cl) == 0 &&
+          getsockname(pfe->fd, (struct sockaddr *)&vip, &vl) == 0 &&
+          cli.sin_family == AF_INET && vip.sin_family == AF_INET) {
+        pp2len = proxy_build_ppv2_v4(pp2buf, sizeof(pp2buf),
+                                     cli.sin_addr.s_addr, cli.sin_port,   /* src = client */
+                                     vip.sin_addr.s_addr, vip.sin_port);  /* dst = VIP */
+      }
+    }
+
     // CRITICAL FIX: For end-to-end HTTPS mode, we need to establish SSL to backend
     // Client → LoxiLB: HTTPS (TLS)
     // LoxiLB → Backend: HTTPS (TLS) - for tcp:e2ehttps mode
@@ -2781,7 +2801,8 @@ h2_have_tepval:
     backend_fd = proxy_setup_ep_connect(ep_ip, ep_port, ep_proto,
                                          ent->val.ssl_epctx,  // SSL context for backend
                                          ent->val.ssl_epctx ? &backend_ssl : NULL,  // Store SSL handle
-                                         pfe);  // Pass pfe for trace events
+                                         pfe,  // Pass pfe for trace events
+                                         (pp2len ? pp2buf : NULL), pp2len);  // L7 fullproxy PPv2
     
     if (backend_fd <= 0) {
       log_error("[HTTP/2] stream %d: Failed to connect to backend ep[%d]", stream->stream_id, ep_idx);

@@ -356,9 +356,51 @@ proxy_ssl_connect(int fd, void *ssl)
   return 0;
 }
 
+/* Build an IPv4 PROXY protocol v2 header (28 bytes) into buf. All addr/port args
+ * are in network byte order. Returns bytes written, or 0 if buf too small.
+ * Shared by the L7 fullproxy HTTP/1 (setup_proxy_path) and HTTP/2 backend paths. */
+int
+proxy_build_ppv2_v4(uint8_t *buf, size_t bufsz, uint32_t sip, uint16_t sport,
+                    uint32_t dip, uint16_t dport)
+{
+  static const uint8_t sig[12] = { 0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D,
+                                   0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A };
+  if (bufsz < 28) return 0;
+  memcpy(buf, sig, 12);
+  buf[12] = 0x21;                    /* ver_cmd: version 2, PROXY command */
+  buf[13] = 0x11;                    /* family: AF_INET + STREAM (TCP) */
+  buf[14] = 0x00; buf[15] = 0x0c;    /* len = 12 (network order) */
+  memcpy(buf + 16, &sip, 4);         /* src_addr (client) */
+  memcpy(buf + 20, &dip, 4);         /* dst_addr (VIP) */
+  memcpy(buf + 24, &sport, 2);       /* src_port */
+  memcpy(buf + 26, &dport, 2);       /* dst_port */
+  return 28;
+}
+
+/* Send the whole buffer, handling short writes / EAGAIN on the non-blocking fd. */
+static int
+proxy_send_all(int fd, const void *buf, size_t len)
+{
+  const uint8_t *p = buf;
+  size_t off = 0;
+
+  while (off < len) {
+    ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL);
+    if (n > 0) { off += (size_t)n; continue; }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+      struct pollfd pf = { .fd = fd, .events = POLLOUT|POLLERR };
+      if (poll(&pf, 1, 500) <= 0 || (pf.revents & POLLERR)) return -1;
+      continue;
+    }
+    return -1;
+  }
+  return 0;
+}
+
 int
 proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
-                       void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe)
+                       void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
+                       const void *pp2hdr, int pp2len)
 {
   int fd, rc;
   struct sockaddr_in epaddr;
@@ -439,7 +481,20 @@ proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
     }
   }
 
-  if (ssl_ctx) {    
+  /* PROXY protocol v2 header must be the FIRST bytes on the backend connection,
+   * before any client payload and before the (optional) backend TLS handshake,
+   * since PROXY protocol is a layer below TLS. Sending here on the freshly
+   * connected socket is stream-level, hence immune to the GSO issue that breaks
+   * the eBPF inline insertion (fullnat path). L7 fullproxy uses this path. */
+  if (pp2hdr && pp2len > 0) {
+    if (proxy_send_all(fd, pp2hdr, (size_t)pp2len)) {
+      log_error("ppv2 send failed %s:%u", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
+      close(fd);
+      return -1;
+    }
+  }
+
+  if (ssl_ctx) {
     // CRITICAL: Check if ssl pointer is NULL before dereferencing
     if (!ssl) {
       log_error("proxy_setup_ep_connect: CRITICAL - ssl parameter is NULL but ssl_ctx provided!");

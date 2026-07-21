@@ -335,7 +335,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                  proxy_ep_sel_t *ep_sel,
                  proxy_epval_t **epv, int *seltype, uint32_t *rid,
                  void *ssl_ctx, void **ssl, uint32_t client_ip,
-                 proxy_fd_ent_t *pfe)  // NEW: For tracing context
+                 proxy_fd_ent_t *pfe,  // NEW: For tracing context
+                 const void *pp2hdr, int pp2len)  // PROXY protocol v2 header (L7 fullproxy)
 {
   int sel = 0;
   uint32_t epip;
@@ -839,7 +840,7 @@ pd_fallback_normal:
         epprotocol = tepval->eps[sel].protocol;
         
         ep_sel->ep_cfds[0].ep_cfd = proxy_setup_ep_connect(epip, epport, (uint8_t)epprotocol,
-                                                           ssl_ctx, ssl, pfe);
+                                                           ssl_ctx, ssl, pfe, pp2hdr, pp2len);
         if (ep_sel->ep_cfds[0].ep_cfd < 0) {
           // P2 Task 2.3: Record connection failure for circuit breaker
           circuit_breaker_record_failure(tepval, sel);
@@ -923,7 +924,7 @@ pd_fallback_normal:
                   tepval->eps[fc_prefill].xip,
                   tepval->eps[fc_prefill].xport,
                   tepval->eps[fc_prefill].protocol,
-                  ssl_ctx, ssl, pfe);
+                  ssl_ctx, ssl, pfe, pp2hdr, pp2len);
               if (fc_fd >= 0) {
                 /* Retry succeeded — update tracking state */
                 pfe->pd_prefill_ep_idx = fc_prefill;
@@ -1242,7 +1243,7 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
 #endif
             
             ep_sel->ep_cfds[0].ep_cfd = proxy_setup_ep_connect(epip, epport, (uint8_t)epprotocol, 
-                                                               NULL, NULL, pfe);
+                                                               NULL, NULL, pfe, pp2hdr, pp2len);
             
             if (ep_sel->ep_cfds[0].ep_cfd > 0) {
               // Connection successful!
@@ -1352,7 +1353,7 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
             epport = tepval->eps[ep].xport;
             epprotocol = tepval->eps[ep].protocol;
             ep_sel->ep_cfds[sel].ep_cfd = proxy_setup_ep_connect(epip, epport, (uint8_t)epprotocol, 
-                                                                 NULL, NULL, pfe);
+                                                                 NULL, NULL, pfe, pp2hdr, pp2len);
             if (ep_sel->ep_cfds[sel].ep_cfd > 0) {
               ep_sel->ep_cfds[sel].ep_num = sel;
               sel++;

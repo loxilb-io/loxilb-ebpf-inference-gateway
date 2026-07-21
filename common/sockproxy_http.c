@@ -2122,6 +2122,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   memcpy(&node->key, new_ent, sizeof(proxy_ent_t));
   node->val.main_fd = -1;
   node->val.have_ssl = arg->have_ssl;
+  node->val.ppv2 = arg->ppv2;   /* L7 fullproxy PROXY protocol v2 emission (mandatory when set) */
   
   // Store proxy_arg pointer for later cleanup if heap-allocated
   // This enables proper memory management for both mTLS and non-mTLS cases
@@ -3288,7 +3289,27 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   epip = tepval->eps[d_idx].xip;
   epport = tepval->eps[d_idx].xport;
 
-  ep_cfd = proxy_setup_ep_connect(epip, epport, IPPROTO_TCP, NULL, NULL, client_pfe);
+  /* PROXY protocol v2 (L7 fullproxy, P/D decode leg): prepend the client 4-tuple
+   * when the rule enables ppv2, consistent with the prefill/HTTP1/HTTP2 backend
+   * legs. Derived from the client fd (getpeername=client, getsockname=VIP). */
+  uint8_t dpp2buf[28];
+  int dpp2len = 0;
+  {
+    proxy_map_ent_t *dent = (proxy_map_ent_t *)client_pfe->head;
+    if (dent && dent->val.ppv2) {
+      struct sockaddr_in cli, vip;
+      socklen_t cl = sizeof(cli), vl = sizeof(vip);
+      if (getpeername(client_pfe->fd, (struct sockaddr *)&cli, &cl) == 0 &&
+          getsockname(client_pfe->fd, (struct sockaddr *)&vip, &vl) == 0 &&
+          cli.sin_family == AF_INET && vip.sin_family == AF_INET) {
+        dpp2len = proxy_build_ppv2_v4(dpp2buf, sizeof(dpp2buf),
+                                      cli.sin_addr.s_addr, cli.sin_port,   /* src = client */
+                                      vip.sin_addr.s_addr, vip.sin_port);  /* dst = VIP */
+      }
+    }
+  }
+  ep_cfd = proxy_setup_ep_connect(epip, epport, IPPROTO_TCP, NULL, NULL, client_pfe,
+                                  (dpp2len ? dpp2buf : NULL), dpp2len);
   if (ep_cfd < 0) {
     log_error("US-505: Failed to connect to decode EP%d", d_idx);
     goto out;
@@ -5019,13 +5040,27 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
            pfe->has_custom_session_header ? pfe->custom_session_header_value : "",
            pfe->has_user_id, pfe->has_user_id ? pfe->user_id : "");
   
+  /* PROXY protocol v2 (L7 fullproxy, mandatory when enabled on the rule): build the
+   * 28-byte v4 header once from the client socket's addresses. key->dip/dport = the
+   * real client (getpeername), key->sip/sport = the VIP the client dialed
+   * (getsockname). It is sent as the first bytes of each backend connection by
+   * proxy_setup_ep_connect(), before any client payload and before backend TLS. */
+  uint8_t pp2buf[28];
+  int pp2len = 0;
+  if (ent->val.ppv2 && protocol == IPPROTO_TCP) {
+    pp2len = proxy_build_ppv2_v4(pp2buf, sizeof(pp2buf),
+                                 key->dip, (uint16_t)(key->dport >> 16),   /* src = client */
+                                 key->sip, (uint16_t)(key->sport >> 16));  /* dst = VIP */
+  }
+
   int psep_rc = proxy_setup_ep__(key->sip, key->sport >> 16, (uint8_t)(protocol),
                        flt_url,
                        pfe->http_path_ok ? pfe->request_path : "/",  // P6: Pass request path
                        pfe->has_conv_id ? pfe->conversation_id : NULL,  // P0.3: Pass conversation ID
                        pfe->prefix_key.hash,  // P1.3: Pass prefix hash for CHWBL
                        custom_header,  // NEW: Pass custom session header value
-                       &ep_sel, &tepval, &seltype, &rid, ent->val.ssl_epctx, &ssl, key->dip, pfe);
+                       &ep_sel, &tepval, &seltype, &rid, ent->val.ssl_epctx, &ssl, key->dip, pfe,
+                       (pp2len ? pp2buf : NULL), pp2len);
   /* Phase 93-04: bounded backpressured admission. The request was enqueued onto a
    * per-EP parked FIFO inside proxy_setup_ep__/pd_select_prefill. SUSPEND the client
    * fd (EPOLLIN-pause, HUP-only — the exact form at the backpressure pause site) and

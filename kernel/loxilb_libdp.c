@@ -2403,6 +2403,10 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // Backend protocol capability (0=http1, 1=http2, 2=both)
   pval->backend_protocol_cap = dat->backend_protocol_cap;
 
+  // PROXY protocol v2 emission on backend connections (L7 fullproxy). Sourced from
+  // the rule's dp_proxy_tacts.ppv2, same flag the fullnat eBPF path consumes.
+  pval->ppv2 = dat->ppv2;
+
   // SSE (Server-Sent Events) streaming configuration
   // US-513: P/D disaggregation implies SSE mode because decode phase uses streaming.
   pval->sse_mode = dat->sse_mode || dat->pd_disagg_mode;

@@ -577,6 +577,7 @@ typedef struct proxy_val {
   int main_fd;
   int have_ssl;
   int have_epssl;
+  int ppv2;             /* PROXY protocol v2 emission on backend conns (L7 fullproxy) */
   int sched_free;
   void *ssl_ctx;
   void *ssl_epctx;
@@ -1098,6 +1099,7 @@ struct proxy_arg {
   uint32_t _id;
   int have_ssl;
   int have_epssl;
+  int ppv2;             /* PROXY protocol v2 emission on backend conns (L7 fullproxy) */
   int proxy_mode;
   int select;
   int n_eps;
@@ -1302,7 +1304,11 @@ void *proxy_get_ssl_ctx_for_hostname(const char *hostname);  // Internal: SNI lo
 // ============================================================================
 int proxy_select_ep(proxy_fd_ent_t *pfe, void *inbuf, size_t insz, int *ep);
 int proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
-                            void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe);
+                            void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
+                            const void *pp2hdr, int pp2len);
+/* Build a 28-byte IPv4 PROXY protocol v2 header (args in network byte order). */
+int proxy_build_ppv2_v4(uint8_t *buf, size_t bufsz, uint32_t sip, uint16_t sport,
+                        uint32_t dip, uint16_t dport);
 int is_endpoint_healthy(proxy_epval_t *tepval, int ep_idx);
 int find_next_healthy_endpoint(proxy_epval_t *tepval, int start_idx);
 int select_healthy_endpoint(proxy_epval_t *tepval, int algorithm_selection);

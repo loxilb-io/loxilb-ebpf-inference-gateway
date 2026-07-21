@@ -37,7 +37,8 @@ int proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                      proxy_ep_sel_t *ep_sel,
                      proxy_epval_t **epv, int *seltype, uint32_t *rid,
                      void *ssl_ctx, void **ssl, uint32_t client_ip,
-                     proxy_fd_ent_t *pfe);
+                     proxy_fd_ent_t *pfe,
+                     const void *pp2hdr, int pp2len);
 
 /* Conversation mapping cleanup background thread */
 void *proxy_conversation_cleanup_thread(void *arg);

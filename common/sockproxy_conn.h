@@ -30,7 +30,8 @@ void proxy_sock_set_opts(int fd, uint8_t protocol);
 
 /* Endpoint connection setup */
 int proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
-                           void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe);
+                           void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
+                           const void *pp2hdr, int pp2len);
 
 /* Listening socket initialization */
 int proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol);
