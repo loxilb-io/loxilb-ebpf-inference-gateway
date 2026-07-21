@@ -31,7 +31,12 @@ dp_sel_nat_ep(void *ctx, struct xfi *xf, struct dp_proxy_tacts *act)
   struct mf_xfrm_inf *nxfrm_act;
   __u16 rule_num = act->ca.cidx;
 
-  if (act->sel_type == NAT_LB_SEL_RR) {
+  /* NAT_LB_SEL_PRIO (WRR) is realized as plain round-robin over the
+   * weight-replicated nxfrms slots that the control plane already expanded
+   * (see rules.go LB2DP prio branch: each EP gets weight*MAX/100 slots). The
+   * kern selector has no dedicated PRIO case, so without this a sel_type=2 rule
+   * falls through with sel=-1 -> xf->pm.nf=0 -> SYN dropped (no DNAT). */
+  if (act->sel_type == NAT_LB_SEL_RR || act->sel_type == NAT_LB_SEL_PRIO) {
     BPF_TRACE_PRINTK("[NAT-LB] Round Robin selection");
 #ifndef HAVE_DP_DPU_SLIM
     bpf_spin_lock(&act->lock);
