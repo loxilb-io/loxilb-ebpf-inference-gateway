@@ -513,7 +513,15 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
         
         // Endpoint selection based on algorithm
         int algorithm_selection = -1;
-        
+
+        /* L7 session-header stickiness overlay (default-off). Populated at the
+         * selection point below (after the algorithmic selectors) so a learned
+         * binding takes precedence. Reuses the branch-agnostic conv_map helpers;
+         * this is the DFL home for what used to live in PROXY_MODE_ALL. */
+        int  ns_used_learned = 0;
+        char ns_session_key[256];
+        ns_session_key[0] = '\0';
+
 #ifdef HAVE_DP_GPU_ROUTING
         // Check selection algorithm
         switch (tepval->select) {
@@ -807,6 +815,39 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
         }
 
 pd_fallback_normal:
+        /* L7 session-header stickiness (default-off). When a session header is
+         * configured and present on the request, a previously learned binding
+         * PINS the backend (PRIORITY 0), overriding any algorithmic/RR choice.
+         * On a miss we deterministically hash the header value (PRIORITY 1) so
+         * the same id stays consistent until the response-learn step binds it. */
+        if (tepval->session_header_enabled &&
+            custom_session_header && custom_session_header[0] != '\0') {
+          /* PRIORITY 0: learned binding for the session-header value. */
+          snprintf(ns_session_key, sizeof(ns_session_key), "custom_%s_%s",
+                   tepval->session_header_name, custom_session_header);
+          int ns_bound = -1;
+          if (lookup_conversation_endpoint(node, ns_session_key, &ns_bound) == 0 &&
+              ns_bound >= 0 && ns_bound < tepval->n_eps &&
+              tepval->eps[ns_bound].inv == 0 && is_endpoint_healthy(tepval, ns_bound)) {
+            algorithm_selection = ns_bound;
+            ns_used_learned = 1;
+            log_info("[NS_STICKY_HIT] key='%s' -> ep[%d] (DFL)", ns_session_key, ns_bound);
+          } else if (algorithm_selection < 0) {
+            /* PRIORITY 1: deterministic hash of the header value until learned. */
+            int h = (int)(session_key_hash(ns_session_key) % (uint32_t)tepval->n_eps);
+            if (tepval->eps[h].inv == 0) algorithm_selection = h;
+          }
+        } else if (tepval->select == PROXY_SEL_STICKY && algorithm_selection < 0) {
+          /* PRIORITY 2: IP-based persistence (RR_PERSIST with no session header) —
+           * same client always pinned to the same backend. Mirrors the legacy
+           * PROXY_MODE_ALL persist path, now unified in DFL. */
+          char ns_ipkey[64];
+          snprintf(ns_ipkey, sizeof(ns_ipkey), "ip_%s",
+                   inet_ntoa(*(struct in_addr *)(&client_ip)));
+          int h = (int)(session_key_hash(ns_ipkey) % (uint32_t)tepval->n_eps);
+          if (tepval->eps[h].inv == 0) algorithm_selection = h;
+        }
+
         // If algorithm didn't select an endpoint, use round-robin
         if (algorithm_selection < 0) {
           int attempts = 0;
@@ -984,6 +1025,21 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
         ep_sel->ep_cfds[0].ep_num = sel;
         ep_sel->n_eps = 1;
 
+        /* L7 session-header stickiness: on a fresh selection, persist the binding
+         * immediately (so a client-supplied id hits PRIORITY 0 next turn) and mark
+         * the connection so a server-issued id (e.g. MCP's Mcp-Session-Id) carried
+         * in the backend response is learned too. Branch-agnostic ep_sel plumbing
+         * (sockproxy_http.c) consumes needs_learning/session_header_name. */
+        if (tepval->session_header_enabled && !ns_used_learned) {
+          if (ns_session_key[0] != '\0') {
+            store_conversation_endpoint(node, ns_session_key, sel);
+          }
+          ep_sel->ep_cfds[0].needs_learning = 1;
+          strncpy(ep_sel->session_header_name, tepval->session_header_name,
+                  sizeof(ep_sel->session_header_name) - 1);
+          ep_sel->session_header_name[sizeof(ep_sel->session_header_name) - 1] = '\0';
+        }
+
 #ifdef HAVE_HTTP_TRACE
         // CRITICAL FIX: Set catalog_id in PROXY_MODE_DFL path
         // Previously only set in PROXY_MODE_ALL path, causing catalog_id=0 for DFL mode
@@ -1008,7 +1064,10 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
         tepval = node->val.ephash;
         if (tepval == NULL) break;
 
-        /* Do not support for this mode */
+        /* PROXY_MODE_ALL is dedicated to N2 / non-L7 protocols only and is never
+         * TLS-terminated. All L7 proxy behaviour (session stickiness, E2E-HTTPS,
+         * AI routing) now lives entirely in PROXY_MODE_DFL; this invariant guards
+         * that split — L7 traffic must never reach this branch. */
         assert(ssl_ctx == NULL);
 
         // Session stickiness with custom header support

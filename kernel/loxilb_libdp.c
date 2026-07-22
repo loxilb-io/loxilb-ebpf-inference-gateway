@@ -2537,9 +2537,11 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
     case NAT_LB_SEL_RR:      
       pval->select = PROXY_SEL_RR;
       
-      // Pass session header config for RR mode (round-robin with session learning)
+      // Pass session header config for RR mode (round-robin with session learning).
+      // L7 session stickiness lives in PROXY_MODE_DFL (backend TLS, circuit-breaker,
+      // AI routing). PROXY_MODE_ALL is reserved for N2 / non-L7 protocols only.
       if (dat->session_header_enabled && dat->session_header_name[0] != '\0') {
-        pval->proxy_mode = PROXY_MODE_ALL;
+        pval->proxy_mode = PROXY_MODE_DFL;
         pval->session_header_enabled = 1;
         strncpy(pval->session_header_name, (const char *)dat->session_header_name,
                 sizeof(pval->session_header_name) - 1);
@@ -2559,7 +2561,8 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
       pval->select = PROXY_SEL_N2;
       break;
     case NAT_LB_SEL_RR_PERSIST:
-      pval->proxy_mode = PROXY_MODE_ALL;
+      // L7 persistent stickiness now runs in PROXY_MODE_DFL (see NAT_LB_SEL_RR).
+      pval->proxy_mode = PROXY_MODE_DFL;
       pval->select = PROXY_SEL_STICKY;
       pval->affinity_type = PROXY_AFFINITY_IP;  // Keep for backward compatibility
       
