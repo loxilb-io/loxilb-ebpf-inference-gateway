@@ -2136,6 +2136,19 @@ llb_nat_dec_act_sessions(uint32_t rid, uint32_t aid)
   }
 }
 
+/* Two DP endpoint slots are "the same" when they target the same backend
+ * (ip+port+family). Used to decide whether an in-place NAT rule update
+ * merely toggled health flags (identity unchanged -> keep the slot's
+ * accumulated stats) or actually re-pointed the slot (clear stale stats).
+ * Ported from loxilb-ebpf upstream facdb93. */
+static int
+llb_nat_ep_slot_same(struct mf_xfrm_inf *a, struct mf_xfrm_inf *b)
+{
+  return !memcmp(a->nat_xip, b->nat_xip, sizeof(a->nat_xip)) &&
+         a->nat_xport == b->nat_xport &&
+         a->nv6 == b->nv6;
+}
+
 static void
 llb_nat_rst_act_sessions(uint32_t rid)
 {
@@ -2657,10 +2670,29 @@ llb_add_map_elem(int tbl, void *k, void *v)
 
     if (tbl == LL_DP_NAT_MAP) {
       int aid = 0;
-      for (aid = 0; aid < LLB_MAX_NXFRMS; aid++) {
-        llb_clear_map_stats(tbl, LLB_NAT_STAT_CID(cidx, aid));
-        llb_nat_rst_act_sessions(cidx);
+      int have_old = 0;
+      struct dp_proxy_tacts *nval = v;
+      static struct dp_proxy_tacts oldv;
+
+      /* Preserve per-endpoint counters across in-place rule updates:
+       * health-monitor driven re-adds toggle only the inactive flag, so
+       * clear a slot's stats only when its endpoint identity changed, and
+       * clear everything on a fresh create. Ported from loxilb-ebpf upstream
+       * facdb93 (our LLB_NAT_STAT_CID keeps 5 aid bits, so no 16-slot cap).
+       * Safe to snapshot into a static oldv -- this path holds XH_LOCK. */
+      if (!xh->have_noebpf &&
+          bpf_map_lookup_elem(llb_map2fd(tbl), k, &oldv) == 0) {
+        have_old = 1;
       }
+
+      for (aid = 0; aid < LLB_MAX_NXFRMS; aid++) {
+        if (have_old &&
+            llb_nat_ep_slot_same(&oldv.nxfrms[aid], &nval->nxfrms[aid])) {
+          continue;
+        }
+        llb_clear_map_stats(tbl, LLB_NAT_STAT_CID(cidx, aid));
+      }
+      llb_nat_rst_act_sessions(cidx);
     } else {
       llb_clear_map_stats(tbl, cidx);
     }
@@ -2910,6 +2942,15 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
 
   /* Need some post-processing for certain maps */
   if (tbl == LL_DP_NAT_MAP) {
+    /* Counters now survive in-place updates (llb_add_map_elem preserves
+     * unchanged slots), so retire them on delete -- otherwise a future rule
+     * reusing this cidx would inherit stale values. Ported from facdb93. */
+    if (ret == 0) {
+      int aid = 0;
+      for (aid = 0; aid < LLB_MAX_NXFRMS; aid++) {
+        llb_clear_map_stats(tbl, LLB_NAT_STAT_CID(t.ca.cidx, aid));
+      }
+    }
     llb_del_map_elem_nat_post_proc(k, &t);
   }
 

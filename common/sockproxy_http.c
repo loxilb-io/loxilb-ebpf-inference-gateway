@@ -1899,8 +1899,35 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
       HASH_FIND_STR(ent->val.ephash, ephash_key, tepval);
       if (tepval != NULL) {
+        /* Refresh the existing pool in place instead of returning -EEXIST.
+         * Returning -EEXIST froze the userspace L7 pool after first creation,
+         * so health-monitor endpoint up/down and member add/remove never
+         * reached sockproxy -- the fullproxy NAT add does `goto out` before the
+         * eBPF map update (loxilb_libdp.c), making proxy_add_entry the ONLY
+         * carrier of these updates. Our eps[] is aid-indexed (slot == rule
+         * endpoint index), so copying the fresh eps[] also refreshes each
+         * endpoint's inv (health) flag consumed by proxy_setup_ep__ selection.
+         * Only membership/health state is touched; the P/D trie, per-EP loads,
+         * chwbl_config, session maps and locks are intentionally preserved
+         * across the update (adapted from loxilb-ebpf upstream facdb93). */
+        tepval->n_eps = arg->n_eps;
+        tepval->_id = arg->_id;
+        tepval->select = arg->select;
+        memcpy(tepval->eps, arg->eps, sizeof(arg->eps));
+        if (tepval->pd_disagg_enabled) {
+          tepval->n_prefill_eps = 0;
+          tepval->n_decode_eps = 0;
+          for (int i = 0; i < arg->n_eps && i < MAX_PROXY_EP; i++) {
+            tepval->ep_role[i] = arg->ep_role[i];
+            if (arg->ep_role[i] == 1) tepval->n_prefill_eps++;
+            if (arg->ep_role[i] == 2) tepval->n_decode_eps++;
+          }
+        }
         PROXY_UNLOCK();
-        return -EEXIST;
+        log_info("sockproxy : %s:%u (%s) updated",
+                 inet_ntoa(*(struct in_addr *)&new_ent->xip),
+                 ntohs(new_ent->xport), ephash_key);
+        return 0;
       } else {
         tepval = calloc(1, sizeof(*tepval));
         assert(tepval);
