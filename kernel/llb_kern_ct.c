@@ -985,7 +985,19 @@ end:
                                  CT_ERR_STAT_TCP_RST_CLIENT :
                                  CT_ERR_STAT_TCP_RST_SERVER, 1);
       } else if (nstate & CT_TCP_ERR) {
+        /* Count a TCP protocol error only once the connection actually
+         * established (or is tearing down). A CT_TCP_ERR out of a pre-established
+         * handshake state (CLOSED / SYN-SENT / SYN-ACK) is not a backend or
+         * protocol error on real load-balanced traffic — it is what the datapath
+         * sees for flows it observed mid-handshake, e.g. short-lived local
+         * management/REST connections to loxilb's own API port. Counting those
+         * manufactured "L4 errors" (~5 per REST call, all from CLOSED/SYN-SENT)
+         * inflated the error signal and could false-fire the error-burst alert.
+         * Backend refusals arrive as RST and are accounted above as
+         * rst_server/rst_client, not here. */
+        if (old_state == CT_TCP_EST || (old_state & CT_TCP_FIN_MASK)) {
         dp_update_ct_error_stats(CT_ERR_STAT_TCP_ERR, 1);
+        }
       }
     }
 
