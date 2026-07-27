@@ -843,6 +843,8 @@ struct proxy_fd_ent {
   // L7 Metrics (independent of Jaeger tracing)
   uint64_t metric_req_start_ns;
   uint16_t metric_response_status;
+  uint8_t  ai_gw_mode;                // 1=AI Gateway connection; copied from the rule at accept
+  uint8_t  metric_ai_recorded;       // 1=this request already counted in ai_requests_total (dedup guard)
 
   // HTTP/HTTPS Trace Context (: Protocol Analyzer)
 #ifdef HAVE_HTTP_TRACE

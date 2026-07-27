@@ -1366,6 +1366,35 @@ skip_deferred_masking:
       }
     }
 
+    /* Record non-SSE AI-Gateway responses into loxilb_ai_requests_total.
+     * The SSE path records at its [DONE] terminator; a plain-JSON response —
+     * the common error shape (OpenAI-compatible backends return errors as JSON
+     * even for streaming requests), and non-streamed 200s — never reaches it, so
+     * the AI request/error-ratio metrics were otherwise blind to it. Once this
+     * backend packet carries a complete response header block ("\r\n\r\n") and
+     * the SSE sniff above did NOT activate a stream, record the request exactly
+     * once. metric_ai_recorded guards against the [DONE] path (which also sets
+     * it) and against re-firing on later packets of the same response; status +
+     * TTFB latency were captured by the L7-metrics block above. */
+    if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
+        rfd_ent->ai_gw_mode && !rfd_ent->metric_ai_recorded &&
+        !rfd_ent->sse_active && rfd_ent->metric_response_status != 0 &&
+        memmem(msg, len, "\r\n\r\n", 4) != NULL) {
+      int64_t ai_ns_lat_ms = 0;
+      if (rfd_ent->metric_req_start_ns > 0) {
+        ai_ns_lat_ms = (int64_t)((get_timestamp_ns() -
+                                  rfd_ent->metric_req_start_ns) / 1000000ULL);
+      }
+      const char *ai_ns_model = proxy_effective_model(rfd_ent);
+      llb_ai_record_request((char *)rfd_ent->tenant_id, (char *)ai_ns_model,
+                            (int)rfd_ent->metric_response_status, ai_ns_lat_ms,
+                            0, 0, 0, 0, "");
+      rfd_ent->metric_ai_recorded = 1;
+      log_info("[AI_NONSSE_RECORDED] client_fd=%d backend_fd=%d model=%s status=%u",
+               rfd_ent->fd, ent->fd, ai_ns_model,
+               (unsigned)rfd_ent->metric_response_status);
+    }
+
     /* C-5: data:[DONE]\n\n scanner — TCP-fragmentation-safe detection of the
      * OpenAI SSE stream terminator using a 20-byte sliding tail buffer.
      *
@@ -1454,6 +1483,7 @@ skip_deferred_masking:
                              : 200;
         llb_ai_record_request((char *)sse_tenant, (char *)sse_model, sse_status,
                               latency_ms, 0, 0, 0, 0, "");
+        rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         log_info("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
         /* Step 6: Reset sse_active AFTER llb_ai_stream_end (idempotent)
@@ -5406,6 +5436,7 @@ handle_on_message_complete(llhttp_t* parser)
   if (pfe->odir == 0) {
     pfe->metric_req_start_ns = get_timestamp_ns();
     pfe->metric_response_status = 0;
+    pfe->metric_ai_recorded = 0;   // re-arm per request (keep-alive connection reuse)
   }
 
   // AI Gateway: Enforce X-Api-Key validation and per-key / per-tenant RPS limits.
@@ -6576,6 +6607,8 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 
   // Copy SSE rule configuration to per-connection state (A-7)
   npfe1->sse_mode = 0;
+  npfe1->ai_gw_mode = 0;           // AI-gateway connection marker (drives request accounting)
+  npfe1->metric_ai_recorded = 0;   // per-request request-accounting dedup guard
   npfe1->max_stream_duration_sec = 0;
   npfe1->backend_keepalive_sec = 0;
   npfe1->inactive_timeout_sec = 0;
@@ -6586,6 +6619,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->sse_tail_len = 0;
   if (ent && ent->val.ephash) {
     npfe1->sse_mode = ent->val.ephash->sse_mode;
+    npfe1->ai_gw_mode = ent->val.ephash->ai_gw_mode;
     npfe1->max_stream_duration_sec = ent->val.ephash->max_stream_duration_sec;
     npfe1->backend_keepalive_sec = ent->val.ephash->backend_keepalive_sec;
     npfe1->inactive_timeout_sec = ent->val.ephash->inactive_timeout_sec;
