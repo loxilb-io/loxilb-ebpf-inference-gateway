@@ -1,4 +1,4 @@
-/* test_resp_framing.c - Phase 90-02 (REQ-REG / contract §5): adversarial
+/* test_resp_framing.c - (REQ-REG / contract §5): adversarial
  * HTTP-response message-framing regression units for the M1 response-leg parser.
  *
  * These lock the property the three hand-rolled memmem detectors (the SSE/chunked
@@ -6,13 +6,13 @@
  * adversarially-fragmented responses fires EXACTLY ONE on_message_complete per
  * message — no double-fire, no miss — regardless of where the TCP read boundaries
  * land. This is the falsifiable proof the new parser path is fragmentation-immune,
- * the regression lock M1's cutover (90-04) and the D-04 deletion (90-06) must keep
+ * the regression lock M1's cutover (90-04) and the deletion (90-06) must keep
  * GREEN.
  *
  * Case 5 is the LOAD-BEARING proof for Pitfall #3: a keep-alive socket that goes
  * SILENT mid-body (no Content-Length satisfied, no last-chunk, no close) does NOT
  * complete — llhttp will not frame it — so the graceful-[DONE] reaper
- * (Phase 89, b327c044) is STILL required. The assertion is completions == 0.
+ * (b327c044) is STILL required. The assertion is completions == 0.
  *
  * The units drive the REAL llhttp parser (the same one the production response leg
  * uses) — they do NOT re-implement chunked/CL decode. We assert llhttp's own
@@ -25,7 +25,7 @@
  * Idiom mirrors test_pd_complete.c: assert(cond && "msg") per case, per-case
  * static functions, main() runs all cases + prints "ALL PASS (test_resp_framing)"
  * + returns 0 on success / assert-aborts on failure. -fsanitize=address catches
- * any over-read llhttp or the harness introduces (T-90-02-02).
+ * any over-read llhttp or the harness introduces.
  */
 #define _GNU_SOURCE
 #include <assert.h>
@@ -245,7 +245,7 @@ test_cl_satisfied_no_double_complete(void)
  * no last-chunk: llhttp will NOT frame it. on_message_complete MUST NOT fire.
  * This is the load-bearing proof that the framing parser ALONE cannot detect a
  * silent stalled stream — so the graceful-[DONE] decode-idle reaper
- * (Phase 89, b327c044) is STILL required. The assertion is completions == 0.
+ * (b327c044) is STILL required. The assertion is completions == 0.
  *
  * llhttp_finish() is deliberately NOT called: on a keep-alive socket the proxy
  * never sees EOF, so the parser is left mid-body exactly as the real stalled-leg
@@ -273,7 +273,7 @@ test_no_terminator_keepalive_silence(void)
   assert(c.message_complete == 0 &&
          "no-terminator keep-alive silence MUST NOT complete -- the framing "
          "parser cannot frame a silent stalled stream; the graceful-[DONE] "
-         "reaper (Phase 89) is STILL required (Pitfall #3)");
+         "reaper is STILL required (Pitfall #3)");
   printf("  [PASS] no-terminator keep-alive silence -> 0 completions "
          "(reaper still required)\n");
 }
@@ -281,7 +281,7 @@ test_no_terminator_keepalive_silence(void)
 int
 main(void)
 {
-  printf("test_resp_framing: Phase 90-02 adversarial HTTP-response framing "
+  printf("test_resp_framing: adversarial HTTP-response framing "
          "(HTTP_RESPONSE llhttp)\n");
   test_header_split_every_byte();
   test_chunked_size_line_split();

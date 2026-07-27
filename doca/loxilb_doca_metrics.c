@@ -15,7 +15,7 @@
  */
 
 /*
- * loxilb_doca_metrics.c -- Phase 65 SDK-counter-query bridge implementation.
+ * loxilb_doca_metrics.c -- SDK-counter-query bridge implementation.
  *
  * Compiled only when HAVE_DOCA=1 (real BF2 hardware build path).
  *
@@ -43,19 +43,19 @@
  *   - 3rdparty/doca-294/.../flow_shared_counter/flow_shared_counter_sample.c
  *     -- batched query pattern at lines 319, 327, 390-418.
  *
- * D-14/D-15 anti-pattern guard:
+ * anti-pattern guard:
  *   - This file MUST NOT call the pipe-cfg miss-counter SETTER
- *     (D-15 descope; rc=-22 opcode 0x1800000 on BASIC pipes per
+ * ( descope; rc=-22 opcode 0x1800000 on BASIC pipes per
  *     Stage-2 G5/G5b harness in 3rdparty/doca-294/.../flow_p65_counter_query).
  *   - This file MUST NOT call the per-pipe MISS-counter QUERY API
- *     (D-15 descope; companion to the disabled precondition).
+ * ( descope; companion to the disabled precondition).
  *   - This file MUST NOT set `monitor.counter_type =
- *     DOCA_FLOW_RESOURCE_TYPE_SHARED` on a BASIC pipe template (D-14
+ * DOCA_FLOW_RESOURCE_TYPE_SHARED` on a BASIC pipe template (
  *     constraint; silicon-rejected in switch,hws,isolated mode).
  *   - DOCA_FLOW_SHARED_RESOURCE_COUNTER is the resource-type ARGUMENT
  *     to doca_flow_shared_resources_query (the pool definition; legal
  *     and required). That argument-vs-template-monitor distinction is
- *     the D-14 fault line.
+ * the fault line.
  */
 
 #include <stdlib.h>
@@ -81,9 +81,9 @@ DOCA_LOG_REGISTER(LLB_DOCA_METRICS);
 
 /*
  * LLB_DOCA_MAX_SHARED_COUNTERS bounds the shared-counter ID space we
- * hand out via llb_doca_alloc_shared_counter. Threat T-65-02-03 (DoS
- * via allocator exhaustion) is mitigated by the hard cap. Phase 65
- * has no production callers for SHARED counters today (D-14 narrows
+ * hand out via llb_doca_alloc_shared_counter. Threat (DoS
+ * via allocator exhaustion) is mitigated by the hard cap. 
+ * has no production callers for SHARED counters today ( narrows
  * BASIC pipes to NON_SHARED), so the cap is forward-proof rather than
  * load-bearing. The Stage-2 G1 sweep harness tops out at N=10000
  * (3rdparty/doca-294/.../flow_p65_counter_query_sample.c MAX_SHARED_IDS
@@ -94,7 +94,7 @@ DOCA_LOG_REGISTER(LLB_DOCA_METRICS);
 
 /*
  * Atomic cursor for shared-counter ID allocation. No mutex by design
- * (D-08 lifecycle keep-simple). On cap-hit we atomically decrement
+ * ( lifecycle keep-simple). On cap-hit we atomically decrement
  * back so the cursor never drifts past LLB_DOCA_MAX_SHARED_COUNTERS.
  */
 static _Atomic uint32_t g_next_shared_counter_id = 0;
@@ -155,7 +155,7 @@ int llb_doca_entry_query_v2(const void *entry_handle,
  *  Section D -- llb_doca_counter_batch_query
  *  Wraps: doca_flow_shared_resources_query
  *  G1 ratified path (p99=0.95-1.01ms at N=10K per 65-STAGE2-RESULTS).
- *  FUTURE-PROOF per D-14 -- no production pipe references SHARED
+ * FUTURE-PROOF per -- no production pipe references SHARED
  *  counters today; protocol-pipe pools (CT/ACL/NAT) ship in a later
  *  plan and will consume this wrapper.
  * ---------------------------------------------------------------- */
@@ -186,7 +186,7 @@ int llb_doca_counter_batch_query(const uint32_t *ids,
      * heap-allocates (sample file line 507) because it sweeps N up
      * to 10000 inside a long-lived measurement loop; here we expect
      * per-call N << 10000 (Plan 65-03 chunked walker stays under the
-     * D-02 polling budget of ~5000 entries per tick), so stack is
+ * polling budget of ~5000 entries per tick), so stack is
      * faster and simpler. If a future caller wants N > 1024 we will
      * revisit with a VLA-vs-heap branch.
      */

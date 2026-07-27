@@ -6,7 +6,7 @@
 #include <assert.h>
 
 /*
- * test_fdb_counter.c -- Phase 49 P49-R2 unit harness.
+ * test_fdb_counter.c -- P49-R2 unit harness.
  *
  * Validates the contract that loxilb_doca_flow.c::llb_doca_fdb_pipe_create
  * and llb_doca_fdb_entry_add now both set
@@ -19,7 +19,7 @@
  * the LOGIC of the production helpers; the production grep assertions
  * in PLAN.md acceptance_criteria guard against drift in the real call sites.
  *
- * This pattern matches test_doca_root_v2.c (Phase 47 P47-R2).
+ * This pattern matches test_doca_root_v2.c ( P47-R2).
  *
  * Build & run on bf2-arm (per CLAUDE.md remote-gate.sh pattern):
  *   ./scripts/remote-gate.sh "cd loxilb-ebpf/common && rm -f test_fdb_counter && make test_fdb_counter && ./test_fdb_counter"

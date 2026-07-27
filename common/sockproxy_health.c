@@ -18,7 +18,7 @@
  * sockproxy_health.c - Universal endpoint health management, circuit breaker,
  *                      and drain management for LoxiLB proxy.
  *
- * Extracted from sockproxy.c as Phase 2 of the refactoring plan.
+ * Extracted from sockproxy.c as of the refactoring plan.
  * Contains:
  *   - proxy_drain_checker_thread (background drain thread)
  *   - Drain management: count_active_connections_to_endpoint,
@@ -54,7 +54,7 @@
 #include "sockproxy_health.h"
 #include "sockproxy_ai_gw.h"
 #include "notify.h"
-/* Phase 87 (FIX-1/FIX-3): pure two-leg teardown helper shared with the unit TU.
+/* pure two-leg teardown helper shared with the unit TU.
  * Included AFTER the headers that define `struct proxy_fd_ent` and
  * notify_delete_ent so the helper's pfe* signature resolves here. */
 #include "sockproxy_pd_leak.h"
@@ -62,7 +62,7 @@
 /* Forward declaration for internal use (defined later in this file) */
 static void check_draining_endpoints(void);
 
-/* Phase 90 (conc=128 single-owner teardown) — replaces the
+/* (conc=128 single-owner teardown) — replaces the
  * `pd_teardown_legs(pfe, notify_delete_ent_adapter, ns) + proxy_release_fd_ctx(pfe,1)`
  * pair at all four reaper sites below.
  *
@@ -84,7 +84,7 @@ static void check_draining_endpoints(void);
  * freeing them is pfe_next-safe (they sit behind the reaper's cursor). Does NOT
  * re-acquire PROXY_LOCK, so it is safe to call while the reaper holds it.
  *
- * Phase 90 r2 (gdb-confirmed live wedge under decode-slowdown teardown churn):
+ * r2 (gdb-confirmed live wedge under decode-slowdown teardown churn):
  * the single-owner free above is NOT actually single-owner. notify_deregister_ent
  * only clears the notifier's earr[fd] entry; the matching free was done here
  * UNCONDITIONALLY, ignoring its return. But a notify worker can win the earr
@@ -152,9 +152,9 @@ pd_teardown_conn(proxy_fd_ent_t *client)
   /* else: a notify worker owns the client's proxy_pdestroy()+free — skip. */
 }
 
-/* Phase 90: prefill-timeout default with an env override (LLB_PD_PREFILL_TIMEOUT_SEC).
+/* prefill-timeout default with an env override (LLB_PD_PREFILL_TIMEOUT_SEC).
  * Unset/invalid => 30s (the production default, behaviour-identical). The override
- * exists so the US-508 prefill-timeout reaper — the path that drives pd_teardown_conn,
+ * exists so the prefill-timeout reaper — the path that drives pd_teardown_conn,
  * i.e. the conc=128 corruption fix — can be exercised DETERMINISTICALLY under load in
  * validation (e.g. =3 so saturated prefills time out and the reaper fires every tick),
  * instead of relying on prefill stochastically exceeding 30s. Cached (getenv once). */
@@ -178,13 +178,13 @@ pd_prefill_timeout_default(void)
   return v;
 }
 
-// P2 Phase 2: Periodic draining check thread
+// P2: Periodic draining check thread
 void *
 proxy_drain_checker_thread(void *arg)
 {
  
   while (1) {
-    /* Tick at 1Hz. FR-07 (Phase 76, D-10): timeoutMemberData is enforced inside
+    /* Tick at 1Hz.: timeoutMemberData is enforced inside
      * check_draining_endpoints' per-rule idle pass, and 76-04 documented the deadline as
      * "rounded UP to whole seconds because this pass ticks once per second". The loop previously
      * slept 5s, so a sub-5s member stall (e.g. the gate's 3s slow backend with a 1500ms→2s deadline)
@@ -196,7 +196,7 @@ proxy_drain_checker_thread(void *arg)
     sleep(1);
     check_draining_endpoints();
 
-    /* Phase 93-06 (AC-4): bounded-footprint soak observability. Every ~10s emit a
+    /* (AC-4): bounded-footprint soak observability. Every ~10s emit a
      * single line carrying the pfe-pool high-water gauges + the global admission
      * gauge/blocked counter so soak_footprint.sh can sample pfe_pool_live (and the
      * accept-gate activity) from `docker logs` alongside RSS. Observability-only:
@@ -227,7 +227,7 @@ proxy_drain_checker_thread(void *arg)
 }
 
 
-// P2 Phase 2: Helper function - Count active connections to specific endpoint
+// P2: Helper function - Count active connections to specific endpoint
 uint32_t
 count_active_connections_to_endpoint(proxy_map_ent_t *ent, int ep_index)
 {
@@ -254,7 +254,7 @@ count_active_connections_to_endpoint(proxy_map_ent_t *ent, int ep_index)
   return count;
 }
 
-// P2 Phase 2: Helper function - Force-close all connections to specified endpoint
+// P2: Helper function - Force-close all connections to specified endpoint
 //
 // I5 fix (2026-06-24): this used to tear down each leg via
 // notify_delete_ent(..., evict=0), which invokes cbs.pdestroy -> proxy_pdestroy()
@@ -314,7 +314,7 @@ restart:
   }
 }
 
-// P2 Phase 2: Proactive session cleanup - Remove all conversation mappings for inactive endpoint
+// P2: Proactive session cleanup - Remove all conversation mappings for inactive endpoint
 // This prevents memory waste and re-learning overhead when endpoints go down
 uint32_t
 cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index)
@@ -350,7 +350,7 @@ cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index)
   return removed;
 }
 
-// P2 Phase 2: Check draining endpoints and force-close if timeout exceeded
+// P2: Check draining endpoints and force-close if timeout exceeded
 // Called periodically (every 5 seconds) by proxy_run() thread
 static void
 check_draining_endpoints(void)
@@ -476,13 +476,13 @@ check_draining_endpoints(void)
   /* C-4: Per-rule idle timeout enforcement — terminate connections that have been
    * idle (no data received) for longer than the rule's inactiveTimeOut setting.
    * Suppressed when sse_active=1 so active SSE streams are not killed by idle
-   * timeout (the whole point of sse_mode suppression in US-401).
+ * timeout (the whole point of sse_mode suppression in).
    * Only enforced when inactive_timeout_sec > 0; setting is sourced from the
    * dat->ito field of dp_proxy_tacts via llb_conv_nat2proxy. */
   {
     proxy_map_ent_t *ito_node = proxy_struct->head;
     while (ito_node) {
-      /* FR-07 (Phase 76, Open-Q1/D-10): timeoutMemberData is enforced HERE, aliased onto the
+      /* (Open-Q1/): timeoutMemberData is enforced HERE, aliased onto the
        * existing per-rule idle deadline (this is THE single chosen member-side relay-idle site —
        * the run loop's one idle-disconnect pass, semantics match A5). When the listener has an
        * L7_POLICY attached (has_l7_policy==1) and a non-zero timeout_member_data_ms is configured,
@@ -490,7 +490,7 @@ check_draining_endpoints(void)
        * the seconds-granularity inactive_timeout_sec for its connections; the deadline is rounded
        * UP to whole seconds (this pass ticks once per second, so sub-second ms cannot be honoured
        * finer than 1s here — documented). For the AI peer / un-configured listeners (has_l7_policy
-       * ==0 or timeout_member_data_ms==0) behaviour is byte-for-byte unchanged (D-01a/D-14). */
+ * ==0 or timeout_member_data_ms==0) behaviour is byte-for-byte unchanged. */
       uint32_t l7_data_to_s = 0;
       if (ito_node->has_l7_policy && ito_node->arg_ptr &&
           ito_node->arg_ptr->timeout_member_data_ms > 0) {
@@ -504,7 +504,7 @@ check_draining_endpoints(void)
         /* L7 member-data deadline overrides the per-rule idle deadline when configured. */
         uint32_t idle_to_s = (l7_data_to_s > 0) ? l7_data_to_s : pfe->inactive_timeout_sec;
 
-        /* FR-07: for the L7 timeoutMemberData deadline use >= so a deadline rounded UP to N whole
+        /* for the L7 timeoutMemberData deadline use >= so a deadline rounded UP to N whole
          * seconds fires AT the Nth 1Hz tick (e.g. 1500ms→2s fires at the 2s pass, landing inside the
          * gate's configured-ms window), rather than only after N+1 seconds. The legacy per-rule
          * inactive_timeout_sec path keeps its original strict > semantics (behaviour-preserving). */
@@ -531,7 +531,7 @@ check_draining_endpoints(void)
     }
   }
 
-  /* US-508: P/D prefill timeout enforcement — walk all client connections and
+  /* P/D prefill timeout enforcement — walk all client connections and
    * detect prefill phases that have exceeded their timeout.  Default is 30s
    * (typical prefill completes in 50-500ms). */
   {
@@ -561,9 +561,9 @@ check_draining_endpoints(void)
           }
 
           if (elapsed >= (time_t)timeout) {
-            log_error("US-508: P/D prefill timeout — fd=%d elapsed=%lds >= timeout=%us",
+            log_error("P/D prefill timeout — fd=%d elapsed=%lds >= timeout=%us",
                       pfe->fd, (long)elapsed, timeout);
-            /* US-509: Record P/D timeout metrics before cleanup */
+            /* Record P/D timeout metrics before cleanup */
             {
               char *pd_tmo_model = "";
               if (pfe->x_model_header[0] != '\0') {
@@ -581,7 +581,7 @@ check_draining_endpoints(void)
                                           1000000ULL);
               }
               int t_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
-              log_info("[US-509] llb_ai_pd_record (prefill timeout): model=%s prefill=%lldms kv=%d",
+              log_info(" llb_ai_pd_record (prefill timeout): model=%s prefill=%lldms kv=%d",
                        pd_tmo_model, (long long)t_prefill_ms, t_kv);
               llb_ai_pd_record(pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
             }
@@ -589,7 +589,7 @@ check_draining_endpoints(void)
               send(pfe->fd, pd_timeout_resp, sizeof(pd_timeout_resp) - 1,
                    MSG_DONTWAIT | MSG_NOSIGNAL);
             }
-            /* Phase 90 single-owner teardown (see pd_teardown_conn). Mark ERROR,
+            /* single-owner teardown (see pd_teardown_conn). Mark ERROR,
              * then deregister+close+free each backend leg and the client exactly
              * once. We hold PROXY_LOCK and pd_teardown_conn does NOT re-acquire it
              * (the Phase-87 pd_teardown_legs route did, via notify_del->pdestroy,
@@ -607,7 +607,7 @@ check_draining_endpoints(void)
     }
   }
 
-  /* Phase 93-05 (AC-5b): MAX-PARK REAP. A bounded-admission PARKED conn is
+  /* (AC-5b): MAX-PARK REAP. A bounded-admission PARKED conn is
    * PD_PHASE_PARKED — INVISIBLE to the prefill-timeout scan above (which gates on
    * PD_PHASE_PREFILL_SENDING..PREFILL_DONE). Without this pass a conn that never gets
    * a slot-free dequeue would leak its fd + 1 MB rcvbuf until the client gives up.
@@ -692,16 +692,16 @@ check_draining_endpoints(void)
     }
   }
 
-  /* Phase 89 (RESOLVED): graceful [DONE]-synthesis safety-net — the real
+  /* (RESOLVED): graceful [DONE]-synthesis safety-net — the real
    * deliverable. Diagnosis: vLLM's P/D-disagg path FINISHES generation but omits
    * the closing "data: [DONE]" SSE chunk for ~2.5% of streams under concurrency
    * (loxilb's :1198 scanner completes 100% of TERMINATED streams — exonerated).
    * Such a stream sits in PD_PHASE_DECODE_STREAMING with sse_active==1 and its
-   * backend leg silent forever, eventually hit by the US-ERR01 502 / FIX-3 504
+ * backend leg silent forever, eventually hit by the 502 / 504
    * backstops below — both of which inject a malformed HTTP status line into a
    * body the client already saw "200 OK" for.
    *
-   * This sweep runs FIRST (before US-ERR01) and, when the BACKEND leg has been
+ * This sweep runs FIRST (before) and, when the BACKEND leg has been
    * idle past PROXY_PD_DECODE_IDLE_CAP_SEC (gated on pd_last_decode_ts, refreshed
    * per relayed byte in sockproxy_http.c — NOT wall-clock-since-start, so a
    * slow-but-live stream is never truncated), synthesizes the protocol-correct
@@ -769,7 +769,7 @@ check_draining_endpoints(void)
           }
 
           /* 4) Mark COMPLETE and tear down with the same leak-proof sequence as
-           * US-508/US-ERR01/FIX-3 (held under PROXY_LOCK; pfe_next-safe). */
+ * (held under PROXY_LOCK; pfe_next-safe). */
           pfe->pd_phase = PD_PHASE_COMPLETE;
           pd_teardown_conn(pfe);
         }
@@ -780,7 +780,7 @@ check_draining_endpoints(void)
     }
   }
 
-  /* US-ERR01: P/D decode stream timeout enforcement — walk all client connections
+  /* P/D decode stream timeout enforcement — walk all client connections
    * and detect decode streaming phases that have exceeded their timeout.
    * Default is 120s. When a decode EP crashes mid-stream, this prevents the
    * client from hanging until the 300s SO_RCVTIMEO fires. */
@@ -816,7 +816,7 @@ check_draining_endpoints(void)
                    sizeof(pd_decode_timeout_resp) - 1,
                    MSG_DONTWAIT | MSG_NOSIGNAL);
             }
-            /* FIX-1 (Phase 87): real two-leg teardown (see US-508 above). */
+            /* real two-leg teardown (see above). */
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_teardown_conn(pfe);
           }
@@ -828,8 +828,8 @@ check_draining_endpoints(void)
     }
   }
 
-  /* FIX-3 (Phase 87): generic ESTABLISHED-but-idle P/D reaper — defense in depth.
-   * The US-508 and US-ERR01 sweeps only cover PREFILL_SENDING..PREFILL_DONE and
+  /* generic ESTABLISHED-but-idle P/D reaper — defense in depth.
+ * The and sweeps only cover PREFILL_SENDING..PREFILL_DONE and
    * DECODE_STREAMING respectively; a pfe stuck in DECODE_SENDING (or any P/D
    * phase that wedged without advancing) would still leak ESTABLISHED-idle legs.
    * This sweep closes ANY pfe whose pd_phase is an in-flight P/D phase
@@ -856,8 +856,8 @@ check_draining_endpoints(void)
             pfe->pd_phase <= PD_PHASE_DECODE_STREAMING &&
             pfe->pd_phase_start_ts > 0) {
           /* Conservative cap: epv override, else max(prefill,decode)+slack. */
-          uint32_t prefill_to = 30;  /* mirrors US-508 default */
-          uint32_t decode_to = 120;  /* mirrors US-ERR01 default */
+          uint32_t prefill_to = 30;  /* mirrors default */
+          uint32_t decode_to = 120;  /* mirrors default */
           uint32_t idle_cap = 0;
           if (pfe->epv) {
             proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
@@ -878,7 +878,7 @@ check_draining_endpoints(void)
 
           time_t elapsed = now - pfe->pd_phase_start_ts;
           if (elapsed >= (time_t)idle_cap) {
-            log_error("FIX-3: generic P/D idle reaper — fd=%d pd_phase=%d "
+            log_error("generic P/D idle reaper — fd=%d pd_phase=%d "
                       "elapsed=%lds >= cap=%us",
                       pfe->fd, (int)pfe->pd_phase, (long)elapsed, idle_cap);
             if (pfe->fd > 0) {
@@ -900,7 +900,7 @@ check_draining_endpoints(void)
 }
 
 
-// P2 Phase 2 Task 2.3: Initialize circuit breaker for an endpoint
+// P2 Task 2.3: Initialize circuit breaker for an endpoint
 void
 circuit_breaker_init(circuit_breaker_t *cb)
 {
@@ -914,7 +914,7 @@ circuit_breaker_init(circuit_breaker_t *cb)
   cb->half_open_max_requests = 3;  // Default: 3 test requests in HALF_OPEN
 }
 
-// P2 Phase 2 Task 2.3: Check if circuit breaker should skip this endpoint
+// P2 Task 2.3: Check if circuit breaker should skip this endpoint
 // Returns: 1 = skip endpoint, 0 = allow traffic
 int
 circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
@@ -957,7 +957,7 @@ circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index)
   return 0;
 }
 
-// P2 Phase 2 Task 2.3: Record connection failure for circuit breaker
+// P2 Task 2.3: Record connection failure for circuit breaker
 void
 circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
 {
@@ -982,7 +982,7 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
       atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: CLOSED→OPEN */
       log_info("Circuit breaker CLOSED → OPEN - ep[%d], %u failures",
                ep_index, cb->failure_count);
-      /* Phase 8: remove tripped EP from trie */
+      /* remove tripped EP from trie */
       if (tepval->pd_trie) {
         pthread_rwlock_wrlock(&tepval->pd_trie_lock);
         pd_trie_remove_ep(tepval->pd_trie, ep_index);
@@ -999,7 +999,7 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
     atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: HALF_OPEN→OPEN */
     log_info("Circuit breaker HALF_OPEN → OPEN - ep[%d], recovery failed",
              ep_index);
-    /* Phase 8: remove tripped EP from trie */
+    /* remove tripped EP from trie */
     if (tepval->pd_trie) {
       pthread_rwlock_wrlock(&tepval->pd_trie_lock);
       pd_trie_remove_ep(tepval->pd_trie, ep_index);
@@ -1013,7 +1013,7 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
   }
 }
 
-// P2 Phase 2 Task 2.3: Record connection success for circuit breaker
+// P2 Task 2.3: Record connection success for circuit breaker
 void
 circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
 {

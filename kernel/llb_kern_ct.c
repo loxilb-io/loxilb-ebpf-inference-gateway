@@ -39,7 +39,7 @@ dp_update_ct_error_stats(__u32 stat_type, __u64 increment)
 }
 
 // ============================================================================
-// L4 TRACING: Phase 2 Full Implementation
+// L4 TRACING: Full Implementation
 // ============================================================================
 #ifdef HAVE_L4_TRACE
 // lxb_l4_trace_event.h included in main entry file (llb_kern_entry.c)
@@ -308,7 +308,7 @@ lxb_l4_populate_event(lxb_l4_trace_event_t *event,
 }
 
 /**
- * Phase 2: Full Event Emission to Ring Buffer
+ * Full Event Emission to Ring Buffer
  * 
  * Split into two __noinline functions for stack management:
  * 1. This function: sampling check + ring buffer allocation
@@ -1133,7 +1133,7 @@ dp_ct_udp_sm(void *ctx, struct xfi *xf,
   }
 
 #ifdef HAVE_L4_TRACE
-  // Phase 2: Save old state before updating for event emission
+  // Save old state before updating for event emission
   uint32_t old_state = us->state;
 #endif
 
@@ -1143,7 +1143,7 @@ dp_ct_udp_sm(void *ctx, struct xfi *xf,
   // bpf_spin_unlock(&atdat->lock);
 
 #ifdef HAVE_L4_TRACE
-  // Phase 2: Emit full event to ring buffer (pass xf to avoid stack allocation)
+  // Emit full event to ring buffer (pass xf to avoid stack allocation)
   if (old_state != nstate) {
     uint32_t state_and_dir = ((uint32_t)old_state << 16) | ((uint32_t)nstate << 8) | (uint32_t)dir;
     lxb_l4_emit_event(xf, atdat, state_and_dir, IPPROTO_UDP);
@@ -2352,7 +2352,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
     adat->ctd.pb.bytes = 0;
     adat->ctd.pb.packets = 0;
 
-    /* Octavia connectionLimit (FR-06/26 / D-74-04/05): increment the per-rule live
+    /* Octavia connectionLimit: increment the per-rule live
      * concurrent-connection count on CT-create, SELECTOR-AGNOSTIC. conc_conns lives in the
      * rule-index-keyed nat_ep_map so the teardown path can decrement it by rule id. Only count
      * NAT'd flows (xi->nat_flags) — the same gate the SecurityRate / active_sess dec uses below.
@@ -2367,7 +2367,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
         bpf_spin_lock(&ccepa->lock);
 #endif
         ccepa->conc_conns++;
-        /* Octavia /stats total_connections (FR-21 / D-74-02 "++ on CT-create"): cumulative,
+        /* Octavia /stats total_connections ( "++ on CT-create"): cumulative,
          * never decremented, so even a flow that tears down before the next RulesSync tick is
          * still counted. conc_conns (above) is the live gauge; total_conns is the running total. */
         ccepa->total_conns++;
@@ -2528,7 +2528,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
       if (xi->nat_flags) {
         dp_do_dec_nat_sess(ctx, xf, atdat->ctd.rid, atdat->ctd.aid);
 
-        /* Octavia connectionLimit (FR-06/26 / D-74-04/05): decrement the per-rule live
+        /* Octavia connectionLimit: decrement the per-rule live
          * concurrent-connection count on CT-teardown, by rule id (atdat->ctd.rid). Pairs with
          * the CT-create increment above. Guarded against underflow so a double-teardown or a
          * pre-existing CT (created before the counter existed) cannot wrap conc_conns. Frees a
@@ -2537,7 +2537,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
           __u32 dc_key = atdat->ctd.rid;
           struct dp_nat_epacts *dcepa = bpf_map_lookup_elem(&nat_ep_map, &dc_key);
           if (dcepa != NULL) {
-            /* Octavia /stats cumulative directional bytes (FR-21 / D-74-06): fold this flow's
+            /* Octavia /stats cumulative directional bytes: fold this flow's
              * final per-direction byte totals into the rule's running sums at teardown. atdat is
              * the entry being torn down; atdat->ctd.dir says which direction it is, axtdat is its
              * twin. The forward (CT_DIR_IN) CT carries client->VIP request bytes (bytes_in); the

@@ -1075,11 +1075,11 @@ int presidio_health_check_v2(void) {
     return llb_presidio_health_check_v2();
 }
 
-// This file contains JSON anonymization implementation for Phase 2.1
+// This file contains JSON anonymization implementation for.1
 // It will be appended to sockproxy_presidio.c
 
 // ============================================================================
-// JSON-AWARE ANONYMIZATION (Phase 2.1)
+// JSON-AWARE ANONYMIZATION (.1)
 // ============================================================================
 
 /**
@@ -1270,7 +1270,7 @@ int presidio_anonymize_json(
 }
 
 // ============================================================================
-// CUSTOM RECOGNIZER REGISTRATION (Phase 2.2)
+// CUSTOM RECOGNIZER REGISTRATION (.2)
 // ============================================================================
 
 /**

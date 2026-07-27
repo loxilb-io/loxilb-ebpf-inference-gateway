@@ -44,7 +44,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 
-/* strnstr_portable moved to sockproxy_http.c (Phase 4b) */
+/* strnstr_portable moved to sockproxy_http.c */
 #include "notify.h"
 #include "uthash.h"
 #include "sockproxy.h"
@@ -68,7 +68,7 @@
 #endif
 
 /* P/D extern decls, internal fwd decls (pd_initiate_decode, pd_update_content_length,
- * handle_on_message_complete), xxhash include — all moved to sockproxy_http.c (Phase 4b) */
+ * handle_on_message_complete), xxhash include — all moved to sockproxy_http.c */
 
 /* HTTP trace includes, globals, forward decls moved to sockproxy_trace.c */
 
@@ -76,26 +76,26 @@
 #ifdef HAVE_PII_DETECTION
 #include "presidio_config.h"
 #include "sockproxy_presidio.h"
-/* g_presidio_initialized, presidio_is_initialized/set defined in sockproxy_http.c (Phase 4b) */
+/* g_presidio_initialized, presidio_is_initialized/set defined in sockproxy_http.c */
 #endif
 
 /* LlamaFirewall: includes for llamafirewall_config_reload/get and init/cleanup */
 #ifdef HAVE_LLAMAFIREWALL
 #include "sockproxy_llamafirewall.h"
 #include "llamafirewall_config.h"
-/* g_llamafirewall_initialized, llamafirewall_is_initialized/set defined in sockproxy_http.c (Phase 4b) */
+/* g_llamafirewall_initialized, llamafirewall_is_initialized/set defined in sockproxy_http.c */
 #endif
 
-/* PROXY_SSL_FNAME_SZ, PROXY_SSL_CERT_DIR, PROXY_SSL_CA_DIR moved to sockproxy_ssl.h (Phase 3) */
-/* PROXY_CACHE_HIGH/LOW_WATER constants moved to sockproxy_cache.h (Phase 2) */
-/* PROXY_NUM_BURST_RX, PROXY_MAX_CACHE_ENTRIES/SIZE moved to sockproxy_http.c (Phase 4b) */
-/* PROXY_SESSION_TIMEOUT, PROXY_SESSION_CLEANUP_INTERVAL moved to sockproxy_http.h (Phase 4b) */
-/* CONVERSATION_MAPPING_TTL, CONVERSATION_CLEANUP_INTERVAL moved to sockproxy_ep.h (Phase 4a) */
+/* PROXY_SSL_FNAME_SZ, PROXY_SSL_CERT_DIR, PROXY_SSL_CA_DIR moved to sockproxy_ssl.h */
+/* PROXY_CACHE_HIGH/LOW_WATER constants moved to sockproxy_cache.h */
+/* PROXY_NUM_BURST_RX, PROXY_MAX_CACHE_ENTRIES/SIZE moved to sockproxy_http.c */
+/* PROXY_SESSION_TIMEOUT, PROXY_SESSION_CLEANUP_INTERVAL moved to sockproxy_http.h */
+/* CONVERSATION_MAPPING_TTL, CONVERSATION_CLEANUP_INTERVAL moved to sockproxy_ep.h */
 
 proxy_struct_t *proxy_struct;
 
 // ============================================================================
-// HTTP/HTTPS TRACING: Runtime Control (Phase 2)
+// HTTP/HTTPS TRACING: Runtime Control 
 // ============================================================================
 /* HTTP trace runtime control (lxb_trace_enable/disable/is_enabled, is_tracing_enabled) moved to sockproxy_trace.c */
 
@@ -123,10 +123,10 @@ int presidio_get_active_version(void) {
  * all moved to sockproxy_metrics.c  -- see sockproxy_refactoring_plan.md §6.8.
  */
 
-/* CHWBL/WRR_HASH forward declarations moved to sockproxy_lb.h (Phase 2) */
+/* CHWBL/WRR_HASH forward declarations moved to sockproxy_lb.h */
 
 /* Health/drain/CB forward declarations replaced by #include "sockproxy_health.h" */
 
 /* proxy_notify_add_fd, proxy_notify_delete_fd, proxy_notifier, proxy_main
- * moved to sockproxy_notifier.c (Phase 5) */
+ * moved to sockproxy_notifier.c */
 #include "sockproxy_notifier.h"

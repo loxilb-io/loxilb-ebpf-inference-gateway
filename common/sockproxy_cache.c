@@ -7,11 +7,11 @@
 /*
  * sockproxy_cache.c -- Xmit cache, backpressure management, and logging helpers.
  *
- * Extracted from sockproxy.c (Phase 2) per sockproxy_refactoring_plan.md §6.1
+ * Extracted from sockproxy.c per sockproxy_refactoring_plan.md §6.1
  *
  * Functions extracted:
  *   pfe_ent_accouting         -- per-connection byte/packet accounting
- *   cmp_proxy_ent             -- entry equality (temp here; moves to conn in Phase 3)
+ * cmp_proxy_ent -- entry equality (temp here; moves to conn in)
  *   proxy_add_xmitcache       -- enqueue a data buffer to the xmit cache (static)
  *   proxy_log / proxy_log_always  -- internal debug logging helpers
  *   proxy_destroy_xmitcache   -- free all cached entries (static)
@@ -83,7 +83,7 @@ pfe_ent_accouting(proxy_fd_ent_t *pfe, uint64_t bc, int txdir)
   }
 }
 
-/* cmp_proxy_ent: promoted to non-static in Phase 1; will move to sockproxy_conn.c in Phase 3.
+/* cmp_proxy_ent: promoted to non-static in; will move to sockproxy_conn.c in.
  * See sockproxy_refactoring_plan.md §6.2 */
 bool
 cmp_proxy_ent(proxy_ent_t *e1, proxy_ent_t *e2)

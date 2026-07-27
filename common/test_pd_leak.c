@@ -1,5 +1,5 @@
-/* test_pd_leak.c - Unit tests for the Phase 87 P/D streaming-completion
- * connection-leak fix (FIX-1/2/3/4), against the PURE helpers in
+/* test_pd_leak.c - Unit tests for the P/D streaming-completion
+ * connection-leak fix, against the PURE helpers in
  * sockproxy_pd_leak.h.
  *
  * Standalone test binary: NO sockproxy.c / proxy-machinery dependencies.
@@ -11,11 +11,11 @@
  * pattern follows the test_pd_cache_aware.c precedent.
  *
  * Coverage:
- *   - FIX-2 (prefill, chunked / no Content-Length)  → detector returns nonzero
- *   - FIX-2 negative (partial chunked, no terminator) → detector returns 0
- *   - FIX-4 (chunked non-SSE decode response)        → detector returns nonzero
+ * (prefill, chunked / no Content-Length) → detector returns nonzero
+ * negative (partial chunked, no terminator) → detector returns 0
+ * (chunked non-SSE decode response) → detector returns nonzero
  *   - SSE [DONE] done-marker                         → detector returns nonzero
- *   - FIX-1/3 (phase timeout → two-leg teardown)     → all fds == -1, every fd
+ * (phase timeout → two-leg teardown) → all fds == -1, every fd
  *                                                       deregistered, no leak
  */
 
@@ -88,7 +88,7 @@ notify_recorded(int fd)
  * harness self-documents the state it guards. */
 #define PREFILL_WAITING_GUARD "pd_detect_http_msg_end gates exit from PREFILL_WAITING"
 
-/* ---------- FIX-2: chunked prefill WITHOUT Content-Length completes ---------- */
+/* ---------: chunked prefill WITHOUT Content-Length completes ---------- */
 static void
 test_fix2_chunked_prefill_complete(void)
 {
@@ -104,12 +104,12 @@ test_fix2_chunked_prefill_complete(void)
       "1a\r\n{\"id\":\"x\",\"object\":\"y\"}\r\n"
       "0\r\n\r\n";
   int r = pd_detect_http_msg_end((const uint8_t *)resp, sizeof(resp) - 1);
-  assert(r != 0 && "FIX-2: chunked prefill with 0\\r\\n\\r\\n must complete (no permanent "
+  assert(r != 0 && "chunked prefill with 0\\r\\n\\r\\n must complete (no permanent "
                    PREFILL_WAITING_GUARD ")");
-  printf("  [PASS] FIX-2  chunked prefill (no Content-Length) -> complete\n");
+  printf(" [PASS] chunked prefill (no Content-Length) -> complete\n");
 }
 
-/* ---------- FIX-2 negative: partial chunked prefill stays WAITING ---------- */
+/* --------- negative: partial chunked prefill stays WAITING ---------- */
 static void
 test_fix2_partial_chunked_incomplete(void)
 {
@@ -122,17 +122,17 @@ test_fix2_partial_chunked_incomplete(void)
       "\r\n"
       "1a\r\n{\"id\":\"x\",\"object\":\"y\"}\r\n";
   int r = pd_detect_http_msg_end((const uint8_t *)resp, sizeof(resp) - 1);
-  assert(r == 0 && "FIX-2 negative: partial chunked (no terminator) must NOT complete");
-  printf("  [PASS] FIX-2  partial chunked (no terminator) -> stays WAITING\n");
+  assert(r == 0 && " negative: partial chunked (no terminator) must NOT complete");
+  printf(" [PASS] partial chunked (no terminator) -> stays WAITING\n");
 }
 
-/* ---------- FIX-4: chunked non-SSE decode response completes ---------- */
+/* ---------: chunked non-SSE decode response completes ---------- */
 static void
 test_fix4_chunked_decode_complete(void)
 {
   /* The non-SSE decode completion gate (http.c:1296-1297) is CL-only today, so a
    * chunked decode response never reaches PD_PHASE_COMPLETE. The detector seeing
-   * "0\r\n\r\n" is what FIX-4 uses to complete it. */
+ * "0\r\n\r\n" is what uses to complete it. */
   static const char resp[] =
       "HTTP/1.1 200 OK\r\n"
       "Transfer-Encoding: chunked\r\n"
@@ -140,8 +140,8 @@ test_fix4_chunked_decode_complete(void)
       "2c\r\n{\"choices\":[{\"text\":\"hello world\"}]}\r\n"
       "0\r\n\r\n";
   int r = pd_detect_http_msg_end((const uint8_t *)resp, sizeof(resp) - 1);
-  assert(r != 0 && "FIX-4: chunked decode with 0\\r\\n\\r\\n must reach PD_PHASE_COMPLETE");
-  printf("  [PASS] FIX-4  chunked decode (no Content-Length) -> complete\n");
+  assert(r != 0 && "chunked decode with 0\\r\\n\\r\\n must reach PD_PHASE_COMPLETE");
+  printf(" [PASS] chunked decode (no Content-Length) -> complete\n");
 }
 
 /* ---------- detector: SSE [DONE] marker also completes ---------- */
@@ -174,7 +174,7 @@ test_detector_bounds(void)
   printf("  [PASS] BOUND  detector honors len, no over-read (ASan-clean)\n");
 }
 
-/* ---------- FIX-1/3: phase-timeout two-leg teardown closes every fd ---------- */
+/* ---------: phase-timeout two-leg teardown closes every fd ---------- */
 static void
 test_fix1_3_teardown_closes_all_legs(void)
 {
@@ -221,7 +221,7 @@ test_fix1_3_teardown_closes_all_legs(void)
   assert(closed2 == 0 && "re-teardown of a torn-down ent closes nothing (idempotent)");
   assert(g_notify_del_n == 0 && g_stub_close_n == 0);
 
-  printf("  [PASS] FIX-1/3 two-leg teardown: fds -> -1, all deregistered, idempotent\n");
+  printf(" [PASS] two-leg teardown: fds -> -1, all deregistered, idempotent\n");
 
   /* Genuinely release the real fds we dup'd (NOT via the stubbed close()). */
 #undef close
@@ -233,7 +233,7 @@ test_fix1_3_teardown_closes_all_legs(void)
 int
 main(void)
 {
-  printf("== test_pd_leak: Phase 87 P/D streaming-leak helpers ==\n");
+  printf("== test_pd_leak: P/D streaming-leak helpers ==\n");
   test_fix2_chunked_prefill_complete();
   test_fix2_partial_chunked_incomplete();
   test_fix4_chunked_decode_complete();

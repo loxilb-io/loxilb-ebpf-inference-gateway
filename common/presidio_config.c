@@ -278,7 +278,7 @@ void presidio_config_dump(void) {
 }
 
 // ============================================================================
-// JSON FIELD MAPPINGS LOADER (Phase 2.1)
+// JSON FIELD MAPPINGS LOADER (.1)
 // ============================================================================
 
 /**
@@ -514,7 +514,7 @@ int presidio_load_json_config(presidio_config_shm_t *config) {
 }
 
 // ============================================================================
-// CUSTOM RECOGNIZER REGISTRY (Phase 2.2)
+// CUSTOM RECOGNIZER REGISTRY (.2)
 // ============================================================================
 
 // Global custom recognizer registry

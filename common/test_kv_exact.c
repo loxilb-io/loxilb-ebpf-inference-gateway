@@ -101,7 +101,7 @@ typedef struct llm_prefix_key {
   int level;
 } llm_prefix_key_t;
 
-/* Phase 91 (Option B): minimal ep_load_tracker mirror — only the two atomic
+/* (Option B): minimal ep_load_tracker mirror — only the two atomic
  * fields the KV-exact load plumbing reads (live in-flight active_conns + the
  * vLLM-advertised num_gpu_blocks capacity). The real struct (sockproxy.h) has
  * more members; the standalone unit needs just these so the #included
@@ -116,7 +116,7 @@ typedef struct proxy_epval {
   proxy_ent_t eps[MAX_PROXY_EP];
   int n_eps;
   int n_prefill_eps;
-  uint8_t ep_role[MAX_PROXY_EP];  /* Phase 43: 0=normal, 1=prefill, 2=decode */
+  uint8_t ep_role[MAX_PROXY_EP];  /* 0=normal, 1=prefill, 2=decode */
   circuit_breaker_t circuit_breakers[MAX_PROXY_EP];
   uint8_t cb_enabled;
   uint8_t kv_exact_mode;
@@ -125,14 +125,14 @@ typedef struct proxy_epval {
   uint32_t kv_block_size;
   uint32_t kv_warmup_sec;
   time_t   kv_warmup_start;
-  ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP]; /* Phase 91 Option-B load/cap */
-  /* Phase 96 (D-07): controller advisory mirror — the #included
+  ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP]; /* Option-B load/cap */
+  /* controller advisory mirror — the #included
    * sockproxy_kv_exact.c reads pd_ctrl_mode/pd_ctrl_ep[] to build the epWeight
    * array for llb_ai_kv_best_worker. Tests zero-init => mode 0 => NULL weights
    * (the byte-identical path). */
   _Atomic uint32_t pd_ctrl_ep[MAX_PROXY_EP];
   _Atomic uint8_t  pd_ctrl_mode;
-  /* Phase 99 (99-06, SGL-04): calling rule identity mirror — the #included
+  /* (99-06, SGL-04): calling rule identity mirror — the #included
    * sockproxy_kv_exact.c threads tepval->kv_svc_id to llb_ai_kv_best_worker.
    * Zero-init (kv_reset_tepval memset) == "no identity" == legacy loop. */
   uint32_t kv_svc_id;
@@ -141,7 +141,7 @@ typedef struct proxy_epval {
 typedef struct proxy_fd_ent {
   int fd;
   llm_prefix_key_t prefix_key;
-  /* Phase 88-03: request-scoped chat-routing signal + raw-body locator.
+  /* request-scoped chat-routing signal + raw-body locator.
    * Mirrors the real sockproxy.h proxy_fd_ent fields the kv-exact tokenize
    * stage now reads (pfe->is_chat / pfe->body_off / pfe->body_len). */
   uint8_t is_chat;
@@ -191,16 +191,16 @@ static uint32_t stub_token_ids[4096];
 static int stub_token_count = 0;
 static int stub_best_ep = -1;
 static int stub_best_score = 0;
-/* Phase 99 (99-01 Task 3): capture the masks pd_kv_exact_select passes to the
+/* (99-01 Task 3): capture the masks pd_kv_exact_select passes to the
  * best-worker CGO stub so the mask-build regression cases can pin them.
  * Sentinel-reset by each test; 0xdeadbeef == "stub never reached". */
 static uint32_t stub_last_prefill_mask = 0xdeadbeefu;
 static uint32_t stub_last_excluded_mask = 0xdeadbeefu;
-/* Phase 99 (99-06 Task 1, SGL-04): capture the svc_id pd_kv_exact_select
+/* (99-06 Task 1, SGL-04): capture the svc_id pd_kv_exact_select
  * threads to the best-worker CGO stub — pins the cross-VIP contamination fix's
  * C half (tepval->kv_svc_id reaches the Go selector intact, 0 by default). */
 static uint32_t stub_last_svc_id = 0xdeadbeefu;
-/* Phase 99 (§9 relief default): capture the kv_exact_mode pd_kv_exact_select
+/* (§9 relief default): capture the kv_exact_mode pd_kv_exact_select
  * threads on the same seam — pins the single-role relief-default gate's C half
  * (tepval->kv_exact_mode reaches the Go selector intact). */
 static uint32_t stub_last_kv_exact_mode = 0xdeadbeefu;
@@ -219,7 +219,7 @@ llb_ai_kv_tokenize(char *text, char *model_name,
   return n;
 }
 
-/* Phase 88-03 chat stub: mirrors llb_ai_kv_tokenize but for the chat path.
+/* chat stub: mirrors llb_ai_kv_tokenize but for the chat path.
  * The C unit cannot run a real tokenizer/template, so it returns the
  * caller-loaded stub_token_ids (the vLLM apply_chat_template golden vector).
  * This proves the C-side block-boundary math is parity-correct GIVEN vLLM ids;
@@ -251,14 +251,14 @@ llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
   (void)hash_size;
   (void)n_hashes;
   (void)model_name;
-  stub_last_prefill_mask = prefill_mask;    /* Phase 99: mask regression capture */
+  stub_last_prefill_mask = prefill_mask;    /* mask regression capture */
   stub_last_excluded_mask = excluded_mask;
-  (void)ep_load;       /* Phase 91: per-EP load[] (active_conns) */
-  (void)ep_cap;        /* Phase 91: per-EP cap[]  (num_gpu_blocks) */
-  (void)ep_weight;     /* Phase 96: per-EP controller weight[] (pd_ctrl_ep) */
+  (void)ep_load;       /* per-EP load (active_conns) */
+  (void)ep_cap;        /* per-EP cap (num_gpu_blocks) */
+  (void)ep_weight;     /* per-EP controller weight (pd_ctrl_ep) */
   (void)n_ep_slots;
-  stub_last_svc_id = kv_svc_id;             /* Phase 99 (SGL-04): svc-id threading capture */
-  stub_last_kv_exact_mode = kv_exact_mode;  /* Phase 99 (§9): relief-default mode capture */
+  stub_last_svc_id = kv_svc_id;             /* (SGL-04): svc-id threading capture */
+  stub_last_kv_exact_mode = kv_exact_mode;  /* (§9): relief-default mode capture */
   if (out_score) *out_score = stub_best_score;
   return stub_best_ep;
 }
@@ -696,7 +696,7 @@ test_guard_e_tokenize_fail(void)
  * n_hashes == 1. The deterministic GUARD_F driver is an INVALID kv_hash_algo:
  * kv_compute_block_hashes returns -1 for any algo that is neither SHA256_CBOR(0)
  * nor XXHASH_CBOR(1) (sockproxy_kv_exact.c:444-445). We assert BOTH rc==-1 and
- * the pd_kv_t15_miss_hashes counter delta (T-80-02-02: never weaken to rc!=0). */
+ * the pd_kv_t15_miss_hashes counter delta (: never weaken to rc!=0). */
 static void
 test_guard_f_no_hashes(void)
 {
@@ -819,7 +819,7 @@ test_guard_g_cb_open(void)
             "pd_kv_t15_miss_excluded incremented (cb_open)");
 }
 
-/* Phase 42-04: proxy_add_entry new-tepval branch must copy five kv_* fields
+/* proxy_add_entry new-tepval branch must copy five kv_* fields
  * from arg to tepval. The real proxy_add_entry function lives in sockproxy_http.c
  * and depends on the full sockproxy stack, so this test mirrors the copy-semantics
  * of the fix block (sockproxy_http.c:1763-1773) against a minimal arg/tepval pair.
@@ -879,7 +879,7 @@ test_proxy_add_entry_kv_exact_fields_new_path(void)
             "tepval.kv_exact_mode == 1 enables pd_kv_exact_select gate");
 }
 
-/* Phase 43 Task 1 (RED tripwire): verify the C-side prefill_mask build loop
+/* Task 1 (RED tripwire): verify the C-side prefill_mask build loop
  * in sockproxy_kv_exact.c correctly sets bits only at indices where
  * ep_role[i] == 1 (prefill). Mirrors the exact construction that will be
  * applied at the single call site in Task 3. Fires instantly without the
@@ -909,7 +909,7 @@ static void test_prefill_mask_from_ep_role(void) {
 }
 
 /* ===========================================================================
- * Phase 99 (99-01 Task 3, D-09/D-10): candidate-mask regression cases for the
+ * (99-01 Task 3): candidate-mask regression cases for the
  * Tier-1.5 single-role decouple seam. Unlike test_prefill_mask_from_ep_role
  * (a construction mirror), these drive the REAL pd_kv_exact_select and pin the
  * mask it actually passes to llb_ai_kv_best_worker via the stub capture —
@@ -1041,7 +1041,7 @@ test_mask_mode3_single_role_admits_all(void)
   }
 }
 
-/* Phase 99 (99-06 Task 1, SGL-04): svc-id threading through the CGO seam.
+/* (99-06 Task 1, SGL-04): svc-id threading through the CGO seam.
  * Arm 1: a stamped tepval->kv_svc_id must reach llb_ai_kv_best_worker intact
  * (the cross-VIP contamination fix's C half). Arm 2: a zero-init tepval passes
  * 0 ("no identity") — the Go side then keeps today's all-services loop, so the
@@ -1066,7 +1066,7 @@ test_kv_svc_id_threading(void)
   int rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
   ASSERT_EQ(rc, 0, "svc-id arm-1 select succeeds (stub hit)");
   ASSERT_EQ((int)stub_last_svc_id, 42, "kv_svc_id=42 reached the CGO stub intact");
-  /* Phase 99 (§9): kv_exact_mode rides the same seam — kv_reset_tepval sets 1
+  /* (§9): kv_exact_mode rides the same seam — kv_reset_tepval sets 1
    * (P/D zmq), so 1 must reach the stub intact (relief-default gate's C half). */
   ASSERT_EQ((int)stub_last_kv_exact_mode, 1, "kv_exact_mode=1 reached the CGO stub intact");
 
@@ -1078,7 +1078,7 @@ test_kv_svc_id_threading(void)
   ASSERT_EQ(rc, 0, "svc-id arm-2 select succeeds (stub hit)");
   ASSERT_EQ((int)stub_last_svc_id, 0, "default kv_svc_id==0 (no identity; legacy loop Go-side)");
 
-  /* Arm 3 (Phase 99 §9): single-role mode 3 threads intact — the value the Go
+  /* Arm 3 ( §9): single-role mode 3 threads intact — the value the Go
    * side's kvSpillReliefFor keys the relief default on. */
   kv_reset_stats();
   kv_reset_tepval(&tepval);
@@ -1149,7 +1149,7 @@ static void test_c2_capacity_skew_cap(void) {
 }
 
 /* C2: a buggy/malicious vLLM advertising NumGPUBlocks=0 must NOT divide-by-zero
- * or zero the weighted sum (T-81-07-01). The clamp turns 0 → 1, so a fleet of
+ * or zero the weighted sum. The clamp turns 0 → 1, so a fleet of
  * all-zero advertisements falls back to a UNIFORM cap (every weight 1) with a
  * well-defined, finite, ≥1 result. */
 static void test_c2_num_gpu_blocks_zero_safe(void) {
@@ -1201,7 +1201,7 @@ void record_kv_stage(int stage, int is_hit, uint64_t latency_us) {
 }
 
 /* ===========================================================================
- * Phase 81-01 Task 1 (C3): per-stage µs histogram accumulation.
+ * Task 1 (C3): per-stage µs histogram accumulation.
  *
  * record_kv_stage(stage, is_hit, latency_us) must accumulate into the correct
  * per-(stage,outcome) 12-bucket histogram + sum/count — the mirror of
@@ -1274,7 +1274,7 @@ static void test_kv_stage_histogram(void) {
 }
 
 /* ===========================================================================
- * Phase 44-02 Task 3: Known-vector tests loaded from shared JSON fixture.
+ * Task 3: Known-vector tests loaded from shared JSON fixture.
  *
  * Loads cicd/common/kv_hash/fixtures/kv_hash_vectors.json
  * and asserts that kv_compute_single_block_hash produces a digest whose
@@ -1641,7 +1641,7 @@ test_hash_vectors_from_json(void)
 }
 
 /* ===========================================================================
- * Phase 88-03 Task 3: chat + special-token block-BOUNDARY parity fixtures.
+ * Task 3: chat + special-token block-BOUNDARY parity fixtures.
  *
  * The C unit cannot run a real tokenizer, so these load the committed vLLM
  * GOLDEN token_id vectors (cicd/common/kv_hash/fixtures/kv_special_token_parity
@@ -1761,7 +1761,7 @@ test_block_boundary_chat(void)
 }
 
 /* ==========================================================================
- * Phase 99 (SGL-02, D-15): SGLang parity vectors — KV_HASH_SHA256_SGLANG.
+ * (SGL-02): SGLang parity vectors — KV_HASH_SHA256_SGLANG.
  *
  * Pins loxilb's C hash arm to SGLang's get_hash_str/hash_str_to_int64 on
  * committed reference vectors. Asserts BOTH levels per vector:

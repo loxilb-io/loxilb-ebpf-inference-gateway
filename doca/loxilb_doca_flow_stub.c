@@ -115,7 +115,7 @@ llb_doca_pipe_handle_t llb_doca_get_udp_ct_pipe(void)
 }
 
 /* Stub for non-DOCA builds; accepts V1 and V2 cfg transparently since
- * no logic depends on cfg contents. The ABI bump from V1->V2 (Phase 47 D-04:
+ * no logic depends on cfg contents. The ABI bump from V1->V2 (:
  * appended miss_pipe_override field) is source-compatible -- the typedef name
  * is unchanged and (void)cfg; ignores the extra byte. Tests rely on the stub
  * loudly returning NOTSUP; do NOT change to OK. */
@@ -125,7 +125,7 @@ int llb_doca_rebuild_root_pipe(const llb_doca_root_pipe_cfg *cfg)
     return LLB_DOCA_ERR_NOTSUP;
 }
 
-/* Phase 36: FDB L2 pipe stubs */
+/* FDB L2 pipe stubs */
 
 llb_doca_pipe_handle_t llb_doca_fdb_pipe_create(uint32_t nr_entries)
 {
@@ -155,7 +155,7 @@ llb_doca_pipe_handle_t llb_doca_get_fdb_pipe(void)
     return NULL;
 }
 
-/* Phase 37: ACL deny pipe stubs */
+/* ACL deny pipe stubs */
 
 llb_doca_pipe_handle_t llb_doca_acl_pipe_create(
     uint32_t src_ip_mask, uint32_t dst_ip_mask,
@@ -186,7 +186,7 @@ llb_doca_pipe_handle_t llb_doca_get_acl_pipe(void) { return NULL; }
 void llb_doca_acl_pipe_destroy(llb_doca_pipe_handle_t pipe) { (void)pipe; }
 void llb_doca_acl_query_all(void) {}
 
-/* Phase 37: L4 dispatch pipe stubs */
+/* L4 dispatch pipe stubs */
 
 llb_doca_pipe_handle_t llb_doca_l4_dispatch_pipe_create(void) { return NULL; }
 
@@ -234,7 +234,7 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
     (void)aging_sec;
     (void)user_ctx;
     (void)meter_id;
-    /* Phase 63-06 (D-12): out_es_entry out-param dropped along with the
+    /* out_es_entry out-param dropped along with the
      * paired g_egress_steer entry pattern (Plan 63-04 deleted the pipe;
      * Plan 63-02's g_egress_dispatch handles per-port FWD via static
      * init-time entries). Stub still returns NULL because DOCA is absent. */
@@ -283,7 +283,7 @@ int llb_doca_get_aged_entries(uint64_t *out_ctx, int max_out)
     return 0;
 }
 
-/* Phase 38: Meter classification pipe stubs */
+/* Meter classification pipe stubs */
 
 llb_doca_pipe_handle_t llb_doca_meter_pipe_create(
     llb_doca_pipe_handle_t miss_target, uint32_t meter_id, uint32_t nr_entries)
@@ -303,7 +303,7 @@ llb_doca_entry_handle_t llb_doca_meter_pipe_entry_add(
 llb_doca_pipe_handle_t llb_doca_get_meter_pipe(void) { return NULL; }
 void llb_doca_set_meter_pipe(llb_doca_pipe_handle_t pipe) { (void)pipe; }
 
-/* Phase 38: Shared meter stubs */
+/* Shared meter stubs */
 
 int llb_doca_meter_add(uint32_t meter_id, uint64_t cir_bps, uint64_t cbs, uint64_t ebs)
 {

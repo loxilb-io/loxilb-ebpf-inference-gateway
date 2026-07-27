@@ -134,7 +134,7 @@ llb_ai_normal_session_hit(char *model_name)
 /* llb_ai_update_ep_queue_depth is defined in sockproxy_metrics.c (C-side),
  * not a CGO export, so no stub needed here. */
 
-/* Phase 5: Per-EP P/D latency recording stub */
+/* Per-EP P/D latency recording stub */
 
 void
 llb_ai_pd_record_ep(char *model_name, int64_t prefill_latency_ms,
@@ -151,7 +151,7 @@ llb_ai_pd_record_ep(char *model_name, int64_t prefill_latency_ms,
     (void)decode_ep_ip;
 }
 
-/* Phase 6: KV-Cache Exact Routing stubs */
+/* KV-Cache Exact Routing stubs */
 
 int
 llb_ai_kv_tokenize(char *text, char *model_name,
@@ -190,17 +190,17 @@ llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
     (void)model_name;
     (void)prefill_mask;
     (void)excluded_mask;
-    (void)ep_load;       /* Phase 91: per-EP load[] (active_conns) */
-    (void)ep_cap;        /* Phase 91: per-EP cap[]  (num_gpu_blocks) */
-    (void)ep_weight;     /* Phase 96: per-EP controller weight[] (pd_ctrl_ep) */
+    (void)ep_load;       /* per-EP load (active_conns) */
+    (void)ep_cap;        /* per-EP cap (num_gpu_blocks) */
+    (void)ep_weight;     /* per-EP controller weight (pd_ctrl_ep) */
     (void)n_ep_slots;
-    (void)kv_svc_id;     /* Phase 99: calling rule identity (SGL-04) */
-    (void)kv_exact_mode; /* Phase 99 §9: single-role relief default gate */
+    (void)kv_svc_id;     /* calling rule identity (SGL-04) */
+    (void)kv_exact_mode; /* §9: single-role relief default gate */
     (void)out_score;
     return -1;  /* no KV inventory in C-only builds */
 }
 
-/* Phase 70: Sockproxy HA state-sync emit stub.
+/* Sockproxy HA state-sync emit stub.
  *
  * The real implementation lives in pkg/loxinet/sockproxy_sync.go (CGO //export)
  * and pushes the event onto a 10K-buffered Go channel with drop-oldest. In

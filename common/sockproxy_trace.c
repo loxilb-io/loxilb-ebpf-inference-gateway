@@ -179,7 +179,7 @@ int lxb_trace_is_enabled(void) {
 // --- Region 3: Catalog management + event emission ---
 #ifdef HAVE_HTTP_TRACE
 // ============================================================================
-// HTTP/HTTPS Tracing: Catalog & Deep Inspection (Phase 3)
+// HTTP/HTTPS Tracing: Catalog & Deep Inspection 
 // ============================================================================
 
 /**
@@ -529,7 +529,7 @@ int lxb_capture_body_to_tmpfs(uint64_t trace_id_hi, uint64_t span_id,
 }
 
 // ============================================================================
-// HTTP/HTTPS Tracing: Event Emission Helpers (Phase 2)
+// HTTP/HTTPS Tracing: Event Emission Helpers 
 // ============================================================================
 
 /* get_timestamp_ns moved to sockproxy_metrics.c (always-compiled) so the TTFB

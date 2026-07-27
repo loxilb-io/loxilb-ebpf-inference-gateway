@@ -314,7 +314,7 @@ pd_prepare_prefill_body(const uint8_t *orig_body, size_t orig_body_len,
   return 0;
 }
 
-/* US-506: Extract kv_transfer_params from prefill response.
+/* Extract kv_transfer_params from prefill response.
  * Searches the prefill response body for "kv_transfer_params" JSON object
  * and copies the full nested object value to kv_out buffer.
  *
@@ -368,7 +368,7 @@ pd_extract_kv_params(const uint8_t *resp_buf, size_t resp_len,
   return 0;
 }
 
-/* US-507: Prepare decode request body.
+/* Prepare decode request body.
  * Combines original request body with kv_transfer_params extracted from
  * prefill response. Inserts ,"kv_transfer_params":<kv_params> before
  * the closing } of the JSON body.
@@ -424,7 +424,7 @@ pd_prepare_decode_body(const uint8_t *orig_body, size_t orig_body_len,
 
   /* Buffer overflow check */
   if (orig_body_len + inject_len >= out_capacity) {
-    log_error("US-507: decode body overflow (%zu + %zu >= %zu) "
+    log_error("decode body overflow (%zu + %zu >= %zu) "
               "— using original body", orig_body_len, inject_len, out_capacity);
     *out_len = orig_body_len;
     return 0;
@@ -471,7 +471,7 @@ pd_prepare_decode_body(const uint8_t *orig_body, size_t orig_body_len,
 #define PD_SESSION_MAX_ENTRIES 4096
 #define PD_SESSION_DEFAULT_TTL 300  /* 5 minutes */
 
-/* Phase 70 — sockproxy HA state-sync emit helpers.
+/* sockproxy HA state-sync emit helpers.
  *
  * INVARIANT (sockproxy_internal.h emit-after-unlock contract):
  *   Caller MUST have released tepval->pd_session_lock BEFORE invoking these
@@ -635,7 +635,7 @@ pd_session_store(proxy_epval_t *tepval, const char *key,
 {
   pd_session_mapping_t *m = NULL;
   uint64_t now;
-  /* Phase 70 — emit-after-unlock state. Captured under wrlock, used after. */
+  /* emit-after-unlock state. Captured under wrlock, used after. */
   int      emit_kind = -1;                    /* -1 = no emit */
   uint64_t emit_created_ts = 0;
   uint32_t emit_request_count = 0;
@@ -656,12 +656,12 @@ pd_session_store(proxy_epval_t *tepval, const char *key,
     m->decode_ep_idx = decode_ep;
     atomic_store(&m->last_access_ts, now);
     m->request_count++;
-    /* Phase 70 emit-state #1: capture for SYNC_SESSION_UPDATE after unlock. */
+    /* emit-state #1: capture for SYNC_SESSION_UPDATE after unlock. */
     emit_kind = SYNC_SESSION_UPDATE;
     emit_created_ts = m->created_ts;
     emit_request_count = m->request_count;
     pthread_rwlock_unlock(&tepval->pd_session_lock);
-    /* Phase 70 EMIT SITE #1 (sockproxy_pd.c) [PHASE_70_EMIT_PD_001] — update existing entry.
+    /* EMIT SITE #1 (sockproxy_pd.c) [PHASE_70_EMIT_PD_001] — update existing entry.
      * Emit-after-unlock: pd_session_lock released above. */
     {
       proxy_sync_event_t _ev70;
@@ -686,7 +686,7 @@ pd_session_store(proxy_epval_t *tepval, const char *key,
       }
     }
     if (oldest) {
-      /* Phase 70 emit-state #2: capture LRU victim for SYNC_SESSION_DELETE
+      /* emit-state #2: capture LRU victim for SYNC_SESSION_DELETE
        * emit after unlock (Landmine L-6 — batch under lock, emit after). */
       strncpy(emit_evicted_conv_id, oldest->conv_id, MAX_CONV_ID_LEN - 1);
       emit_evicted_conv_id[MAX_CONV_ID_LEN - 1] = '\0';
@@ -700,7 +700,7 @@ pd_session_store(proxy_epval_t *tepval, const char *key,
   if (!m) {
     pthread_rwlock_unlock(&tepval->pd_session_lock);
     /* Emit the LRU-eviction even on calloc failure (state changed).
-     * Phase 70 EMIT SITE #2 (sockproxy_pd.c) [PHASE_70_EMIT_PD_002] — LRU eviction (calloc-fail path). */
+ * EMIT SITE #2 (sockproxy_pd.c) [PHASE_70_EMIT_PD_002] — LRU eviction (calloc-fail path). */
     if (emit_evicted_conv_id[0] != '\0') {
       proxy_sync_event_t _ev70;
       if (pd_session_build_event(&_ev70, tepval, SYNC_SESSION_DELETE, emit_evicted_conv_id,
@@ -717,14 +717,14 @@ pd_session_store(proxy_epval_t *tepval, const char *key,
   atomic_store(&m->last_access_ts, now);
   m->request_count = 1;
   HASH_ADD_STR(tepval->pd_session_map, conv_id, m);
-  /* Phase 70 emit-state #3: capture for SYNC_SESSION_CREATE after unlock. */
+  /* emit-state #3: capture for SYNC_SESSION_CREATE after unlock. */
   emit_kind = SYNC_SESSION_CREATE;
   emit_created_ts = m->created_ts;
   emit_request_count = m->request_count;
 
   pthread_rwlock_unlock(&tepval->pd_session_lock);
 
-  /* Phase 70 EMIT SITE #3 (sockproxy_pd.c) [PHASE_70_EMIT_PD_003] — LRU eviction during insert
+  /* EMIT SITE #3 (sockproxy_pd.c) [PHASE_70_EMIT_PD_003] — LRU eviction during insert
    * (post-calloc success path). Lands BEFORE the new entry's CREATE emit
    * so the receiver sees the same sequence of state transitions. */
   if (emit_evicted_conv_id[0] != '\0') {
@@ -734,7 +734,7 @@ pd_session_store(proxy_epval_t *tepval, const char *key,
       llb_sockproxy_emit_sync_event(&_ev70);
   }
 
-  /* Phase 70 EMIT SITE #4 (sockproxy_pd.c) [PHASE_70_EMIT_PD_004] — new-entry CREATE. */
+  /* EMIT SITE #4 (sockproxy_pd.c) [PHASE_70_EMIT_PD_004] — new-entry CREATE. */
   if (emit_kind == SYNC_SESSION_CREATE) {
     proxy_sync_event_t _ev70;
     if (pd_session_build_event(&_ev70, tepval, SYNC_SESSION_CREATE, key,
@@ -755,7 +755,7 @@ pd_session_evict(proxy_epval_t *tepval)
   pd_session_mapping_t *iter, *tmp;
   uint64_t now;
   uint32_t ttl;
-  /* Phase 70 — Landmine L-6: batch deletions to a stack-local list under
+  /* Landmine L-6: batch deletions to a stack-local list under
    * wrlock, emit AFTER unlock. Cap victims at 256 per pass; if more entries
    * are expired they will be picked up next tick (cleanup runs every 30s). */
   #define PD_SESSION_EVICT_BATCH 256
@@ -786,7 +786,7 @@ pd_session_evict(proxy_epval_t *tepval)
   }
   pthread_rwlock_unlock(&tepval->pd_session_lock);
 
-  /* Phase 70 EMIT SITE #5 (sockproxy_pd.c) [PHASE_70_EMIT_PD_005] — bulk TTL evict.
+  /* EMIT SITE #5 (sockproxy_pd.c) [PHASE_70_EMIT_PD_005] — bulk TTL evict.
    * Emit-after-unlock: per-victim DELETE events. Landmine L-6 compliant. */
   for (uint32_t i = 0; i < n_victims; i++) {
     proxy_sync_event_t _ev70;
@@ -806,7 +806,7 @@ void
 pd_session_evict_key(proxy_epval_t *tepval, const char *key)
 {
   pd_session_mapping_t *m = NULL;
-  /* Phase 70 — capture state under lock, emit after unlock. */
+  /* capture state under lock, emit after unlock. */
   int emit_was_present = 0;
   uint64_t emit_created_ts = 0;
 
@@ -823,7 +823,7 @@ pd_session_evict_key(proxy_epval_t *tepval, const char *key)
   }
   pthread_rwlock_unlock(&tepval->pd_session_lock);
 
-  /* Phase 70 EMIT SITE #6 (sockproxy_pd.c) [PHASE_70_EMIT_PD_006] — single-key evict.
+  /* EMIT SITE #6 (sockproxy_pd.c) [PHASE_70_EMIT_PD_006] — single-key evict.
    * Emit-after-unlock contract preserved. */
   if (emit_was_present) {
     proxy_sync_event_t _ev70;
@@ -834,7 +834,7 @@ pd_session_evict_key(proxy_epval_t *tepval, const char *key)
 }
 
 /* ============================================================================
- * 3-Tier P/D Endpoint Selection (Phase 4: Cache-Aware Routing)
+ * 3-Tier P/D Endpoint Selection (: Cache-Aware Routing)
  *
  * pd_select_prefill: Tier 0 (session) -> Tier 1 (trie) -> Tier 2 (min-load)
  * pd_select_decode:  Session hint -> min-load among decode EPs
@@ -879,27 +879,27 @@ pd_kv_loadguard_on(void)
   return v;
 }
 
-/* Phase 93: distinct return for "all prefill EPs at in-flight cap". Normally provided
+/* distinct return for "all prefill EPs at in-flight cap". Normally provided
  * by sockproxy.h, but under the unit-test guards (TEST_PD_CACHE_AWARE) sockproxy.h is
  * not included, so define it here too (idempotent #ifndef). */
 #ifndef PD_PREFILL_NO_CAPACITY
 #define PD_PREFILL_NO_CAPACITY (-2)
 #endif
 
-/* Phase 93-04: distinct return for "all prefill EPs capped but a per-EP parked
+/* distinct return for "all prefill EPs capped but a per-EP parked
  * FIFO has room" (hold-don't-drop). Like PD_PREFILL_NO_CAPACITY, normally from
  * sockproxy.h but absent under TEST_PD_CACHE_AWARE — define idempotently. */
 #ifndef PD_PREFILL_PARKED
 #define PD_PREFILL_PARKED (-3)
 #endif
 
-/* Phase 93-04: compile cap for the per-EP parked ring (sockproxy.h provides it in
+/* compile cap for the per-EP parked ring (sockproxy.h provides it in
  * production; define here for the cache_aware unit build where sockproxy.h is skipped). */
 #ifndef PD_MAX_QUEUE_DEPTH
 #define PD_MAX_QUEUE_DEPTH 64
 #endif
 
-/* Phase 96 (D-07): PD_CTRL_* packed-word constants + accessors. Normally provided
+/* PD_CTRL_* packed-word constants + accessors. Normally provided
  * by sockproxy.h; absent under the TEST_PD_CACHE_AWARE unit build — define
  * idempotently (PD_PREFILL_NO_CAPACITY precedent). State values are lockstep with
  * the frozen loxilb.aictrl.v1 EpState enum (96-02): 1=ACTIVE 2=DRAINING 3=DISABLED,
@@ -913,7 +913,7 @@ pd_kv_loadguard_on(void)
 #define PD_CTRL_WEIGHT(p) ((p) & 0xff)
 #endif
 
-/* Phase 93: per-EP in-flight admission cap (env LLB_PD_MAX_INFLIGHT_PER_EP, cached
+/* per-EP in-flight admission cap (env LLB_PD_MAX_INFLIGHT_PER_EP, cached
  * getenv-once). 0/unset = DISABLED -> pd_select_prefill is byte-identical to today
  * (back-compat). When >0, pd_select_prefill excludes any prefill EP whose real-time
  * active_conns >= cap so selection spills to an under-cap EP across ALL tiers; when
@@ -937,17 +937,17 @@ pd_max_inflight_per_ep(void)
   return (uint32_t)v;
 }
 
-/* Phase 93: count of requests shed by the in-flight cap (observability; also logged
+/* count of requests shed by the in-flight cap (observability; also logged
  * per shed via [PD_ADMISSION]). File-static atomic — no global_stats struct churn. */
 static _Atomic uint64_t pd_admission_shed_total = 0;
 
-/* Phase 93-04: bounded backpressured admission — per-EP parked FIFO depth (env
+/* bounded backpressured admission — per-EP parked FIFO depth (env
  * LLB_PD_QUEUE_DEPTH_PER_EP, cached getenv-once; mirrors pd_max_inflight_per_ep
  * EXACTLY). 0/unset = DISABLED -> the all-capped branch sheds a 429 exactly as
  * 93-01 (byte-identical back-compat). When >0 (clamped to PD_MAX_QUEUE_DEPTH),
  * the all-capped branch ENQUEUES the request onto the least-loaded eligible EP's
  * FIFO (hold-don't-drop) and returns PD_PREFILL_PARKED; 429 then fires ONLY when
- * every candidate FIFO is also full (overflow valve). Phase 93-05: non-static so the
+ * every candidate FIFO is also full (overflow valve).: non-static so the
  * pd_cleanup dequeue hook (sockproxy_http.c) can gate on it (default-off invariant). */
 uint32_t
 pd_queue_depth_per_ep(void)
@@ -968,13 +968,13 @@ pd_queue_depth_per_ep(void)
   return (uint32_t)v;
 }
 
-/* Phase 93-04: admission observability — requests held (parked, NOT shed) by the
+/* admission observability — requests held (parked, NOT shed) by the
  * FIFO, and requests shed only because every candidate FIFO was also full
  * (overflow valve). File-static atomics mirroring pd_admission_shed_total. */
 static _Atomic uint64_t pd_admission_queued_total = 0;
 static _Atomic uint64_t pd_admission_overflow_shed_total = 0;
 
-/* Phase 96 (D-07): [PD_CTRL] fold-in transition observability. A DISABLED/DRAINING
+/* [PD_CTRL] fold-in transition observability. A DISABLED/DRAINING
  * EP folds on EVERY selection while the snapshot holds, so logging per request
  * would spam the hot path — instead we log + count only on TRANSITIONS of the
  * folded set (the [PD_ADMISSION] tagged-prefix shape, rare-event discipline).
@@ -986,7 +986,7 @@ static _Atomic uint64_t pd_admission_overflow_shed_total = 0;
 static _Atomic uint64_t pd_ctrl_fold_state = 0;
 static _Atomic uint64_t pd_ctrl_fold_transitions_total = 0;
 
-/* Phase 96 (OBS-01): read-only export of the Phase-93 file-static admission
+/* (OBS-01): read-only export of the Phase-93 file-static admission
  * counters for the Prometheus snapshot (proxy_get_metrics in sockproxy_metrics.c).
  * The accessor route is deliberate — the Phase-93 comments above explicitly
  * avoided global_stats struct churn, so the counters stay file-static and are
@@ -1003,7 +1003,7 @@ pd_admission_stats_get(int which)
   }
 }
 
-/* Phase 93-04: CLOCK_MONOTONIC nanoseconds (matches the sockproxy_http.c reaper
+/* CLOCK_MONOTONIC nanoseconds (matches the sockproxy_http.c reaper
  * idiom). Stamped on each parked entry's enqueue_ns for the 93-05 max-park reap. */
 static uint64_t
 pd_now_ns(void)
@@ -1047,7 +1047,7 @@ pd_queued_or_fill(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_fill)
 }
 
 /* ===========================================================================
- * Phase 93-05: bounded-admission FIFO dequeue + reap primitives.
+ * bounded-admission FIFO dequeue + reap primitives.
  *
  * These are pure ring-buffer ops on a single pd_parked_fifo_t. They do NOT take
  * pd_parked_lock — the CALLER holds it (the production callers run them under
@@ -1133,7 +1133,7 @@ pd_max_park_sec(void)
   return (uint32_t)v;
 }
 
-/* Phase 93-06 (AC-4): global total in-flight+queued footprint bound (env
+/* (AC-4): global total in-flight+queued footprint bound (env
  * LLB_PD_MAX_TOTAL_INFLIGHT), cached getenv-once — mirrors pd_max_park_sec
  * EXACTLY. 0/unset = DISABLED ⇒ accept() is byte-identical (no gate, no counter
  * check). When >0, accept() refuses a new client connection once the global
@@ -1158,7 +1158,7 @@ pd_max_total_inflight(void)
   return (uint32_t)v;
 }
 
-/* Phase 93-06 (AC-4): the pure accept()-gate decision, factored out so it is
+/* (AC-4): the pure accept-gate decision, factored out so it is
  * unit-testable in isolation (the accept loop itself is hard to drive standalone
  * — integration is covered by the live conc=128 gate + footprint soak). Returns
  * 1 = ACCEPT, 0 = REFUSE. bound==0 (feature off) ALWAYS accepts (byte-identical).
@@ -1170,7 +1170,7 @@ pd_admission_should_accept(uint64_t cur_inflight, uint32_t bound)
   return cur_inflight < (uint64_t)bound;     /* ACCEPT iff strictly under the bound */
 }
 
-/* Phase 96 (D-07): advisory DRAINING predicate for NEW-session assignment.
+/* advisory DRAINING predicate for NEW-session assignment.
  *
  * Design rationale (96-03 Task 2B): the controller path deliberately does NOT
  * write tepval->drain_state[] — that array is owned by the local health
@@ -1197,9 +1197,9 @@ pd_ctrl_draining(proxy_epval_t *tepval, int i, uint8_t cmode)
   return PD_CTRL_STATE(atomic_load(&tepval->pd_ctrl_ep[i])) == PD_CTRL_ST_DRAINING;
 }
 
-/* Phase 96 (D-07): controller weight applied to an EP's CLAMPED effective
+/* controller weight applied to an EP's CLAMPED effective
  * capacity in the Tier-2 scorer. weight 100 or packed==0 (no instruction) is an
- * arithmetic no-op; weight>100 is clamped to 100 (T-96-08 pure-intersection —
+ * arithmetic no-op; weight>100 is clamped to 100 ( pure-intersection —
  * the snapshot may only scale capacity down-or-neutral, never widen); weight 0
  * is treated as "no weight instruction" here per the plan's Tier-2 contract
  * (true removal is a STATE — DISABLED — not a weight). Integer math only; the
@@ -1219,7 +1219,7 @@ int
 pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                   uint32_t excluded_mask)
 {
-  /* --- Phase 96 (D-07): global-controller advisory fold-in (SNAP-03/04) ---
+  /* --: global-controller advisory fold-in (SNAP-03/04) ---
    * G3 guard order (Pitfall 2): read pd_ctrl_mode FIRST. mode 0 == controller
    * absent/autonomous == ZERO further controller work (no loop, no pd_ctrl_ep
    * loads) — the Phase-95 byte-identical hot path. mode != 0: ONE walk over
@@ -1228,7 +1228,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
    *       tier already honors excluded_mask, and the per-tier CB/health checks
    *       run AFTER this fold-in, so the applier's word can only SHRINK
    *       eligibility — a locally-excluded/CB-open EP is never resurrected by
-   *       an ACTIVE snapshot (G4 ordering; T-96-08 pure intersection);
+ * an ACTIVE snapshot (G4 ordering; pure intersection);
    *   (b) DRAINING bits -> ctrl_drain, consumed via pd_ctrl_draining() at the
    *       NEW-session assignment predicates below and OR'd into the mask passed
    *       to Tier 1.5's pd_kv_exact_select (Tier-0 pinned sessions keep routing
@@ -1260,7 +1260,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     }
   }
 
-  /* --- Phase 93: per-EP in-flight admission cap (excluded_mask augmentation) ---
+  /* --: per-EP in-flight admission cap (excluded_mask augmentation) ---
    * Exclude prefill EPs already at the in-flight cap so every tier below spills to
    * an under-cap EP; if ALL healthy prefill EPs are at cap, shed (caller -> 429).
    * cap==0 -> skip entirely (byte-identical back-compat). */
@@ -1274,7 +1274,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
         if (excluded_mask & (1u << (unsigned)i)) continue;
         if (tepval->cb_enabled &&
             tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
-        if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* Phase 96: no NEW work */
+        if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* no NEW work */
         healthy_elig++;
         if (atomic_load(&tepval->pd_ep_loads[i].active_conns) >= cap)
           cap_excl |= (1u << (unsigned)i);
@@ -1293,7 +1293,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                    (unsigned long)n);
           return PD_PREFILL_NO_CAPACITY;
         }
-        /* Phase 93-04: hold-don't-drop. Pick the eligible (healthy, capped, not
+        /* hold-don't-drop. Pick the eligible (healthy, capped, not
          * excluded) prefill EP with the SHORTEST parked FIFO; if its depth < the
          * runtime bound, ENQUEUE (fd, gen, now) and PARK. Only when EVERY eligible
          * FIFO is also full do we shed (overflow valve). Selection re-walks the EPs
@@ -1307,7 +1307,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           if (excluded_mask & (1u << (unsigned)i)) continue;
           if (tepval->cb_enabled &&
               tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
-          if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* Phase 96: no NEW work */
+          if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* no NEW work */
           uint32_t c = tepval->pd_parked[i].count;
           if (c < best_count) { best_count = c; park_ep = i; }
         }
@@ -1403,7 +1403,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
       if (excluded_mask & (1u << (unsigned)i)) continue;
       if (tepval->cb_enabled &&
           tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
-      if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* Phase 96: not a candidate */
+      if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* not a candidate */
       uint32_t load = atomic_load(&tepval->pd_ep_loads[i].active_conns);
       if (load < min_load) min_load = load;
       if (load > max_load) max_load = load;
@@ -1423,7 +1423,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           !tepval->eps[trie_ep].inv &&
           !(tepval->cb_enabled &&
             tepval->circuit_breakers[trie_ep].state == CB_STATE_OPEN) &&
-          !pd_ctrl_draining(tepval, trie_ep, cmode) /* Phase 96: no NEW work */) {
+          !pd_ctrl_draining(tepval, trie_ep, cmode) /* no NEW work */) {
         /* Tier 1 hit — update trie timestamp */
         pthread_rwlock_wrlock(&tepval->pd_trie_lock);
         pd_trie_insert(tepval->pd_trie, pfe->prefix_key.prefix,
@@ -1435,7 +1435,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     }
   }
 
-  /* --- Tier 1.5: KV block-hash exact routing (Phase 6) --- */
+  /* -- Tier 1.5: KV block-hash exact routing --- */
   if (tepval->kv_exact_mode == 1) {
     /* 81-09 Approach A (env LLB_KV_LOADGUARD=1): hard load-imbalance guard that
      * mirrors the Tier-1 (radix-trie) guard above. KV-exact has NO load awareness,
@@ -1450,7 +1450,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
         if (excluded_mask & (1u << (unsigned)i)) continue;
         if (tepval->cb_enabled &&
             tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
-        if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* Phase 96: not a candidate */
+        if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* not a candidate */
         uint32_t load = atomic_load(&tepval->pd_ep_loads[i].active_conns);
         if (load < min_load) min_load = load;
         if (load > max_load) max_load = load;
@@ -1465,7 +1465,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                  (unsigned)tepval->pd_balance_abs_threshold);
       }
     }
-    /* Phase 96: Tier 1.5 is always a NEW-session assignment, so controller-
+    /* Tier 1.5 is always a NEW-session assignment, so controller-
      * DRAINING EPs are folded into the mask it sees (ctrl_drain == 0 at mode 0
      * — byte-identical). pd_kv_exact_select lives in a different TU; widening
      * the mask keeps its predicate chain and the Go argmax untouched. */
@@ -1494,7 +1494,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     /* C2 (81-07): capacity-weighted bounded-load scoring is the GPU-aware arm.
      * It is engaged ONLY when ep_sel == PROXY_SEL_GPU_AWARE; otherwise the
      * scorer below is byte-identical to the shipped COMP-07 path (C1), so the
-     * A/B is one build flag-toggled (D-25). When engaged we pre-sum the clamped
+ * A/B is one build flag-toggled. When engaged we pre-sum the clamped
      * capacity across the eligible prefill EPs so pd_capacity_blend_score can
      * normalise each EP's load by its share of fleet capacity — lighting up the
      * reserved PROXY_SEL_GPU_AWARE weights. */
@@ -1507,9 +1507,9 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
         if (excluded_mask & (1u << (unsigned)i)) continue;
         if (tepval->cb_enabled &&
             tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
-        if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* Phase 96: not a candidate */
+        if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* not a candidate */
         uint32_t cap = atomic_load(&tepval->pd_ep_loads[i].num_gpu_blocks);
-        /* Phase 96: controller weight scales the CLAMPED effective capacity
+        /* controller weight scales the CLAMPED effective capacity
          * (no-op at mode 0 / weight 100 / packed 0) — the pre-sum and the
          * per-EP cap_i below MUST see the SAME scaled value so the blend's
          * capacity-share normalisation stays consistent. */
@@ -1546,7 +1546,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
       if (excluded_mask & (1u << (unsigned)i)) continue;
       if (tepval->cb_enabled &&
           tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
-      if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* Phase 96: no NEW work */
+      if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* no NEW work */
       uint32_t conns = atomic_load(&tepval->pd_ep_loads[i].active_conns);
       uint32_t queued = pd_queued_or_fill(&tepval->pd_ep_loads[i], q_now_sec, stale_fill);
       uint64_t score;
@@ -1554,7 +1554,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
         /* C2: capacity-weighted blend — consumes the reserved
          * DEFAULT_{QUEUE,KV_CACHE,SWAP}_WEIGHT (PROXY_SEL_GPU_AWARE). A
          * larger-capacity EP is penalised LESS for the same live load.
-         * Phase 96: cap_i carries the controller weight (same scaling as the
+ * cap_i carries the controller weight (same scaling as the
          * pre-sum above; no-op at mode 0 / weight 100 / packed 0). */
         uint32_t swap = atomic_load(&tepval->pd_ep_loads[i].swap_pressure);
         uint64_t cap_i = pd_ctrl_eff_cap(tepval, i,

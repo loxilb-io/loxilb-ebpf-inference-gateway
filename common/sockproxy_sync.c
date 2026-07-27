@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * sockproxy_sync.c — Phase 70 HA state-sync receiver.
+ * sockproxy_sync.c — HA state-sync receiver.
  * SPEC.md req: A4, A5, A7.
  *
  * Implements:
@@ -54,7 +54,7 @@ extern int is_endpoint_healthy(proxy_epval_t *tepval, int ep_idx);
  * is held (Landmine L-7).
  *
  * NB: a stronger implementation would index by service_key in a hashmap, but
- * Phase 70 only invokes this on the receive path (RPC traffic, not packet
+ * only invokes this on the receive path (RPC traffic, not packet
  * traffic), so linear walk over a typical-handful service list is fine.
  */
 static proxy_map_ent_t *
@@ -99,7 +99,7 @@ proxy_lookup_service_by_key(const char *service_key)
   return NULL;
 }
 
-/* Pick the P/D-enabled proxy_epval_t for the service. Phase 70 only syncs
+/* Pick the P/D-enabled proxy_epval_t for the service. only syncs
  * P/D-enabled or session-stickiness-enabled services; non-P/D services have
  * no per-EP session table to sync. */
 static proxy_epval_t *
@@ -120,7 +120,7 @@ pick_tepval_for_sync(proxy_map_ent_t *ent)
 
 /*
  * apply_conv_sync_entry — install one remote conversation_mapping entry into
- * ent->val.conv_map (Phase 70 synced state #2). The pd_session apply below
+ * ent->val.conv_map ( synced state #2). The pd_session apply below
  * targets pd_session_map; this targets conv_map. Disambiguation between the
  * two synced tables is by field convention — ev->ep_idx >= 0 with
  * prefill/decode == -1 means a conversation_mapping row — exactly as
@@ -245,7 +245,7 @@ proxy_sync_apply_session_entry(const proxy_sync_event_t *ev)
   if (!tepval)
     return SYNC_APPLY_ERROR;
 
-  /* Phase 70 — route conversation_mapping rows (ep_idx set, prefill/decode
+  /* route conversation_mapping rows (ep_idx set, prefill/decode
    * == -1) to ent->val.conv_map; pd_session rows (prefill/decode set, ep_idx
    * == -1) fall through to the pd_session_map path below. Without this the
    * receiver dropped every conversation entry into pd_session_map and left
@@ -430,7 +430,7 @@ sockproxy_snapshot_conv_sessions(proxy_map_ent_t *ent,
  * prefill_ep_idx / decode_ep_idx set.  service_key is populated from the
  * service's (xip, xport, protocol) triple.
  *
- * This is the cold-start BulkGet back-end (Phase 70-L). It intentionally
+ * This is the cold-start BulkGet back-end (-L). It intentionally
  * snapshots under per-map rdlocks (not a global freeze) to keep latency
  * bounded; the receiver already applies first-writer-wins conflict
  * resolution (SPEC A6), so a small race window is acceptable.

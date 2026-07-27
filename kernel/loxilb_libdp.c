@@ -2166,10 +2166,10 @@ llb_nat_rst_act_sessions(uint32_t rid)
       for (i = 0; i < LLB_MAX_NXFRMS; i++) {
         epa.active_sess[i] = 0;
       }
-      /* Octavia connectionLimit (D-74-05): clear the per-rule live concurrent-conn count on
+      /* Octavia connectionLimit: clear the per-rule live concurrent-conn count on
        * rule reset/delete so a re-created rule starts at 0 (no stale count blocking new conns). */
       epa.conc_conns = 0;
-      /* Octavia /stats (D-74-02): clear the cumulative totals too so a re-created rule restarts
+      /* Octavia /stats: clear the cumulative totals too so a re-created rule restarts
        * its statistics from zero (reset-on-restart semantics, mirroring the in-memory CP copy). */
       epa.total_conns = 0;
       epa.cum_bytes_in = 0;
@@ -2182,10 +2182,10 @@ llb_nat_rst_act_sessions(uint32_t rid)
       for (i = 0; i < LLB_MAX_NXFRMS; i++) {
         epa.active_sess[i] = 0;
       }
-      /* Octavia connectionLimit (D-74-05): clear the per-rule live concurrent-conn count on
+      /* Octavia connectionLimit: clear the per-rule live concurrent-conn count on
        * rule reset/delete so a re-created rule starts at 0 (no stale count blocking new conns). */
       epa.conc_conns = 0;
-      /* Octavia /stats (D-74-02): clear the cumulative totals too so a re-created rule restarts
+      /* Octavia /stats: clear the cumulative totals too so a re-created rule restarts
        * its statistics from zero (reset-on-restart semantics, mirroring the in-memory CP copy). */
       epa.total_conns = 0;
       epa.cum_bytes_in = 0;
@@ -2421,23 +2421,23 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->ppv2 = dat->ppv2;
 
   // SSE (Server-Sent Events) streaming configuration
-  // US-513: P/D disaggregation implies SSE mode because decode phase uses streaming.
+  // P/D disaggregation implies SSE mode because decode phase uses streaming.
   pval->sse_mode = dat->sse_mode || dat->pd_disagg_mode;
   pval->max_stream_duration_sec = dat->max_stream_duration_sec;
   pval->backend_keepalive_sec = dat->backend_keepalive_sec;
   // inactiveTimeOut is stored in dat->ito as nanoseconds; convert to seconds for sockproxy.
   pval->inactive_timeout_sec = (dat->ito > 0) ? (uint32_t)(dat->ito / 1000000000ULL) : 0;
 
-  // Octavia FR-07 (Phase 76, D-10): per-listener member timeouts in MILLISECONDS, copied
-  // verbatim (native unit, NO conversion). Default-off (0 ⇒ preserve today's behaviour, D-14).
+  // Octavia: per-listener member timeouts in MILLISECONDS, copied
+  // verbatim (native unit, NO conversion). Default-off (0 ⇒ preserve today's behaviour).
   // Consumed in the data plane only on the L7_Proxy peer (has_l7_policy==1).
   pval->timeout_member_connect_ms = dat->timeout_member_connect_ms;
   pval->timeout_member_data_ms = dat->timeout_member_data_ms;
   pval->timeout_tcp_inspect_ms = dat->timeout_tcp_inspect_ms;
 
-  // Phase 77 TLS-hardening scalars (FR-32 version/cipher pinning, FR-33 HSTS, FR-11 backend
+  // TLS-hardening scalars ( version/cipher pinning, HSTS, backend
   // certIds). Copied verbatim into proxy_arg (additive/default-off, 0/empty ⇒ today's behaviour,
-  // D-77-COMPAT). Consumed only on the L7_Proxy peer (has_l7_policy==1); the AI peer is unchanged.
+  // COMPAT). Consumed only on the L7_Proxy peer (has_l7_policy==1); the AI peer is unchanged.
   pval->tls_version_min = dat->tls_version_min;
   pval->tls_version_max = dat->tls_version_max;
   pval->hsts_max_age = dat->hsts_max_age;
@@ -2446,7 +2446,7 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   strncpy(pval->tls_ciphers, dat->tls_ciphers, sizeof(pval->tls_ciphers) - 1);
   pval->tls_ciphers[sizeof(pval->tls_ciphers) - 1] = '\0';
 #ifdef HAVE_MTLS
-  // FR-11 (D-77-14/16): backend re-encryption material referenced by certId into the FR-05
+  // backend re-encryption material referenced by certId into the 
   // registry (resolved to managed-dir paths at backend SSL_CTX build). HAVE_MTLS-gated because
   // backend_ca_cert_id/backend_client_cert_id live in the proxy_arg HAVE_MTLS block (sockproxy.h).
   strncpy(pval->backend_ca_cert_id, dat->backend_ca_cert_id, sizeof(pval->backend_ca_cert_id) - 1);
@@ -2455,7 +2455,7 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->backend_client_cert_id[sizeof(pval->backend_client_cert_id) - 1] = '\0';
 #endif /* HAVE_MTLS */
 
-  // P/D disaggregation configuration (US-502)
+  // P/D disaggregation configuration 
   pval->pd_disagg_mode = dat->pd_disagg_mode;
   pval->ai_gw_mode = dat->ai_gw_mode;
 
@@ -2468,13 +2468,13 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->pd_balance_abs_threshold = dat->pd_balance_abs_threshold;
   pval->pd_session_ttl_sec = dat->pd_session_ttl_sec;
 
-  // KV-Cache Exact Routing configuration (Phase 8: gap closure)
+  // KV-Cache Exact Routing configuration (: gap closure)
   pval->kv_exact_mode  = dat->kv_exact_mode;
   pval->kv_hash_algo   = dat->kv_hash_algo;
   pval->kv_zmq_port    = dat->kv_zmq_port;
   pval->kv_block_size  = dat->kv_block_size;
   pval->kv_warmup_sec  = dat->kv_warmup_sec;
-  // Phase 99 (SGL-03): per-rule engine + DP rank count — the nat2proxy hop of
+  // (SGL-03): per-rule engine + DP rank count — the nat2proxy hop of
   // the additive chain (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
   pval->kv_engine_type   = dat->kv_engine_type;
   pval->kv_dp_rank_count = dat->kv_dp_rank_count;
@@ -2518,8 +2518,8 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
         proxy_ep->protocol = nat_key->l4proto;
         proxy_ep->inv = mf->inactive;
         proxy_ep->weight = mf->wprio ? mf->wprio : 1;  // Default weight=1 if 0
-        proxy_ep->nixl_port = mf->nixl_xport;           // NIXL side-channel port (US-514), network byte order
-        pval->ep_role[unique_count] = mf->ep_role;      // P/D endpoint role (US-502)
+        proxy_ep->nixl_port = mf->nixl_xport;           // NIXL side-channel port, network byte order
+        pval->ep_role[unique_count] = mf->ep_role;      // P/D endpoint role 
         unique_count++;
       }
     }
@@ -2535,8 +2535,8 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
       proxy_ep->protocol = nat_key->l4proto;
       proxy_ep->inv = mf->inactive;
       proxy_ep->weight = mf->wprio;  // Not used by non-WRR modes
-      proxy_ep->nixl_port = mf->nixl_xport;  // NIXL side-channel port (US-514), network byte order
-      pval->ep_role[i] = mf->ep_role;  // P/D endpoint role (US-502)
+      proxy_ep->nixl_port = mf->nixl_xport;  // NIXL side-channel port, network byte order
+      pval->ep_role[i] = mf->ep_role;  // P/D endpoint role 
     }
     j = dat->nxfrm;  // Total number of slots (may include duplicates)
   }
@@ -2625,7 +2625,7 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
     pval->require_client_cn = dat->mtls_require_client_cn;
     strncpy(pval->client_cn_pattern, dat->mtls_client_cn_pattern, sizeof(pval->client_cn_pattern) - 1);
     pval->client_cn_pattern[sizeof(pval->client_cn_pattern) - 1] = '\0';
-    // Phase 77 FR-09 (D-77-07): explicit client-cert CRL path (empty ⇒ 77-04 sibling-crl convention).
+    // explicit client-cert CRL path (empty ⇒ 77-04 sibling-crl convention).
     strncpy(pval->client_crl_path, dat->mtls_client_crl_path, sizeof(pval->client_crl_path) - 1);
     pval->client_crl_path[sizeof(pval->client_crl_path) - 1] = '\0';
 

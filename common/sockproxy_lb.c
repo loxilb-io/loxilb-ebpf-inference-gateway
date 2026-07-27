@@ -7,7 +7,7 @@
 /*
  * sockproxy_lb.c -- Load Balancing Algorithms (WRR and CHWBL).
  *
- * Extracted from sockproxy.c (Phase 2) per sockproxy_refactoring_plan.md §6.7
+ * Extracted from sockproxy.c per sockproxy_refactoring_plan.md §6.7
  *
  * This file is the SOLE owner of XXH_IMPLEMENTATION (see plan §3.P4).
  * All other files that use xxhash must include "xxhash.h" WITHOUT defining

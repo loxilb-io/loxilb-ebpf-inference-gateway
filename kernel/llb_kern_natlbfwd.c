@@ -234,7 +234,7 @@ dp_do_nat(void *ctx, struct xfi *xf)
       act->ca.act_type == DP_SET_DNAT) {
     sel = dp_sel_nat_ep(ctx, xf, act);
 
-    /* Octavia connectionLimit gate (FR-06/26 / D-74-05): refuse-by-drop at SYN time.
+    /* Octavia connectionLimit gate: refuse-by-drop at SYN time.
      * act->conn_limit == 0 means unlimited (legacy / back-compat). The live per-rule
      * concurrent-connection count (conc_conns) lives in the rule-index-keyed nat_ep_map
      * and is maintained selector-agnostically on CT-create/teardown (llb_kern_ct.c). When
@@ -242,7 +242,7 @@ dp_do_nat(void *ctx, struct xfi *xf)
      * refuse branch below (xf->pm.nf = 0): the SYN is not NAT'd, not forwarded, and NO CT is
      * created — so conc_conns is NOT incremented for the refused SYN and the N in-flight
      * connections are untouched. A slot frees on the next CT-teardown decrement. This is the
-     * SAME live count the stats active_connections endpoint reads (D-74-04). */
+ * SAME live count the stats active_connections endpoint reads. */
     if (act->conn_limit != 0) {
       __u32 climit_key = act->ca.cidx;
       struct dp_nat_epacts *cepa = bpf_map_lookup_elem(&nat_ep_map, &climit_key);

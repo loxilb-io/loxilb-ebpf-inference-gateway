@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * sockproxy_l7policy.c — Phase 75 L7 content-routing policy engine.
+ * sockproxy_l7policy.c — L7 content-routing policy engine.
  *
  * Plan 75-01 shipped this as a compiling STUB; Plan 75-03 (this revision)
  * implements the real ORDERED FIRST-MATCH-WINS evaluation engine over the
- * concrete superset IR defined in sockproxy_l7policy.h (CONTEXT D-06/D-07/D-08).
+ * concrete superset IR defined in sockproxy_l7policy.h (CONTEXT).
  *
  *   l7_policy_evaluate(pfe, routes, n_routes, decision_out)
  *     - routes arrive POSITION-SORTED (the attach path, Plan 05, sorts them) and
@@ -19,8 +19,8 @@
  *       helpers (RESEARCH §Don't Hand-Roll) — never hand-rolled here.
  *     - REGEX uses the PRE-COMPILED, cached cond->re (compiled ONCE at attach,
  *       Plan 05) and runs regexec on an operand TRUNCATED to L7_REGEX_INPUT_MAX.
- *       The hot path NEVER calls regcomp (ReDoS mitigation T-75-07; POSIX has no
- *       match timeout). No raw operand pointer reaches the matcher (T-75-08).
+ * The hot path NEVER calls regcomp (ReDoS mitigation; POSIX has no
+ * match timeout). No raw operand pointer reaches the matcher.
  *
  * The function is PURE: it reads pfe + routes and writes only *decision_out; it
  * never sends on the socket (REJECT/REDIRECT/FORWARD execution is Plan 04).
@@ -42,7 +42,7 @@
 #include "sockproxy_l7policy.h"
 #include "sockproxy_internal.h" /* proxy_struct_t, proxy_struct, PROXY_LOCK/UNLOCK (attach) */
 #include "sockproxy_cache.h"    /* cmp_proxy_ent — entry equality at attach/detach */
-#include "sockproxy_cookie.h"   /* FR-10 stateless cookie token derive/verify (pure) */
+#include "sockproxy_cookie.h"   /* stateless cookie token derive/verify (pure) */
 #include "log.h"                /* log_error — attach diagnostics */
 
 /* strip_port_from_hostname is declared in sockproxy.h (external linkage) — used
@@ -115,7 +115,7 @@ l7_op_matches(l7_op_t op, const char *operand, const char *value,
     return strstr(operand, value) != NULL;
 
   case L7OP_REGEX: {
-    /* ReDoS bound (T-75-07/08): copy the operand into a fixed stack buffer,
+    /* ReDoS bound: copy the operand into a fixed stack buffer,
      * truncating to L7_REGEX_INPUT_MAX, so an unbounded attacker-controlled
      * field can never reach regexec. NEVER regcomp here — the pattern was
      * compiled ONCE at attach time (Plan 05). */
@@ -247,7 +247,7 @@ l7_resolve_operand(struct proxy_fd_ent *pfe, const l7_condition_t *cond,
     return buf;
 
   default:
-    /* SSL_* (Phase 79) and any future field types are not resolvable yet. */
+    /* SSL_* and any future field types are not resolvable yet. */
     return NULL;
   }
 }
@@ -317,7 +317,7 @@ l7_policy_evaluate(struct proxy_fd_ent *pfe, const l7_route_t *routes,
     return -1;
 
   /* INVARIANT: `routes` is position-sorted at attach time (Plan 05). The engine
-   * walks them in array order and the FIRST matching route wins (D-06). */
+ * walks them in array order and the FIRST matching route wins. */
   for (i = 0; i < n_routes; i++) {
     const l7_route_t *route = &routes[i];
     if (!l7_route_matches(pfe, route))
@@ -358,7 +358,7 @@ l7_policy_evaluate(struct proxy_fd_ent *pfe, const l7_route_t *routes,
  * 403/401 (sockproxy_http.c:4543/4552) + 429 (sockproxy_http.c:4576) idiom:
  * snprintf a complete HTTP/1.1 response into a stack buffer, send() it on the
  * client fd, then shutdown(SHUT_RDWR) and return. Terminal — bypasses the backend
- * and never interacts with SSE (D-05).
+ * and never interacts with SSE.
  * ------------------------------------------------------------------------- */
 
 /* Map a status code to its canonical reason phrase. Only the codes the L7 engine
@@ -383,7 +383,7 @@ l7_reason_phrase(int code)
   }
 }
 
-/* True if `s` contains a CR or LF — header/CRLF-injection guard (T-75-09). A
+/* True if `s` contains a CR or LF — header/CRLF-injection guard. A
  * value that fails this MUST NOT be emitted verbatim into a header line. */
 static int
 l7_has_crlf(const char *s)
@@ -393,7 +393,7 @@ l7_has_crlf(const char *s)
 
 /*
  * l7_send_reject — emit a synthetic terminal REJECT (default 403). The optional
- * `body` is plain text; to avoid leaking backend internals (T-75-10 / ASVS V7)
+ * `body` is plain text; to avoid leaking backend internals (ASVS V7)
  * the caller passes only minimal text (NULL => a generic one-liner). Any CR/LF in
  * `body` is rejected (it would otherwise let an attacker-influenced value inject
  * headers) — on a tainted body we fall back to the safe generic body.
@@ -414,10 +414,10 @@ int l7_send_reject(struct proxy_fd_ent *pfe, int status_code, const char *body)
   if (code < 400 || code > 599)
     code = 403;
 
-  /* CRLF-safe body (T-75-09): a tainted body collapses to the generic one. */
+  /* CRLF-safe body: a tainted body collapses to the generic one. */
   safe_body = (body && !l7_has_crlf(body)) ? body : "Request rejected by policy";
 
-  /* HTTP/2 (T-75-17): on an active h2 stream the raw "HTTP/1.1 ..." bytes below
+  /* HTTP/2: on an active h2 stream the raw "HTTP/1.1..." bytes below
    * are an h2 framing violation (the client aborts the connection — curl 000), so
    * frame the REJECT via nghttp2 instead. Returns 0 when it handled h2; -1 (off
    * h2) falls through to the H1 raw-response path. */
@@ -441,7 +441,7 @@ int l7_send_reject(struct proxy_fd_ent *pfe, int status_code, const char *body)
 /*
  * l7_send_redirect — emit a synthetic terminal 3xx with a Location: header
  * (default 302). The status code is restricted to {301,302,303,307,308} (any
- * other value coerces to 302). CRLF-SAFE (T-75-09): a `location` carrying a CR or
+ * other value coerces to 302). CRLF-SAFE: a `location` carrying a CR or
  * LF is rejected outright (we send a 400 instead of emitting an injectable
  * header) — no attacker-influenced value ever reaches the header line unfiltered.
  */
@@ -464,14 +464,14 @@ int l7_send_redirect(struct proxy_fd_ent *pfe, int status_code,
     break;
   }
 
-  /* CRLF / header-injection guard (T-75-09): never emit a Location with CR/LF.
+  /* CRLF / header-injection guard: never emit a Location with CR/LF.
    * Also reject an empty/absent location (a redirect with no target is invalid). */
   if (!location || location[0] == '\0' || l7_has_crlf(location)) {
     l7_send_reject(pfe, 400, "Invalid redirect target");
     return 0;
   }
 
-  /* HTTP/2 (T-75-17): frame the 3xx + Location via nghttp2 on the active stream;
+  /* HTTP/2: frame the 3xx + Location via nghttp2 on the active stream;
    * the raw "HTTP/1.1 ..." bytes below corrupt an h2 connection. 0 = handled on
    * h2; -1 (off h2) falls through to the H1 raw-response path. */
   if (proxy_h2_send_l7_synthetic(pfe, code, location, NULL) == 0)
@@ -498,7 +498,7 @@ int l7_send_redirect(struct proxy_fd_ent *pfe, int status_code,
 /*
  * l7_resolve_pool — map a FORWARD action to a tepval-equivalent (proxy_epval_t *)
  * representing the MATCHED ROUTE'S target backend set so FORWARD re-enters the
- * EXISTING intra-pool endpoint selector (D-03 — a plain pool, never the AI model
+ * EXISTING intra-pool endpoint selector (a plain pool, never the AI model
  * engine) but selects ONLY among the route's endpoints (honoring weights).
  *
  * Mechanism (gap-fix): the service's backends are the members (eps[]) of the base
@@ -561,7 +561,7 @@ l7_resolve_pool(proxy_map_ent_t *ent, l7_forward_t *fwd)
   sub->chwbl_config     = NULL;
   sub->pd_trie          = NULL;
   sub->pd_session_map   = NULL;
-  sub->pd_disagg_enabled = 0;       /* a FORWARD subset is a plain pool (D-03)     */
+  sub->pd_disagg_enabled = 0;       /* a FORWARD subset is a plain pool */
   sub->ai_gw_mode       = 0;
   sub->pd_cache_aware_mode = 0;
   sub->cb_enabled       = 0;        /* circuit-breaker state belongs to the base   */
@@ -640,7 +640,7 @@ l7_resolve_pool(proxy_map_ent_t *ent, l7_forward_t *fwd)
  *
  * Returns 0 on success (out holds a usable URL), -1 if no host could be resolved or
  * the assembled value would carry CR/LF (caller then leaves Location empty so
- * l7_send_redirect fails closed to 400 — never an injectable header, T-75-09).
+ * l7_send_redirect fails closed to 400 — never an injectable header).
  */
 static int
 l7_assemble_redirect_location(struct proxy_fd_ent *pfe, const l7_redirect_t *redir,
@@ -724,7 +724,7 @@ l7_assemble_redirect_location(struct proxy_fd_ent *pfe, const l7_redirect_t *red
 /*
  * l7_route_dispatch — shared discriminator + dispatch. See the header for the
  * full contract. Invoked IDENTICALLY at both the H1 (sockproxy_ep.c:400) and the
- * H2 (sockproxy_h2.c:1962) find_endpoint_lpm seams so they cannot drift (T-75-12).
+ * H2 (sockproxy_h2.c:1962) find_endpoint_lpm seams so they cannot drift.
  */
 int
 l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
@@ -733,8 +733,8 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
   l7_decision_t d;
   const l7_route_t *routes;
 
-  /* DISCRIMINATOR (D-10): no L7 policy attached => pure no-op fall-through, so
-   * every AI/model service runs UNCHANGED (D-04 / Pitfall 5 / T-75-11). This is
+  /* DISCRIMINATOR: no L7 policy attached => pure no-op fall-through, so
+ * every AI/model service runs UNCHANGED (Pitfall 5). This is
    * the first reader of has_l7_policy (declared on proxy_map_ent by Plan 04;
    * populated by Plan 05's proxy_attach_l7_policy). */
   if (!ent || !ent->has_l7_policy)
@@ -754,7 +754,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
        * (l7_policy_evaluate) precisely so it could be built here, where pfe carries
        * the per-connection (H1) / stream-mirrored (H2) request fields. On failure to
        * resolve a target, d.location stays empty and l7_send_redirect fails closed to
-       * 400 rather than emitting an injectable/invalid header (T-75-09). */
+ * 400 rather than emitting an injectable/invalid header. */
       l7_assemble_redirect_location(pfe, &d.u.redir, d.location, sizeof(d.location));
       l7_send_redirect(pfe, d.u.redir.status_code, d.location);
       return L7_DISPATCH_TERMINATED;
@@ -776,7 +776,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
 }
 
 /* -------------------------------------------------------------------------
- * FR-08 (Phase 76, CONTEXT D-07/D-08/D-09) — request header insertion applier.
+ * (CONTEXT) — request header insertion applier.
  *
  * THE SINGLE SHARED op-selection + validation logic for BOTH H1 and H2 (Pitfall
  * 1 parity). Protocol-neutral: it emits the ordered op set (X-Forwarded-* trio
@@ -785,7 +785,7 @@ l7_route_dispatch(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent,
  * the WHAT and the validation live here, ONCE.
  * ------------------------------------------------------------------------- */
 
-/* Reject CR/LF/NUL/control chars in a header NAME (T-76-06-02 CRLF injection).
+/* Reject CR/LF/NUL/control chars in a header NAME ( CRLF injection).
  * Empty name is invalid. Bounded scan to L7_HDR_NAME_MAX. */
 int
 l7_hdr_name_valid(const char *name)
@@ -804,7 +804,7 @@ l7_hdr_name_valid(const char *name)
   return (name[i] == '\0') ? 1 : 0;
 }
 
-/* Reject CR/LF/NUL/control chars in a header VALUE (T-76-06-02). An EMPTY value
+/* Reject CR/LF/NUL/control chars in a header VALUE. An EMPTY value
  * is allowed (a header may legitimately carry an empty value). Bounded scan. */
 int
 l7_hdr_value_valid(const char *value)
@@ -824,8 +824,8 @@ l7_hdr_value_valid(const char *value)
 }
 
 /*
- * FR-33 (Phase 77, D-77-05) — synthesize the HSTS header VALUE, shared by the H1
- * and H2 emit seams (one-synthesizer/two-emit-seams, Phase 76). Builds
+ * synthesize the HSTS header VALUE, shared by the H1
+ * and H2 emit seams (one-synthesizer/two-emit-seams). Builds
  * "max-age=N[; includeSubDomains][; preload]" from the proxy_arg HSTS scalars.
  * max_age==0 ⇒ no injection (returns 0; default-off, RFC 6797). The value is
  * fully server-synthesized (no client/operator string flows in — low injection
@@ -840,7 +840,7 @@ l7_hsts_synthesize(uint32_t max_age, uint8_t include_subdomains,
   if (!out || outlen == 0)
     return 0;
   out[0] = '\0';
-  if (max_age == 0)            /* D-77-05: 0 ⇒ no HSTS injection. */
+  if (max_age == 0)            /* 0 ⇒ no HSTS injection. */
     return 0;
   n = snprintf(out, outlen, "max-age=%u%s%s",
                (unsigned)max_age,
@@ -855,7 +855,7 @@ l7_hsts_synthesize(uint32_t max_age, uint8_t include_subdomains,
 
 /* Return the FIRST matching route for `pfe` over `ent`'s position-sorted array
  * (mirrors l7_policy_evaluate's first-match-wins), or NULL if none match. Its
- * hdr_filters[] are the insertHeaders ops that apply to this request (D-09). */
+ * hdr_filters are the insertHeaders ops that apply to this request. */
 static const l7_route_t *
 l7_first_matching_route(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent)
 {
@@ -884,9 +884,9 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
   if (!pfe || !ent || !emit)
     return;
 
-  /* (1)-(3) Always-overwrite X-Forwarded-* trio (D-07/D-08). SET semantics =
+  /* (1)-(3) Always-overwrite X-Forwarded-* trio. SET semantics =
    * strip-any-existing + add, so a client-supplied XFF can NEVER be trusted —
-   * loxilb is the trust boundary (T-76-06-01). Each value is validated (the peer
+ * loxilb is the trust boundary. Each value is validated (the peer
    * IP / scheme are loxilb-derived and well-formed, but validate anyway as
    * defence-in-depth — a malformed one is dropped, never spliced). */
   if (xff_ip && l7_hdr_value_valid(xff_ip))
@@ -898,18 +898,18 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
   if (xfproto && l7_hdr_value_valid(xfproto))
     emit(ctx, L7HDR_SET, "X-Forwarded-Proto", xfproto);
 
-  /* (4) The matched route's bounded insertHeaders ops (D-09). */
+  /* (4) The matched route's bounded insertHeaders ops. */
   route = l7_first_matching_route(pfe, (proxy_map_ent_t *)ent);
   if (!route)
     return;
 
   n = route->n_hdr_filters;
   if (n > L7_MAX_HDR_FILTERS)
-    n = L7_MAX_HDR_FILTERS;               /* DoS bound T-76-06-03 */
+    n = L7_MAX_HDR_FILTERS;               /* DoS bound */
   for (i = 0; i < n; i++) {
     const l7_hdr_filter_t *f = &route->hdr_filters[i];
     /* Reject control-char names/values at APPLY time (defence-in-depth behind the
-     * REST 400) — a bad entry is SKIPPED, never spliced (T-76-06-02). */
+ * REST 400) — a bad entry is SKIPPED, never spliced. */
     if (!l7_hdr_name_valid(f->name))
       continue;
     if (f->op != L7HDR_REMOVE && !l7_hdr_value_valid(f->value))
@@ -920,10 +920,10 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
 }
 
 /* -------------------------------------------------------------------------
- * FR-10 (Phase 76, CONTEXT D-02/D-03/D-04/D-05) — STATELESS HTTP_COOKIE
+ * (CONTEXT) — STATELESS HTTP_COOKIE
  * persistence: node-level bridges from the data-plane structs (proxy_map_ent /
  * proxy_epval) to the PURE token primitives in sockproxy_cookie.h. NOTHING is
- * stored on proxy_fd_ent — the cookie value IS the entire binding (D-02), so the
+ * stored on proxy_fd_ent — the cookie value IS the entire binding, so the
  * affinity survives HA failover with zero xSync change. The primitives are unit-
  * tested standalone (sockproxy_cookie_test.c) — here we only marshal struct
  * fields into them.
@@ -931,7 +931,7 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
 
 /* Compute this service's deterministic per-VIP secret from node->key (VIP:port).
  * Byte-identical on both HA peers (the key is synced config), so a cookie minted
- * on peer A read-back-matches on peer B (D-02 cross-peer affinity). Returns 0 on
+ * on peer A read-back-matches on peer B ( cross-peer affinity). Returns 0 on
  * success. */
 int
 l7_cookie_node_vip_secret(const struct proxy_map_ent *node,
@@ -970,7 +970,7 @@ l7_cookie_node_token_for_ep(const struct proxy_map_ent *node,
 /* Read-back: match a presented cookie `token` against the LIVE member set of
  * `tepval`, constant-time. Returns the matched EP index, or L7_COOKIE_MISS on no
  * match (the caller MUST then fall through to the normal LB hash — never an
- * arbitrary backend, D-03 / T-76-07-01). Down members (inv!=0) are skipped so a
+ * arbitrary backend). Down members (inv!=0) are skipped so a
  * stale token rehashes. */
 int
 l7_cookie_node_match(const struct proxy_map_ent *node,
@@ -1042,7 +1042,7 @@ l7_cookie_read_presented(struct proxy_fd_ent *pfe, char *out, size_t outsz)
  * The discriminator fields (has_l7_policy / l7_routes / n_l7_routes) were already
  * DECLARED on proxy_map_ent by Plan 04; this code only POPULATES them. The
  * 4096-byte proxy_arg _Static_assert is NOT touched — the route array lives on the
- * per-service heap struct, never on the eBPF map value (D-09 / Pitfall 2).
+ * per-service heap struct, never on the eBPF map value (Pitfall 2).
  * ------------------------------------------------------------------------- */
 
 /* qsort comparator: ascending `position` (FIRST-MATCH-WINS depends on this — the
@@ -1123,7 +1123,7 @@ l7_clear_attached(proxy_map_ent_t *ent)
  *   2. deep-copy the n_routes into a heap array OWNED by the map_ent;
  *   3. regcomp ONCE (REG_EXTENDED | REG_NOSUB) every L7OP_REGEX condition into
  *      cond->re / cond->re_valid — this is the ONLY place regcomp runs (ReDoS,
- *      T-75-07/08; the hot path NEVER compiles). A malformed pattern => roll back
+ *; the hot path NEVER compiles). A malformed pattern => roll back
  *      the whole attach and return -1 (the handler maps that to a REST 400);
  *   4. sort the routes ascending by `position` (the evaluate engine assumes sorted);
  *   5. POPULATE the Plan-04 discriminator fields: l7_routes / n_l7_routes /
@@ -1155,7 +1155,7 @@ int proxy_attach_l7_policy(struct proxy_ent *key, const l7_route_t *routes,
   memcpy(copy, routes, (size_t)n_routes * sizeof(l7_route_t));
 
   /* regcomp ONCE per REGEX condition (the SINGLE compile site — Pattern 3 /
-   * ReDoS T-75-07/08). The incoming `routes` carry re_valid == 0 (the handler IR
+ * ReDoS). The incoming `routes` carry re_valid == 0 (the handler IR
    * never compiles); we own the compiled programs from here. On ANY failure we
    * regfree everything compiled so far and abort the attach (=> REST 400). */
   for (i = 0; i < n_routes; i++) {
@@ -1174,7 +1174,7 @@ int proxy_attach_l7_policy(struct proxy_ent *key, const l7_route_t *routes,
         cond->re_valid = 0;
         if (cond->op == L7OP_REGEX) {
           if (regcomp(&cond->re, cond->value, REG_EXTENDED | REG_NOSUB) != 0) {
-            /* Bad pattern: roll back the partial compile + abort (T-75-15). */
+            /* Bad pattern: roll back the partial compile + abort. */
             log_error("l7policy attach: regcomp FAILED for pattern \"%s\"", cond->value);
             cond->re_valid = 0; /* this one is NOT compiled */
             l7_free_routes(copy, n_routes);

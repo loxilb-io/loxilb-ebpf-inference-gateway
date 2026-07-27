@@ -7,7 +7,7 @@
  * session management, HTTP parsing callbacks, P/D disaggregation, multiplexor,
  * per-fd I/O helpers, and the listen/active data path handlers.
  *
- * Extracted from sockproxy.c (Phase 4b) — see sockproxy_refactoring_plan.md.
+ * Extracted from sockproxy.c — see sockproxy_refactoring_plan.md.
  */
 #define _GNU_SOURCE
 #define HAVE_PROXY_EXTRA_DEBUG
@@ -47,7 +47,7 @@
 #include "llb_dpapi.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy.h"
-#include "sockproxy_l7policy.h" /* FR-08 (Phase 76): l7_apply_req_filters + L7HDR_* ops */
+#include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_internal.h"
 #include "sockproxy_metrics.h"
 #include "sockproxy_routing.h"
@@ -65,7 +65,7 @@
 #include "sockproxy_ep.h"
 #include "sockproxy_ktls.h"
 #include "sockproxy_h2.h"
-/* Phase 87 (FIX-2/FIX-4): pure HTTP-message-end detector (chunked "0\r\n\r\n" /
+/* pure HTTP-message-end detector (chunked "0\r\n\r\n" /
  * SSE "[DONE]") shared with the unit TU. Included AFTER sockproxy.h so the real
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
  * pd_teardown_legs; pd_detect_http_msg_end here is buffer-only). */
@@ -78,7 +78,7 @@
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash.h"
 
-/* US-505: P/D body rewriting (sockproxy_pd.c) */
+/* P/D body rewriting (sockproxy_pd.c) */
 extern int pd_prepare_prefill_body(const uint8_t *orig_body, size_t orig_body_len,
                                    uint8_t *out_buf, size_t *out_len, size_t out_capacity);
 extern int pd_extract_kv_params(const uint8_t *resp_buf, size_t resp_len,
@@ -90,7 +90,7 @@ extern int pd_prepare_decode_body(const uint8_t *orig_body, size_t orig_body_len
 /* AI Gateway CGO bridge */
 extern void llb_ai_normal_session_hit(char *model_name);
 
-/* PII Detection (Phase 2: Dynamic Configuration) */
+/* PII Detection (: Dynamic Configuration) */
 #ifdef HAVE_PII_DETECTION
 #include <fnmatch.h>
 #include "presidio_config.h"
@@ -135,7 +135,7 @@ static const char *strnstr_portable(const char *haystack, const char *needle, si
 }
 
 /* ---------------------------------------------------------------------------
- * pd_framing_v2 runtime feature-flag (REQ-R2 / Phase 90, D-04 migration scaffold)
+ * pd_framing_v2 runtime feature-flag (REQ-R2 /, migration scaffold)
  *
  * Mirrors the kv_hash_debug_on() idiom (sockproxy_kv_exact.c:182-204) verbatim
  * in shape: a once-cached, atomic-init latch reading getenv("LLB_PD_FRAMING_V2")
@@ -146,7 +146,7 @@ static const char *strnstr_portable(const char *haystack, const char *needle, si
  * "1"      → the v2 (parser-owned) request/response framing path (wired later).
  *
  * Default MUST be OFF. As of 90-01 this gate is DEFINED ONLY — it is not
- * consulted anywhere yet. Per D-06 Invariant 2 any future per-message framing
+ * consulted anywhere yet. Per Invariant 2 any future per-message framing
  * state goes on proxy_fd_ent (NOT on proxy_sync_event_t / llm_prefix_key_t),
  * which is not xSync-serialized (sockproxy.h pd_last_decode_ts precedent).
  * --------------------------------------------------------------------------- */
@@ -171,7 +171,7 @@ pd_framing_v2_on(void)
 }
 
 /* Test hook: force the pd_framing_v2 gate without setenv/unsetenv races in unit
- * tests (test_resp_framing.c, 90-02) and the D-06 mismatched-flag HA variant. */
+ * tests (test_resp_framing.c, 90-02) and the mismatched-flag HA variant. */
 void
 pd_framing_v2_test_set(int on)
 {
@@ -181,7 +181,7 @@ pd_framing_v2_test_set(int on)
 }
 
 /* ---------------------------------------------------------------------------
- * [FRAME_MISMATCH] round-2 Bug-B instrument (REQ-R2 / Phase 90, 90-01 Task 2)
+ * [FRAME_MISMATCH] round-2 Bug-B instrument (REQ-R2 /, 90-01 Task 2)
  *
  * LOG-ONLY. Emits one [FRAME_MISMATCH] line at each request-forward site to
  * discriminate the three Bug-B candidates (BUGB-RCA.md §"Round-2 instrument"):
@@ -195,7 +195,7 @@ pd_framing_v2_test_set(int on)
  *   rcv_off - hdr_len, mismatch = (decl_cl > 0 && body_bytes != decl_cl),
  *   rcv_off, tid = pthread_self(), site=.
  *
- * memmem is bounded by *cur_len (T-90-01-02 — never reads past the buffered
+ * memmem is bounded by *cur_len (never reads past the buffered
  * span). This is a diagnostic build aid; it does NOT alter forward behavior.
  * --------------------------------------------------------------------------- */
 static void
@@ -220,7 +220,7 @@ static int pd_initiate_decode(proxy_fd_ent_t *client_pfe);
 static int pd_update_content_length(uint8_t *buf, size_t *buf_len, size_t buf_capacity,
                                     size_t new_body_len);
 static int handle_on_message_complete(llhttp_t *parser);
-/* Phase 90 M1 (REQ-M1): response-leg HTTP_RESPONSE parser path (pd_framing_v2).
+/* response-leg HTTP_RESPONSE parser path (pd_framing_v2).
  * Defined after handle_on_message_complete; forward-declared here for the
  * proxy_try_epxmit feed site (odir==1) which precedes the definitions. */
 static int handle_resp_headers_complete(llhttp_t *parser);
@@ -480,10 +480,10 @@ inject_request_id_header(void *msg, size_t *len, size_t bufsize,
 }
 
 /* ===========================================================================
- * FR-08 (Phase 76, CONTEXT D-07/D-08/D-09) — NEW L7-gated H1 request-header
+ * (CONTEXT) — NEW L7-gated H1 request-header
  * injection. SEPARATE from inject_forwarded_headers() above, which is left
- * BYTE-FOR-BYTE UNTOUCHED (D-01b — it runs ungated on the shared/AI path). This
- * NEW path runs ONLY when node->has_l7_policy (D-01a) and mirrors the legacy
+ * BYTE-FOR-BYTE UNTOUCHED (it runs ungated on the shared/AI path). This
+ * NEW path runs ONLY when node->has_l7_policy and mirrors the legacy
  * \r\n\r\n splice SHAPE while sharing the op-selection + validation with the H2
  * path via the single l7_apply_req_filters() in sockproxy_l7policy.c (Pitfall 1).
  *
@@ -589,11 +589,11 @@ l7h1_emit(void *vctx, int op, const char *name, const char *value)
 }
 
 /*
- * l7_inject_req_headers_h1 — apply the FR-08 request-header op set to an H1
+ * l7_inject_req_headers_h1 — apply the request-header op set to an H1
  * request buffer in place. Caller MUST have already gated on node->has_l7_policy.
  * Returns the new buffer length, or the unchanged length on a non-HTTP/chunked
  * buffer (the splice would corrupt binary/chunked bodies — mirrors the legacy
- * guards). `fd` is the client socket (for the real TCP peer IP, D-07).
+ * guards). `fd` is the client socket (for the real TCP peer IP).
  */
 static size_t
 l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
@@ -618,7 +618,7 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
       return buflen;
   }
 
-  /* Real TCP peer IP (D-07): the client socket peer, NOT any client-supplied XFF. */
+  /* Real TCP peer IP: the client socket peer, NOT any client-supplied XFF. */
   char xff_ip[INET6_ADDRSTRLEN] = {0};
   struct sockaddr_in peer;
   socklen_t plen = sizeof(peer);
@@ -639,18 +639,18 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
 }
 
 /*
- * FR-10 (Phase 76, CONTEXT D-02/D-03/D-04) — H1 RESPONSE-side Set-Cookie
+ * (CONTEXT) — H1 RESPONSE-side Set-Cookie
  * injection for stateless HTTP_COOKIE persistence. Splices a fixed-name
  * Set-Cookie carrying the opaque keyed-HMAC token of the BACKEND THIS REQUEST WAS
  * SENT TO into the response header block (before the final \r\n\r\n), mirroring
- * the legacy rewrite_location_header shape. The token IS the binding (D-02 —
+ * the legacy rewrite_location_header shape. The token IS the binding (
  * nothing stored on proxy_fd_ent), so the client presents it on the next request
  * and read-back pins to the same backend (session dispatch, sockproxy_ep.c).
  *
- * Attributes (D-04): Path=/; HttpOnly always; Secure iff the listener is HTTPS;
+ * Attributes: Path=/; HttpOnly always; Secure iff the listener is HTTPS;
  * SameSite unset. Idempotent — re-minting the same token on every response is
  * harmless (same backend ⇒ same value), so no per-connection "already sent" state
- * is needed (keeps D-02 pure).
+ * is needed (keeps pure).
  *
  *   client      — the CLIENT proxy_fd_ent (odir==0); its head is the L7 service,
  *                 its epv/ep_num identify the backend chosen for this request.
@@ -688,11 +688,11 @@ l7_inject_set_cookie_h1(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen,
   if (!memmem(buf, buflen, "\r\n\r\n", 4))
     return buflen;
 
-  /* Mint the token for the backend this request was routed to (D-03 opaque). */
+  /* Mint the token for the backend this request was routed to ( opaque). */
   if (l7_cookie_node_token_for_ep(node, tepval, ep_idx, token, sizeof(token)) <= 0)
     return buflen;
 
-  /* Set-Cookie: <name>=<token>; Path=/; HttpOnly[; Secure]  (D-04). */
+  /* Set-Cookie: <name>=<token>; Path=/; HttpOnly[; Secure]. */
   n = snprintf(cookie_line, sizeof(cookie_line),
                "%s=%s; Path=/; HttpOnly%s",
                LB_COOKIE_NAME, token, is_ssl ? "; Secure" : "");
@@ -708,18 +708,18 @@ l7_inject_set_cookie_h1(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen,
 }
 
 /*
- * FR-33 (Phase 77, D-77-05/06, RFC 6797) — H1 RESPONSE-side HSTS injection.
+ * (RFC 6797) — H1 RESPONSE-side HSTS injection.
  * Synthesizes "Strict-Transport-Security: max-age=N[; includeSubDomains]
  * [; preload]" from the proxy_arg HSTS scalars (added 77-02) and splices it onto
  * the backend→client response header block via the SAME response-side seam as the
  * Set-Cookie injector (l7h1_splice_header), NOT the request-egress
  * l7_inject_req_headers_h1 (Pitfall 1: HSTS is a RESPONSE header).
  *
- * Triple gate (D-77-06): inject ONLY when
+ * Triple gate: inject ONLY when
  *   have_ssl (HTTPS/TLS-terminating listener) && has_l7_policy && hsts_max_age>0.
  * On a plain-HTTP listener (have_ssl==0) HSTS is meaningless (browsers ignore it
  * over plaintext) — skip + log once and leave the response byte-for-byte intact.
- * has_l7_policy==0 (AI / un-configured) is a pure no-op (D-01a/D-14). The value is
+ * has_l7_policy==0 (AI / un-configured) is a pure no-op. The value is
  * server-synthesized, but still passes l7_hdr_value_valid (defence in depth).
  *
  * Idempotent: HSTS is a fixed single-value header; the splice strips any existing
@@ -741,14 +741,14 @@ l7_inject_hsts_h1(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen,
     return buflen;
   node = (proxy_map_ent_t *)client->head;
   if (!node || !node->has_l7_policy)
-    return buflen;                       /* AI / un-configured — no-op (D-01a). */
+    return buflen;                       /* AI / un-configured — no-op. */
   if (!node->arg_ptr || node->arg_ptr->hsts_max_age == 0)
     return buflen;                       /* HSTS not configured (default-off). */
 
-  /* D-77-06: HTTPS/TLS-terminating listeners ONLY (RFC 6797). On plain-HTTP
+  /* HTTPS/TLS-terminating listeners ONLY (RFC 6797). On plain-HTTP
    * skip + log — emitting HSTS over plaintext is meaningless (browsers ignore). */
   if (!node->val.have_ssl) {
-    log_debug("[FR-33][HSTS] skip: plain-HTTP listener (have_ssl=0), "
+    log_debug("[HSTS] skip: plain-HTTP listener (have_ssl=0), "
               "HSTS not injected (RFC 6797)");
     return buflen;
   }
@@ -1023,20 +1023,20 @@ skip_deferred_masking:
       return 0;  // Skip processing but don't error
     }
 
-    /* FR-07 (Phase 76, D-10): the member has now sent response data (ent->odir==1 ⇒ this is the
+    /* the member has now sent response data (ent->odir==1 ⇒ this is the
      * backend→client direction). DISARM the timeoutMemberData idle deadline on the client-side entry
      * by clearing its last_activity anchor (which the H1/H2 headers-complete sites set to start the
      * "waiting for member" clock). Without this, a fast-responding member's keepalive/h2c connection
      * keeps last_activity pinned at request time and the 1Hz idle pass (sockproxy_health.c) would
      * shut down a perfectly healthy idle connection ~timeout_member_data seconds later — which broke
      * cookie-affinity reads on the :2020 listener (the connection was cut mid-keepalive). Only clears
-     * the FR-07-armed anchor on a non-sticky connection; sticky sessions manage last_activity
+ * the -armed anchor on a non-sticky connection; sticky sessions manage last_activity
      * themselves (is_sticky path), so leave those untouched. */
     if (ent->odir == 1 && rfd_ent && !rfd_ent->is_sticky && rfd_ent->last_activity != 0) {
       rfd_ent->last_activity = 0;
     }
 
-    /* Phase 90 M1 (REQ-M1): response-leg HTTP_RESPONSE parser feed, gated on
+    /* response-leg HTTP_RESPONSE parser feed, gated on
      * pd_framing_v2. This runs IN PARALLEL to (BEFORE) the three legacy memmem
      * detectors below (:1085-1355) — NOT replacing them in this plan. With the
      * flag OFF this is a pure no-op and behavior is byte-identical to today.
@@ -1049,7 +1049,7 @@ skip_deferred_masking:
      * parser only OBSERVES framing and fires handle_resp_message_complete once
      * per response message (the single completion consumer).
      *
-     * conc=128 UAF fix (Phase 90 M1b): the parser feed WRITES mutable parser
+ * conc=128 UAF fix: the parser feed WRITES mutable parser
      * state into the backend pfe struct itself (ent->parser / ent->settings) —
      * a per-read write the legacy memmem detectors NEVER did (they only read the
      * local `msg` bytes and write the client pfe `rfd_ent` under its lock; they
@@ -1075,19 +1075,19 @@ skip_deferred_masking:
      * rwlock is non-recursive; ent is NOT already locked on this path (only
      * rfd_ent is, :1016), so the nested acquire cannot self-deadlock.
      *
-     * conc=128 UAF fix-2 (Phase 90 M1c, Pitfall #2 — prefill-leg skip): the
+ * conc=128 UAF fix-2 (Pitfall #2 — prefill-leg skip): the
      * guard below ALSO skips the M1 framer feed on the INTERNAL prefill leg
      * (client pfe still in PD_PHASE_PREFILL_WAITING). The prefill response is
      * NEVER client-facing — it is buffered into rfd_ent->pd_prefill_resp_buf
-     * and parsed for kv_params by the US-505 block just below (:1211-1259),
+ * and parsed for kv_params by the block just below (:1211-1259),
      * then DROPPED; the client only ever sees the decode-leg response. Framing
      * the prefill response here fires handle_resp_message_complete /
      * client-stream completion on a response the client never receives, which
-     * races the pd_initiate_decode rewire+teardown (the US-505 path UNLOCKs
+ * races the pd_initiate_decode rewire+teardown (the path UNLOCKs
      * rfd_ent at :1260 and tears the prefill backend down) — the conc=128
      * corruptor that survived fix-1. Discriminator = rfd_ent->pd_phase ==
-     * PD_PHASE_PREFILL_WAITING, matching the US-505 intercept at :1211 EXACTLY
-     * so the framer is skipped on precisely the responses US-505 swallows (no
+ * PD_PHASE_PREFILL_WAITING, matching the intercept at:1211 EXACTLY
+ * so the framer is skipped on precisely the responses swallows (no
      * gap, no overlap). Non-P/D and decode-leg responses (the only
      * client-facing bytes) are framed as before. Flag OFF: whole block skipped,
      * byte-identical. */
@@ -1239,7 +1239,7 @@ skip_deferred_masking:
       }
     }
 
-    /* US-505: P/D prefill response buffering — when client is in PREFILL_WAITING,
+    /* P/D prefill response buffering — when client is in PREFILL_WAITING,
      * buffer the backend response instead of forwarding to client.
      * The prefill response is small (max_tokens=1) and will be parsed for kv_params. */
     if (ent->odir == 1) {
@@ -1256,7 +1256,7 @@ skip_deferred_masking:
           rfd_ent->pd_prefill_resp_len += copy_len;
         }
         if (copy_len < len) {
-          log_warn("US-505: Prefill response buffer full (%zu/%zu), truncating",
+          log_warn("Prefill response buffer full (%zu/%zu), truncating",
                    rfd_ent->pd_prefill_resp_len, rfd_ent->pd_prefill_resp_cap);
         }
 
@@ -1280,7 +1280,7 @@ skip_deferred_masking:
             }
           } else if (pd_detect_http_msg_end(rfd_ent->pd_prefill_resp_buf,
                                             rfd_ent->pd_prefill_resp_len)) {
-            /* FIX-2 (Phase 87): chunked / CL-less prefill response. With no
+            /* chunked / CL-less prefill response. With no
              * Content-Length header the response is chunked (or
              * connection-delimited); the prefill leg used to stay in
              * PREFILL_WAITING forever (the 9/10 stuck-prefill-legs root cause).
@@ -1288,18 +1288,18 @@ skip_deferred_masking:
              * accumulated buffer (bounded by pd_prefill_resp_len; the 64KB
              * pd_prefill_resp_cap guard above caps that length). This is the
              * success path only — no client error here; the error sends live in
-             * the US-508/US-ERR01 reapers. */
+ * the reapers. */
             pr_complete = 1;
           }
           if (pr_complete) {
-            log_info("US-505: Prefill response complete — client_fd=%d "
+            log_info("Prefill response complete — client_fd=%d "
                      "resp_len=%zu", rfd_ent->fd, rfd_ent->pd_prefill_resp_len);
             rfd_ent->pd_phase = PD_PHASE_PREFILL_DONE;
             PROXY_ENT_UNLOCK(rfd_ent);
 
             /* Initiate decode phase */
             if (pd_initiate_decode(rfd_ent) < 0) {
-              log_error("US-508: Failed to initiate decode — client_fd=%d",
+              log_error("Failed to initiate decode — client_fd=%d",
                         rfd_ent->fd);
               /* P5-fix: Send 503 (not 502) — decode endpoint unreachable means
                * the P/D backend pool is unavailable, not a proxy protocol error. */
@@ -1309,7 +1309,7 @@ skip_deferred_masking:
                   "Connection: close\r\n\r\n"
                   "{\"error\":\"pd_pool_unavailable\",\"detail\":\"decode endpoint unreachable\"}";
               if (rfd_ent->fd > 0) {
-                /* US-508: Use SSL_write when client connection is TLS to avoid
+                /* Use SSL_write when client connection is TLS to avoid
                  * sending plaintext over an encrypted channel (T9 fix). */
                 if (rfd_ent->ssl) {
                   SSL_write(rfd_ent->ssl, pd_dec_err, sizeof(pd_dec_err) - 1);
@@ -1352,15 +1352,15 @@ skip_deferred_masking:
         log_info("[SSE_ACTIVATED] client_fd=%d backend_fd=%d model=%s",
                  rfd_ent->fd, ent->fd, sse_model);
 
-        /* US-505: P/D decode streaming transition — decode EP is now streaming */
+        /* P/D decode streaming transition — decode EP is now streaming */
         if (rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING) {
           rfd_ent->pd_phase = PD_PHASE_DECODE_STREAMING;
-          rfd_ent->pd_phase_start_ts = time(NULL); /* US-ERR01: reset for decode stream timeout */
-          /* Phase 89: arm the backend-idle clock for the graceful-[DONE] safety-net
+          rfd_ent->pd_phase_start_ts = time(NULL); /* reset for decode stream timeout */
+          /* arm the backend-idle clock for the graceful-[DONE] safety-net
            * reaper. This read carried the activation bytes, so "now" is the last
            * backend activity. Refreshed per byte in the [DONE] scanner below. */
           rfd_ent->pd_last_decode_ts = time(NULL);
-          log_info("US-505: Decode streaming started — client_fd=%d backend_fd=%d",
+          log_info("Decode streaming started — client_fd=%d backend_fd=%d",
                    rfd_ent->fd, ent->fd);
         }
       }
@@ -1381,7 +1381,7 @@ skip_deferred_masking:
 
     if (ent->odir == 1 && rfd_ent->sse_active == 1 &&
         rfd_ent->stream_end_ts == 0 && len > 0) {
-      /* Phase 89: refresh the backend-idle clock on every relayed decode byte.
+      /* refresh the backend-idle clock on every relayed decode byte.
        * The graceful-[DONE] safety-net reaper (sockproxy_health.c) measures idle
        * from THIS timestamp, so a stream that is still producing tokens — however
        * slowly — keeps pushing its reap deadline out and is never truncated; only a
@@ -1436,7 +1436,7 @@ skip_deferred_masking:
         const char *sse_model = proxy_effective_model(rfd_ent);
         const char *sse_tenant = rfd_ent->tenant_id;
 
-        /* Step 3: Record token consumption (US-403).
+        /* Step 3: Record token consumption.
          * Pass 0,0 for token counts — per-request token extraction from
          * the final SSE chunk is not yet wired (best-effort B-2 mode).
          * Pass NULL for result — the current response is complete and
@@ -1457,13 +1457,13 @@ skip_deferred_masking:
         log_info("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
         /* Step 6: Reset sse_active AFTER llb_ai_stream_end (idempotent)
-         * to signal stream lifecycle complete (US-403) */
+ * to signal stream lifecycle complete */
         rfd_ent->sse_active = 0;
 
-        /* US-505: P/D flow complete — decode stream finished */
+        /* P/D flow complete — decode stream finished */
         if (rfd_ent->pd_phase == PD_PHASE_DECODE_STREAMING) {
           rfd_ent->pd_phase = PD_PHASE_COMPLETE;
-          /* US-509: Record P/D metrics before cleanup clears timestamps */
+          /* Record P/D metrics before cleanup clears timestamps */
           {
             struct timespec _pdts;
             clock_gettime(CLOCK_MONOTONIC, &_pdts);
@@ -1482,14 +1482,14 @@ skip_deferred_masking:
             int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
             llb_ai_pd_record((char *)sse_model, prefill_ms, decode_ms, pd_kv, 0);
           }
-          log_info("US-505: P/D flow complete — client_fd=%d backend_fd=%d",
+          log_info("P/D flow complete — client_fd=%d backend_fd=%d",
                    rfd_ent->fd, ent->fd);
           pd_cleanup(rfd_ent);
         }
       }
     }
 
-    /* US-509: Non-SSE decode completion — detect via Content-Length tracking.
+    /* Non-SSE decode completion — detect via Content-Length tracking.
      * The [DONE] scanner above handles streaming (SSE) decode responses.
      * For non-streaming decode (stream=false), the backend returns a complete
      * JSON response with Content-Length.  HTTP keep-alive means the EOF path
@@ -1519,17 +1519,17 @@ skip_deferred_masking:
         rfd_ent->pd_decode_bytes_received += len;
       }
 
-      /* FIX-4 (Phase 87) + T3 (Phase 89): chunked / CL-less non-SSE decode
+      /* + T3: chunked / CL-less non-SSE decode
        * completion. When the decode response has no Content-Length (chunked
        * transfer-coding), the Content-Length tracking above never fires.
        *
-       * T3 (Bug A — the high-concurrency stall): this !sse_active branch is ALSO
+ * T3 (the high-concurrency stall): this !sse_active branch is ALSO
        * the only completion detector when sse_active never flipped — the
        * fragmented-"Content-Type" stall. Under load the response header block can
        * split across reads, so the single-read sniff at :1157 misses
        * "Content-Type: text/event-stream" -> sse_active stays 0 -> pd_phase stays
        * PD_PHASE_DECODE_SENDING -> control reaches HERE, not the :1198 SSE
-       * scanner. FIX-4 originally scanned only the CURRENT packet, so a terminator
+ * scanner. originally scanned only the CURRENT packet, so a terminator
        * ("data: [DONE]\n\n" or the chunked "0\r\n\r\n") split across two TCP
        * segments was missed -> the decode leg stalled forever and was eventually
        * watchdog-reaped (~50% of high-rate points at conc=64).
@@ -1590,23 +1590,23 @@ skip_deferred_masking:
       }
       len = new_len;
 
-      /* FR-10 (Phase 76, D-02/D-03/D-04): NEW L7-gated stateless HTTP_COOKIE
+      /* NEW L7-gated stateless HTTP_COOKIE
        * Set-Cookie injection on the backend→client response. Mints the opaque
        * keyed-HMAC token of the backend THIS request was routed to (rfd_ent->epv
        * / ep_num) and splices a fixed-name Set-Cookie (Path=/; HttpOnly; Secure
        * iff HTTPS). Pure no-op unless the matched route's cookie_persist is set
        * (l7_cookie_persist_active gates inside) — AI peer / non-cookie listeners
-       * are byte-for-byte unchanged (D-01a/D-14). Nothing stored on proxy_fd_ent
-       * (D-02): the token IS the binding, so affinity survives HA failover. */
+ * are byte-for-byte unchanged. Nothing stored on proxy_fd_ent
+ * the token IS the binding, so affinity survives HA failover. */
       len = l7_inject_set_cookie_h1(rfd_ent, (uint8_t *)msg, len, SP_SOCK_MSG_LEN,
                                     rfd_ent->ssl != NULL);
 
-      /* FR-33 (Phase 77, D-77-05/06, RFC 6797): HSTS response injection on the
+      /* (RFC 6797): HSTS response injection on the
        * SAME backend→client response seam. Synthesizes Strict-Transport-Security
        * from the proxy_arg HSTS scalars and splices it, gated strictly on
        * have_ssl && has_l7_policy && hsts_max_age>0 (the gate lives inside
        * l7_inject_hsts_h1). Pure no-op for plain-HTTP / AI / un-configured
-       * listeners — byte-for-byte unchanged (D-01a/D-14). */
+ * listeners — byte-for-byte unchanged. */
       len = l7_inject_hsts_h1(rfd_ent, (uint8_t *)msg, len, SP_SOCK_MSG_LEN);
     }
 
@@ -1869,11 +1869,11 @@ skip_deferred_masking:
   return 0;
 }
 
-/* proxy_skmap_key_from_fd moved to sockproxy_conn.c (Phase 3) */
-/* socket utils (setnb, setnodelay, set_opts, server_setup, ssl_connect) moved to sockproxy_conn.c (Phase 3) */
+/* proxy_skmap_key_from_fd moved to sockproxy_conn.c */
+/* socket utils (setnb, setnodelay, set_opts, server_setup, ssl_connect) moved to sockproxy_conn.c */
 
 /* Session hash, conversation mapping, endpoint selection (proxy_setup_ep__),
- * proxy_conversation_cleanup_thread, proxy_run moved to sockproxy_ep.c (Phase 4) */
+ * proxy_conversation_cleanup_thread, proxy_run moved to sockproxy_ep.c */
 
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
@@ -1959,13 +1959,13 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           tepval->session_header_name[0] = '\0';
         }
 
-        // SSE streaming configuration (US-401)
+        // SSE streaming configuration 
         tepval->sse_mode = arg->sse_mode;
         tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
         tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
         tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
 
-        // US-502: P/D disaggregation configuration
+        // P/D disaggregation configuration
         tepval->pd_disagg_enabled = arg->pd_disagg_mode;
         tepval->ai_gw_mode = arg->ai_gw_mode;
         log_info("[PD_CONFIG] proxy_add: pd_disagg=%d ai_gw=%d n_eps=%d",
@@ -1988,16 +1988,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->pd_balance_abs_threshold = arg->pd_balance_abs_threshold ? arg->pd_balance_abs_threshold : 3;
         tepval->pd_session_ttl_sec = arg->pd_session_ttl_sec;
 
-        // KV-Cache Exact Routing (Phase 8: gap closure)
+        // KV-Cache Exact Routing (: gap closure)
         tepval->kv_exact_mode = arg->kv_exact_mode;
         tepval->kv_hash_algo  = arg->kv_hash_algo;
         tepval->kv_zmq_port   = arg->kv_zmq_port;
         tepval->kv_block_size = arg->kv_block_size;
         tepval->kv_warmup_sec = arg->kv_warmup_sec;
-        // Phase 99 (SGL-03): engine + DP rank count ride the same copy block.
+        // (SGL-03): engine + DP rank count ride the same copy block.
         tepval->kv_engine_type = arg->kv_engine_type;
         tepval->kv_dp_rank_count = arg->kv_dp_rank_count;
-        /* Phase 99 (SGL-04): the calling rule's identity for the Tier-1.5 Go
+        /* (SGL-04): the calling rule's identity for the Tier-1.5 Go
          * selector — arg->_id already carries the rule number end-to-end
          * (ca.cidx via llb_conv_nat2proxy), so the stamp just mirrors it into
          * the kv config block. 0 == no identity ⇒ Go keeps the legacy loop. */
@@ -2005,11 +2005,11 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
         tepval->pd_session_map = NULL;
         pthread_rwlock_init(&tepval->pd_session_lock, NULL);
-        /* Phase 93-04: bounded backpressured admission — per-EP parked FIFO lock.
+        /* bounded backpressured admission — per-EP parked FIFO lock.
          * Mirror placement with the other P/D locks; FIFOs are zero-init by the
          * tepval calloc, untouched when LLB_PD_QUEUE_DEPTH_PER_EP is 0 (default-off). */
         pthread_mutex_init(&tepval->pd_parked_lock, NULL);
-        /* Phase 8: allocate radix trie for Tier 1 cache affinity */
+        /* allocate radix trie for Tier 1 cache affinity */
         if (tepval->pd_cache_aware_mode) {
           tepval->pd_trie = pd_trie_create();
           pthread_rwlock_init(&tepval->pd_trie_lock, NULL);
@@ -2023,7 +2023,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         }
 #endif
 
-        // P2 Phase 2: Initialize draining fields
+        // P2: Initialize draining fields
         tepval->drain_policy = DRAIN_POLICY_GRACEFUL;  // Default: graceful draining
         tepval->drain_timeout_sec = 60;                // Default: 60 seconds
         memset(tepval->drain_state, 0, sizeof(tepval->drain_state));
@@ -2168,9 +2168,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 #endif
 
   if (arg->have_ssl) {
-    // FR-32 (D-77-03/04/04b): thread the rule's proxy_arg so version/cipher
+    // thread the rule's proxy_arg so version/cipher
     // pinning is applied to the frontend listener SSL_CTX. arg is byte-for-byte
-    // today's behaviour when the TLS-pinning fields are unset (D-77-COMPAT).
+    // today's behaviour when the TLS-pinning fields are unset (-COMPAT).
     ssl_ctx = proxy_server_ssl_ctx_init(arg);
     assert(ssl_ctx);
     
@@ -2236,12 +2236,12 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     }
     
 #ifdef HAVE_MTLS
-    // Backend mTLS is now integrated into proxy_client_ssl_ctx_init (Phase 3)
+    // Backend mTLS is now integrated into proxy_client_ssl_ctx_init 
     // No additional configuration needed here - kept for backward compatibility check
-    // Phase 77 FR-11 (D-77-14): backend material referenced by certId.
+    // backend material referenced by certId.
     if (arg->backend_verify_cert || arg->backend_client_cert_id[0] != '\0') {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-      log_debug("[mTLS] Backend mTLS configured via proxy_client_ssl_ctx_init (Phase 3)");
+      log_debug("[mTLS] Backend mTLS configured via proxy_client_ssl_ctx_init ");
       log_debug("[mTLS]   verify_server_cert=%d, client_cert_id present=%s",
                 arg->backend_verify_cert,
                 arg->backend_client_cert_id[0] ? "yes" : "no");
@@ -2355,13 +2355,13 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     tepval->session_header_name[0] = '\0';
   }
 
-  // SSE streaming configuration (US-401)
+  // SSE streaming configuration 
   tepval->sse_mode = arg->sse_mode;
   tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
   tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
   tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
 
-  // US-502: P/D disaggregation configuration (new entry path)
+  // P/D disaggregation configuration (new entry path)
   tepval->pd_disagg_enabled = arg->pd_disagg_mode;
   tepval->ai_gw_mode = arg->ai_gw_mode;
   log_info("[PD_CONFIG] proxy_add(new): pd_disagg=%d ai_gw=%d n_eps=%d sse=%d",
@@ -2386,7 +2386,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   tepval->pd_balance_abs_threshold = arg->pd_balance_abs_threshold ? arg->pd_balance_abs_threshold : 3;
   tepval->pd_session_ttl_sec = arg->pd_session_ttl_sec;
 
-  // Phase 42-04: KV-Cache Exact Routing (Tier 1.5) — propagate five kv_* fields on
+  // KV-Cache Exact Routing (Tier 1.5) — propagate five kv_* fields on
   // the new-tepval path. Mirrors the update-existing-tepval branch at L1384-1388.
   // Without these copies, tepval->kv_exact_mode stays 0, pd_select_prefill's
   // `if (kv_exact_mode == 1)` gate never fires, and Tier 1.5 routing is silently
@@ -2396,10 +2396,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   tepval->kv_zmq_port   = arg->kv_zmq_port;
   tepval->kv_block_size = arg->kv_block_size;
   tepval->kv_warmup_sec = arg->kv_warmup_sec;
-  // Phase 99 (SGL-03): engine + DP rank count ride the same copy block.
+  // (SGL-03): engine + DP rank count ride the same copy block.
   tepval->kv_engine_type = arg->kv_engine_type;
   tepval->kv_dp_rank_count = arg->kv_dp_rank_count;
-  /* Phase 99 (SGL-04): the calling rule's identity for the Tier-1.5 Go
+  /* (SGL-04): the calling rule's identity for the Tier-1.5 Go
    * selector — arg->_id already carries the rule number end-to-end (ca.cidx
    * via llb_conv_nat2proxy), so the stamp just mirrors it into the kv config
    * block. 0 == no identity ⇒ Go keeps the legacy all-services loop. */
@@ -2411,9 +2411,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   tepval->pd_session_map = NULL;
   pthread_rwlock_init(&tepval->pd_session_lock, NULL);
-  /* Phase 93-04: bounded backpressured admission — per-EP parked FIFO lock. */
+  /* bounded backpressured admission — per-EP parked FIFO lock. */
   pthread_mutex_init(&tepval->pd_parked_lock, NULL);
-  /* Phase 8: allocate radix trie for Tier 1 cache affinity */
+  /* allocate radix trie for Tier 1 cache affinity */
   if (tepval->pd_cache_aware_mode) {
     tepval->pd_trie = pd_trie_create();
     pthread_rwlock_init(&tepval->pd_trie_lock, NULL);
@@ -2427,7 +2427,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   }
 #endif
 
-  // P2 Phase 2: Initialize draining fields
+  // P2: Initialize draining fields
   tepval->drain_policy = DRAIN_POLICY_GRACEFUL;  // Default: graceful draining
   tepval->drain_timeout_sec = 60;                // Default: 60 seconds
   memset(tepval->drain_state, 0, sizeof(tepval->drain_state));
@@ -2569,7 +2569,7 @@ proxy_delete_entry(proxy_ent_t *ent, proxy_arg_t *arg)
 
   return ret;
 }
-/* Drain management moved to sockproxy_health.c (Phase 2) */
+/* Drain management moved to sockproxy_health.c */
 
 // P2 Task 1.3: Lightweight endpoint health update with graceful draining
 //
@@ -2628,7 +2628,7 @@ proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
         uint8_t old_state = tepval->eps[ep_index].inv;
         tepval->eps[ep_index].inv = inactive;
 
-        // P2 Phase 2: Proactive session cleanup when endpoint becomes inactive
+        // P2: Proactive session cleanup when endpoint becomes inactive
         if (inactive && old_state == 0) {
           // CRITICAL: Remove all stale session mappings for this endpoint
           // This prevents memory waste and avoids re-learning overhead on every request
@@ -2638,7 +2638,7 @@ proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
                      ep_index, cleaned);
           }
 
-          /* Phase 8: remove dead EP from trie to prevent stale Tier 1 matches */
+          /* remove dead EP from trie to prevent stale Tier 1 matches */
           if (tepval->pd_trie) {
             pthread_rwlock_wrlock(&tepval->pd_trie_lock);
             pd_trie_remove_ep(tepval->pd_trie, ep_index);
@@ -2646,7 +2646,7 @@ proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
           }
         }
 
-        // P2 Phase 2: Handle draining based on policy
+        // P2: Handle draining based on policy
         if (inactive && old_state == 0) {
           
           if (tepval->drain_policy == DRAIN_POLICY_TIMED) {
@@ -2759,7 +2759,7 @@ proxy_update_ep_health_by_ip(proxy_ent_t *key, uint32_t ep_ip, uint8_t inactive)
   return -ENOENT;
 }
 
-// P2 Phase 2: Configure draining policy for a proxy service
+// P2: Configure draining policy for a proxy service
 // This sets the draining behavior when endpoints are marked inactive
 // policy: 0=GRACEFUL, 1=TIMED, 2=IMMEDIATE
 int
@@ -2769,12 +2769,12 @@ proxy_set_drain_policy(proxy_ent_t *key, unsigned int policy, uint32_t timeout_s
   proxy_epval_t *tepval, *tmp_epval;
   
   if (!key) {
-    log_error("P2 Phase 2: proxy_set_drain_policy - invalid key");
+    log_error("P2: proxy_set_drain_policy - invalid key");
     return -EINVAL;
   }
   
   if (policy > DRAIN_POLICY_IMMEDIATE) {
-    log_error("P2 Phase 2: proxy_set_drain_policy - invalid policy %d", policy);
+    log_error("P2: proxy_set_drain_policy - invalid policy %d", policy);
     return -EINVAL;
   }
 
@@ -2789,7 +2789,7 @@ proxy_set_drain_policy(proxy_ent_t *key, unsigned int policy, uint32_t timeout_s
         tepval->drain_policy = (drain_policy_t)policy;
         tepval->drain_timeout_sec = timeout_sec > 0 ? timeout_sec : 60; // Default 60s
         
-        log_info("P2 Phase 2: Drain policy updated - service %s:%u, policy=%d, timeout=%us",
+        log_info("P2: Drain policy updated - service %s:%u, policy=%d, timeout=%us",
                  inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
                  policy, tepval->drain_timeout_sec);
         
@@ -2798,14 +2798,14 @@ proxy_set_drain_policy(proxy_ent_t *key, unsigned int policy, uint32_t timeout_s
       }
       
       PROXY_UNLOCK();
-      log_error("P2 Phase 2: proxy_set_drain_policy - no ephash entry found");
+      log_error("P2: proxy_set_drain_policy - no ephash entry found");
       return -ENOENT;
     }
     ent = ent->next;
   }
 
   PROXY_UNLOCK();
-  log_error("P2 Phase 2: proxy_set_drain_policy - entry not found for %s:%u",
+  log_error("P2: proxy_set_drain_policy - entry not found for %s:%u",
             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
   return -ENOENT;
 }
@@ -2891,9 +2891,9 @@ proxy_set_chwbl_prefix_config(proxy_ent_t *key,
   log_error("proxy_set_chwbl_prefix_config: Service not found");
   return -ENOENT;
 }
-/* Circuit breaker moved to sockproxy_health.c (Phase 2) */
+/* Circuit breaker moved to sockproxy_health.c */
 
-// P2 Phase 2 Task 2.3: Configure circuit breaker for a proxy service
+// P2 Task 2.3: Configure circuit breaker for a proxy service
 // enabled: 1=enabled, 0=disabled
 // failure_threshold: Number of consecutive failures before opening (0=use default 5)
 // open_timeout_sec: Timeout before HALF_OPEN (0=use default 30)
@@ -3196,7 +3196,7 @@ cleanup_failed_ssl_connection(proxy_fd_ent_t *pfe)
   }
 }
 
-/* US-505: Initiate decode phase after prefill completes.
+/* Initiate decode phase after prefill completes.
  * Creates a new backend connection to the decode EP, builds the decode request
  * (original body + kv_params), and sends it. The decode response will flow to
  * the client via normal proxy path (including SSE streaming). */
@@ -3218,15 +3218,15 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   d_idx = client_pfe->pd_decode_ep_idx;
 
   if (d_idx < 0 || d_idx >= tepval->n_eps) {
-    log_error("US-505: Invalid decode EP index %d", d_idx);
+    log_error("Invalid decode EP index %d", d_idx);
     return -1;
   }
 
-  /* Phase 90 (conc=128 UAF fix): pd_initiate_decode runs on the PREFILL worker
+  /* (conc=128 UAF fix): pd_initiate_decode runs on the PREFILL worker
    * and reads three heap buffers (pd_prefill_resp_buf / pd_saved_body /
    * pd_saved_headers) off the shared client pfe, while pd_cleanup() can free the
    * SAME buffers concurrently on the CLIENT-fd worker on client-close (see the
-   * pd_free_claim() banner for the cross-worker sharding). Phase 89 closed the
+ * pd_free_claim banner for the cross-worker sharding). closed the
    * free-vs-free double-free; this surviving use-vs-free read freed memory and
    * corrupted the heap under load. Atomically CLAIM the buffers into locals so
    * THIS function becomes their single owner — a racing pd_cleanup() then
@@ -3275,7 +3275,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   size_t decode_body_cap = l_body_len + 8192;
   decode_body = malloc(decode_body_cap);
   if (!decode_body) {
-    log_error("US-505: malloc failed for decode_body");
+    log_error("malloc failed for decode_body");
     goto out;
   }
 
@@ -3286,7 +3286,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
                              client_pfe->pd_kv_params_len,
                              decode_body, &decode_body_len,
                              decode_body_cap) != 0) {
-    log_error("US-507: pd_prepare_decode_body() failed");
+    log_error("pd_prepare_decode_body failed");
     goto out;
   }
 
@@ -3294,7 +3294,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   size_t decode_req_cap = l_headers_len + decode_body_len + 256;
   decode_req = malloc(decode_req_cap);
   if (!decode_req) {
-    log_error("US-505: malloc failed for decode_req");
+    log_error("malloc failed for decode_req");
     goto out;
   }
 
@@ -3338,14 +3338,14 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   ep_cfd = proxy_setup_ep_connect(epip, epport, IPPROTO_TCP, NULL, NULL, client_pfe,
                                   (dpp2len ? dpp2buf : NULL), dpp2len);
   if (ep_cfd < 0) {
-    log_error("US-505: Failed to connect to decode EP%d", d_idx);
+    log_error("Failed to connect to decode EP%d", d_idx);
     goto out;
   }
 
   /* 5. Create backend pfe for decode connection */
   proxy_fd_ent_t *decode_pfe = pfe_alloc();   /* D2 root fix: pooled pfe shell */
   if (!decode_pfe) {
-    log_error("US-505: calloc failed for decode_pfe");
+    log_error("calloc failed for decode_pfe");
     close(ep_cfd);
     goto out;
   }
@@ -3358,7 +3358,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   decode_pfe->seltype = client_pfe->seltype;
   decode_pfe->ep_num = -1;
   decode_pfe->odir = 1;
-  decode_pfe->is_pd_decode_backend = 1; /* US-505: identify as decode backend for EOF handler */
+  decode_pfe->is_pd_decode_backend = 1; /* identify as decode backend for EOF handler */
   decode_pfe->n_rfd = 1;
   decode_pfe->head = client_pfe->head;
 
@@ -3369,7 +3369,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
 
   /* Initialize HTTP parser for decode response.
    *
-   * Phase 90 M1 (REQ-M1): under pd_framing_v2, the decode backend response leg is
+ * under pd_framing_v2, the decode backend response leg is
    * framed by an HTTP_RESPONSE parser (NOT HTTP_BOTH — 1xx/204/304/HEAD framing
    * keys off parser->type) with the three response callbacks. The pd_framing_v2
    * path lazily (re)inits this same parser as HTTP_RESPONSE on the first response
@@ -3396,7 +3396,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     client_pfe->n_rfd++;
   }
 
-  /* US-505: Set phase BEFORE notify_add_ent to eliminate race condition.
+  /* Set phase BEFORE notify_add_ent to eliminate race condition.
    * On a fast localhost backend the decode response can arrive and be
    * processed by the event loop before pd_phase is updated, causing the
    * completion check (phase == PD_PHASE_DECODE_SENDING) to miss and
@@ -3418,7 +3418,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     ent->val.nfds++;
     PROXY_UNLOCK();
 
-    /* Phase 89 Option A: pin the decode backend fd to the CLIENT fd's notify
+    /* Option A: pin the decode backend fd to the CLIENT fd's notify
      * worker so this connection's relay (proxy_notifier) and teardown
      * (proxy_pdestroy) serialize on one thread — prevents the cross-thread pfe
      * use-after-free that wedged loxilb under load. */
@@ -3434,21 +3434,21 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
       ssize_t n = write(ep_cfd, decode_req + sent, decode_req_len - sent);
       if (n <= 0) {
         if (errno == EINTR || errno == EAGAIN) continue;
-        log_error("US-505: Failed to send decode request: %s", strerror(errno));
+        log_error("Failed to send decode request: %s", strerror(errno));
         goto out;
       }
       sent += (size_t)n;
     }
   }
 
-  log_info("US-505: Decode request sent — client_fd=%d decode_fd=%d decode_ep=%d "
+  log_info("Decode request sent — client_fd=%d decode_fd=%d decode_ep=%d "
            "body_len=%zu",
            client_pfe->fd, ep_cfd, d_idx, decode_body_len);
 
   ret = 0;
 
 out:
-  /* Single-owner free (Phase 90 conc=128 UAF fix): release the prefill/body/
+  /* Single-owner free ( conc=128 UAF fix): release the prefill/body/
    * headers buffers we atomically claimed at entry plus the locally-owned decode
    * scratch buffers. A racing pd_cleanup() saw NULL for the claimed fields and
    * freed nothing, so there is no double free; every error/success path lands
@@ -3461,7 +3461,7 @@ out:
   return ret;
 }
 
-/* Phase 89 (conc-wedge RCA): race-safe single-owner free of a P/D heap buffer.
+/* (conc-wedge RCA): race-safe single-owner free of a P/D heap buffer.
  *
  * A P/D connection spans TWO fds — the client fd and the backend (prefill/decode)
  * rfd — which notify.c shards to DIFFERENT worker threads (`tslot = fd % n_thrs`).
@@ -3488,7 +3488,7 @@ pd_free_claim(uint8_t **pp)
   }
 }
 
-/* US-505: Reset P/D orchestration state and free heap buffers.
+/* Reset P/D orchestration state and free heap buffers.
  * Called on connection close, error, and P/D flow completion. */
 void
 pd_cleanup(proxy_fd_ent_t *fd_ent)
@@ -3500,7 +3500,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
              fd_ent->pd_prefill_ep_idx, fd_ent->pd_decode_ep_idx);
   }
 
-  /* Phase 89: atomic single-owner free — see pd_free_claim() banner. The historic
+  /* atomic single-owner free — see pd_free_claim banner. The historic
    * if(p){free;p=NULL;} double-freed when this ran concurrently for the same pfe on
    * the client-fd and backend-fd worker threads (conc=128 permanent wedge). */
   pd_free_claim(&fd_ent->pd_saved_body);
@@ -3523,7 +3523,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
       if (cur_pre > 0)
         atomic_fetch_sub(&teardown_epval->pd_ep_loads[fd_ent->pd_prefill_ep_idx].active_conns, 1);
 
-      /* Phase 93-05 (R1) DEQUEUE-ON-SLOT-FREE: a prefill slot on EP `e` just freed.
+      /* (R1) DEQUEUE-ON-SLOT-FREE: a prefill slot on EP `e` just freed.
        * If the bounded-admission FIFO is enabled and EP `e` has a parked head, pop the
        * OLDEST entry and WAKE ITS OWNER WORKER to re-drive it (pd_resume_parked). We do
        * NOT re-dispatch here: pd_cleanup may run on the decode-complete backend worker
@@ -3572,7 +3572,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
     }
   }
 
-  /* Phase 99 (D-09/D-10): single-role Tier-1.5 load release — the generic-
+  /* single-role Tier-1.5 load release — the generic-
    * teardown half of the paired decrement (increment lives in the single-role
    * KV branch in sockproxy_ep.c; the other claimant is the backend connect-
    * failure path there). __atomic_exchange claims kv_sr_load_held so
@@ -3606,7 +3606,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
   fd_ent->pd_decode_bytes_received = 0;
 }
 
-/* US-505: Update Content-Length header in HTTP request buffer.
+/* Update Content-Length header in HTTP request buffer.
  * Searches for "Content-Length:" header and replaces the value with new_body_len.
  * Uses memmem() + memmove() pattern (same as PII masking).
  * Returns 0 on success, -1 on error. */
@@ -3648,7 +3648,7 @@ pd_update_content_length(uint8_t *buf, size_t *buf_len, size_t buf_capacity,
   return 0;
 }
 
-/* proxy_release_fd_ctx moved to sockproxy_conn.c (Phase 3) */
+/* proxy_release_fd_ctx moved to sockproxy_conn.c */
 
 static void
 proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
@@ -3727,7 +3727,7 @@ proxy_pdestroy(void *priv)
       }
     }
 
-    /* US-508: P/D prefill connection failure — when a backend fd (odir==1)
+    /* P/D prefill connection failure — when a backend fd (odir==1)
      * is being destroyed while its client is waiting for a prefill response,
      * send 502 {"error":"pd_prefill_failed"} to the client before cleanup. */
     if (!is_listener && pfe->odir == 1) {
@@ -3744,7 +3744,7 @@ proxy_pdestroy(void *priv)
               "Connection: close\r\n"
               "\r\n"
               "{\"error\":\"pd_pool_unavailable\",\"detail\":\"prefill backend connection dropped\"}";
-          log_error("US-508: Prefill backend died — client_fd=%d backend_fd=%d "
+          log_error("Prefill backend died — client_fd=%d backend_fd=%d "
                     "phase=%d", client_pfe->fd, pfe->fd, client_pfe->pd_phase);
           if (client_pfe->fd > 0) {
             send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
@@ -3755,7 +3755,7 @@ proxy_pdestroy(void *priv)
         }
       }
 
-      /* US-513: P/D backend EOF during decode phase.
+      /* P/D backend EOF during decode phase.
        * Two scenarios when a backend (odir==1) closes while client is in decode:
        * 1. PREFILL backend EOF: normal — prefill completed, detach without cascading
        * 2. DECODE backend EOF: non-streaming decode complete — record metrics
@@ -3798,14 +3798,14 @@ proxy_pdestroy(void *priv)
         int is_prefill_backend = 0;
         for (int j = 0; j < client_pfe->n_rfd; j++) {
           if (client_pfe->rfd_ent[j] == pfe) {
-            /* US-505: Use is_pd_decode_backend flag for reliable prefill/decode
+            /* Use is_pd_decode_backend flag for reliable prefill/decode
              * backend identification instead of has_other_backend heuristic.
              * The heuristic failed when both pfe slots were still populated at
              * EOF time, misidentifying the decode backend as a prefill backend. */
             if (!pfe->is_pd_decode_backend) {
               is_prefill_backend = 1;
               client_pfe->rfd_ent[j] = NULL;
-              log_info("US-513: Prefill backend EOF during decode — detaching "
+              log_info("Prefill backend EOF during decode — detaching "
                        "client_fd=%d backend_fd=%d phase=%d",
                        client_pfe->fd, pfe->fd, client_pfe->pd_phase);
             }
@@ -3820,7 +3820,7 @@ proxy_pdestroy(void *priv)
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
           /* Decode backend EOF — non-streaming decode complete */
           client_pfe->pd_phase = PD_PHASE_COMPLETE;
-          log_info("US-513: Non-streaming decode complete (decode backend EOF) — "
+          log_info("Non-streaming decode complete (decode backend EOF) — "
                    "client_fd=%d decode_fd=%d",
                    client_pfe->fd, pfe->fd);
           {
@@ -3840,7 +3840,7 @@ proxy_pdestroy(void *priv)
                                      client_pfe->pd_decode_start_ns) / 1000000ULL);
             }
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            log_info("[US-509] llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
+            log_info(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
                      pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
             llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv, 0);
           }
@@ -3977,7 +3977,7 @@ extract_cookie_session_key(const char *http_data, size_t data_len,
 // Supports all standard cookie formats used by web frameworks
 // Example: extract_cookie_by_name("Cookie: JSESSIONID=abc; theme=dark", "JSESSIONID", value, 64)
 // Result: value = "abc" (only the cookie value, other cookies ignored)
-// Phase 75 (FR-19): external linkage so sockproxy_l7policy.c reuses this proven
+// external linkage so sockproxy_l7policy.c reuses this proven
 // parser for the L7 COOKIE compare op (RESEARCH §Don't Hand-Roll); prototype in
 // sockproxy_l7policy.h. The `static` qualifier was dropped in lock-step.
 int
@@ -4051,7 +4051,7 @@ extract_cookie_by_name(const char *headers, const char *cookie_name,
 // Supports both ? and & delimiters, handles URL encoding
 // Example: extract_query_param_value("/api/data?sessionid=abc123&foo=bar", "sessionid", value, 64)
 // Result: value = "abc123"
-// Phase 75 (FR-19): external linkage so sockproxy_l7policy.c reuses this proven
+// external linkage so sockproxy_l7policy.c reuses this proven
 // parser for the L7 QUERY compare op (RESEARCH §Don't Hand-Roll); prototype in
 // sockproxy_l7policy.h. The `static` qualifier was dropped in lock-step.
 int
@@ -5088,7 +5088,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
                        custom_header,  // NEW: Pass custom session header value
                        &ep_sel, &tepval, &seltype, &rid, ent->val.ssl_epctx, &ssl, key->dip, pfe,
                        (pp2len ? pp2buf : NULL), pp2len);
-  /* Phase 93-04: bounded backpressured admission. The request was enqueued onto a
+  /* bounded backpressured admission. The request was enqueued onto a
    * per-EP parked FIFO inside proxy_setup_ep__/pd_select_prefill. SUSPEND the client
    * fd (EPOLLIN-pause, HUP-only — the exact form at the backpressure pause site) and
    * hold it open. Do NOT proxy_destroy_eps, do NOT shutdown. The caller translates
@@ -5329,7 +5329,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe1->n_rfd++;
 
     for (retry = 0; retry < PROXY_MAPFD_RETRIES; retry++) {
-      /* Phase 89 Option A: pin the backend fd to the CLIENT fd's (npfe1) notify
+      /* Option A: pin the backend fd to the CLIENT fd's (npfe1) notify
        * worker so both legs of this connection serialize on one thread (prevents
        * the cross-thread pfe use-after-free wedge). Not P/D-specific — covers
        * every proxied connection's client+backend pair. */
@@ -5816,22 +5816,22 @@ handle_on_message_complete(llhttp_t* parser)
   emit_trace_event(pfe, LXB_EVENT_REQ_START, 0);
 #endif
 
-  /* US-505: P/D prefill completion detection (backend response complete, odir==1).
+  /* P/D prefill completion detection (backend response complete, odir==1).
    * Body rewriting for client requests (odir==0) is handled AFTER setup_proxy_path()
    * in proxy_try_read() because pfe->epv is not yet set at this point. */
   if (pfe->odir == 1 && pfe->rfd_ent[0]) {
       proxy_fd_ent_t *client_pfe = pfe->rfd_ent[0];
       if (client_pfe->pd_phase == PD_PHASE_PREFILL_WAITING) {
         client_pfe->pd_phase = PD_PHASE_PREFILL_DONE;
-        log_info("US-505: Prefill complete — client_fd=%d backend_fd=%d "
+        log_info("Prefill complete — client_fd=%d backend_fd=%d "
                  "resp_len=%zu",
                  client_pfe->fd, pfe->fd, client_pfe->pd_prefill_resp_len);
 
         /* Trigger decode phase — connect to decode EP and send request */
         if (pd_initiate_decode(client_pfe) < 0) {
-          log_error("US-508: Failed to initiate decode — client_fd=%d",
+          log_error("Failed to initiate decode — client_fd=%d",
                     client_pfe->fd);
-          /* US-509: Record P/D decode failure metrics before cleanup */
+          /* Record P/D decode failure metrics before cleanup */
           {
             const char *pd_dec_model = proxy_effective_model(client_pfe);
             int64_t d_prefill_ms = 0;
@@ -5849,7 +5849,7 @@ handle_on_message_complete(llhttp_t* parser)
                                         1000000ULL);
             }
             int d_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            log_info("[US-509] llb_ai_pd_record (decode error): model=%s prefill=%lldms kv=%d",
+            log_info(" llb_ai_pd_record (decode error): model=%s prefill=%lldms kv=%d",
                      pd_dec_model, (long long)d_prefill_ms, d_kv);
             llb_ai_pd_record((char *)pd_dec_model, d_prefill_ms, 0, d_kv, 2);
           }
@@ -5863,7 +5863,7 @@ handle_on_message_complete(llhttp_t* parser)
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\",\"detail\":\"decode response processing failed\"}";
             if (client_pfe->fd > 0) {
-              /* US-508: Use SSL_write when client connection is TLS to avoid
+              /* Use SSL_write when client connection is TLS to avoid
                * sending plaintext over an encrypted channel (T9 fix). */
               if (client_pfe->ssl) {
                 SSL_write(client_pfe->ssl, pd_decode_err, sizeof(pd_decode_err) - 1);
@@ -5887,13 +5887,13 @@ handle_on_message_complete(llhttp_t* parser)
 }
 
 /* ---------------------------------------------------------------------------
- * Phase 90 M1 (REQ-M1): response-leg HTTP_RESPONSE parser path (pd_framing_v2).
+ * response-leg HTTP_RESPONSE parser path (pd_framing_v2).
  *
  * The three callbacks below + pd_resp_parser_init() are the ONE framer that
  * replaces the three hand-rolled memmem detectors (sockproxy_http.c:1085-1355)
  * on the backend (decode/prefill) response leg. They run BEHIND pd_framing_v2:
  * with the flag OFF none of this is consulted and the legacy detectors own
- * completion byte-for-byte (D-04 deletion is 90-06, gated on the live oracle).
+ * completion byte-for-byte ( deletion is 90-06, gated on the live oracle).
  *
  * Registered on a BACKEND pfe (odir==1) initialized with HTTP_RESPONSE (NOT
  * HTTP_BOTH) so 1xx/204/304/HEAD framing rules key off parser->type correctly
@@ -5904,7 +5904,7 @@ handle_on_message_complete(llhttp_t* parser)
 
 /* on_headers_complete seam — the fragmentation-immune replacement for the
  * single-read "Content-Type: text/event-stream" memmem sniff at :1157 (the
- * Bug-A response-splitting source, T-90-04-01). OBSERVE-only here; the SSE-gauge
+ * Bug-A response-splitting source). OBSERVE-only here; the SSE-gauge
  * side effects stay on the legacy detectors until 90-06. */
 static int
 handle_resp_headers_complete(llhttp_t *parser)
@@ -5922,7 +5922,7 @@ handle_resp_headers_complete(llhttp_t *parser)
 }
 
 /* on_body seam — [DONE] is ORDINARY body data under the parser path (no longer a
- * completion gate; case demoted per D-00). OBSERVE-only; relay is unchanged. */
+ * completion gate; case demoted per). OBSERVE-only; relay is unchanged. */
 static int
 handle_resp_body(llhttp_t *parser, const char *at, size_t length)
 {
@@ -5940,20 +5940,20 @@ handle_resp_body(llhttp_t *parser, const char *at, size_t length)
  * exactly once per response message (chunked last-chunk / CL satisfied /
  * conn-close), proven fragmentation-immune by test_resp_framing.c cases 1-4.
  *
- * Reaper interlock (Pitfall #3, T-90-04-03): set stream_end_ts on the CLIENT pfe
+ * Reaper interlock (Pitfall #3): set stream_end_ts on the CLIENT pfe
  * so the sockproxy_health.c:451 graceful-[DONE] reaper short-circuits
  * (pd_should_graceful_complete returns 0 when stream_end_ts != 0,
  * sockproxy_pd_leak.h:240) — the framed case must NOT also be reaped (no
  * double-completion). The reaper STAYS unchanged; it nets the no-terminator
  * keep-alive-silent case llhttp cannot frame (test_resp_framing.c case 5).
  *
- * Teardown discipline (Pitfall #4, T-90-04-02 — the conc=128 cross-thread pfe
+ * Teardown discipline (Pitfall #4, — the conc=128 cross-thread pfe
  * UAF): this callback is a teardown TRIGGER only. It does NOT free the pfe — a
  * relay may still be in flight on another notify worker. The existing two-leg
  * teardown machinery (pd_cleanup / proxy_release_fd_ctx) owns the free, on the
- * notify worker both legs are pinned to (Phase 89 notify_add_ent_pinned, already
+ * notify worker both legs are pinned to ( notify_add_ent_pinned, already
  * landed at :4980). Do NOT pre-fold any additional pinning here — only the live
- * oracle (D-03 trapdoor) may demand it. */
+ * oracle ( trapdoor) may demand it. */
 static int
 handle_resp_message_complete(llhttp_t *parser)
 {
@@ -6019,7 +6019,7 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
   str[length] = '\0';
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-  // Phase 3: Debug log for header name parsing
+  // Debug log for header name parsing
   log_debug("[HTTP_HEADER] fd=%d odir=%d header_name='%s' (len=%zu)",
             pfe->fd, pfe->odir, str, length);
 #endif
@@ -6047,7 +6047,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
   assert(pfe);
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-  // Phase 3: Debug log for header value parsing
+  // Debug log for header value parsing
   char value_preview[128];
   size_t preview_len = (length < sizeof(value_preview) - 1) ? length : sizeof(value_preview) - 1;
   strncpy(value_preview, at, preview_len);
@@ -6076,7 +6076,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
     }
   }
 
-  /* US-501: Also store X-Request-Id in vllm_request_id for P/D propagation */
+  /* Also store X-Request-Id in vllm_request_id for P/D propagation */
   if (!strncasecmp("X-Request-Id", pfe->last_header_name, 12)) {
     size_t copy_len = length < sizeof(pfe->vllm_request_id) - 1
                     ? length : sizeof(pfe->vllm_request_id) - 1;
@@ -6228,7 +6228,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
     }
   }
 
-  // US-202 Criterion A: Extract X-Model header for model-based endpoint pool selection
+  // Criterion A: Extract X-Model header for model-based endpoint pool selection
   // Priority: X-Model header (fast path) > JSON body "model" field > "" (wildcard)
   if (!strncasecmp("X-Model", pfe->last_header_name, 7)) {
     if (length > 0 && length < sizeof(pfe->x_model_header)) {
@@ -6237,7 +6237,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
     }
   }
 
-  // AI Gateway: Extract X-Api-Key header for data-plane enforcement (US-403)
+  // AI Gateway: Extract X-Api-Key header for data-plane enforcement 
   if (!strncasecmp("X-Api-Key", pfe->last_header_name, 9)) {
     if (length > 0 && length < sizeof(pfe->x_api_key_raw)) {
       strncpy(pfe->x_api_key_raw, at, length);
@@ -6256,7 +6256,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
   }
 
 #ifdef HAVE_HTTP_TRACE
-  // Parse W3C Trace Context traceparent header (Phase 2: Protocol Analyzer)
+  // Parse W3C Trace Context traceparent header (: Protocol Analyzer)
   // Format: 00-<trace_id>-<parent_id>-<flags>
   // Example: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
   if (!strncasecmp("traceparent", pfe->last_header_name, 11)) {
@@ -6300,10 +6300,10 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
 	         (length > 50) ? "..." : "");
 #endif
 
-  // Phase 75 (FR-19): append EVERY parsed header into the bounded generic L7
+  // append EVERY parsed header into the bounded generic L7
   // store so l7_policy_evaluate (Plan 03/04) can match arbitrary HEADER/COOKIE
   // conditions, not just the ~8 named headers special-cased above. The named
-  // cascade is left untouched (the AI path + existing CICD depend on it — D-04);
+  // cascade is left untouched (the AI path + existing CICD depend on it);
   // re-storing those names here is harmless. `at`/`length` are NOT NUL-terminated
   // (llhttp), and pfe->last_header_name IS NUL-terminated (set in handle_header_field),
   // so use the length-aware helper. The store is bounded (overflow dropped).
@@ -6352,7 +6352,7 @@ handle_url(llhttp_t *parser, const char *at, size_t length)
     }
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-    // Phase 3: Enhanced debug log with method information
+    // Enhanced debug log with method information
     log_debug("[HTTP_REQUEST] fd=%d odir=%d method=%s path='%s'",
               pfe->fd, pfe->odir, pfe->http_method, pfe->request_path);
 #endif
@@ -6364,9 +6364,9 @@ handle_url(llhttp_t *parser, const char *at, size_t length)
 /* JSON functions (jsoneq, json_extract_string, compute_*_hash, extract_llm_prefix, compute_prefix_hash) moved to sockproxy_json.c */
 
 
-/* CHWBL ring algorithms moved to sockproxy_lb.c (Phase 2) */
+/* CHWBL ring algorithms moved to sockproxy_lb.c */
 
-/* Universal health mgmt moved to sockproxy_health.c (Phase 2) */
+/* Universal health mgmt moved to sockproxy_health.c */
 
 /*
  * handle_new_connection - Accept and initialize new client connections
@@ -6395,7 +6395,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   proxy_fd_ent_t *npfe1 = NULL;
   SSL *ssl = NULL;
 
-  /* Phase 93-06 (AC-4): global total-footprint ingress backpressure (knob
+  /* (AC-4): global total-footprint ingress backpressure (knob
    * LLB_PD_MAX_TOTAL_INFLIGHT). BEFORE accept(), if the bound is enabled
    * (pd_max_total_inflight() > 0, i.e. LLB_PD_MAX_TOTAL_INFLIGHT set) and the
    * global in-flight gauge has reached it, REFUSE this accept() — return WITHOUT
@@ -6574,7 +6574,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
              (ent && ent->val.ephash) ? ent->val.ephash->session_header_enabled : 0);
   }
 
-  // Copy SSE rule configuration to per-connection state (US-401, A-7)
+  // Copy SSE rule configuration to per-connection state (A-7)
   npfe1->sse_mode = 0;
   npfe1->max_stream_duration_sec = 0;
   npfe1->backend_keepalive_sec = 0;
@@ -6591,7 +6591,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     npfe1->inactive_timeout_sec = ent->val.ephash->inactive_timeout_sec;
   }
 
-  // US-501: Initialize vLLM request ID state for new connection
+  // Initialize vLLM request ID state for new connection
   npfe1->vllm_request_id[0] = '\0';
   npfe1->has_vllm_request_id = 0;
   npfe1->request_id_injected = 0;
@@ -6651,7 +6651,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 
   // Setup backend path for certain protocols
   if (pfe->seltype == PROXY_SEL_N2 || protocol == IPPROTO_SCTP) {
-    /* Phase 93-04: N2/SCTP is NOT a P/D path, so PD_SETUP_PARKED never arises here.
+    /* N2/SCTP is NOT a P/D path, so PD_SETUP_PARKED never arises here.
      * Capture rc defensively and treat any non-zero (parked included, though it
      * cannot occur) as a setup failure — these protocols have no parked-resume. */
     int sp_rc = setup_proxy_path(key, rkey, npfe1, NULL);
@@ -6671,7 +6671,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   return 0; // Success
 }
 
-/* Phase 93-05 (R1): pd_setup_and_forward() return contract — the dispatch+forward
+/* (R1): pd_setup_and_forward return contract — the dispatch+forward
  * sequence (setup_proxy_path + P/D body-rewrite + backend forward) factored out of
  * handle_client_data so the bounded-admission RESUME path (pd_resume_parked) re-drives
  * the EXACT same code as a fresh dispatch (charged<=>dispatched holds; no divergent
@@ -6686,7 +6686,7 @@ static int pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                                 struct llb_sockmap_key *rkey,
                                 const char *phurl);
 
-/* Phase 93-05 (R1): dispatch + forward, factored verbatim out of handle_client_data
+/* (R1): dispatch + forward, factored verbatim out of handle_client_data
  * (was the inline `Setup backend connection` + `NOW forward accumulated data` block).
  * Used by BOTH the fresh-dispatch site and the bounded-admission resume so the two
  * paths can never diverge. Returns SP_FWD_PARKED / SP_FWD_RESTART / SP_FWD_DONE /
@@ -6700,7 +6700,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
   // Setup backend connection
   {
     int sp_rc = setup_proxy_path(key, rkey, pfe, phurl);
-    /* Phase 93-04: parked = held/suspended. Keep the fd, do NOT forward
+    /* parked = held/suspended. Keep the fd, do NOT forward
      * to a backend (there is none yet), do NOT close. 93-05 resumes it. */
     if (sp_rc == PD_SETUP_PARKED) return SP_FWD_PARKED;
     if (sp_rc) {
@@ -6711,7 +6711,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
   // NOW forward accumulated data to backend
   if (pfe->rfd[0] > 0) {  // Backend connected successfully
 
-    /* US-505: P/D disaggregation body rewriting.
+    /* P/D disaggregation body rewriting.
      * Moved here from handle_on_message_complete because pfe->epv
      * is only set after setup_proxy_path() runs (line above).
      * When P/D mode is active: save original body, rewrite for prefill,
@@ -6773,26 +6773,26 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                         (uint64_t)_ts.tv_nsec;
                   }
 
-                  log_info("US-505: P/D entry — fd=%d prefill_ep=%d "
+                  log_info("P/D entry — fd=%d prefill_ep=%d "
                            "decode_ep=%d orig_body=%zu prefill_body=%zu",
                            pfe->fd, pfe->pd_prefill_ep_idx,
                            pfe->pd_decode_ep_idx,
                            pd_body_len, prefill_body_len);
                 } else {
-                  log_error("US-505: malloc failed for prefill_resp_buf");
-                  pd_free_claim(&pfe->pd_saved_body);  /* Phase 89: race-safe */
+                  log_error("malloc failed for prefill_resp_buf");
+                  pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
                 }
               } else {
-                log_error("US-505: pd_prepare_prefill_body() failed");
-                pd_free_claim(&pfe->pd_saved_body);  /* Phase 89: race-safe */
+                log_error("pd_prepare_prefill_body failed");
+                pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
               }
               free(prefill_buf);
             } else {
-              log_error("US-505: malloc failed for prefill_buf");
-              pd_free_claim(&pfe->pd_saved_body);  /* Phase 89: race-safe */
+              log_error("malloc failed for prefill_buf");
+              pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
             }
           } else {
-            log_error("US-505: malloc failed for pd_saved_body (%zu)", pd_body_len);
+            log_error("malloc failed for pd_saved_body (%zu)", pd_body_len);
           }
         }
       }
@@ -6839,13 +6839,13 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     }
     pfe->rcv_off = new_len;
 
-    /* FR-08 (Phase 76, D-07/D-08/D-09): NEW L7-gated request-header
+    /* NEW L7-gated request-header
      * injection — ALWAYS-overwrite X-Forwarded-For (real TCP peer IP) +
      * X-Forwarded-Port/Proto + insertHeaders SET/ADD/REMOVE. Gated on
-     * node->has_l7_policy (D-01a): a pure no-op for the AI peer /
+ * node->has_l7_policy: a pure no-op for the AI peer /
      * un-configured listeners (has_l7_policy==0), so that path is
-     * byte-for-byte unchanged (D-14). Runs AFTER the legacy
-     * inject_forwarded_headers (untouched, D-01b). */
+ * byte-for-byte unchanged. Runs AFTER the legacy
+ * inject_forwarded_headers (untouched). */
     {
       proxy_map_ent_t *l7node = (proxy_map_ent_t *)pfe->head;
       if (l7node && l7node->has_l7_policy) {
@@ -6854,8 +6854,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       }
     }
 
-    /* US-505: P/D request-ID override — generate with prefill/decode addresses
-     * so vllm-router can route correctly. Must happen BEFORE normal US-501 path. */
+    /* P/D request-ID override — generate with prefill/decode addresses
+ * so vllm-router can route correctly. Must happen BEFORE normal path. */
     if (pfe->pd_phase == PD_PHASE_PREFILL_SENDING && pfe->epv) {
       proxy_epval_t *pd_epval = (proxy_epval_t *)pfe->epv;
       int p_idx = pfe->pd_prefill_ep_idx;
@@ -6865,7 +6865,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
         char p_addr[64], d_addr[64];
         struct in_addr p_in = { .s_addr = pd_epval->eps[p_idx].xip };
         struct in_addr d_in = { .s_addr = pd_epval->eps[d_idx].xip };
-        /* US-514: Use NIXL side-channel port if configured, else fall back to HTTP port */
+        /* Use NIXL side-channel port if configured, else fall back to HTTP port */
         uint16_t p_port = pd_epval->eps[p_idx].nixl_port ?
                           ntohs(pd_epval->eps[p_idx].nixl_port) :
                           ntohs(pd_epval->eps[p_idx].xport);
@@ -6893,7 +6893,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                               "cl_rewrite_prefill");
       }
     } else {
-      /* US-501: Auto-generate vLLM request ID if absent (AI Gateway mode only).
+      /* Auto-generate vLLM request ID if absent (AI Gateway mode only).
        * Must happen after setup_proxy_path (which sets epv) and after
        * inject_forwarded_headers, but before proxy_multiplexor forwards data. */
       if (pfe->epv) {
@@ -6904,7 +6904,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       }
     }
 
-    /* US-501: Inject X-Request-Id header if auto-generated.
+    /* Inject X-Request-Id header if auto-generated.
      * Skip injection when client provided the header (has_vllm_request_id=1). */
     if (pfe->vllm_request_id[0] != '\0' &&
         !pfe->has_vllm_request_id && !pfe->request_id_injected) {
@@ -6918,7 +6918,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       }
     }
 
-    /* US-505: Save complete headers (with X-Request-Id) for decode phase */
+    /* Save complete headers (with X-Request-Id) for decode phase */
     if (pfe->pd_phase == PD_PHASE_PREFILL_SENDING && !pfe->pd_saved_headers) {
       uint8_t *hdr_end = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
       if (hdr_end) {
@@ -6957,7 +6957,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                pfe->pd_phase == PD_PHASE_PREFILL_SENDING ? "PD_PREFILL" : "PLAIN");
     }
 
-    /* US-505: P/D-aware forwarding — force prefill EP, or normal multiplexor */
+    /* P/D-aware forwarding — force prefill EP, or normal multiplexor */
     if (pfe->pd_phase == PD_PHASE_PREFILL_SENDING) {
       /* R2 [FRAME_MISMATCH] instrument (log-only): prefill forward site —
        * declared (parser-owned) CL vs actual relayed body bytes. */
@@ -6966,7 +6966,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       /* Send to EP 0 which is the prefill EP (set in proxy_setup_ep__) */
       proxy_try_epxmit(pfe, pfe->rcvbuf, pfe->rcv_off, 0);
       pfe->pd_phase = PD_PHASE_PREFILL_WAITING;
-      log_info("US-505: Prefill request sent — fd=%d phase→PREFILL_WAITING", pfe->fd);
+      log_info("Prefill request sent — fd=%d phase→PREFILL_WAITING", pfe->fd);
     } else {
       /* R2 [FRAME_MISMATCH] instrument (log-only): generic multiplexor forward
        * site — declared (parser-owned) CL vs actual relayed body. */
@@ -7006,9 +7006,9 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     // Each request must extract its own session header independently
     pfe->custom_session_header_value[0] = '\0';
     pfe->has_custom_session_header = 0;
-    pfe->x_model_header[0] = '\0';  // US-202: Reset X-Model header for next request
+    pfe->x_model_header[0] = '\0';  // Reset X-Model header for next request
 
-    // US-501: Reset vLLM request ID for next request on keep-alive connection
+    // Reset vLLM request ID for next request on keep-alive connection
     pfe->vllm_request_id[0] = '\0';
     pfe->has_vllm_request_id = 0;
     pfe->request_id_injected = 0;
@@ -7037,10 +7037,10 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->sse_tail_len = 0;
     pfe->pd_last_decode_ts = 0;
 
-    // US-505: Reset P/D state ONLY when not in active P/D flow.
+    // Reset P/D state ONLY when not in active P/D flow.
     // During P/D, the prefill phase sets pd_phase=PREFILL_WAITING
     // and we must preserve it until the decode phase completes.
-    // Phase 99 load-signal fix: ALSO preserve an in-flight single-role KV load
+    // load-signal fix: ALSO preserve an in-flight single-role KV load
     // unit (kv_sr_load_held). This keep-alive reset runs right AFTER forwarding
     // the request, BEFORE the backend generates. pd_cleanup() here releases the
     // single-role active_conns unit — so previously the unit lived only for the
@@ -7071,7 +7071,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
   return SP_FWD_NOBACKEND;  /* setup ok but backend not connected */
 }
 
-/* Phase 93-05 (R1): RESUME a parked client fd — runs ON THE PARKED FD'S OWNER WORKER
+/* (R1): RESUME a parked client fd — runs ON THE PARKED FD'S OWNER WORKER
  * (registered as notify_cbs.resume; the slot-freeing thread only enqueued the fd +
  * woke this worker). All pfe mutation/dispatch therefore stays on the owner thread =
  * the Phase-89/90 cross-thread UAF invariant.
@@ -7299,11 +7299,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       if (pfe->h2_session && pfe->h2_session->h2_enabled) {
         pfe->rcv_off += rc;
 
-        /* FR-07/D-11 (H2 parity with the H1 path below): header-accumulation deadline.
+        /* (H2 parity with the H1 path below): header-accumulation deadline.
          * On the L7_Proxy peer only (has_l7_policy==1), anchor at the first client byte and drop
          * the connection if the HEADERS frame has not completed within timeout_tcp_inspect_ms
          * (or the bounded default). The anchor is cleared in proxy_h2_on_frame_recv_callback once
-         * END_HEADERS arrives. No-op for the AI peer / un-configured listeners (D-01a/D-14). */
+ * END_HEADERS arrives. No-op for the AI peer / un-configured listeners. */
         {
           proxy_map_ent_t *h2ent = (proxy_map_ent_t *)pfe->head;
           if (h2ent && h2ent->has_l7_policy) {
@@ -7316,7 +7316,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               uint32_t inspect_s = (inspect_ms + 999) / 1000;
               if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
                 log_info("[TCP_INSPECT] fd=%d (h2): header-accumulation deadline %ums exceeded "
-                         "(slowloris guard, D-11) — dropping connection", fd, inspect_ms);
+                         "(slowloris guard) — dropping connection", fd, inspect_ms);
                 return -1;
               }
             }
@@ -7364,12 +7364,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         // Accumulate data in buffer
         pfe->rcv_off += rc;
 
-        /* FR-07 (Phase 76, D-11): header-accumulation deadline (slowloris guard). On the L7_Proxy
+        /* header-accumulation deadline (slowloris guard). On the L7_Proxy
          * peer ONLY (has_l7_policy==1), bound the total time spent accumulating the request headers
          * before they complete. Anchor the deadline at the first byte of the in-progress request,
          * then drop the connection if the configured timeout_tcp_inspect_ms (or the bounded default
          * when 0) elapses before http_hok flips. For the AI peer / un-configured listeners
-         * (has_l7_policy==0) this is a pure no-op (D-01a/D-14 — byte-for-byte unchanged). The H1
+ * (has_l7_policy==0) this is a pure no-op (byte-for-byte unchanged). The H1
          * \r\n\r\n terminator is reflected by pfe->http_hok after llhttp_execute below; we evaluate
          * the deadline here, before re-parsing, using the anchor set on the previous (partial) read. */
         {
@@ -7384,7 +7384,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               uint32_t inspect_s = (inspect_ms + 999) / 1000;  /* round up to whole seconds */
               if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
                 log_info("[TCP_INSPECT] fd=%d: header-accumulation deadline %ums exceeded "
-                         "(slowloris guard, D-11) — dropping connection", fd, inspect_ms);
+                         "(slowloris guard) — dropping connection", fd, inspect_ms);
                 return -1;  /* restart/teardown — partial headers dropped at the deadline */
               }
             }
@@ -7451,18 +7451,18 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         pfe->parsed_off = pfe->rcv_off;
         
         if (err == HPE_OK) {
-          /* FR-07/D-11: headers complete — clear the accumulation anchor so the tcp_inspect
+          /* headers complete — clear the accumulation anchor so the tcp_inspect
            * deadline never bounds the body-upload phase (it guards header accumulation only). */
           if (pfe->http_hok) {
             pfe->l7_hdr_accum_start = 0;
-            /* FR-07 (D-10): arm the member-data idle baseline. The request is now fully received and
+            /* arm the member-data idle baseline. The request is now fully received and
              * about to be relayed to the member, so the timeoutMemberData deadline must start counting
              * "time waiting for the member to send data". The idle pass (sockproxy_health.c) only
              * evaluates when last_activity>0, but last_activity was historically set ONLY for sticky
              * sessions — so a plain L7 FORWARD never armed the deadline and a slow/blackhole member ran
-             * the full backend delay. Stamp it here, gated on the SAME FR-07 condition the idle pass
+ * the full backend delay. Stamp it here, gated on the SAME condition the idle pass
              * uses (has_l7_policy + timeout_member_data_ms>0), so it is a pure no-op for the AI peer /
-             * un-configured listeners (D-01a/D-14). A response that arrives inside the window completes
+ * un-configured listeners. A response that arrives inside the window completes
              * normally before the idle pass ticks; a member that stalls is cut at the configured ms. */
             {
               proxy_map_ent_t *l7ent = (proxy_map_ent_t *)pfe->head;
@@ -7594,7 +7594,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 }
 #endif
                 
-                // Phase 88-03 (B1): chat-routing signal + raw-body locator for
+                // (B1): chat-routing signal + raw-body locator for
                 // the KV-exact tokenize stage. body_start points INTO pfe->rcvbuf
                 // (== rcvbuf + header_end + 4), so we pin the body as an
                 // (offset,len) pair within rcvbuf; pd_kv_exact_select rebuilds the
@@ -7602,7 +7602,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 // backend setup / pd_kv_exact_select path runs.
                 // is_chat: exact match on the parsed request path. Default 0
                 // (completions/other) is fail-safe to the existing single-text
-                // tokenize path (threat T-88-07). Reuse the parsed pfe->request_path
+                // tokenize path (threat). Reuse the parsed pfe->request_path
                 // (set by the on_url parser callback) rather than re-scanning rcvbuf.
                 pfe->is_chat = 0;
                 if (pfe->request_path[0] != '\0' &&
@@ -7690,7 +7690,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             }
 #endif
 
-            // Setup backend connection + forward. Phase 93-05: the dispatch+forward
+            // Setup backend connection + forward.: the dispatch+forward
             // sequence is factored into pd_setup_and_forward() so the bounded-admission
             // RESUME path (pd_resume_parked) re-drives the EXACT same code as a fresh
             // dispatch. PARKED => held/suspended (keep fd, no forward, no close — 93-05
@@ -7738,7 +7738,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->custom_session_header_value[0] = '\0';
           pfe->has_custom_session_header = 0;
 
-          // US-501: Reset vLLM request ID on parse error
+          // Reset vLLM request ID on parse error
           pfe->vllm_request_id[0] = '\0';
           pfe->has_vllm_request_id = 0;
           pfe->request_id_injected = 0;
@@ -7751,7 +7751,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->sse_tail_len = 0;
           pfe->pd_last_decode_ts = 0;
 
-          // US-505: Reset P/D state on parse error
+          // Reset P/D state on parse error
           pd_cleanup(pfe);
           pfe->pd_phase = PD_PHASE_NONE;
 
@@ -7761,7 +7761,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
         {
           int sp_rc = setup_proxy_path(key, rkey, pfe, phurl);
-          /* Phase 93-04: parked = held/suspended. Keep the fd, do NOT forward, do
+          /* parked = held/suspended. Keep the fd, do NOT forward, do
            * NOT close. 93-05 dequeues+resumes when a prefill slot frees. */
           if (sp_rc == PD_SETUP_PARKED) return 0;
           if (sp_rc) {
@@ -7988,10 +7988,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         rc = new_len;  // Update length (may be unchanged for chunked)
       }
 
-      /* FR-08 (Phase 76, D-07/D-08/D-09): NEW L7-gated request-header injection on
+      /* NEW L7-gated request-header injection on
        * the keep-alive/burst egress too (H1 parity with the first-data path above).
-       * Gated on has_l7_policy (D-01a) — no-op for the AI peer / un-configured
-       * listeners. Legacy inject_forwarded_headers (above) stays untouched (D-01b). */
+ * Gated on has_l7_policy — no-op for the AI peer / un-configured
+ * listeners. Legacy inject_forwarded_headers (above) stays untouched. */
       {
         proxy_map_ent_t *l7node = (proxy_map_ent_t *)pfe->head;
         if (l7node && l7node->has_l7_policy) {

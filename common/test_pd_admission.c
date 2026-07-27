@@ -64,7 +64,7 @@
 #define DEFAULT_SWAP_WEIGHT      1
 #endif
 
-/* Phase 93-04: admission verdict + parked-FIFO mock (mirrors sockproxy.h). */
+/* admission verdict + parked-FIFO mock (mirrors sockproxy.h). */
 #ifndef PD_PREFILL_NO_CAPACITY
 #define PD_PREFILL_NO_CAPACITY (-2)
 #endif
@@ -166,13 +166,13 @@ typedef struct proxy_epval {
   uint32_t pd_session_ttl_sec;
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP];
 
-  /* Phase 96 (D-07): controller advisory mirror (sockproxy.h) — the #included
+  /* controller advisory mirror (sockproxy.h) — the #included
    * sockproxy_pd.c reads these in pd_select_prefill. memset-0 init == mode 0 ==
    * byte-identical selection (G3), so every existing case is untouched. */
   _Atomic uint32_t pd_ctrl_ep[MAX_PROXY_EP];
   _Atomic uint8_t  pd_ctrl_mode;
 
-  /* Phase 93-04: bounded backpressured admission — per-EP parked FIFO */
+  /* bounded backpressured admission — per-EP parked FIFO */
   pd_parked_fifo_t  pd_parked[MAX_PROXY_EP];
   pthread_mutex_t   pd_parked_lock;
 
@@ -187,7 +187,7 @@ typedef struct proxy_epval {
 
 typedef struct proxy_fd_ent {
   int      fd;
-  _Atomic uint64_t gen;                   /* Phase 93-04: pfe pool generation (parked staleness guard) */
+  _Atomic uint64_t gen;                   /* pfe pool generation (parked staleness guard) */
   char conversation_id[MAX_CONV_ID_LEN];
   int has_conv_id;
   char user_id[128];
@@ -195,8 +195,8 @@ typedef struct proxy_fd_ent {
   llm_prefix_key_t prefix_key;
   char     x_model_header[MAX_MODEL_LEN];
   int      pd_decode_ep_idx;
-  int      park_ep_idx;                   /* Phase 93-04: parked-behind prefill EP (-1 = not parked) */
-  uint64_t park_start_ts;                 /* Phase 93-04: CLOCK_MONOTONIC ns at park enqueue */
+  int      park_ep_idx;                   /* parked-behind prefill EP (-1 = not parked) */
+  uint64_t park_start_ts;                 /* CLOCK_MONOTONIC ns at park enqueue */
 } proxy_fd_ent_t;
 
 /* ===== Log stubs ===== */
@@ -205,7 +205,7 @@ typedef struct proxy_fd_ent {
 #define log_debug(fmt, ...) ((void)0)
 #define log_info(fmt, ...)  ((void)0)
 
-/* ===== Phase 70 sync-event stubs (sockproxy_pd.c references these) ===== */
+/* ===== sync-event stubs (sockproxy_pd.c references these) ===== */
 typedef enum {
     SYNC_SESSION_CREATE = 0,
     SYNC_SESSION_UPDATE = 1,

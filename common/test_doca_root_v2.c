@@ -1,5 +1,5 @@
 /*
- * Unit test for Phase 47 root-pipe cfg V2 validator + miss-dispatch.
+ * Unit test for root-pipe cfg V2 validator + miss-dispatch.
  *
  * Tests the LOGIC, not live DOCA. The real validator + miss-dispatch lives
  * in loxilb-ebpf/doca/loxilb_doca_flow.c (llb_doca_rebuild_root_pipe); this

@@ -106,7 +106,7 @@ typedef struct proxy_struct {
   pthread_t conversation_cleanup_thr;   /* Conversation mapping cleanup thread */
   pthread_t watchdog_thr;               /* D2-wedge fix: proxy liveness watchdog (lock-wedge self-heal) */
 #ifdef HAVE_HTTP_TRACE
-  pthread_t trace_cleanup_thr;          /* Phase 1: Trace file cleanup thread */
+  pthread_t trace_cleanup_thr;          /* Trace file cleanup thread */
 #endif
   int run;                              /* Control flag for cleanup threads */
   proxy_map_ent_t *head;
@@ -119,7 +119,7 @@ typedef struct proxy_struct {
   ssl_cert_entry_t *global_cert_map;    /* Global hash map: hostname -> SSL_CTX */
   pthread_rwlock_t  global_cert_lock;   /* Lock priority 8 (guards BOTH maps below) */
 
-  /* Phase 77 FR-05 (D-77-10): certId registry LAYERED OVER global_cert_map.
+  /* certId registry LAYERED OVER global_cert_map.
    * Keyed by the opaque certId management handle; each entry tracks the managed
    * dir and the SAN/CN-derived hostnames it registered into global_cert_map.
    * Guarded by the SAME global_cert_lock (the registry and the SNI store form one
@@ -145,7 +145,7 @@ extern proxy_struct_t *proxy_struct;
 void proxy_log(const char *str, smap_key_t *key);
 void proxy_log_always(const char *str, smap_key_t *key);
 void proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset);
-/* Phase 90: single-owner pfe free (refcount used--; frees when used<=0). Also
+/* single-owner pfe free (refcount used--; frees when used<=0). Also
  * declared in sockproxy_conn.h; mirrored here for the reaper teardown path. */
 void proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe);
 /* D2 root fix (pfe pool + generation, B-split). pfe_alloc(): return a zeroed pfe
@@ -156,12 +156,12 @@ void proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe);
  * free() it to the heap, so a stale notify dispatch reading pfe->gen is safe. */
 proxy_fd_ent_t *pfe_alloc(void);
 void pfe_recycle(proxy_fd_ent_t *pfe);
-/* Phase 93-06 (AC-4): read-only snapshot of the pfe-pool high-water gauges for the
+/* (AC-4): read-only snapshot of the pfe-pool high-water gauges for the
  * bounded-footprint soak (live = shells checked out now; total = shells ever made).
  * Lock-guarded, never mutates. NULL out-params are skipped. */
 void pfe_pool_snapshot(unsigned long *live, unsigned long *total);
 void pd_cleanup(proxy_fd_ent_t *fd_ent);
-/* Phase 93-05 (R1): owner-worker resume of a parked client fd. Registered as
+/* (R1): owner-worker resume of a parked client fd. Registered as
  * notify_cbs.resume and invoked ON THE PARKED FD'S OWNER WORKER (via notify_wake_worker)
  * when a prefill slot frees. Re-arms EPOLLIN, reconstructs the dispatch from the pfe
  * alone (key via proxy_skmap_key_from_fd; phurl via pfe->host_url), and re-drives
@@ -170,7 +170,7 @@ void pd_resume_parked(int fd);
 void proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe);
 
 /* =========================================================================
- * Phase 70 — sockproxy HA state-sync event bridge (CGO C → Go).
+ * sockproxy HA state-sync event bridge (CGO C → Go).
  *
  * Emit site count: 11 across 5 C functions (5 in sockproxy_pd.c + 6 in
  * sockproxy_ep.c). Reconciled from SPEC A4 "at least 5" per 70-PATTERNS.md L-12.

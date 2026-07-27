@@ -54,7 +54,7 @@
 #include "sockproxy_kv_exact.h"
 #endif
 
-/* Phase 96 (D-07): PD_CTRL_* packed-word constants + accessors. Normally from
+/* PD_CTRL_* packed-word constants + accessors. Normally from
  * sockproxy.h; absent under the TEST_KV_EXACT unit build — define idempotently
  * (the sockproxy_pd.c PD_PREFILL_NO_CAPACITY precedent). Lockstep with the
  * frozen aictrl.v1 EpState enum (96-02). */
@@ -67,7 +67,7 @@
 #define PD_CTRL_WEIGHT(p) ((p) & 0xff)
 #endif
 
-/* Phase 99 (D-09): single-role kv_exact_mode value. Canonical definition lives
+/* single-role kv_exact_mode value. Canonical definition lives
  * in sockproxy.h (beside proxy_epval_t); this idempotent twin exists for the
  * TEST_KV_EXACT single-TU unit build, which does not include sockproxy.h
  * (the PD_CTRL_ST_NONE precedent above). Value 2 stays reserved for NATS. */
@@ -189,7 +189,7 @@ kv_cbor_encode_block_input(const uint8_t *parent_hash, int parent_hash_len,
  * then fed into SHA256 (sha256_cbor) or xxhash.xxh3_128_digest
  * (xxhash_cbor); the first 8 bytes (big-endian) become the uint64 key that
  * loxilb's Go inventory stores (ai_kv_subscriber.go:cBlockHashesToUint64).
- * Phase 44 adds an env-gated [KV_HASH] logger immediately after the hash
+ * adds an env-gated [KV_HASH] logger immediately after the hash
  * step to expose CBOR bytes + uint64 truncation for cross-layer parity
  * audits. Zero-cost when LLB_KV_HASH_DEBUG is unset.
  * --------------------------------------------------------------------------- */
@@ -309,7 +309,7 @@ kv_hash_debug_emit(int blk_idx, const char *algo, int n_tokens,
  * Longer seeds would need a 1-byte length extension (0x78); not supported
  * here — operators pick short seeds like "0". If the env is unset or the
  * seed is too long, fall back to zeros (backwards-compatible with pre-
- * Phase 44 testbeds; mismatches a vLLM that has PYTHONHASHSEED set).
+ * testbeds; mismatches a vLLM that has PYTHONHASHSEED set).
  *
  * 44-04 drift #2 root cause: TK27 second-run proved the truncation fix
  * (fa541a7 + f2ec335) was necessary but not sufficient — admin API
@@ -453,7 +453,7 @@ kv_compute_single_block_hash(uint8_t hash_algo,
   return digest_len;
 }
 
-/* kv_hash_sglang_block — one SGLang radix-page digest (SGL-02, D-15).
+/* kv_hash_sglang_block — one SGLang radix-page digest (SGL-02).
  *
  * Source of record: sglang python/sglang/srt/mem_cache/cpp_utils/
  * hash_binding.cpp (hash_page) @ d8ef76682e — do NOT re-derive from a moved
@@ -523,9 +523,9 @@ kv_compute_block_hashes(uint8_t hash_algo, const uint32_t *tokens,
     return -1;
   }
 
-  /* ---- SGLang arm (Phase 99, SGL-02): dedicated loop ----
+  /* --- SGLang arm (SGL-02): dedicated loop ----
    * Kept fully separate from the vLLM CBOR loop below so the algo-0/1 code
-   * paths stay byte-identical (T-99-03-02). Contract differences (pinned by
+ * paths stay byte-identical. Contract differences (pinned by
    * the committed parity vectors, sglang d8ef76682e):
    *   1. NO kv_compute_none_hash seed — block 0 hashes with NO parent bytes.
    *   2. NO CBOR — kv_hash_sglang_block hashes raw parent||tokens_LE4.
@@ -574,7 +574,7 @@ kv_compute_block_hashes(uint8_t hash_algo, const uint32_t *tokens,
 
   /* First block: parent = NONE_HASH (seeded via LLB_KV_NONE_HASH_SEED to
    * mirror vLLM v0.17.0 init_none_hash under PYTHONHASHSEED). Fallback to
-   * zeros if env unset — backwards-compatible with pre-Phase 44 testbeds
+ * zeros if env unset — backwards-compatible with pre- testbeds
    * but mismatches a vLLM that has PYTHONHASHSEED set. See 44-04. */
   kv_compute_none_hash(hash_algo, parent_hash, parent_len);
 
@@ -646,12 +646,12 @@ kv_compute_block_hashes(uint8_t hash_algo, const uint32_t *tokens,
 
 #if !defined(TEST_KV_EXACT) || defined(TEST_KV_EXACT_WITH_GUARDS)
 
-/* KV91_NO_SKIP_LB — Phase 91 invariant: KV-exact relies on the Go
+/* KV91_NO_SKIP_LB — invariant: KV-exact relies on the Go
  * capacity-bounded blend (kvUnifiedSelect, fed loxilb's own pd_ep_loads load+cap
  * via the kv_load[]/kv_cap[] arrays below) for its load cap. skip_load_balance
  * MUST remain 0 on this path (sockproxy_lb.c:524) — that flag is for the strict
  * pure-locality prefix_hash mode and DISABLES the bounded-load cap, which would
- * re-introduce the single-EP prefill hot-spot Phase 91 fixes (81-09 a417f037).
+ * re-introduce the single-EP prefill hot-spot fixes (81-09 a417f037).
  * This path never enters the C chwbl ring and never enables skip_load_balance
  * (asserted in test/audit): selection is the Go export, the cap is the blend. */
 int
@@ -743,7 +743,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
     for (int _s = 0; _s < KV_N_STAGES; _s++) {                              \
       if (measured[_s]) record_kv_stage(_s, (outcome), stage_us[_s]);       \
     }                                                                       \
-    /* Optional content-free per-request structured record (T-81-01-01):    \
+    /* Optional content-free per-request structured record: \
      * flag-gated so the production path is byte-identical when off.        \
      * Logs ONLY stage timings + outcome — never prompt text/hashes. */     \
     if (kv_hash_debug_on()) {                                               \
@@ -757,7 +757,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   } while (0)
 
   /* STAGE 1: tokenize via CGO.
-   * Phase 88-03 (B1): branch on the request-scoped is_chat signal set in
+ * (B1): branch on the request-scoped is_chat signal set in
    * sockproxy_http.c. For /v1/chat/completions the un-templated first-user-message
    * in prefix_key.prefix does NOT tokenize to vLLM's ids (apply_chat_template adds
    * the ChatML/system/role wrappers), so pass the RAW JSON body to the chat bridge
@@ -797,7 +797,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   uint32_t block_size = tepval->kv_block_size;
   if (block_size == 0) block_size = 16;
 
-  /* Phase 99 (SGL-02) confirm, no code change: algo 2 (KV_HASH_SHA256_SGLANG)
+  /* (SGL-02) confirm, no code change: algo 2 (KV_HASH_SHA256_SGLANG)
    * takes the else branch here → stride 32, matching its 32-byte digest. */
   int hash_stride = (tepval->kv_hash_algo == KV_HASH_XXHASH_CBOR) ? 16 : 32;
   uint8_t hashes[KV_MAX_BLOCKS * KV_MAX_HASH_BYTES];
@@ -820,7 +820,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   }
 
   /* Build candidate EP bitmask — bit i set iff ep_role[i] == 1 (P/D prefill).
-   * Phase 99 (D-09/D-10): at kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE the
+ * at kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE the
    * disjunct admits ALL EPs (single-role services have no roles — ep_role[]
    * is all-zero, Assumption A2); at mode 1 the disjunct is provably never
    * true, so the P/D mask build is byte-identical (mutation-locked by
@@ -828,7 +828,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
    * MAX_PROXY_EP == 32 so uint32_t gives EXACT 1:1 coverage (bits 0..31).
    * The static_assert below fires if MAX_PROXY_EP is ever increased —
    * BOTH prefill_mask and excluded_mask would need to widen to uint64_t.
-   * Single call-site per Pitfall 2 to prevent Phase 42-style branch drift. */
+ * Single call-site per Pitfall 2 to prevent -style branch drift. */
   _Static_assert(MAX_PROXY_EP <= 32,
                  "prefill_mask/excluded_mask uint32_t requires MAX_PROXY_EP <= 32; "
                  "widen both masks (and CGO signature) to uint64_t if MAX_PROXY_EP grows");
@@ -839,7 +839,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
       prefill_mask |= (1u << (unsigned)i);
   }
 
-  /* Phase 91 (Option B): feed the Go selector loxilb's OWN balancer-tracked
+  /* (Option B): feed the Go selector loxilb's OWN balancer-tracked
    * per-EP live load + advertised capacity, indexed by the ABSOLUTE epIdx (the
    * same index space as prefill_mask/excluded_mask). This replaces the dead
    * vLLM workerMetrics scraper path (rules.go:3423 builds it with updateFn=nil
@@ -860,7 +860,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
     kv_cap[i] = atomic_load(&tepval->pd_ep_loads[i].num_gpu_blocks);
   }
 
-  /* Phase 96 (D-07): per-EP controller weights for the Go Tier-1.5 selector.
+  /* per-EP controller weights for the Go Tier-1.5 selector.
    * Twin-lockstep discipline: the Go //export signature, the C prototype
    * (sockproxy_ai_gw.h) and this call site change in the SAME commit. mode 0
    * (controller absent) => pass NULL — the Go side treats nil as all-100, the
@@ -885,14 +885,14 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   /* STAGE 3: CGO crossing into the Go inventory scorer. The best_worker scan
    * (STAGE 4) runs INSIDE this call; it is timed Go-side in plan 81-02, so it
    * is folded into the CGO delta here (the enum reserves the 4th slot).
-   * Phase 99 (SGL-04, Pitfall 2): tepval->kv_svc_id threads the calling rule's
+ * (SGL-04, Pitfall 2): tepval->kv_svc_id threads the calling rule's
    * identity across the CGO seam so the Go selector scores ONLY this rule's
    * inventories (cross-VIP contamination fix). Zero (legacy/uninitialized
    * structs) means "no identity" — the Go side keeps today's all-services
    * loop, so the seam is independently default-off (kv_weight precedent). */
   int score = 0;
   uint64_t _t2 = kv_now_us();
-  /* Phase 99 (§9 relief default): kv_exact_mode rides the same seam so the Go
+  /* (§9 relief default): kv_exact_mode rides the same seam so the Go
    * side can default the Phase-95 pressure-relief pass ON for single-role
    * rules only (twin-lockstep with sockproxy_ai_gw.h + ai_kv_subscriber.go). */
   int best_ep = llb_ai_kv_best_worker(

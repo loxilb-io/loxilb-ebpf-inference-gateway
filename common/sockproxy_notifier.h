@@ -7,7 +7,7 @@
 #define __SOCKPROXY_NOTIFIER_H__
 
 /*
- * sockproxy_notifier.h — Phase 5 extraction
+ * sockproxy_notifier.h — extraction
  *
  * proxy_notify_add_fd, proxy_notify_delete_fd, and proxy_main are declared
  * in sockproxy.h (the public API).  This header exists as the canonical

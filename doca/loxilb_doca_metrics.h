@@ -15,7 +15,7 @@
  */
 
 /*
- * loxilb_doca_metrics.h -- Phase 65 SDK-counter-query bridge declarations.
+ * loxilb_doca_metrics.h -- SDK-counter-query bridge declarations.
  *
  * This header is included by the CGO preamble (via the umbrella bridge
  * header) and by the C implementation in loxilb_doca_metrics.c.
@@ -29,16 +29,16 @@
  *     exclusively inside loxilb_doca_metrics.c after that file pulls in
  *     the SDK headers.
  *
- * Phase 65 in-scope SDK APIs wrapped here (full SDK identifiers are
+ * in-scope SDK APIs wrapped here (full SDK identifiers are
  * documented inline in loxilb_doca_metrics.c; this header deliberately
  * paraphrases them to keep the opaque-pointer grep gate green):
  *
  *   - Per-entry counter query (G3 ratified, D-P65-01 entry 1)
  *   - Batched shared-resource counter query (G1 ratified, D-P65-01
- *     entry 3, FUTURE-PROOF per D-14 narrowing)
+ * entry 3, FUTURE-PROOF per narrowing)
  *   - Mandatory entries-process flush per RESEARCH Pitfall 9
  *
- * EXPLICITLY DESCOPED per D-15 (silicon-rejected on BASIC pipes):
+ * EXPLICITLY DESCOPED per (silicon-rejected on BASIC pipes):
  *
  *   - Pipe-miss counter create-time precondition. Stage-2 G5/G5b prove
  *     BASIC + miss-counter is silicon-rejected (rc=-22 opcode 0x1800000).
@@ -49,12 +49,12 @@
  *
  * Downstream consumers (Plans 65-03 and 65-04 will consume these symbols
  * via the Go CGO scaffold in pkg/loxinet/dpu_doca_bf2_metrics.go):
- *   - Plan 65-03: chunked walker (D-16) plus ReconcileCtStats lazy-on-read
- *     contract scaffold (D-11) plus registers a per-tick collector via
+ * Plan 65-03: chunked walker plus ReconcileCtStats lazy-on-read
+ * contract scaffold plus registers a per-tick collector via
  *     RegisterDocaCollector. The walker calls llb_doca_entry_query_v2 in
- *     a chunked loop bounded by D-02's polling-budget shape.
- *   - Plan 65-04: REST debug endpoint per-entry query (D-07) plus wires
- *     InvokeRegisteredDocaCollectors() into the existing Phase 49
+ * a chunked loop bounded by 's polling-budget shape.
+ * Plan 65-04: REST debug endpoint per-entry query plus wires
+ * InvokeRegisteredDocaCollectors into the existing 
  *     per-tick path at pkg/loxinet/dpu_metrics.go.
  *   - Plan 65-05: operator runbook for BF2 HW build + validation.
  */
@@ -86,7 +86,7 @@ typedef struct {
 } llb_doca_counter_result_t;
 
 /*
- * llb_doca_entry_query_v2 -- per-entry counter query (Phase 65 struct API).
+ * llb_doca_entry_query_v2 -- per-entry counter query ( struct API).
  *
  * Naming note (planner-discretion deviation from PLAN interfaces section):
  * the umbrella header at offset 395 already declares a legacy
@@ -94,7 +94,7 @@ typedef struct {
  * out-pointer signature consumed by the existing `DocaEntryQuery` Go
  * wrapper at pkg/loxinet/dpu_doca_cgo.go (the legacy site uses
  * uint64_t out-pointers, NOT a struct). Two C declarations with the same
- * identifier and different signatures fail at compile. Phase 65 takes
+ * identifier and different signatures fail at compile. takes
  * the suffix `_v2` (mirrors the LLB_DOCA_ROOT_PIPE_CFG_V2 precedent in
  * the umbrella) so this struct-returning variant coexists with the
  * legacy two-out-pointer API. The verify-gate grep
@@ -103,16 +103,16 @@ typedef struct {
  * Plan 65-02 side is `EntryQuery`; no collision in the Go namespace.
  *
  * Wraps: the SDK per-entry resource query (G3 ratified at p99=540-660ns
- * per 65-STAGE2-RESULTS.md; PRIMARY counter API in Phase 65 per RESEARCH
+ * per 65-STAGE2-RESULTS.md; PRIMARY counter API in per RESEARCH
  * Standard Stack section).
  *
  * Stage-2 gate: G3 PASS (Round 3 sustained).
  *
  * Consumed by:
- *   - Plan 65-03 chunked walker (D-16) for periodic counter reconciliation
- *     under the D-02 polling-budget cap.
- *   - Plan 65-03/04 ReconcileCtStats lazy-on-read (D-11).
- *   - Plan 65-04 REST debug endpoint (D-07) for operator per-entry queries.
+ * Plan 65-03 chunked walker for periodic counter reconciliation
+ * under the polling-budget cap.
+ * Plan 65-03/04 ReconcileCtStats lazy-on-read.
+ * Plan 65-04 REST debug endpoint for operator per-entry queries.
  *
  * Serves: D-P65-01 entry 1, D-P65-05 (reconciliation contract).
  *
@@ -133,12 +133,12 @@ int llb_doca_entry_query_v2(const void *entry_handle,
  *
  * Stage-2 gate: G1 PASS (Round 3 sustained across N sweeps).
  *
- * FUTURE-PROOF per D-14 narrowing -- no production pipe references
+ * FUTURE-PROOF per narrowing -- no production pipe references
  * SHARED counters today (BF2 switch,hws,isolated mode silicon-rejects
  * BASIC with SHARED counter monitor type; SHARED counters may only be
  * referenced from protocol pipes -- CT/ACL/NAT in loxilb terms). This
  * wrapper is allocated now for forward-compat when a protocol-pipe
- * SHARED counter pool ships in a future plan (not Phase 65).
+ * SHARED counter pool ships in a future plan (not).
  *
  * Consumed by: nothing today. Plan 65-03 may declare a registration
  * site but will not invoke the wrapper since no SHARED-counter pool
@@ -174,7 +174,7 @@ int llb_doca_counter_batch_query(const uint32_t *ids,
  * counter reads (the chunked walker in Plan 65-03 calls this at the
  * top of each chunk).
  *
- * Serves: D-P65-01 (counter-read correctness precondition), D-02
+ * Serves: D-P65-01 (counter-read correctness precondition), 
  * (polling-budget -- the flush itself is the first cost in the budget).
  *
  * @param port_handle Opaque port handle (the SDK native type on the C
@@ -188,14 +188,14 @@ int llb_doca_entries_process_flush(const void *port_handle);
  *
  * Increments an atomic cursor (`_Atomic uint32_t`) capped at
  * LLB_DOCA_MAX_SHARED_COUNTERS. Returns 0 plus allocated ID on success,
- * -1 past the cap. No mutex -- the cursor is the entire allocator (D-08
+ * 1 past the cap. No mutex -- the cursor is the entire allocator (
  * lifecycle keep-simple decision).
  *
  * `scope_key` is accepted for forward-compat (Plan 65-05 runbook
  * documents potential lazy-recycle pool) but ignored in v6.0 first
  * release -- pass any non-NULL string or NULL.
  *
- * Serves: D-08 lifecycle, D-P65-01 entry 3 (counter-pool primitive for
+ * Serves: lifecycle, D-P65-01 entry 3 (counter-pool primitive for
  * the future SHARED counter use cases).
  *
  * @param scope_key Forward-compat scope tag; NULL acceptable.
@@ -212,7 +212,7 @@ int llb_doca_alloc_shared_counter(const char *scope_key, uint32_t *id_out);
  * follow-up). Kept in the API surface so Plan 65-03/04 call sites can
  * pair alloc/free cleanly when lazy-recycle ships.
  *
- * Serves: D-08 lifecycle (forward-compat).
+ * Serves: lifecycle (forward-compat).
  *
  * @param id Previously-allocated shared-counter ID.
  */

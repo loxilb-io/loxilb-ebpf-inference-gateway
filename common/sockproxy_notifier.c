@@ -4,7 +4,7 @@
  * SPDX short identifier: BSD-3-Clause
  */
 /*
- * sockproxy_notifier.c — Phase 5 extraction
+ * sockproxy_notifier.c — extraction
  *
  * Contains the top-level event dispatcher (proxy_notifier) and the
  * initialization entry-point (proxy_main).  Extracted from sockproxy.c.
@@ -21,7 +21,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
-#include <execinfo.h>   /* Phase 93-06 RCA: backtrace()/backtrace_symbols_fd() in FAILLOUD */
+#include <execinfo.h>   /* RCA: backtrace/backtrace_symbols_fd in FAILLOUD */
 #include <sys/syscall.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -85,11 +85,11 @@ int proxy_notify_delete_fd(int fd, int evict)
 }
 
 
-/* FD mapping (HAVE_PROXY_MAPFD block) moved to sockproxy_conn.c (Phase 3) */
-/* Xmit cache, backpressure, logging helpers moved to sockproxy_cache.c (Phase 2) */
+/* FD mapping (HAVE_PROXY_MAPFD block) moved to sockproxy_conn.c */
+/* Xmit cache, backpressure, logging helpers moved to sockproxy_cache.c */
 /* inject_forwarded_headers, proxy_try_epxmit, proxy_add_entry, proxy_pdestroy,
  * cleanup_expired_sessions, handle_new_connection, handle_client_data, and all
- * HTTP parsing / P/D helpers moved to sockproxy_http.c (Phase 4b) */
+ * HTTP parsing / P/D helpers moved to sockproxy_http.c */
 
 #ifdef D2_DEBUG_INJECT
 /* D2 root-fix VALIDATION ONLY — compiled in only with -DD2_DEBUG_INJECT (a
@@ -438,7 +438,7 @@ llb_fatal_handler(int sig, siginfo_t *si, void *uc)
      * unswallowable exit so docker --restart unless-stopped self-heals in ~1s. */
     llb_async_write2("[FATAL][FAILLOUD] loxilb proxy worker fatal signal — "
                      "immediate _exit(134)+core (was the ~30s lock-wedge path)\n");
-    /* Phase 93-06 RCA: dump the faulting worker's C backtrace to stderr (docker
+    /* RCA: dump the faulting worker's C backtrace to stderr (docker
      * logs). backtrace_symbols_fd is async-signal-safe (no malloc, writes the fd
      * directly). The binary ships -g/not-stripped, so addr2line on these frames
      * pins the exact fault site even when no core lands. */
@@ -568,7 +568,7 @@ proxy_main(sockmap_cb_t sockmap_cb, int ktls_enabled)
   notify_cbs_t cbs = { 0 };
   cbs.notify = proxy_notifier;
   cbs.pdestroy = proxy_pdestroy;
-  /* Phase 93-05 (R1): owner-worker resume hook for the bounded admission layer. The
+  /* (R1): owner-worker resume hook for the bounded admission layer. The
    * notify worker calls this on its OWN thread when a parked client fd is woken
    * (notify_wake_worker), so the re-drive of setup_proxy_path never runs off-owner
    * (the Phase-89/90 cross-thread UAF invariant). Declared in sockproxy_internal.h. */
@@ -609,7 +609,7 @@ proxy_main(sockmap_cb_t sockmap_cb, int ktls_enabled)
   // Initialize control flag for cleanup threads
   proxy_struct->run = 1;
   
-  // HTTP/HTTPS Tracing: Initialize ring buffers (Phase 2)
+  // HTTP/HTTPS Tracing: Initialize ring buffers 
 #ifdef HAVE_HTTP_TRACE
   const char *trace_enabled = getenv("LOXILB_HTTP_TRACE_ENABLED");
   if (trace_enabled && strcmp(trace_enabled, "1") == 0) {
@@ -671,7 +671,7 @@ proxy_main(sockmap_cb_t sockmap_cb, int ktls_enabled)
       log_info("[Presidio] PII detection is ENABLED (initialized)");
       presidio_config_dump();
       
-      // Phase 2.2: Initialize custom recognizer registry and load patterns
+      // .2: Initialize custom recognizer registry and load patterns
       if (presidio_registry_init() == 0) {
         log_info("[Presidio] ✓ Custom recognizer registry initialized");
         
@@ -755,7 +755,7 @@ proxy_main(sockmap_cb_t sockmap_cb, int ktls_enabled)
 
   pthread_create(&proxy_struct->pthr, NULL, proxy_run, NULL);
 
-  // P2 Phase 2: Start draining checker thread
+  // P2: Start draining checker thread
   pthread_create(&proxy_struct->drain_checker_thr, NULL, proxy_drain_checker_thread, NULL);
   
   // Start conversation mapping cleanup thread

@@ -1,5 +1,5 @@
-/* test_pd_complete.c - Unit tests for the Phase 89 T3 load-path stall fix
- * (Bug A: streaming-completion stall when sse_active never flips under TCP
+/* test_pd_complete.c - Unit tests for the T3 load-path stall fix
+ * (: streaming-completion stall when sse_active never flips under TCP
  * fragmentation). Exercises the PURE windowed detector pd_scan_msg_end_window()
  * in sockproxy_pd_leak.h.
  *
@@ -9,9 +9,9 @@
  * Idiom mirrors test_pd_leak.c: assert() per case, "ALL PASS" at the end, exit 0
  * on success / nonzero (assert abort) on failure.
  *
- * The regression these guard: FIX-4 (Phase 87) scanned only the CURRENT packet,
+ * The regression these guard: scanned only the CURRENT packet,
  * so a message-end terminator split across two reads was missed. On the
- * sse_active==0 path (fragmented Content-Type under load — Bug A) that is the
+ * sse_active==0 path (fragmented Content-Type under load) that is the
  * ONLY decode completion detector, so the missed terminator stranded the decode
  * leg forever (~50% of high-rate points at conc=64 were watchdog-reaped).
  * pd_scan_msg_end_window() keeps a sliding tail so the straddling terminator is
@@ -75,7 +75,7 @@ test_done_split_across_reads(void)
   assert(scan(&ts, "id: 1\ndata: [DO") == 0 &&
          "partial terminator must NOT complete");
 
-  /* ... and STILL nothing in packet 2 ALONE (this is what FIX-4 missed) ... */
+  /* ... and STILL nothing in packet 2 ALONE (this is what missed)... */
   assert(pd_detect_http_msg_end((const uint8_t *)"NE]\n\n", 5) == 0);
 
   /* ... but the windowed scan, carrying the tail from packet 1, completes. */
@@ -133,12 +133,12 @@ test_bug_a_fragmented_no_content_type(void)
   /* final terminator split across the last two reads */
   assert(scan(&ts, "data: [DON") == 0);
   assert(scan(&ts, "E]\n\n") != 0 &&
-         "Bug A: completion must fire on the sse_active==0 path even with a "
+         "completion must fire on the sse_active==0 path even with a "
          "fragmented Content-Type and a split terminator");
   printf("  [PASS] Bug-A fragmented Content-Type + split [DONE] -> complete\n");
 }
 
-/* ---- Phase 89 (RESOLVED) graceful-[DONE] safety-net predicate ----
+/* --- (RESOLVED) graceful-[DONE] safety-net predicate ----
  * pd_should_graceful_complete() decides whether a decode-streaming SSE connection
  * whose backend leg went silent (vLLM dropped its closing "data: [DONE]") should
  * be force-completed with a synthesized terminator. The load-bearing property is
@@ -204,7 +204,7 @@ test_graceful_guards(void)
 int
 main(void)
 {
-  printf("test_pd_complete: Phase 89 load-path (windowed completion + graceful [DONE])\n");
+  printf("test_pd_complete: load-path (windowed completion + graceful [DONE])\n");
   test_done_whole_packet();
   test_done_split_across_reads();
   test_chunked_terminator_split();

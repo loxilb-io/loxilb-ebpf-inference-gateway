@@ -59,16 +59,16 @@ static struct doca_dev       *g_dev  = NULL;
 static struct doca_flow_port *g_ports[LLB_DOCA_MAX_PORTS];
 #define g_port g_ports[0]   /* backward-compat alias for existing readers */
 static struct doca_flow_port *g_switch_port = NULL;
-/* Phase 33+ unified CT pipe architecture (topology-agnostic):
+/* + unified CT pipe architecture (topology-agnostic):
  *   RSS pipe → to_kernel pipe (FWD_TARGET KERNEL)
  *   root_l3l4_dispatch_pipe (BASIC, is_root, L3+L4 classifier, Step 6e)
- *     -> acl_pipe (BASIC, deny-only firewall, Phase 37, Step 6d4)
- *       -> [meter_pipe_N, ...] (dynamic, Phase 38, per-policer)
- *         -> l4_dispatch_pipe (BASIC, Phase 37, Step 6d2)
+ * > acl_pipe (BASIC, deny-only firewall, Step 6d4)
+ * > [meter_pipe_N,...] (dynamic, per-policer)
+ * > l4_dispatch_pipe (BASIC, Step 6d2)
  *           -> CT_5TUPLE_PIPE (BASIC, TRANSPORT, no dir_info, Step 6c)
  *           -> udp_ct_pipe (BASIC, UDP, no dir_info, Step 6d)
  *     -> to_kernel_pipe (root miss: ICMP, GRE, ARP, IPv6)
- *   fdb_pipe (BASIC, Phase 36, independent L2, Step 6f — last, non-fatal)
+ * fdb_pipe (BASIC, independent L2, Step 6f — last, non-fatal)
  *
  * Root pipe matches parser_meta.outer_l3_type + outer_l4_type (per-entry).
  * Dispatch: TCP+UDP → ACL (or L4_dispatch if ACL absent, or CT fallback).
@@ -91,7 +91,7 @@ static struct doca_flow_pipe *g_root_pipe      = NULL;
  * entry in it.  Used by llb_doca_diag_dump_pipe_misses() to read total
  * to-kernel volume vs each upstream pipe's miss count. */
 static struct doca_flow_pipe_entry *g_to_kernel_entry = NULL;
-/* Phase 63-04 (D-04): miss-chained CT pipe pair.
+/* miss-chained CT pipe pair.
  * g_ct_fwd_pipe (renamed from g_ct_pipe) handles uplink→VIP DNAT+SNAT.
  * g_ct_rev_pipe handles VIP→uplink reverse SNAT+DNAT, reached via fwd's
  * miss action. Both forward to g_egress_dispatch via template fwd; both
@@ -99,39 +99,39 @@ static struct doca_flow_pipe_entry *g_to_kernel_entry = NULL;
  * (ct_fwd). Mirrors the validated sample's lb_fwd → lb_rev → to_kernel
  * pattern (flow_lb_snat_dnat_sample.c:786-799). */
 static struct doca_flow_pipe *g_ct_fwd_pipe    = NULL;
-static struct doca_flow_pipe *g_ct_rev_pipe    = NULL;  /* Phase 52 origin; rebuilt 63-04 as fwd-miss target */
-/* Phase 63-04: g_egress_steer_pipe deleted wholesale (EGRESS-domain pipe was
- * Phase 54 architecture, proven wrong by validated DOCA samples — see
- * CONTEXT.md D-04 + STATE.md SUPERSEDED notice). Replaced by miss-chained
+static struct doca_flow_pipe *g_ct_rev_pipe    = NULL;  /* origin; rebuilt 63-04 as fwd-miss target */
+/* g_egress_steer_pipe deleted wholesale (EGRESS-domain pipe was
+ * architecture, proven wrong by validated DOCA samples — see
+ * CONTEXT.md + STATE.md SUPERSEDED notice). Replaced by miss-chained
  * BASIC DEFAULT pair (g_ct_fwd_pipe → g_ct_rev_pipe → g_to_kernel_pipe) that
  * forwards to g_egress_dispatch via template fwd. */
-/* Phase 63 Plan 02 (per CONTEXT.md D-02/D-03): DEFAULT-domain BASIC pipe that
+/* Plan 02 (per CONTEXT.md): DEFAULT-domain BASIC pipe that
  * matches meta.pkt_meta and forwards to a discovered port via per-entry FWD_PORT.
  * Sample analog: flow_e2e_l3_routing_sample.c:169-242 (create_egress_dispatch_pipe).
  * Declared unconditionally; the former LLB_DOCA_SPIKE_003_META_DISPATCH gate is gone. */
 static struct doca_flow_pipe *g_egress_dispatch = NULL;
-static struct doca_flow_pipe *g_udp_ct_pipe    = NULL;  /* Phase 34: dedicated UDP CT pipe */
-static struct doca_flow_pipe *g_fdb_pipe       = NULL;  /* Phase 36: L2 FDB MAC forwarding pipe */
-/* Phase 64 D-01 / D-13: rebuilt-from-validated-sample DENY+ALLOW pipe pair.
+static struct doca_flow_pipe *g_udp_ct_pipe    = NULL;  /* dedicated UDP CT pipe */
+static struct doca_flow_pipe *g_fdb_pipe       = NULL;  /* L2 FDB MAC forwarding pipe */
+/* rebuilt-from-validated-sample DENY+ALLOW pipe pair.
  * Lazy lifecycle — both NULL until the first FwRule with HwOffload=true arrives,
  * destroyed when the last HwOffload=true rule is removed. DENY drops per-entry,
  * ALLOW forwards to g_ct_fwd_pipe as a counter-only audit layer (CT owns MAC rewrite). */
-static struct doca_flow_pipe *g_deny_pipe       = NULL;  /* Phase 64: ACL deny pipe (lazy) */
-static struct doca_flow_pipe *g_allow_pipe      = NULL;  /* Phase 64: ACL allow pipe (lazy) */
-static struct doca_flow_pipe *g_meter_pipe      = NULL;  /* Phase 38: meter classification pipe (no NAT) */
-static struct doca_flow_pipe *g_l4_dispatch_pipe = NULL; /* Phase 37 vestigial: always NULL post-Phase-64; accessor kept for Go binary compat until Plan 64-03 retires the Go bridge */
+static struct doca_flow_pipe *g_deny_pipe       = NULL;  /* ACL deny pipe (lazy) */
+static struct doca_flow_pipe *g_allow_pipe      = NULL;  /* ACL allow pipe (lazy) */
+static struct doca_flow_pipe *g_meter_pipe      = NULL;  /* meter classification pipe (no NAT) */
+static struct doca_flow_pipe *g_l4_dispatch_pipe = NULL; /* vestigial: always NULL post-Phase-64; accessor kept for Go binary compat until Plan 64-03 retires the Go bridge */
 static struct doca_flow_pipe *g_rss_pipe       = NULL;
 static struct doca_flow_pipe *g_to_kernel_pipe = NULL;
 static struct doca_flow_target *g_kernel_target = NULL;
 static int g_root_pipe_has_actions = 0;  /* false: root pipe is port_meta dispatcher only */
-static int g_ct_pipe_has_actions   = 1;  /* true: unified CT pipe has NAT actions (Phase 33) */
+static int g_ct_pipe_has_actions   = 1;  /* true: unified CT pipe has NAT actions */
 static int                    g_num_ports   = 0;
 static uint32_t               g_num_repr    = 2;  /* default VF representor count */
 /* SPIKE-001: include host-PF representor (pf0hpf) in the probe so we can A/B test
  * port_meta dispatch through a non-VF representor. mlx5 typically assigns
  * port_id=1 to pf0hpf when present, shifting VF reps to port_id=2..N+1.
  * Set to 0 (or revert the devargs string) to restore the original VF-only probe. */
-static int                    g_has_pf_rep  = 1;  /* Phase 54-01 T4q1: re-enabled.
+static int                    g_has_pf_rep  = 1;  /* T4q1: re-enabled.
                                                     * T4k temporarily disabled to match
                                                     * sample's single-probe pattern during
                                                     * EOPNOTSUPP bisect; T4m proved actual
@@ -143,14 +143,14 @@ static int                    g_initialized = 0;
 
 /* Configurable pipe capacities (overridden by llb_doca_config in init) */
 static uint32_t g_ct_pipe_capacity       = 8192;
-static uint32_t g_udp_ct_pipe_capacity   = 8192;  /* Phase 34: default same as TCP */
+static uint32_t g_udp_ct_pipe_capacity   = 8192;  /* default same as TCP */
 static uint32_t g_snat_pipe_capacity     = 2048;
 
 /* Entry callback state */
 static volatile int g_entry_status = -1;
-static int g_meter_capable = 0;  /* Phase 38: set to 1 if shared meter pre-alloc succeeded */
+static int g_meter_capable = 0;  /* set to 1 if shared meter pre-alloc succeeded */
 
-/* Phase 35: Aged-entry ring buffer (producer=callback, consumer=poll drain, same thread) */
+/* Aged-entry ring buffer (producer=callback, consumer=poll drain, same thread) */
 static llb_doca_aged_entry_t g_aged_ring[LLB_DOCA_AGED_RING_SIZE];
 static uint32_t g_aged_ring_head = 0; /* written by callback */
 static uint32_t g_aged_ring_tail = 0; /* read by poll drain */
@@ -177,7 +177,7 @@ static void entry_status_cb(struct doca_flow_pipe_entry *entry,
     (void)entry; (void)pipe_queue;
     g_entry_status = (int)status;
 
-    /* Phase 35: detect aged entries via op field (NOT status enum) */
+    /* detect aged entries via op field (NOT status enum) */
     if (op == DOCA_FLOW_ENTRY_OP_AGED && user_ctx) {
         uint32_t h = __atomic_load_n(&g_aged_ring_head, __ATOMIC_RELAXED);
         uint32_t next = (h + 1) % LLB_DOCA_AGED_RING_SIZE;
@@ -385,7 +385,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         }
     }
 
-    /* Phase 54-01 T4l: Configure and start ALL DPDK ports (uplink + representors).
+    /* T4l: Configure and start ALL DPDK ports (uplink + representors).
      * Previously we only configured/started port 0. EGRESS-domain BASIC pipes on
      * BF2 require every port to have valid TX queue context — they operate at
      * the eswitch crossbar level and need every representor port DPDK-started
@@ -470,7 +470,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
 
     doca_flow_cfg_set_pipe_queues(flow_cfg, 1);
 
-    /* Phase 54-01 T4k: add set_default_rss to match sample's init_doca_flow_cb
+    /* T4k: add set_default_rss to match sample's init_doca_flow_cb
      * (flow_common.c:88-96). The sample sets default RSS with 1 queue ([0]).
      * queues_array must remain valid until doca_flow_init() runs — same scope
      * is fine. Hypothesis: missing default RSS may interact with EGRESS-domain
@@ -481,9 +481,9 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
     t4k_rss.queues_array = t4k_rss_queues;
     doca_flow_cfg_set_default_rss(flow_cfg, &t4k_rss);
 
-    /* Phase 63 testbed-portability gap: `isolated` + `hairpinq_num=4` are
+    /* testbed-portability gap: `isolated` + `hairpinq_num=4` are
      * load-bearing for doca_flow_get_target(DOCA_FLOW_TARGET_KERNEL) on BF2
-     * DOCA 2.9.4. Phase 63-01 stripped them as "Phase 54 diagnostic noise",
+ * DOCA 2.9.4. stripped them as " diagnostic noise",
      * but the to_kernel pipe's FWD_TARGET(KERNEL) — which is how every
      * unmatched packet reaches the eBPF slow path — returns EOPNOTSUPP
      * without the hairpin-queue backing. The validated samples use FWD_RSS
@@ -491,12 +491,12 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
      * explicit kernel target. Restored to the proven Spike-003 string. */
     doca_flow_cfg_set_mode_args(flow_cfg, "switch,hws,isolated,hairpinq_num=4");
     doca_flow_cfg_set_cb_entry_process(flow_cfg, entry_status_cb);
-    /* Sample-aligned default; was diagnostic value 22 during Phase 54 EGRESS-domain bisect. */
+    /* Sample-aligned default; was diagnostic value 22 during EGRESS-domain bisect. */
     doca_flow_cfg_set_nr_counters(flow_cfg, 65536);
 
-    /* Phase 54-01 T4k: skip METER reservation. Sample doesn't reserve METER
+    /* T4k: skip METER reservation. Sample doesn't reserve METER
      * shared resources. Hypothesis: METER reservation may make EGRESS-domain
-     * BASIC pipe creation impossible. Phase 38 meter offload will be disabled
+ * BASIC pipe creation impossible. meter offload will be disabled
      * in this run — acceptable for diagnostic; CB drops back if needed. */
     g_meter_capable = 0;
     /*
@@ -511,7 +511,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
     }
     */
 
-    /* Phase 54-01 T4e: reserve shared mirror resources required for EGRESS-domain
+    /* T4e: reserve shared mirror resources required for EGRESS-domain
      * BASIC pipes on BF2/DOCA 2.9.4. Without this, doca_flow_pipe_create rejects
      * EGRESS-domain pipes with DOCA_ERROR_NOT_PERMITTED. Reference: DOCA 2.9.4
      * sample flow_switch_to_wire_sample.c:643 (nr_shared_resources[MIRROR] = 4). */
@@ -538,7 +538,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
     int total_ports = 1 + (g_has_pf_rep ? 1 : 0) + (int)g_num_repr;
     if (total_ports > LLB_DOCA_MAX_PORTS)
         total_ports = LLB_DOCA_MAX_PORTS;
-    /* Phase 63 testbed-portability gap: cap by actual DPDK port count. SPIKE-001
+    /* testbed-portability gap: cap by actual DPDK port count. SPIKE-001
      * probes for `vf0-3` (4 VFs) but smaller testbeds enumerate fewer ports.
      * Without this cap, doca_flow_port_start fails on port_id >= dpdk_avail and
      * the whole init aborts even though the available ports would have worked. */
@@ -562,7 +562,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
                     i, doca_error_get_descr(dret));
             goto port_fail;
         }
-        /* Phase 54-01 T4m: set doca_dev for port 0 (proxy), NULL for representors.
+        /* T4m: set doca_dev for port 0 (proxy), NULL for representors.
          * MIRRORS sample's create_doca_flow_port at flow_common.c:182 — sample
          * passes dev_arr[port_id] where dev_arr[0]=doca_dev, dev_arr[1..N]=NULL.
          * Without set_dev, DOCA can't establish the eswitch ↔ doca_dev binding
@@ -574,7 +574,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         snprintf(port_id_str, sizeof(port_id_str), "%u", i);
         doca_flow_port_cfg_set_devargs(port_cfg, port_id_str);
 
-        /* Phase 54-01 T4l: set operation_state=ACTIVE (matches sample's
+        /* T4l: set operation_state=ACTIVE (matches sample's
          * init_doca_flow_ports_with_op_state at flow_common.c:248). Without
          * explicit ACTIVE state, DOCA may default to a state where EGRESS-domain
          * pipes can't be created. */
@@ -693,12 +693,12 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         fprintf(stderr, "llb_doca: rss pipe created OK\n");
     }
 
-    /* 6a-egress: Phase 54-01 EGRESS_STEER_PIPE creation block deleted in 63-04.
+    /* 6a-egress: EGRESS_STEER_PIPE creation block deleted in 63-04.
      * The validated DOCA samples (flow_lb_snat_dnat + flow_e2e_l3_routing) prove
      * the EGRESS-domain pipe with paired-entry pattern is the wrong architecture
      * on BF2 DOCA 2.9.4. Replaced by miss-chained BASIC DEFAULT pair
      * (g_ct_fwd_pipe → g_ct_rev_pipe) that forward to g_egress_dispatch (built
-     * just below at step 6b2) via template fwd. See CONTEXT.md D-04 + D-09. */
+ * just below at step 6b2) via template fwd. See CONTEXT.md +. */
 
     /* 6b: Create to_kernel pipe (middle) */
     {
@@ -808,7 +808,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
                 "(catch-all, FWD_TARGET KERNEL)\n");
     }
 
-    /* 6b2: Create egress_dispatch pipe (Phase 63 Plan 02, per CONTEXT.md D-02/D-03).
+    /* 6b2: Create egress_dispatch pipe ( Plan 02, per CONTEXT.md).
      *
      * Sample analog: flow_e2e_l3_routing_sample.c:169-242 (create_egress_dispatch_pipe).
      *
@@ -839,7 +839,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
         doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, 16);
         /* NOTE: deliberately NO doca_flow_pipe_cfg_set_dir_info() — sample omits it
-         * and the Phase 54 EGRESS-domain artifacts proved set_dir_info(BIDIRECTIONAL)
+ * and the EGRESS-domain artifacts proved set_dir_info(BIDIRECTIONAL)
          * silently breaks data plane on BF2 DOCA 2.9.4. */
 
         /* Match: meta.pkt_meta CHANGEABLE */
@@ -912,7 +912,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
                 g_num_ports);
     }
 
-    /* 6c-rev: Create CT REV pipe (Phase 63-04 D-04: miss-chain target for
+    /* 6c-rev: Create CT REV pipe (miss-chain target for
      * g_ct_fwd_pipe; sample-aligned with flow_lb_snat_dnat_sample.c's lb_rev_pipe).
      *
      * Construction order requirement (PATTERNS.md §"Pipe-chain construction
@@ -920,7 +920,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
      * the FORWARD pipe because the forward pipe references g_ct_rev_pipe as
      * its miss target in doca_flow_pipe_create's miss_fwd argument.
      *
-     * Shape: BASIC DEFAULT, no set_dir_info (Phase 63-03 already removed),
+ * Shape: BASIC DEFAULT, no set_dir_info ( already removed),
      * protocol-agnostic TRANSPORT match handles both TCP+UDP.
      * Capacity: combined 2 * g_ct_pipe_capacity (16384)
      * fwd  template → g_egress_dispatch (per-flow CT entry's pkt_meta NAT
@@ -941,7 +941,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);
         doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
         doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, g_ct_pipe_capacity * 2);
-        /* Phase 63 testbed-validation gap: set_dir_info(BIDIRECTIONAL) is
+        /* testbed-validation gap: set_dir_info(BIDIRECTIONAL) is
          * load-bearing for the FWD_TARGET(KERNEL) slow-path return on BF2.
          * The "DOCA ground truth reset" retraction was derived from the
          * validated samples — but those samples deliver to kernel via FWD_RSS,
@@ -968,7 +968,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         lb_match.outer.transport.dst_port  = 0xffff;
         doca_flow_pipe_cfg_set_match(pipe_cfg, &lb_match, NULL);
 
-        /* NAT action template (D-05): src_ip + dst_ip + src_mac + dst_mac +
+        /* NAT action template: src_ip + dst_ip + src_mac + dst_mac +
          * pkt_meta — all CHANGEABLE. Per-entry NAT action sets concrete values
          * including pkt_meta = htonl(target_port_id) which g_egress_dispatch
          * matches downstream. Mirrors create_lb_pipe() in the validated sample. */
@@ -985,7 +985,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         struct doca_flow_actions *lb_acts_arr[1] = { &lb_actions };
         doca_flow_pipe_cfg_set_actions(pipe_cfg, lb_acts_arr, NULL, NULL, 1);
 
-        /* Monitor: per-entry NON_SHARED counter + aging wildcard (Phase 35) */
+        /* Monitor: per-entry NON_SHARED counter + aging wildcard */
         struct doca_flow_monitor lb_monitor;
         memset(&lb_monitor, 0, sizeof(lb_monitor));
         lb_monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;
@@ -1022,7 +1022,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
                 g_ct_pipe_capacity * 2);
     }
 
-    /* 6c-fwd: Create CT FWD pipe (Phase 63-04 D-04: forward direction of the
+    /* 6c-fwd: Create CT FWD pipe (forward direction of the
      * miss-chained pair). Mirrors flow_lb_snat_dnat_sample.c:267-370 create_lb_pipe.
      *
      * Created AFTER g_ct_rev_pipe because its miss target is g_ct_rev_pipe
@@ -1062,7 +1062,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
         lb_match.outer.transport.dst_port  = 0xffff;
         doca_flow_pipe_cfg_set_match(pipe_cfg, &lb_match, NULL);
 
-        /* NAT action template (D-05): identical shape to ct_rev. */
+        /* NAT action template: identical shape to ct_rev. */
         struct doca_flow_actions lb_actions;
         memset(&lb_actions, 0, sizeof(lb_actions));
         lb_actions.outer.l3_type            = DOCA_FLOW_L3_TYPE_IP4;
@@ -1112,10 +1112,10 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
                 g_ct_pipe_capacity * 2);
     }
 
-    /* Phase 63 stub: DOCA pipe creation/entry-update deferred until validated
+    /* stub: DOCA pipe creation/entry-update deferred until validated
      * against the new core pipeline (CT pair + egress_dispatch + simplified root).
      * Go-side Capabilities() still advertises this offload; eBPF slow path handles
-     * the feature at runtime. Restoration plan: CONTEXT.md D-15. Old body in git
+ * the feature at runtime. Restoration plan: CONTEXT.md. Old body in git
      * history at <pre-Phase-63 commit>.
      *
      * UDP CT pipe specifically: the unified g_ct_fwd_pipe/g_ct_rev_pipe pair built
@@ -1124,23 +1124,23 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
      * line 100 and remains NULL for the lifetime of the process. */
     /* g_udp_ct_pipe stays NULL — UDP traffic flows through unified CT pair */
 
-    /* 6d2-6d4: Phase 37 L4-dispatch + single-pipe ACL init removed by Phase 64 (D-19).
+    /* 6d2-6d4: L4-dispatch + single-pipe ACL init removed by.
      * The post-Phase-63 ROOT pipe dispatches per-L4-proto directly to CT_FWD, with no
      * L4-dispatch hop. ACL is now a lazy DENY+ALLOW pipe pair created on first
-     * FwRule with HwOffload=true (D-13) — see the Phase 64 lifecycle entry point below.
-     * Meter pipes remain dynamic per-policer (Phase 38), unchanged by Phase 64. */
+ * FwRule with HwOffload=true — see the lifecycle entry point below.
+ * Meter pipes remain dynamic per-policer, unchanged by. */
     /* g_l4_dispatch_pipe and g_deny_pipe/g_allow_pipe stay NULL at init time. */
 
-    /* 6e: Create FDB L2 pipe BEFORE root rebuild (Phase 47 D-05).
+    /* 6e: Create FDB L2 pipe BEFORE root rebuild.
      *
      * The FDB pipe must exist before we build the root so that the root's
-     * miss_pipe_override can point at it -- otherwise the Phase 36 FDB pipe
+ * miss_pipe_override can point at it -- otherwise the FDB pipe
      * would be orphaned (Bug #2: root miss went direct to to_kernel, no
      * packet ever reached the FDB pipe).
      *
      * Independent BASIC pipe matching outer.eth.dst_mac with FWD_PORT action.
      * Miss action: to_kernel (broadcast, multicast, unknown unicast) --
-     * set inside llb_doca_fdb_pipe_create(), unchanged by Phase 47.
+ * set inside llb_doca_fdb_pipe_create, unchanged by.
      *
      * Non-fatal: if FDB pipe creation fails, g_fdb_pipe stays NULL and the
      * root rebuild below falls back to V1 semantics (miss -> to_kernel). */
@@ -1155,18 +1155,18 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
 
     /* 6f: Create root BASIC pipe via llb_doca_rebuild_root_pipe().
      *
-     * Phase 63 D-11 (REVISED — per-ingress-port dispatch restored):
+ * (REVISED — per-ingress-port dispatch restored):
      * The root pipe dispatches by (ingress port_meta, L4 proto). Forward traffic
      * (ingress = uplink p0, port_meta=0) → g_ct_fwd_pipe. Reply traffic (ingress
      * = any representor, port_meta=1..N) → g_ct_rev_pipe directly. This mirrors
-     * the proven Spike-003 / Phase 51-52 per-direction routing.
+ * the proven Spike-003 / per-direction routing.
      *
      * WHY match_port_meta=1 is load-bearing (not just a filter):
      * When the root pipe MATCHES on parser_meta.port_meta, BF2 carries port_meta
      * through the whole pipeline as flow context. The slow-path tail
      * (ct_* miss → to_kernel → FWD_TARGET(KERNEL)) relies on that preserved
      * port_meta so FWD_TARGET(KERNEL) lands the packet on the *ingress port's*
-     * kernel netdev. With match_port_meta=0 (the collapsed Phase 63-05 form),
+ * kernel netdev. With match_port_meta=0 (the collapsed form),
      * port_meta is never looked at — FWD_TARGET(KERNEL) then defaults every
      * slow-path packet onto port 0's netdev. Forward traffic (ingress p0) works
      * by luck; reply traffic (ingress pf0vf0) is delivered to the wrong netdev
@@ -1180,12 +1180,12 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
      * in the header (loxilb_doca_flow.h:127-141) remain unchanged.
      *
      * Non-TCP/non-UDP IPv4 (ICMP, GRE) and non-IPv4 (ARP, IPv6) fall through
-     * root pipe miss → FDB pipe (Phase 47 D-04 V2 miss-override) → fdb miss →
+ * root pipe miss → FDB pipe ( V2 miss-override) → fdb miss →
      * to_kernel; port_meta is still carried so kernel delivery lands right. */
     {
         llb_doca_root_pipe_cfg root_cfg;
         memset(&root_cfg, 0, sizeof(root_cfg));
-        root_cfg.version         = LLB_DOCA_ROOT_PIPE_CFG_V3; /* V3 ABI preserved (Phase 52 D-04) */
+        root_cfg.version         = LLB_DOCA_ROOT_PIPE_CFG_V3; /* V3 ABI preserved */
         root_cfg.nr_entries      = 16;                         /* headroom over num_dispatch */
         root_cfg.match_port_meta = 1;                          /* per-ingress-port exact match */
 
@@ -1224,7 +1224,7 @@ int llb_doca_init(const char *pci_addr, int no_huge, const llb_doca_config *cfg)
             goto port_fail;
         }
         fprintf(stderr,
-            "llb_doca: root pipe rebuilt (Phase 63 D-11 per-port) — %u dispatch entries "
+            "llb_doca: root pipe rebuilt ( per-port) — %u dispatch entries "
             "(port_meta=0 → g_ct_fwd_pipe; port_meta=1..%d → g_ct_rev_pipe; "
             "miss → to_kernel, port_meta preserved)\n", idx, g_num_ports - 1);
     }
@@ -1267,13 +1267,13 @@ void llb_doca_shutdown(void)
     g_num_ports = 0;
     g_switch_port = NULL;
     g_root_pipe = NULL;
-    g_ct_fwd_pipe = NULL;   /* Phase 63-04: renamed from g_ct_pipe */
-    g_ct_rev_pipe = NULL;   /* Phase 52: prevent stale handle on re-init (Pitfall 3) */
-    /* Phase 63-04: g_egress_steer_pipe deleted. */
-    g_egress_dispatch = NULL;    /* Phase 63-02: same re-init Pitfall 3 protection */
+    g_ct_fwd_pipe = NULL;   /* renamed from g_ct_pipe */
+    g_ct_rev_pipe = NULL;   /* prevent stale handle on re-init (Pitfall 3) */
+    /* g_egress_steer_pipe deleted. */
+    g_egress_dispatch = NULL;    /* same re-init Pitfall 3 protection */
     g_udp_ct_pipe = NULL;
     g_fdb_pipe = NULL;
-    /* Phase 64: lazy DENY+ALLOW pipes — destroy if currently up (idempotent NULL-safe). */
+    /* lazy DENY+ALLOW pipes — destroy if currently up (idempotent NULL-safe). */
     if (g_deny_pipe) {
         doca_flow_pipe_destroy(g_deny_pipe);
         g_deny_pipe = NULL;
@@ -1491,7 +1491,7 @@ llb_doca_pipe_handle_t llb_doca_get_ct_rev_pipe(void)
     return (llb_doca_pipe_handle_t)g_ct_rev_pipe;
 }
 
-/* Phase 63-04: llb_doca_get_egress_steer_pipe() deleted along with
+/* llb_doca_get_egress_steer_pipe deleted along with
  * g_egress_steer_pipe. Plan 63-06 owns removing the matching Go-side
  * wrappers DocaGetEgressSteerPipe / docaGetSteerPipeDirect in
  * pkg/loxinet/dpu_doca_cgo.go. Until then the !doca stub
@@ -1608,7 +1608,7 @@ int llb_doca_ct_rev_test_drop_all(void)
 
     /* Re-wire root pipe to the new g_ct_rev_pipe handle via the miss-chain.
      *
-     * Phase 63 D-11: collapsed root dispatches to a single IPv4 TCP+UDP classifier
+ * collapsed root dispatches to a single IPv4 TCP+UDP classifier
      * pointing at g_ct_fwd_pipe. Reply traffic still reaches the newly-rebuilt
      * (miss=DROP) g_ct_rev_pipe via the ct_fwd → ct_rev miss-chain installed in
      * Plan 63-04. Diagnostic intent preserved: a packet from a VF rep that fails
@@ -1643,7 +1643,7 @@ int llb_doca_ct_rev_test_drop_all(void)
             return LLB_DOCA_ERR_PIPE;
         }
         fprintf(stderr,
-            "llb_doca_ct_rev_test_drop_all: root re-wired (Phase 63 D-11) — "
+            "llb_doca_ct_rev_test_drop_all: root re-wired — "
             "2 dispatch entries (IPv4/TCP + IPv4/UDP → g_ct_fwd_pipe; "
             "miss-chain → g_ct_rev_pipe (miss=DROP); root miss → g_fdb_pipe)\n");
     }
@@ -1653,16 +1653,16 @@ int llb_doca_ct_rev_test_drop_all(void)
 
 llb_doca_pipe_handle_t llb_doca_get_udp_ct_pipe(void)
 {
-    /* Phase 63 stub: DOCA pipe creation/entry-update deferred until validated
+    /* stub: DOCA pipe creation/entry-update deferred until validated
      * against the new core pipeline (CT pair + egress_dispatch + simplified root).
      * Go-side Capabilities() still advertises this offload; eBPF slow path handles
-     * the feature at runtime. Restoration plan: CONTEXT.md D-15. Old body in git
+ * the feature at runtime. Restoration plan: CONTEXT.md. Old body in git
      * history at <pre-Phase-63 commit>. */
     return NULL;
 }
 
 /* ----------------------------------------------------------------
- *  Root pipe rebuild (Phase 34, reusable for Phases 35/37)
+ * Root pipe rebuild (reusable for Phases 35/37)
  *
  *  Creates a BASIC root pipe with L3+L4 dispatch.  Each dispatch entry
  *  matches outer_l3_type=IPV4 + outer_l4_type=<per-entry> and forwards
@@ -1683,13 +1683,13 @@ int llb_doca_rebuild_root_pipe(const llb_doca_root_pipe_cfg *cfg)
 
     if (!cfg)
         return LLB_DOCA_ERR_PARAM;
-    /* Phase 47 D-04: accept BOTH V1 and V2. V1 callers (e.g. dpu_doca_cgo.go:612
+    /* accept BOTH V1 and V2. V1 callers (e.g. dpu_doca_cgo.go:612
      * ACL-rebuild path) stay operable during Plan 04 Go-side migration; V2 callers
      * may optionally set miss_pipe_override to redirect the root miss away from
      * g_to_kernel_pipe (fixes Bug #2 -- FDB pipe orphaning). */
     if (cfg->version != LLB_DOCA_ROOT_PIPE_CFG_V1 &&
         cfg->version != LLB_DOCA_ROOT_PIPE_CFG_V2 &&
-        cfg->version != LLB_DOCA_ROOT_PIPE_CFG_V3)   /* Phase 52 D-04 */
+        cfg->version != LLB_DOCA_ROOT_PIPE_CFG_V3)   /* */
         return LLB_DOCA_ERR_PARAM;
     if (cfg->num_dispatch == 0 || cfg->num_dispatch > LLB_DOCA_ROOT_PIPE_MAX_DISPATCH)
         return LLB_DOCA_ERR_PARAM;
@@ -1723,7 +1723,7 @@ int llb_doca_rebuild_root_pipe(const llb_doca_root_pipe_cfg *cfg)
     memset(&root_match, 0, sizeof(root_match));
     root_match.parser_meta.outer_l3_type = UINT32_MAX;
     root_match.parser_meta.outer_l4_type = UINT32_MAX;
-    /* Phase 52 D-04: V3 callers with match_port_meta!=0 add parser_meta.port_meta
+    /* V3 callers with match_port_meta!=0 add parser_meta.port_meta
      * to the pipe template. V1/V2 callers and V3 callers with match_port_meta==0
      * keep the V2 template (Pitfall 1: ACL rebuild path stays binary-compatible). */
     if (cfg->version == LLB_DOCA_ROOT_PIPE_CFG_V3 && cfg->match_port_meta != 0) {
@@ -1733,12 +1733,12 @@ int llb_doca_rebuild_root_pipe(const llb_doca_root_pipe_cfg *cfg)
 
     /* SPIKE-001 DIAG: pipe-level monitor was attempted here but BF2 firmware
      * rejects it on root pipes in switch+isolated mode (same restriction as
-     * actions — see Phase 30 lesson below). Got "Operation not supported" on
+ * actions — see lesson below). Got "Operation not supported" on
      * doca_flow_pipe_create. Kept only the per-entry monitor passed to
      * doca_flow_pipe_add_entry below; if the firmware also rejects per-entry
      * monitors on root entries, we'll need a shadow-pipe diagnostic instead. */
 
-    /* NO actions -- root pipe is pure L3+L4 classifier (Phase 30 lesson:
+    /* NO actions -- root pipe is pure L3+L4 classifier ( lesson:
      * eSwitch FDB rejects actions on root pipes in switch,isolated mode) */
 
     /* FWD: FWD_PIPE to first dispatch target as default */
@@ -1749,7 +1749,7 @@ int llb_doca_rebuild_root_pipe(const llb_doca_root_pipe_cfg *cfg)
 
     /* Miss: FWD_PIPE → miss_target (default g_to_kernel_pipe; V2 override honored).
      *
-     * Phase 47 D-04: V2 callers may set cfg->miss_pipe_override to a non-NULL
+ * V2 callers may set cfg->miss_pipe_override to a non-NULL
      * pipe handle to redirect root misses away from to_kernel (e.g. into the
      * FDB L2 pipe). V2 with override==0 collapses to V1 semantics. V1 callers
      * ignore the field entirely.
@@ -1785,7 +1785,7 @@ int llb_doca_rebuild_root_pipe(const llb_doca_root_pipe_cfg *cfg)
         memset(&entry_match, 0, sizeof(entry_match));
         entry_match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;
         entry_match.parser_meta.outer_l4_type = cfg->dispatch[i].l4_type;
-        /* Phase 52 D-04: V3 callers set per-entry exact ingress port_meta */
+        /* V3 callers set per-entry exact ingress port_meta */
         if (cfg->version == LLB_DOCA_ROOT_PIPE_CFG_V3 && cfg->match_port_meta != 0) {
             entry_match.parser_meta.port_meta = cfg->port_meta_value[i];
         }
@@ -1840,7 +1840,7 @@ int llb_doca_pipe_destroy(llb_doca_pipe_handle_t pipe)
 }
 
 /* ================================================================
- *  FDB L2 pipe (Phase 36)
+ * FDB L2 pipe 
  * ================================================================ */
 
 llb_doca_pipe_handle_t llb_doca_fdb_pipe_create(uint32_t nr_entries)
@@ -1868,7 +1868,7 @@ llb_doca_pipe_handle_t llb_doca_fdb_pipe_create(uint32_t nr_entries)
     doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, nr_entries);
 
-    /* Phase 49 P49-R2: enable per-entry HW counters on the FDB pipe.
+    /* P49-R2: enable per-entry HW counters on the FDB pipe.
      * Without counter_type = NON_SHARED, doca_flow_resource_query_entry()
      * returns {total_pkts=0, total_bytes=0} for every FDB entry.
      * Mirrors the CT/LB/ACL pipes at loxilb_doca_flow.c lines 607, 1022, 1441. */
@@ -1952,7 +1952,7 @@ llb_doca_entry_handle_t llb_doca_fdb_entry_add(
     entry_fwd.port_id = fwd_port_id;
 
     /* Monitor: aging timeout + user context for aged-entry identification.
-     * Phase 49 P49-R2: always set counter_type on the per-entry monitor so the
+ * P49-R2: always set counter_type on the per-entry monitor so the
      * HW reports hw_pkts/hw_bytes. aging_sec is additive (set only when >0). */
     struct doca_flow_monitor monitor;
     memset(&monitor, 0, sizeof(monitor));
@@ -2003,7 +2003,7 @@ llb_doca_pipe_handle_t llb_doca_get_fdb_pipe(void)
 }
 
 /* ================================================================
- *  ACL HW offload — rebuilt from validated flow_acl_basic sample (Phase 64)
+ * ACL HW offload — rebuilt from validated flow_acl_basic sample 
  *
  *  Two-pipe pipeline:
  *      ROOT → DENY_PIPE → ALLOW_PIPE → CT_FWD → CT_REV(miss) → EGRESS_DISPATCH
@@ -2011,23 +2011,23 @@ llb_doca_pipe_handle_t llb_doca_get_fdb_pipe(void)
  *  DENY_PIPE  (BASIC, non-root, BIDIRECTIONAL default):
  *      - per-entry FWD_DROP
  *      - fwd_miss → ALLOW_PIPE
- *      - 5-tuple TRANSPORT match (D-08) with per-entry mask (CIDR support)
- *      - NON_SHARED counter monitor (D-12) — set BEFORE pipe_create
+ * 5-tuple TRANSPORT match with per-entry mask (CIDR support)
+ * NON_SHARED counter monitor — set BEFORE pipe_create
  *      - sample analog: flow_acl_basic_sample.c:369-424 (create_deny_pipe)
  *
  *  ALLOW_PIPE (BASIC, non-root, BIDIRECTIONAL default):
  *      - per-entry FWD_PIPE → g_ct_fwd_pipe (counter-only audit; CT owns MAC rewrite)
- *      - fwd_miss → g_ct_fwd_pipe (D-03 transparent passthrough)
- *      - 5-tuple TRANSPORT match (D-08) with per-entry mask
- *      - NO pipe_cfg_set_actions (D-03 explicitly drops sample's MAC rewrite + pkt_meta)
- *      - NON_SHARED counter monitor (D-12)
- *      - sample analog: flow_acl_basic_sample.c:293-366 (create_allow_pipe, with D-03 divergence)
+ * fwd_miss → g_ct_fwd_pipe ( transparent passthrough)
+ * 5-tuple TRANSPORT match with per-entry mask
+ * NO pipe_cfg_set_actions ( explicitly drops sample's MAC rewrite + pkt_meta)
+ * NON_SHARED counter monitor 
+ * sample analog: flow_acl_basic_sample.c:293-366 (create_allow_pipe, with divergence)
  *
- *  Lazy lifecycle (D-13): both pipes are NULL until the first FwRule with
+ * Lazy lifecycle: both pipes are NULL until the first FwRule with
  *  HwOffload=true arrives. Plan 64-04 owns the Go-side debouncer that drives
  *  doca_flow_entries_process() on its 50ms tick when DOCA_FLOW_NO_WAIT is used.
  *
- *  Anti-pattern guard (D-20): BIDIRECTIONAL default (no explicit set_dir_info call),
+ * Anti-pattern guard: BIDIRECTIONAL default (no explicit set_dir_info call),
  *  DEFAULT domain only (no EGRESS-domain steering), no CHANGEABLE forward template.
  *  See `make check-doca-pipeline-contract` for the Makefile-enforced check.
  * ================================================================ */
@@ -2047,10 +2047,10 @@ static doca_error_t llb_doca_create_deny_pipe(uint32_t nr_entries,
         return DOCA_ERROR_INVALID_VALUE;
     }
     if (!g_allow_pipe) {
-        /* D-13 OPENING order: ALLOW must be alive before DENY because
+        /* OPENING order: ALLOW must be alive before DENY because
          * DENY's fwd_miss.next_pipe = g_allow_pipe. */
         fprintf(stderr, "llb_doca: DENY_PIPE create guard failed: g_allow_pipe NULL "
-                        "(call ALLOW create first per D-13)\n");
+                        "(call ALLOW create first per)\n");
         return DOCA_ERROR_INVALID_VALUE;
     }
 
@@ -2059,7 +2059,7 @@ static doca_error_t llb_doca_create_deny_pipe(uint32_t nr_entries,
     memset(&monitor,    0, sizeof(monitor));
     memset(&fwd_drop,   0, sizeof(fwd_drop));
     memset(&fwd_miss,   0, sizeof(fwd_miss));
-    monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;  /* D-12 */
+    monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;  /* */
 
     dret = doca_flow_pipe_cfg_create(&pipe_cfg, g_switch_port);
     if (dret != DOCA_SUCCESS) {
@@ -2068,8 +2068,8 @@ static doca_error_t llb_doca_create_deny_pipe(uint32_t nr_entries,
         return dret;
     }
     doca_flow_pipe_cfg_set_name(pipe_cfg, "DENY_PIPE");
-    doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);     /* D-02 */
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);                 /* D-02 */
+    doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);     /* */
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);                 /* */
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, nr_entries);
     dret = doca_flow_pipe_cfg_set_miss_counter(pipe_cfg, true);
     if (dret != DOCA_SUCCESS) {
@@ -2079,7 +2079,7 @@ static doca_error_t llb_doca_create_deny_pipe(uint32_t nr_entries,
         return dret;
     }
 
-    /* D-08 v4 (2026-05-18): EXPLICIT mask, no parser_meta. Empirically locked
+    /* v4 (2026-05-18): EXPLICIT mask, no parser_meta. Empirically locked
      * by standalone sample flow_p64_acl_5tuple bisect (variants v1..v4 on BF2
      * DOCA 2.9.4 switch,hws):
      *   v1 parser_meta + TRANSPORT + NULL mask → FAIL (hw_pkts=0)
@@ -2088,7 +2088,7 @@ static doca_error_t llb_doca_create_deny_pipe(uint32_t nr_entries,
      *   v4 TRANSPORT   + EXPL mask            → PASS (hw_pkts=30)  ← this shape
      *
      * The PIPE_BASIC + switch,hws code path on BF2 silently rejects NULL mask;
-     * the prior D-08 v3 hypothesis ("DOCA derives mask from template UINT*
+ * the prior v3 hypothesis ("DOCA derives mask from template UINT*
      * fields") is empirically false. CT_FWD/CT_REV pipes are unaffected
      * because they're PIPE_HASH, which has different mask semantics.
      *
@@ -2125,7 +2125,7 @@ static doca_error_t llb_doca_create_deny_pipe(uint32_t nr_entries,
         return dret;
     }
 
-    /* D-12: monitor MUST be set BEFORE pipe_create. The sample's troubleshooting
+    /* monitor MUST be set BEFORE pipe_create. The sample's troubleshooting
      * #4 ("counter not defined") is caused by the reverse order. */
     dret = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
     if (dret != DOCA_SUCCESS) {
@@ -2135,7 +2135,7 @@ static doca_error_t llb_doca_create_deny_pipe(uint32_t nr_entries,
         return dret;
     }
 
-    /* D-02: per-entry forward action template = DROP; miss → ALLOW_PIPE. */
+    /* per-entry forward action template = DROP; miss → ALLOW_PIPE. */
     fwd_drop.type      = DOCA_FLOW_FWD_DROP;
     fwd_miss.type      = DOCA_FLOW_FWD_PIPE;
     fwd_miss.next_pipe = g_allow_pipe;
@@ -2170,7 +2170,7 @@ static doca_error_t llb_doca_create_allow_pipe(uint32_t nr_entries,
     memset(&monitor,    0, sizeof(monitor));
     memset(&fwd_tmpl,   0, sizeof(fwd_tmpl));
     memset(&fwd_miss,   0, sizeof(fwd_miss));
-    monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;  /* D-12 */
+    monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;  /* */
 
     dret = doca_flow_pipe_cfg_create(&pipe_cfg, g_switch_port);
     if (dret != DOCA_SUCCESS) {
@@ -2179,8 +2179,8 @@ static doca_error_t llb_doca_create_allow_pipe(uint32_t nr_entries,
         return dret;
     }
     doca_flow_pipe_cfg_set_name(pipe_cfg, "ALLOW_PIPE");
-    doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);     /* D-02 */
-    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);                 /* D-02 */
+    doca_flow_pipe_cfg_set_type(pipe_cfg, DOCA_FLOW_PIPE_BASIC);     /* */
+    doca_flow_pipe_cfg_set_is_root(pipe_cfg, false);                 /* */
     doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, nr_entries);
     dret = doca_flow_pipe_cfg_set_miss_counter(pipe_cfg, true);
     if (dret != DOCA_SUCCESS) {
@@ -2190,7 +2190,7 @@ static doca_error_t llb_doca_create_allow_pipe(uint32_t nr_entries,
         return dret;
     }
 
-    /* D-08 v4: identical match shape as DENY_PIPE — full rationale in the
+    /* v4: identical match shape as DENY_PIPE — full rationale in the
      * DENY_PIPE comment above (PIPE_BASIC on BF2 DOCA 2.9.4 requires explicit
      * mask; bisect locked v4 shape). Template + mask kept symmetric so DENY
      * and ALLOW share the same per-entry contract; differences live in the
@@ -2217,9 +2217,9 @@ static doca_error_t llb_doca_create_allow_pipe(uint32_t nr_entries,
         return dret;
     }
 
-    /* D-03: explicitly NO pipe_cfg_set_actions — CT_FWD/CT_REV own MAC rewrite + pkt_meta. */
+    /* explicitly NO pipe_cfg_set_actions — CT_FWD/CT_REV own MAC rewrite + pkt_meta. */
 
-    /* D-12: monitor BEFORE pipe_create. */
+    /* monitor BEFORE pipe_create. */
     dret = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
     if (dret != DOCA_SUCCESS) {
         fprintf(stderr, "llb_doca: ALLOW_PIPE set_monitor failed: %s\n",
@@ -2228,7 +2228,7 @@ static doca_error_t llb_doca_create_allow_pipe(uint32_t nr_entries,
         return dret;
     }
 
-    /* D-03: per-entry FWD_PIPE → CT_FWD; miss also → CT_FWD (transparent passthrough). */
+    /* per-entry FWD_PIPE → CT_FWD; miss also → CT_FWD (transparent passthrough). */
     fwd_tmpl.type      = DOCA_FLOW_FWD_PIPE;
     fwd_tmpl.next_pipe = g_ct_fwd_pipe;
     fwd_miss.type      = DOCA_FLOW_FWD_PIPE;
@@ -2251,7 +2251,7 @@ int llb_doca_acl_pipes_create(void)
         return LLB_DOCA_OK;
     }
 
-    /* D-13 OPENING order: ALLOW first (DENY's fwd_miss.next_pipe = g_allow_pipe). */
+    /* OPENING order: ALLOW first (DENY's fwd_miss.next_pipe = g_allow_pipe). */
     doca_error_t dret = llb_doca_create_allow_pipe(4096, &g_allow_pipe);
     if (dret != DOCA_SUCCESS) {
         fprintf(stderr, "llb_doca: acl_pipes_create ALLOW failed rc=%d\n", (int)dret);
@@ -2276,7 +2276,7 @@ int llb_doca_acl_pipes_create(void)
 
 void llb_doca_acl_pipes_destroy(void)
 {
-    /* D-13 CLOSING: caller (Plan 64-04 Go-side) MUST have already re-dispatched
+    /* CLOSING: caller (Plan 64-04 Go-side) MUST have already re-dispatched
      * the root pipe AWAY from g_deny_pipe before invoking this. */
     if (g_deny_pipe != NULL) {
         doca_flow_pipe_destroy(g_deny_pipe);
@@ -2318,7 +2318,7 @@ llb_doca_entry_handle_t llb_doca_acl_deny_entry_add(
      * p0 in vs pf0vf0 out confirmed packets vanish inside DPU) but
      * doca_flow_resource_query_entry() returned hw_pkts=0 forever. Pipe-level
      * monitor (set at create time with counter_type=NON_SHARED, line 2107) and
-     * pipe-default fwd_drop (line 2120) carry the semantics. D-02 still met. */
+ * pipe-default fwd_drop (line 2120) carry the semantics. still met. */
     g_entry_status = -1;
     struct doca_flow_pipe_entry *entry = NULL;
     dret = doca_flow_pipe_add_entry(0,
@@ -2327,7 +2327,7 @@ llb_doca_entry_handle_t llb_doca_acl_deny_entry_add(
                                      NULL,        /* no actions for DENY */
                                      NULL,        /* monitor inherits pipe-level */
                                      NULL,        /* fwd inherits pipe-default DROP */
-                                     DOCA_FLOW_NO_WAIT,  /* D-15 batched flush */
+                                     DOCA_FLOW_NO_WAIT,  /* batched flush */
                                      NULL,        /* user_ctx unused for ACL */
                                      &entry);
     if (dret != DOCA_SUCCESS) {
@@ -2346,7 +2346,7 @@ llb_doca_entry_handle_t llb_doca_acl_deny_entry_add(
             return NULL;
         }
     }
-    /* timeout_ms == 0: caller (Go-side debouncer per D-15) drives
+    /* timeout_ms == 0: caller (Go-side debouncer per) drives
      * doca_flow_entries_process() on its 50ms tick. */
     return (llb_doca_entry_handle_t)entry;
 }
@@ -2380,13 +2380,13 @@ llb_doca_entry_handle_t llb_doca_acl_allow_entry_add(
      * passed as NULL — pipe-level monitor (line 2194, counter_type=NON_SHARED)
      * and pipe-default fwd_tmpl FWD_PIPE→g_ct_fwd_pipe (line 2208) carry the
      * semantics. Mirrors flow_acl_basic_sample.c:571,602,634 pattern. See
-     * llb_doca_acl_deny_entry_add for full RCA. D-03 still met. */
+ * llb_doca_acl_deny_entry_add for full RCA. still met. */
     g_entry_status = -1;
     struct doca_flow_pipe_entry *entry = NULL;
     dret = doca_flow_pipe_add_entry(0,
                                      g_allow_pipe,
                                      (struct doca_flow_match *)match,
-                                     NULL,        /* no actions for ALLOW — D-03 */
+                                     NULL,        /* no actions for ALLOW — */
                                      NULL,        /* monitor inherits pipe-level */
                                      NULL,        /* fwd inherits pipe-default FWD_PIPE→CT_FWD */
                                      DOCA_FLOW_NO_WAIT,
@@ -2451,7 +2451,7 @@ llb_doca_pipe_handle_t llb_doca_get_allow_pipe(void)
     return (llb_doca_pipe_handle_t)g_allow_pipe;
 }
 
-/* Plan 64-04 D-19 ext: per-entry match buffer alloc/fill helpers. Keep the
+/* Plan 64-04 ext: per-entry match buffer alloc/fill helpers. Keep the
  * bridge header opaque (loxilb_doca_flow.h:21 contract) by exposing only
  * primitive args. The struct doca_flow_match layout is private to this file. */
 void *llb_doca_acl_match_alloc_ip4(
@@ -2505,7 +2505,7 @@ void llb_doca_acl_match_free(void *match)
 }
 
 /* ================================================================
- *  Meter classification pipe (Phase 38: per-service / per-host QoS)
+ * Meter classification pipe (: per-service / per-host QoS)
  *
  *  BASIC pipe with NO NAT actions — only match + shared meter + counter.
  *  BF2 firmware accepts meter wildcards when no NAT modify actions exist.
@@ -2519,10 +2519,10 @@ llb_doca_pipe_handle_t llb_doca_meter_pipe_create(
     uint32_t meter_id,
     uint32_t nr_entries)
 {
-    /* Phase 63 stub: DOCA pipe creation/entry-update deferred until validated
+    /* stub: DOCA pipe creation/entry-update deferred until validated
      * against the new core pipeline (CT pair + egress_dispatch + simplified root).
      * Go-side Capabilities() still advertises this offload; eBPF slow path handles
-     * the feature at runtime. Restoration plan: CONTEXT.md D-15. Old body in git
+ * the feature at runtime. Restoration plan: CONTEXT.md. Old body in git
      * history at <pre-Phase-63 commit>. */
     (void)miss_target; (void)meter_id; (void)nr_entries;
     return NULL;
@@ -2533,10 +2533,10 @@ llb_doca_entry_handle_t llb_doca_meter_pipe_entry_add(
     uint32_t dst_ip,
     uint32_t timeout_ms)
 {
-    /* Phase 63 stub: DOCA pipe creation/entry-update deferred until validated
+    /* stub: DOCA pipe creation/entry-update deferred until validated
      * against the new core pipeline (CT pair + egress_dispatch + simplified root).
      * Go-side Capabilities() still advertises this offload; eBPF slow path handles
-     * the feature at runtime. Restoration plan: CONTEXT.md D-15. Old body in git
+ * the feature at runtime. Restoration plan: CONTEXT.md. Old body in git
      * history at <pre-Phase-63 commit>. */
     (void)pipe; (void)dst_ip; (void)timeout_ms;
     return NULL;
@@ -2553,11 +2553,11 @@ llb_doca_pipe_handle_t llb_doca_get_meter_pipe(void)
 }
 
 /* ================================================================
- *  L4 dispatch pipe — vestigial after Phase 64 (D-19).
+ * L4 dispatch pipe — vestigial after.
  *
- *  Phase 37 introduced this pipe between ACL and CT for protocol re-classification.
- *  Phase 63 rebuilt the root pipe to dispatch per-L4-proto directly to CT_FWD,
- *  rendering the L4-dispatch hop unnecessary. Phase 64 D-19 retires the
+ * introduced this pipe between ACL and CT for protocol re-classification.
+ * rebuilt the root pipe to dispatch per-L4-proto directly to CT_FWD,
+ * rendering the L4-dispatch hop unnecessary. retires the
  *  creator function entirely (header decl removed in Task 1; body removed here).
  *
  *  The accessor `llb_doca_get_l4_dispatch_pipe()` is kept to satisfy unresolved
@@ -2567,7 +2567,7 @@ llb_doca_pipe_handle_t llb_doca_get_meter_pipe(void)
 
 llb_doca_pipe_handle_t llb_doca_get_l4_dispatch_pipe(void)
 {
-    /* Phase 64: pipe is never created; always NULL. */
+    /* pipe is never created; always NULL. */
     return (llb_doca_pipe_handle_t)g_l4_dispatch_pipe;
 }
 
@@ -2597,7 +2597,7 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
     doca_error_t ret;
     static const uint8_t zero_mac[6] = {0};
 
-    /* Phase 63-06 (D-12): out_es_entry out-param dropped along with the
+    /* out_es_entry out-param dropped along with the
      * paired g_egress_steer entry pattern. CT entries drive downstream
      * dispatch via meta.pkt_meta = target_port_id; g_egress_dispatch
      * (Plan 63-02) handles per-port FWD via pre-installed entries. */
@@ -2615,7 +2615,7 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
         entry_match.outer.ip4.src_ip = src_ip;
 
     /* Port match fields: CT_FWD and CT_REV pipes both use TRANSPORT
-     * (protocol-agnostic) per the 63-04 D-04 miss-chain pair. Both pipes
+ * (protocol-agnostic) per the 63-04 miss-chain pair. Both pipes
      * carry both TCP+UDP via per-entry l4_type. */
     int use_transport = ((struct doca_flow_pipe *)pipe == g_ct_fwd_pipe ||
                          (struct doca_flow_pipe *)pipe == g_ct_rev_pipe);
@@ -2669,7 +2669,7 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
     if (new_src_mac && memcmp(new_src_mac, zero_mac, 6) != 0)
         memcpy(entry_actions.outer.eth.src_mac, new_src_mac, 6);
 
-    /* Phase 63-06 (TX-3): encode per-entry pkt_meta from fwd_port_id so
+    /* (TX-3): encode per-entry pkt_meta from fwd_port_id so
      * g_egress_dispatch (Plan 63-02 DEFAULT-domain BASIC pipe) can match
      * this entry's port via meta.pkt_meta = port_id.
      *
@@ -2682,13 +2682,13 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
      * action MUST too: on little-endian BF2, native fwd_port_id>=1 (e.g.
      * 0x00000001) never equals the entry's htonl(1)=0x01000000, so those
      * packets silently miss egress_dispatch and fall through miss→to_kernel.
-     * Observed in Phase 63-08 validation as a stalled forward direction
+ * Observed in validation as a stalled forward direction
      * (fwd_port=1) while reply (fwd_port=0, htonl-invariant) worked.
      * (user_ctx is still passed to doca_flow_pipe_add_entry below as the
-     * aged-entry identification cookie — Phase 35.) */
+ * aged-entry identification cookie —.) */
     entry_actions.meta.pkt_meta = htonl((uint32_t)fwd_port_id);
 
-    /* Phase 63-06 (TX-3): CT entries rely on the template fwd
+    /* (TX-3): CT entries rely on the template fwd
      * (g_egress_dispatch from Plan 63-02) — no per-entry FWD override
      * needed because the pipe template already carries the correct
      * destination, and pkt_meta-as-action drives the downstream dispatch
@@ -2720,7 +2720,7 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
     if ((struct doca_flow_pipe *)pipe == g_root_pipe && !g_root_pipe_has_actions) {
         entry_acts_ptr = NULL;
     }
-    /* Unified CT pipe always has actions (Phase 33) -- no guard needed.
+    /* Unified CT pipe always has actions -- no guard needed.
      * The g_ct_pipe_has_actions check is retained for external pipes. */
 
     const char *pipe_name =
@@ -2743,11 +2743,11 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
             fwd_port_id,
             entry_acts_ptr ? "NAT-rewrite" : "NULL(match-only)");
 
-    /* Phase 35: per-entry aging monitor + Phase 38: per-entry shared meter */
+    /* per-entry aging monitor +: per-entry shared meter */
     struct doca_flow_monitor entry_monitor;
     memset(&entry_monitor, 0, sizeof(entry_monitor));
     entry_monitor.aging_sec = aging_sec;
-    /* Phase 38: attach shared meter to this entry if meter_id is valid */
+    /* attach shared meter to this entry if meter_id is valid */
     if (meter_id != LLB_DOCA_METER_NONE && meter_id < LLB_DOCA_MAX_METERS) {
         entry_monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;
         entry_monitor.shared_meter.shared_meter_id = meter_id;
@@ -2777,9 +2777,9 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
     fprintf(stderr, "llb_doca: entry offloaded OK [%s] entry=%p fwd_port=%u\n",
             pipe_name, (void *)entry, fwd_port_id);
 
-    /* Phase 63-06 (D-12): the obsolete `if (out_es_entry) *out_es_entry =
+    /* the obsolete `if (out_es_entry) *out_es_entry =
      * NULL;` write is gone with the out-param drop. Per-flow paired
-     * g_egress_steer install (Phase 54-01 / Phase 55 P2) was removed in
+ * g_egress_steer install ( P2) was removed in
      * Plan 63-04; g_egress_dispatch (Plan 63-02) handles per-port FWD
      * via static init-time entries keyed on meta.pkt_meta. */
 
@@ -2846,7 +2846,7 @@ int llb_doca_entry_query(llb_doca_entry_handle_t entry,
  * pipe but matched no entry, so they took the pipe's miss path."
  *
  * CRITICAL — a pipe miss is NOT the same as "fell to the slow path".  The
- * Phase 63 pipeline is a MISS-CHAIN, so a miss on one pipe is just a hop to
+ * pipeline is a MISS-CHAIN, so a miss on one pipe is just a hop to
  * the next pipe.  The chain is:
  *
  *     root --(port_meta)--> CT_FWD --miss--> CT_REV --miss--> to_kernel
@@ -2937,7 +2937,7 @@ void llb_doca_diag_dump_root_entries(void)
     diag_dump_pipe_miss_one("FDB",         g_fdb_pipe,         "to_kernel");
     diag_dump_pipe_miss_one("TO_KERNEL",   g_to_kernel_pipe,
         "rss (effectively unreachable — catch-all entry matches all)");
-    /* Phase 63-04: EGRESS_STEER diag dump removed along with the pipe.
+    /* EGRESS_STEER diag dump removed along with the pipe.
      * Replacement diag (egress_dispatch + ct_fwd/ct_rev miss counters) is
      * carried by the CT_FWD/CT_REV/TO_KERNEL lines already above; the new
      * miss-chain semantics make a per-EGRESS_STEER line meaningless. */
@@ -2949,7 +2949,7 @@ void llb_doca_diag_dump_root_entries(void)
 }
 
 /* ================================================================
- *  Phase 38: Shared meter lifecycle (QoS metering HW offload)
+ * Shared meter lifecycle (QoS metering HW offload)
  * ================================================================ */
 
 /* llb_doca_meter_add -- Configure and bind a shared RFC2697 srTCM meter.
@@ -2967,10 +2967,10 @@ void llb_doca_diag_dump_root_entries(void)
  */
 int llb_doca_meter_add(uint32_t meter_id, uint64_t cir_bps, uint64_t cbs, uint64_t ebs)
 {
-    /* Phase 63 stub: DOCA pipe creation/entry-update deferred until validated
+    /* stub: DOCA pipe creation/entry-update deferred until validated
      * against the new core pipeline (CT pair + egress_dispatch + simplified root).
      * Go-side Capabilities() still advertises this offload; eBPF slow path handles
-     * the feature at runtime. Restoration plan: CONTEXT.md D-15. Old body in git
+ * the feature at runtime. Restoration plan: CONTEXT.md. Old body in git
      * history at <pre-Phase-63 commit>. */
     (void)meter_id; (void)cir_bps; (void)cbs; (void)ebs;
     return 0;
@@ -2978,10 +2978,10 @@ int llb_doca_meter_add(uint32_t meter_id, uint64_t cir_bps, uint64_t cbs, uint64
 
 int llb_doca_meter_del(uint32_t meter_id)
 {
-    /* Phase 63 stub: DOCA pipe creation/entry-update deferred until validated
+    /* stub: DOCA pipe creation/entry-update deferred until validated
      * against the new core pipeline (CT pair + egress_dispatch + simplified root).
      * Go-side Capabilities() still advertises this offload; eBPF slow path handles
-     * the feature at runtime. Restoration plan: CONTEXT.md D-15. Old body in git
+ * the feature at runtime. Restoration plan: CONTEXT.md. Old body in git
      * history at <pre-Phase-63 commit>. */
     (void)meter_id;
     return 0;
@@ -2989,10 +2989,10 @@ int llb_doca_meter_del(uint32_t meter_id)
 
 int llb_doca_meter_query(uint32_t meter_id, struct llb_doca_meter_stats *stats)
 {
-    /* Phase 63 stub: DOCA pipe creation/entry-update deferred until validated
+    /* stub: DOCA pipe creation/entry-update deferred until validated
      * against the new core pipeline (CT pair + egress_dispatch + simplified root).
      * Go-side Capabilities() still advertises this offload; eBPF slow path handles
-     * the feature at runtime. Restoration plan: CONTEXT.md D-15. Old body in git
+ * the feature at runtime. Restoration plan: CONTEXT.md. Old body in git
      * history at <pre-Phase-63 commit>. */
     (void)meter_id;
     if (stats) memset(stats, 0, sizeof(*stats));
@@ -3047,7 +3047,7 @@ int llb_doca_entry_update_meter(llb_doca_pipe_handle_t pipe, void *entry_handle,
 }
 
 /* ================================================================
- *  Phase 35: Aging infrastructure
+ * Aging infrastructure
  * ================================================================ */
 
 /* llb_doca_aging_poll -- Walk HW aging tables and fire callbacks for aged entries.
@@ -3080,13 +3080,13 @@ int llb_doca_aging_poll(uint64_t quota_time, uint32_t timeout_us, uint32_t max_e
 
 /* llb_doca_entries_drain -- Process pending DOCA_FLOW_NO_WAIT entries.
  *
- * Pairs with the Plan 64-04 D-15 ACL debouncer which enqueues entries via
+ * Pairs with the Plan 64-04 ACL debouncer which enqueues entries via
  * doca_flow_pipe_add_entry(..., DOCA_FLOW_NO_WAIT, ...) and relies on the
  * caller to drain the per-pipe-queue pending buffer. Without this drain the
  * queue saturates at the DOCA per-queue depth (~128 with set_pipe_queues(1)
  * on BF2 DOCA 2.9.4) and every subsequent add_entry returns INVALID_VALUE.
  *
- * Phase 35 aging implicitly drains the same queue for CT entries via
+ * aging implicitly drains the same queue for CT entries via
  * llb_doca_aging_poll's entries_process call; ACL pipes are not aged so they
  * need this explicit drain from the Go-side flushAclPending tick.
  *

@@ -5,7 +5,7 @@
  */
 /*
  * sockproxy_ep.c -- Endpoint selection, session affinity, conversation mapping
- * Extracted from sockproxy.c Phase 4a refactoring.
+ * Extracted from sockproxy.c refactoring.
  * Functions: session_key_hash, lookup/store/get conversation_endpoint,
  *            strip_port_from_hostname, proxy_setup_ep__,
  *            proxy_conversation_cleanup_thread, proxy_run
@@ -33,10 +33,10 @@
 #include "sockproxy_cache.h"    /* cmp_proxy_ent */
 #include "sockproxy_conn.h"     /* proxy_setup_ep_connect */
 #include "sockproxy_routing.h"  /* find_endpoint_lpm */
-#include "sockproxy_l7policy.h" /* Phase 75: l7_route_dispatch (L7 content routing) */
+#include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "sockproxy_lb.h"       /* wrr_select_endpoint, chwbl_select_endpoint, chwbl_dec_load */
 #include "sockproxy_health.h"   /* is_endpoint_healthy, circuit_breaker_record_failure/success */
-#include "sockproxy_kv_exact.h" /* Phase 99: pd_kv_exact_select (single-role Tier-1.5 branch) */
+#include "sockproxy_kv_exact.h" /* pd_kv_exact_select (single-role Tier-1.5 branch) */
 #include "sockproxy_ep.h"       /* own header */
 
 #define XXH_STATIC_LINKING_ONLY
@@ -49,7 +49,7 @@ extern void llb_ai_normal_session_hit(char *model_name);
  * pd_session_evict, pd_trie_evict_lru are declared in sockproxy.h */
 
 /* =========================================================================
- * Phase 70 — sockproxy HA state-sync emit helper (conversation_mapping_t).
+ * sockproxy HA state-sync emit helper (conversation_mapping_t).
  *
  * Mirrors the pd_session_build_event helper in sockproxy_pd.c but for
  * conversation_mapping_t (synced state #2 — PRD table). All emit call
@@ -108,7 +108,7 @@ session_key_hash(const char *session_key)
   return hash;
 }
 
-/* proxy_setup_ep_connect moved to sockproxy_conn.c (Phase 3) */
+/* proxy_setup_ep_connect moved to sockproxy_conn.c */
 
 // P0.3: Find existing conversation mapping
 static int __attribute__((unused))
@@ -207,7 +207,7 @@ store_conversation_endpoint(proxy_map_ent_t *ent,
   HASH_FIND_STR(ent->val.conv_map, conv_id, existing);
   
   if (existing) {
-    /* Phase 70 — capture state under wrlock for emit-after-unlock. */
+    /* capture state under wrlock for emit-after-unlock. */
     uint64_t emit_created_ts    = existing->created_ts;
     uint64_t emit_last_access   = existing->last_access_ts;
     uint32_t emit_request_count = existing->request_count;
@@ -227,7 +227,7 @@ store_conversation_endpoint(proxy_map_ent_t *ent,
     log_debug("[CONV_UPDATE] Updated existing mapping '%s' → endpoint[%d] (request_count=%u)",
               conv_id, ep_idx, existing->request_count);
 #endif
-    /* Phase 70 EMIT SITE #1 (sockproxy_ep.c) [PHASE_70_EMIT_EP_001] — conversation UPDATE.
+    /* EMIT SITE #1 (sockproxy_ep.c) [PHASE_70_EMIT_EP_001] — conversation UPDATE.
      * Emit-after-unlock: conv_lock released by the line above. */
     {
       proxy_sync_event_t _ev70;
@@ -257,7 +257,7 @@ store_conversation_endpoint(proxy_map_ent_t *ent,
   mapping->validated_healthy = 0;       // Not yet validated
 
   HASH_ADD_STR(ent->val.conv_map, conv_id, mapping);
-  /* Phase 70 — capture state under wrlock for emit-after-unlock. */
+  /* capture state under wrlock for emit-after-unlock. */
   {
     uint64_t emit_created_ts    = mapping->created_ts;
     uint64_t emit_last_access   = mapping->last_access_ts;
@@ -269,7 +269,7 @@ store_conversation_endpoint(proxy_map_ent_t *ent,
     log_debug("[CONV_NEW] Created new mapping '%s' → endpoint[%d]", conv_id, ep_idx);
 #endif
 
-    /* Phase 70 EMIT SITE #2 (sockproxy_ep.c) [PHASE_70_EMIT_EP_002] — conversation CREATE.
+    /* EMIT SITE #2 (sockproxy_ep.c) [PHASE_70_EMIT_EP_002] — conversation CREATE.
      * Emit-after-unlock: conv_lock released by the line above. */
     {
       proxy_sync_event_t _ev70;
@@ -385,12 +385,12 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           char host_only[256];
           strip_port_from_hostname(host_str, host_only, sizeof(host_only));
 
-          // US-202 Criterion A: Determine effective model name with priority:
+          // Criterion A: Determine effective model name with priority:
           //   1. X-Model HTTP header (fast path — set during header parsing)
           //   2. JSON body "model" field (set by extract_llm_prefix during body parsing)
           //   3. "" (empty string — wildcard, backward compatible)
           // Criterion C: same effective_model is the value that llb_ai_validate_key
-          // (US-006 CGO bridge) would receive for AllowedModels checking.
+          // ( CGO bridge) would receive for AllowedModels checking.
           const char *effective_model = "";
           if (pfe && pfe->x_model_header[0] != '\0') {
             effective_model = pfe->x_model_header;       // Priority 1: X-Model header
@@ -398,14 +398,14 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             effective_model = pfe->prefix_key.model;     // Priority 2: JSON body "model"
           }
 
-          // Phase 75 (D-10): L7 content-routing discriminator + dispatch — the H1
+          // L7 content-routing discriminator + dispatch — the H1
           // seam. Runs AFTER the AI-GW auth/QUOTA gate (handle_on_message_complete,
           // sockproxy_http.c:4532-4593, untouched) and BEFORE the AI model
           // selection. When no L7_POLICY is attached (has_l7_policy==0, the default
           // for every AI service) l7_route_dispatch is a PURE NO-OP returning
           // L7_DISPATCH_FALLTHROUGH, so the model path below runs byte-for-byte
-          // unchanged (D-04 / Pitfall 5). The SAME shared helper is invoked at the
-          // H2 seam (sockproxy_h2.c) — parity (T-75-12).
+          // unchanged (Pitfall 5). The SAME shared helper is invoked at the
+          // H2 seam (sockproxy_h2.c) — parity.
           if (node && node->has_l7_policy) {
             proxy_epval_t *l7_tepval = NULL;
             int l7_rc = l7_route_dispatch(pfe, node, &l7_tepval);
@@ -414,7 +414,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
               return -1;
             } else if (l7_rc == L7_DISPATCH_FORWARD) {
               // FORWARD: a plain pool was resolved; re-enter the existing intra-pool
-              // EP-select below WITHOUT touching the AI model engine (D-03).
+              // EP-select below WITHOUT touching the AI model engine.
               tepval = l7_tepval;
               if (!tepval) {
                 // FORWARD with no usable pool -> no-route (mirror the AI 503 idiom).
@@ -437,7 +437,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             // has_l7_policy==0) — fall through to the unchanged AI/LPM path.
           }
 
-          // US-202 Criterion B: find_endpoint_lpm tries model-specific pool first, then
+          // Criterion B: find_endpoint_lpm tries model-specific pool first, then
           // wildcard pool (empty model_name).  Returns NULL only when both lookups fail.
           tepval = find_endpoint_lpm(node, host_only, request_path, effective_model);
 
@@ -501,7 +501,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
         }
 
-      l7_have_tepval:  // Phase 75: L7 FORWARD jumps here with a resolved plain pool
+      l7_have_tepval:  // L7 FORWARD jumps here with a resolved plain pool
         if (tepval == NULL) {
 #ifdef HAVE_HTTP_TRACE
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -642,9 +642,9 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
         if (tepval->pd_disagg_enabled && tepval->n_prefill_eps > 0 && tepval->n_decode_eps > 0) {
           int pd_prefill = -1, pd_decode = -1;
 
-          /* KV-T15 / D-05.3: seed the exclusion mask with health/CB state so the
+          /* KV-T15 /.3: seed the exclusion mask with health/CB state so the
            * Tier-1.5 Go argmax (llb_ai_kv_best_worker) SKIPS down/CB-open EPs and
-           * returns the genuine 2nd-best-overlap prefill — the FR-2 contract
+ * returns the genuine 2nd-best-overlap prefill — the contract
            * ("excluded winner falls to 2nd-best PREFILL EP, not Tier-2 RR").
            * Previously first-attempt selection passed 0 and inv/CB were only
            * checked POST-argmax (GUARD_G -> miss -> Tier-2 RR), so a down winner
@@ -659,13 +659,13 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             }
           }
 
-          /* Phase 93: capture the prefill rc so the in-flight-cap "no capacity"
+          /* capture the prefill rc so the in-flight-cap "no capacity"
            * verdict (PD_PREFILL_NO_CAPACITY) sheds a retriable 429 instead of
            * falling to any-healthy/normal mode (which would BYPASS the cap). This
            * shed happens BEFORE the active_conns increment below, so a shed never
            * perturbs the load counters. */
           int pf_rc = pd_select_prefill(tepval, pfe, &pd_prefill, pd_excl);
-          /* Phase 93-04: bounded backpressured admission. PARKED means the request
+          /* bounded backpressured admission. PARKED means the request
            * was already ENQUEUED onto a per-EP FIFO inside pd_select_prefill (it
            * held + stamped park_start_ts there). Do NOT connect, do NOT 429, do NOT
            * active_conns++. Propagate PD_SETUP_PARKED so setup_proxy_path SUSPENDS
@@ -748,7 +748,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 
           log_info("US-PD804: P/D EP selected — prefill=EP%d decode=EP%d", pd_prefill, pd_decode);
         } else if (tepval->kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE && pfe) {
-          /* Phase 99 (D-09/D-10): single-role Tier-1.5 KV-exact selection — the
+          /* single-role Tier-1.5 KV-exact selection — the
            * SIBLING of the P/D block above, structurally parallel and textually
            * independent (at kv_exact_mode == 1 this branch is provably never
            * entered; the P/D path stays byte-identical). A role-less service
@@ -779,7 +779,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
              * kv_sr_load_held (pd_free_claim single-owner shape) — either by
              * the backend connect-failure path below or by pd_cleanup() at
              * generic teardown (sockproxy_http.c). */
-            /* Phase 99 load-signal fix (release-before-acquire): a REUSED
+            /* load-signal fix (release-before-acquire): a REUSED
              * keep-alive connection can still hold the PRIOR request's
              * single-role unit here — that request's response has completed (the
              * client could not have sent THIS request otherwise). Release it
@@ -905,7 +905,7 @@ pd_fallback_normal:
           }
 #endif /* HAVE_DP_GPU_ROUTING */
 
-          /* Phase 99 (D-09/D-10): single-role KV load — release the held
+          /* single-role KV load — release the held
            * active_conns unit immediately on backend connect failure (failed
            * connections must not leak load forever — the chwbl_dec_load idiom
            * above). __atomic_exchange claims kv_sr_load_held so pd_cleanup()
@@ -1073,27 +1073,27 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
         // Session stickiness with custom header support
         // PROXY_SEL_STICKY: IP-based fallback for first request (backward compatible)
         // PROXY_SEL_RR: Round-robin fallback for first request (better load balancing)
-        // FR-10 (Phase 76): also enter when an L7 HTTP_COOKIE route is active, so
+        // also enter when an L7 HTTP_COOKIE route is active, so
         // the stateless cookie read-back pin runs regardless of the base select
         // mode; on a cookie miss the existing RR/IP fallback below selects the
-        // backend (the cookie pin is purely additive — D-03 miss->rehash).
+        // backend (the cookie pin is purely additive — miss->rehash).
         if (tepval->select == PROXY_SEL_STICKY ||
             (tepval->select == PROXY_SEL_RR && tepval->session_header_enabled) ||
             (node->has_l7_policy && pfe && l7_cookie_persist_active(pfe, node))) {
           char session_key[256];  // Increased size for long header values
           int selected_ep = -1;
           int using_learned_session = 0;
-          int cookie_pinned = 0;   // FR-10: 1 if a valid LB cookie pinned selected_ep
+          int cookie_pinned = 0;   // 1 if a valid LB cookie pinned selected_ep
 
-          /* FR-10 (Phase 76, D-02/D-03/D-05): STATELESS HTTP_COOKIE read-back pin.
+          /* STATELESS HTTP_COOKIE read-back pin.
            * When the matched L7 route enables cookie_persist and the request
            * carries a valid LB cookie, re-derive + constant-time-match the token
            * against the LIVE member set and PIN selected_ep to that member — the
            * existing connect loop below honours selected_ep. On a forged/stale
            * token (or no cookie) l7_cookie_node_match returns L7_COOKIE_MISS and
-           * we fall through to the normal hash/RR selection (D-03: NEVER an
+ * we fall through to the normal hash/RR selection (: NEVER an
            * arbitrary backend). Nothing is read from / written to proxy_fd_ent
-           * state (D-02) — the cookie value IS the binding, so this works
+ * state — the cookie value IS the binding, so this works
            * identically on an HA peer that never saw the original request. */
           if (node->has_l7_policy && pfe &&
               l7_cookie_persist_active(pfe, node)) {
@@ -1157,7 +1157,7 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
                   pthread_rwlock_wrlock(&node->val.conv_lock);
                   conversation_mapping_t *stale_mapping = NULL;
                   HASH_FIND_STR(node->val.conv_map, session_key, stale_mapping);
-                  /* Phase 70 — capture state under wrlock for emit-after-unlock. */
+                  /* capture state under wrlock for emit-after-unlock. */
                   int      emit_stale_present = 0;
                   uint64_t emit_stale_created_ts = 0;
                   int      emit_stale_ep_idx = -1;
@@ -1169,7 +1169,7 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
                     free(stale_mapping);
                   }
                   pthread_rwlock_unlock(&node->val.conv_lock);
-                  /* Phase 70 EMIT SITE #3 (sockproxy_ep.c) [PHASE_70_EMIT_EP_003] — stale-mapping DELETE.
+                  /* EMIT SITE #3 (sockproxy_ep.c) [PHASE_70_EMIT_EP_003] — stale-mapping DELETE.
                    * Emit-after-unlock: conv_lock released by the line above. */
                   if (emit_stale_present) {
                     proxy_sync_event_t _ev70;
@@ -1185,7 +1185,7 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
                 pthread_rwlock_wrlock(&node->val.conv_lock);
                 conversation_mapping_t *invalid_mapping = NULL;
                 HASH_FIND_STR(node->val.conv_map, session_key, invalid_mapping);
-                /* Phase 70 — capture state under wrlock for emit-after-unlock. */
+                /* capture state under wrlock for emit-after-unlock. */
                 int      emit_inv_present = 0;
                 uint64_t emit_inv_created_ts = 0;
                 int      emit_inv_ep_idx = -1;
@@ -1199,7 +1199,7 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
                             session_key, selected_ep, tepval->n_eps);
                 }
                 pthread_rwlock_unlock(&node->val.conv_lock);
-                /* Phase 70 EMIT SITE #4 (sockproxy_ep.c) [PHASE_70_EMIT_EP_004] — invalid-mapping DELETE. */
+                /* EMIT SITE #4 (sockproxy_ep.c) [PHASE_70_EMIT_EP_004] — invalid-mapping DELETE. */
                 if (emit_inv_present) {
                   proxy_sync_event_t _ev70;
                   if (conv_build_sync_event(&_ev70, node, SYNC_CONV_DELETE, session_key,
@@ -1215,7 +1215,7 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
           }
           
           // PRIORITY 1: If no learned session, try hash-based custom header stickiness
-          // FR-10: a valid LB cookie pin (cookie_pinned) takes precedence over the
+          // a valid LB cookie pin (cookie_pinned) takes precedence over the
           // hash/RR fallbacks — selected_ep is already set to the pinned member.
           if (!cookie_pinned && !using_learned_session &&
               tepval->session_header_enabled &&
@@ -1494,9 +1494,9 @@ pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
   return -1;
 }
 
-/* proxy_sock_init moved to sockproxy_conn.c (Phase 3) */
+/* proxy_sock_init moved to sockproxy_conn.c */
 
-/* proxy_drain_checker_thread moved to sockproxy_health.c (Phase 2) */
+/* proxy_drain_checker_thread moved to sockproxy_health.c */
 
 // Conversation mapping cleanup thread - removes stale/expired mappings
 void *
@@ -1512,7 +1512,7 @@ proxy_conversation_cleanup_thread(void *arg)
     now = time(NULL);
     total_removed = 0;
     
-    /* Phase 70.1 — CR-04 / D-04 two-pass gather-then-evict for P/D-enabled
+    /* .1 — CR-04 / two-pass gather-then-evict for P/D-enabled
      * ephash entries. Closes the recursive-rwlock UB documented in
      * .planning/phases/70-sockproxy-ha-sync/70-REVIEW.md (CR-04).
      *
@@ -1545,10 +1545,10 @@ proxy_conversation_cleanup_thread(void *arg)
 
       /* conv_map two-pass block — scoped so its local `victims[]` struct
        * array does NOT shadow the outer P/D gather `victims` pointer below
-       * (Pri-3 sibling pattern, predates D-04). */
+ * (Pri-3 sibling pattern, predates). */
       {
         conversation_mapping_t *mapping, *tmp;
-        /* Phase 70 — Landmine L-6 batch list for emit-after-unlock. Bounded
+        /* Landmine L-6 batch list for emit-after-unlock. Bounded
          * to 256 victims per pass; further evictions land in the next 30s tick. */
         #define CONV_CLEANUP_EMIT_BATCH 256
         struct {
@@ -1563,7 +1563,7 @@ proxy_conversation_cleanup_thread(void *arg)
         HASH_ITER(hh, node->val.conv_map, mapping, tmp) {
           // Remove mappings that haven't been accessed within TTL
           if (now - mapping->last_access_ts > CONVERSATION_MAPPING_TTL) {
-            /* Phase 70 — capture victim for emit-after-unlock. */
+            /* capture victim for emit-after-unlock. */
             if (n_victims < CONV_CLEANUP_EMIT_BATCH) {
               strncpy(victims[n_victims].conv_id, mapping->conv_id, MAX_CONV_ID_LEN - 1);
               victims[n_victims].conv_id[MAX_CONV_ID_LEN - 1] = '\0';
@@ -1588,7 +1588,7 @@ proxy_conversation_cleanup_thread(void *arg)
         pthread_rwlock_unlock(&node->val.conv_lock);
         total_removed += node_removed;
 
-        /* Phase 70 EMIT SITE #5 (sockproxy_ep.c) [PHASE_70_EMIT_EP_005] — cleanup-thread bulk DELETE.
+        /* EMIT SITE #5 (sockproxy_ep.c) [PHASE_70_EMIT_EP_005] — cleanup-thread bulk DELETE.
          * Emit-after-unlock: conv_lock released above. Landmine L-6 compliant. */
         for (uint32_t i = 0; i < n_victims; i++) {
           proxy_sync_event_t _ev70;
@@ -1604,7 +1604,7 @@ proxy_conversation_cleanup_thread(void *arg)
        * PROXY_LOCK Pri-1 wrlock). pd_session_evict() is called AFTER the
        * PROXY_UNLOCK() below to avoid recursive Pri-1 rdlock via
        * pd_session_resolve_service_key. See block-header comment for the
-       * full lock-hierarchy rationale (CR-04 / D-04). */
+ * full lock-hierarchy rationale (CR-04). */
       {
         proxy_epval_t *tepval, *tv_tmp;
         HASH_ITER(hh, node->val.ephash, tepval, tv_tmp) {
@@ -1638,7 +1638,7 @@ proxy_conversation_cleanup_thread(void *arg)
             victims[n_v++] = tepval;
           }
           skip_pd_gather:
-          /* Phase 8: trie LRU eviction safety net. STAYS inline under PROXY_LOCK
+          /* trie LRU eviction safety net. STAYS inline under PROXY_LOCK
            * — pd_trie_lock (Pri-5) does NOT recurse into proxy_struct->lock,
            * so the Pri-1 → Pri-5 hierarchy is preserved (RESEARCH Pitfall 11). */
           if (tepval->pd_trie) {
@@ -1682,15 +1682,15 @@ proxy_run(void *arg)
   return NULL;
 }
 
-/* proxy_find_ep moved to sockproxy_conn.c (Phase 3) */
-/* alpn_select_callback moved to sockproxy_ssl.c (Phase 3) */
+/* proxy_find_ep moved to sockproxy_conn.c */
+/* alpn_select_callback moved to sockproxy_ssl.c */
 
-/* proxy_free_fd_ctx, proxy_try_free_fd_ctx, proxy_delete_entry__ moved to sockproxy_conn.c (Phase 3) */
-/* SSL context management moved to sockproxy_ssl.c (Phase 3) */
-/* WRR algorithms moved to sockproxy_lb.c (Phase 2) */
+/* proxy_free_fd_ctx, proxy_try_free_fd_ctx, proxy_delete_entry__ moved to sockproxy_conn.c */
+/* SSL context management moved to sockproxy_ssl.c */
+/* WRR algorithms moved to sockproxy_lb.c */
 
 /* US-PD801: Old P/D RR/WRR selection functions (pd_rr_select_from_role,
  * pd_wrr_select_from_role, pd_select_worker_pair) have been deleted.
- * Phase 4 will implement pd_select_prefill/pd_select_decode with 3-tier logic.
+ * will implement pd_select_prefill/pd_select_decode with 3-tier logic.
  */
 

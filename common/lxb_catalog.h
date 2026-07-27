@@ -57,7 +57,7 @@ typedef struct __attribute__((packed)) {
   // === Path Matching ===
   char     path_prefix[LXB_MAX_PATH_LEN]; // HTTP path prefix (e.g., "/v1/chat/completions")
   
-  // === L4 Tracing Configuration (Phase 3) ===
+  // === L4 Tracing Configuration ===
   uint8_t  l4_tracing_enabled;  // L4 connection tracing (1=yes, 0=no)
   uint8_t  l4_sampling_rate;    // L4 sampling rate 0-100 (percent)
   uint8_t  _pad2[2];            // Alignment padding

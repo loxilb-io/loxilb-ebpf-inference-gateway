@@ -5,7 +5,7 @@
  *
  * sockproxy_http.h — Public interface for sockproxy_http.c.
  * Only declares symbols NOT already covered by sockproxy.h / sockproxy_internal.h.
- * Extracted from sockproxy.c (Phase 4b) — see sockproxy_refactoring_plan.md.
+ * Extracted from sockproxy.c — see sockproxy_refactoring_plan.md.
  */
 #ifndef __SOCKPROXY_HTTP_H__
 #define __SOCKPROXY_HTTP_H__
@@ -61,10 +61,10 @@ int handle_client_data(int fd, proxy_fd_ent_t *pfe,
                        struct llb_sockmap_key *key, struct llb_sockmap_key *rkey);
 
 /* -------------------------------------------------------------------------
- * pd_framing_v2 runtime feature-flag (REQ-R2 / Phase 90, D-04)
+ * pd_framing_v2 runtime feature-flag (REQ-R2)
  * pd_framing_v2_test_set — force the LLB_PD_FRAMING_V2 gate without
  * setenv/unsetenv races in unit tests (test_resp_framing.c, 90-02) and the
- * D-06 mismatched-flag HA variant. Mirrors kv_hash_debug_test_set.
+ * mismatched-flag HA variant. Mirrors kv_hash_debug_test_set.
  * ------------------------------------------------------------------------- */
 void pd_framing_v2_test_set(int on);
 

@@ -14,7 +14,7 @@
 #include "lxb_l4_trace_event.h"
 #endif
 
-// Phase 1: Runtime Control API for L4 Tracing
+// Runtime Control API for L4 Tracing
 // This provides CGO-compatible functions for Go runtime control
 
 #ifdef HAVE_L4_TRACE
@@ -123,22 +123,22 @@ void lxb_l4_trace_reset_stats(void) {
     printf("[L4Trace] Statistics reset\n");
 }
 
-// Phase 2: Ring buffer initialization (Go manages ring buffers via BPF syscalls)
+// Ring buffer initialization (Go manages ring buffers via BPF syscalls)
 int lxb_l4_trace_ring_init(void) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     printf("[L4Trace] Ring buffer managed by Go consumer (no C-side init needed)\n");
 #endif
-    // Phase 2: Ring buffers are created by eBPF loader and accessed via Go
+    // Ring buffers are created by eBPF loader and accessed via Go
     // This function is kept for API compatibility but is a no-op in current design
     return 0;
 }
 
-// Phase 2: Ring buffer cleanup (Go manages cleanup)
+// Ring buffer cleanup (Go manages cleanup)
 void lxb_l4_trace_ring_cleanup(void) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     printf("[L4Trace] Ring buffer cleanup handled by Go consumer\n");
 #endif
-    // Phase 2: Ring buffer cleanup happens in Go-side consumer Stop()
+    // Ring buffer cleanup happens in Go-side consumer Stop
 }
 
 #else  // !HAVE_L4_TRACE

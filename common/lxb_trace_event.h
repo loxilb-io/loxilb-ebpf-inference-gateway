@@ -11,7 +11,7 @@
 /**
  * HTTP/HTTPS Trace Event - Fixed-size structure for lock-free ring buffer
  * 
- * Size: ~616 bytes (Phase 1: includes 280-byte inline body storage)
+ * Size: ~616 bytes (: includes 280-byte inline body storage)
  * Protocol: Generic HTTP/HTTPS (no protocol-specific fields)
  * 
  * Design principles:

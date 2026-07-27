@@ -1,5 +1,5 @@
 /*
- * Unit tests for vLLM Request-ID generation and injection (US-501)
+ * Unit tests for vLLM Request-ID generation and injection 
  * Build: gcc -Wall -Wextra -o test_request_id test_request_id.c -I. -DTEST_REQUEST_ID
  * Run:   ./test_request_id
  */
@@ -460,7 +460,7 @@ static void test_end_to_end(void) {
 /* ============ MAIN ============ */
 
 int main(void) {
-  printf("=== US-501: Request-ID Unit Tests ===\n\n");
+  printf("===: Request-ID Unit Tests ===\n\n");
 
   /* UUID generation tests */
   test_uuid_format();

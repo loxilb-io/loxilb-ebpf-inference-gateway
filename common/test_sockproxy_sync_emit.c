@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * test_sockproxy_sync_emit.c — Phase 70 C-side emit-after-unlock + ring overflow test.
+ * test_sockproxy_sync_emit.c — C-side emit-after-unlock + ring overflow test.
  * SPEC.md req: A4.
  *
  * What this test proves:
@@ -284,7 +284,7 @@ static int test_five_function_coverage(void) {
 }
 
 int main(void) {
-    printf("Phase 70 Task A2 — sockproxy emit-after-unlock + 10K ring tests\n");
+    printf(" Task A2 — sockproxy emit-after-unlock + 10K ring tests\n");
     RUN_TEST(test_emit_after_unlock);
     RUN_TEST(test_ring_overflow_drop_oldest);
     RUN_TEST(test_five_function_coverage);

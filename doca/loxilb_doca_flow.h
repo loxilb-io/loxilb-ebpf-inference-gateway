@@ -53,8 +53,8 @@ typedef void *llb_doca_entry_handle_t;
 typedef enum {
     LLB_DOCA_FWD_DROP   = 0,
     LLB_DOCA_FWD_PORT   = 1,
-    LLB_DOCA_FWD_RSS    = 2,  /* Phase 26 readiness */
-    LLB_DOCA_FWD_TARGET = 3,  /* FWD_TARGET (KERNEL, etc.) -- Phase 30 */
+    LLB_DOCA_FWD_RSS    = 2,  /* readiness */
+    LLB_DOCA_FWD_TARGET = 3,  /* FWD_TARGET (KERNEL, etc.) -- */
 } llb_doca_fwd_type_t;
 
 /* ---- Pipe capacity configuration ---- */
@@ -67,7 +67,7 @@ typedef struct {
 
 /* ---- Root pipe rebuild configuration (versioned for ABI compat) ----
  *
- * Phase 47 (D-04): bumped to V2 by appending `miss_pipe_override`.
+ * bumped to V2 by appending `miss_pipe_override`.
  * V1 callers remain ABI-compatible via zero-initialisation: the new
  * trailing field lands at offset >= sizeof(V1-layout), and the validator
  * accepts both LLB_DOCA_ROOT_PIPE_CFG_V1 and _V2. When version==V2 and
@@ -76,7 +76,7 @@ typedef struct {
  * orphaning). When version==V2 and miss_pipe_override==0, behaviour
  * collapses to V1 semantics.
  *
- * Phase 52 (D-04): bumped to V3 by appending per-dispatch
+ * bumped to V3 by appending per-dispatch
  * `port_meta_value[]` array AND a global `match_port_meta` flag at the
  * tail. V1 and V2 callers remain ABI-compatible via zero-initialisation:
  * the new trailing fields land at offset >= sizeof(V2-layout), and the
@@ -88,12 +88,12 @@ typedef struct {
  */
 #define LLB_DOCA_ROOT_PIPE_CFG_V1   1
 #define LLB_DOCA_ROOT_PIPE_CFG_V2   2
-#define LLB_DOCA_ROOT_PIPE_CFG_V3   3   /* Phase 52: per-port ingress dispatch (D-04) */
+#define LLB_DOCA_ROOT_PIPE_CFG_V3   3   /* per-port ingress dispatch */
 #define LLB_DOCA_ROOT_PIPE_MAX_DISPATCH 8
 
 typedef struct {
     uint32_t version;        /* struct version for ABI compat (LLB_DOCA_ROOT_PIPE_CFG_V1 or _V2) */
-    uint32_t nr_entries;     /* root pipe capacity (4 for Phase 34) */
+    uint32_t nr_entries;     /* root pipe capacity (4 for) */
     uint32_t num_dispatch;   /* number of l4 dispatch entries */
     struct {
         uint32_t l4_type;              /* DOCA_FLOW_L4_META_TCP or _UDP value (cast from enum) */
@@ -102,7 +102,7 @@ typedef struct {
     /* V2: non-NULL overrides default g_to_kernel_pipe miss destination.
      * V1 callers leave this field zero-initialised; behaviour unchanged. */
     llb_doca_pipe_handle_t miss_pipe_override;
-    /* V3 (Phase 52 D-04): per-dispatch ingress port_meta exact-match value.
+    /* V3: per-dispatch ingress port_meta exact-match value.
      * 0 = wildcard (V2 behaviour preserved entry-by-entry — uplink port_id is 0
      *               on BF2 standard switchdev, but `match_port_meta=0` keeps
      *               the entire feature opt-out for V2 callers).
@@ -118,7 +118,7 @@ typedef struct {
 } llb_doca_root_pipe_cfg;
 
 /* Defense-in-depth: compile-time assertions that the V2 layout APPENDED
- * miss_pipe_override at the end (Phase 47 D-04). Any silent drift -- e.g.
+ * miss_pipe_override at the end. Any silent drift -- e.g.
  * a future editor inserting a field in the middle -- trips the build.
  *
  * Anchor: miss_pipe_override sits strictly after dispatch[] (so V1 wire
@@ -132,12 +132,12 @@ _Static_assert(offsetof(llb_doca_root_pipe_cfg, miss_pipe_override) >=
 _Static_assert(offsetof(llb_doca_root_pipe_cfg, port_meta_value) ==
                offsetof(llb_doca_root_pipe_cfg, miss_pipe_override) +
                    sizeof(((llb_doca_root_pipe_cfg *)0)->miss_pipe_override),
-               "Phase 52 (D-04): port_meta_value must be appended directly AFTER "
+               " port_meta_value must be appended directly AFTER "
                "miss_pipe_override (V2 zero-init compat)");
 _Static_assert(sizeof(llb_doca_root_pipe_cfg) ==
                offsetof(llb_doca_root_pipe_cfg, _pad_v3) +
                    sizeof(((llb_doca_root_pipe_cfg *)0)->_pad_v3),
-               "Phase 52 (D-04): _pad_v3 must be the LAST field "
+               " _pad_v3 must be the LAST field "
                "(no trailing insertions without bumping V4)");
 
 /* ---- Init / Shutdown ---- */
@@ -170,18 +170,18 @@ int llb_doca_pipe_destroy(llb_doca_pipe_handle_t pipe);
 /* ---- Root pipe access ---- */
 llb_doca_pipe_handle_t llb_doca_get_root_pipe(void);
 
-/* ---- CT-FWD pipe access (Phase 63-04 D-04, renamed from llb_doca_get_ct_pipe) ---- */
+/* --- CT-FWD pipe access (renamed from llb_doca_get_ct_pipe) ---- */
 llb_doca_pipe_handle_t llb_doca_get_ct_fwd_pipe(void);
 
-/* Phase 63-06 (TX-2): transitional alias `#define llb_doca_get_ct_pipe
+/* (TX-2): transitional alias `#define llb_doca_get_ct_pipe
  * llb_doca_get_ct_fwd_pipe` removed. The Go CGO wrapper rename to
  * DocaGetCTFwdPipe (calling C.llb_doca_get_ct_fwd_pipe directly) landed in
  * this plan; the alias is no longer needed. */
 
-/* ---- CT-REV pipe access (Phase 52: per-direction reply pipe, D-01) ---- */
+/* --- CT-REV pipe access (: per-direction reply pipe) ---- */
 llb_doca_pipe_handle_t llb_doca_get_ct_rev_pipe(void);
 
-/* Phase 63-06 (TX-1): the deliberate HAVE_DOCA=1 CGO link break for
+/* (TX-1): the deliberate HAVE_DOCA=1 CGO link break for
  * DocaGetEgressSteerPipe / docaGetSteerPipeDirect is resolved by deleting
  * both Go wrappers and their callers in pkg/loxinet/dpu_doca_*. The
  * C-side prototype was already removed in Plan 63-04. */
@@ -192,19 +192,19 @@ llb_doca_pipe_handle_t llb_doca_get_ct_rev_pipe(void);
  * REMOVE after diagnosis is complete. ---- */
 int llb_doca_ct_rev_test_drop_all(void);
 
-/* ---- UDP CT pipe access (Phase 34, dedicated UDP conntrack pipe) ---- */
+/* --- UDP CT pipe access (dedicated UDP conntrack pipe) ---- */
 llb_doca_pipe_handle_t llb_doca_get_udp_ct_pipe(void);
 
-/* ---- Root pipe rebuild (Phase 34, reusable for Phases 35/37) ---- */
+/* --- Root pipe rebuild (reusable for Phases 35/37) ---- */
 int llb_doca_rebuild_root_pipe(const llb_doca_root_pipe_cfg *cfg);
 
-/* Phase 63-04: EGRESS_STEER_NR_ENTRIES macro deleted along with the
- * EGRESS-domain steer pipe (CONTEXT.md D-04). The Go-side
+/* EGRESS_STEER_NR_ENTRIES macro deleted along with the
+ * EGRESS-domain steer pipe (CONTEXT.md). The Go-side
  * GetEgressSteerCapacity() in pkg/loxinet/dpu_doca_cgo.go is a pure Go
  * constant (returns 1024) — Plan 63-06 will remove that helper and the
  * deferred_offload capacity gate that consumes it. */
 
-/* ---- FDB L2 pipe (Phase 36: MAC-based unicast forwarding) ---- */
+/* --- FDB L2 pipe (: MAC-based unicast forwarding) ---- */
 #define LLB_DOCA_FDB_PIPE_CAPACITY 4096
 
 llb_doca_pipe_handle_t llb_doca_fdb_pipe_create(uint32_t nr_entries);
@@ -220,26 +220,26 @@ llb_doca_entry_handle_t llb_doca_fdb_entry_add(
 
 llb_doca_pipe_handle_t llb_doca_get_fdb_pipe(void);
 
-/* ---- ACL HW offload (Phase 64: rebuilt from validated flow_acl_basic sample) ----
+/* --- ACL HW offload (: rebuilt from validated flow_acl_basic sample) ----
  *
- * Phase 37 single-pipe signatures and the Phase 63 L4 dispatch stub are RETIRED per Phase 64 D-19
+ * single-pipe signatures and the L4 dispatch stub are RETIRED per 
  * (replaced by the lazy DENY+ALLOW pipe pair declared below; 15,360 shared NON_SHARED counter
- * ceiling per D-11; ROOT now dispatches per-L4-proto directly to CT_FWD).
+ * ceiling per; ROOT now dispatches per-L4-proto directly to CT_FWD).
  *
- * New Phase 64 pipeline: ROOT → DENY_PIPE → ALLOW_PIPE → CT_FWD → CT_REV(miss) → EGRESS_DISPATCH.
+ * New pipeline: ROOT → DENY_PIPE → ALLOW_PIPE → CT_FWD → CT_REV(miss) → EGRESS_DISPATCH.
  * DENY_PIPE drops per-entry; ALLOW_PIPE is a counter-only audit layer (no MAC rewrite — CT owns that).
- * Both pipes are lazy: created on first HwOffload=true rule, destroyed when the last is removed (D-13).
- * Match shape: 5-tuple TRANSPORT with per-entry mask for CIDR support (D-08).
+ * Both pipes are lazy: created on first HwOffload=true rule, destroyed when the last is removed.
+ * Match shape: 5-tuple TRANSPORT with per-entry mask for CIDR support.
  */
 
 /* Lazy lifecycle: create BOTH g_deny_pipe and g_allow_pipe atomically.
  * Returns LLB_DOCA_OK on success, LLB_DOCA_ERR on any failure (rollback both).
  * Idempotent — second call when both pipes are already up returns LLB_DOCA_OK.
- * ALLOW_PIPE is created FIRST because DENY_PIPE's fwd_miss.next_pipe = g_allow_pipe (D-13). */
+ * ALLOW_PIPE is created FIRST because DENY_PIPE's fwd_miss.next_pipe = g_allow_pipe. */
 int llb_doca_acl_pipes_create(void);
 
 /* Lazy lifecycle: destroy BOTH pipes. Caller MUST first re-dispatch the root pipe
- * AWAY from g_deny_pipe before invoking this (D-13 OPENING→CLOSING sequencing). */
+ * AWAY from g_deny_pipe before invoking this ( OPENING→CLOSING sequencing). */
 void llb_doca_acl_pipes_destroy(void);
 
 /* Per-rule entry add for the DENY pipe. The pipe must be up — the caller must invoke the
@@ -250,12 +250,12 @@ void llb_doca_acl_pipes_destroy(void);
  *
  * Exact-IP values only — DOCA 2.9.4 `doca_flow_pipe_add_entry` is 9-arg and BASIC pipes
  * use the pipe-level template mask set at create time; per-entry masks are NOT supported.
- * D-08 "CIDR via per-entry mask" was infeasible — corrected to exact-IP-only;
+ * "CIDR via per-entry mask" was infeasible — corrected to exact-IP-only;
  * `validateHwOffloadExpressible` rejects non-/32 source / destination prefixes.
  *
  * When `timeout_ms > 0`, the call blocks on wait_entry_offload(); when `timeout_ms == 0`,
  * the call returns immediately after the DOCA_FLOW_NO_WAIT enqueue and the Go-side
- * debouncer drives doca_flow_entries_process() on its 50ms tick (D-15). Returns entry
+ * debouncer drives doca_flow_entries_process on its 50ms tick. Returns entry
  * handle (opaque), NULL on failure. */
 llb_doca_entry_handle_t llb_doca_acl_deny_entry_add(
     const void *em,
@@ -271,11 +271,11 @@ llb_doca_entry_handle_t llb_doca_acl_allow_entry_add(
 int llb_doca_acl_deny_entry_del(llb_doca_entry_handle_t entry);
 int llb_doca_acl_allow_entry_del(llb_doca_entry_handle_t entry);
 
-/* Pipe-handle accessors. Return NULL when pipes are not up (D-13 lazy state). */
+/* Pipe-handle accessors. Return NULL when pipes are not up ( lazy state). */
 llb_doca_pipe_handle_t llb_doca_get_deny_pipe(void);
 llb_doca_pipe_handle_t llb_doca_get_allow_pipe(void);
 
-/* Match-buffer helpers — Plan 64-04 D-19 ext: the bridge header must stay free of
+/* Match-buffer helpers — Plan 64-04 ext: the bridge header must stay free of
  * DOCA includes (loxilb_doca_flow.h:21 contract) so Go callers cannot use
  * `C.sizeof_struct_doca_flow_match` directly. These helpers allocate and fill an
  * opaque match buffer from primitive Go-side args, returning a heap pointer the
@@ -288,7 +288,7 @@ void *llb_doca_acl_match_alloc_ip4(
     uint32_t dst_ip,
     uint32_t dst_mask,
     uint16_t src_port,      /* network byte order; 0 = wildcard if mask=0 */
-    uint16_t src_port_mask, /* 0=wildcard, 0xFFFF=exact (D-08) */
+    uint16_t src_port_mask, /* 0=wildcard, 0xFFFF=exact */
     uint16_t dst_port,
     uint16_t dst_port_mask);
 
@@ -307,15 +307,15 @@ void llb_doca_acl_match_free(void *match);
 
 /* ---- Entry CRUD -- BASIC pipe ----
  *
- * Phase 63-06 (D-12): dropped the trailing `out_es_entry` out-param. The paired
- * g_egress_steer entry pattern (Phase 55 P2) is removed entirely — Plan 63-02
+ * dropped the trailing `out_es_entry` out-param. The paired
+ * g_egress_steer entry pattern ( P2) is removed entirely — Plan 63-02
  * replaced it with a DEFAULT-domain g_egress_dispatch pipe that installs
  * static per-port FWD_PORT entries at init, and Plan 63-04 deleted
  * g_egress_steer_pipe wholesale. CT entries now drive the downstream dispatch
  * via meta.pkt_meta = target_port_id; no paired install is needed at flow time.
  *
- * REQ-55-INV-01 invariant preserved: the per-direction CT split (g_ct_fwd_pipe
- * forward + g_ct_rev_pipe reply, miss-chained per 63-04 D-04) still flows
+ * INV-01 invariant preserved: the per-direction CT split (g_ct_fwd_pipe
+ * forward + g_ct_rev_pipe reply, miss-chained per 63-04) still flows
  * through this single shared function body.
  */
 llb_doca_entry_handle_t llb_doca_entry_add_basic(
@@ -333,9 +333,9 @@ llb_doca_entry_handle_t llb_doca_entry_add_basic(
     uint32_t timeout_ms,          /* max wait for offload callback */
     uint8_t  match_proto,         /* IPPROTO_TCP or IPPROTO_UDP for port field dispatch */
     uint16_t fwd_port_id,         /* per-entry FWD_PORT target (DPDK port ID for VF repr) */
-    uint32_t aging_sec,           /* per-entry idle timeout for DOCA aging (Phase 35) */
-    uint64_t user_ctx,            /* opaque ID for aged-entry identification (Phase 35) */
-    uint32_t meter_id             /* shared meter ID (LLB_DOCA_METER_NONE = no meter) (Phase 38) */
+    uint32_t aging_sec,           /* per-entry idle timeout for DOCA aging */
+    uint64_t user_ctx,            /* opaque ID for aged-entry identification */
+    uint32_t meter_id             /* shared meter ID (LLB_DOCA_METER_NONE = no meter) */
 );
 
 /* ---- Entry remove ---- */
@@ -343,7 +343,7 @@ int llb_doca_entry_remove(llb_doca_pipe_handle_t pipe,
                            llb_doca_entry_handle_t entry,
                            uint32_t timeout_ms);
 
-/* ---- Aging infrastructure (Phase 35) ---- */
+/* --- Aging infrastructure ---- */
 #define LLB_DOCA_AGED_RING_SIZE 512
 
 typedef struct {
@@ -359,7 +359,7 @@ int llb_doca_get_aged_entries(uint64_t *out_ctx, int max_out);
  * queue saturates (default ~128 entries on BF2 DOCA 2.9.4 switch,hws). */
 int llb_doca_entries_drain(uint32_t timeout_us, uint32_t max_entries);
 
-/* ---- Meter classification pipe (Phase 38: per-service/per-host metering) ---- */
+/* --- Meter classification pipe (: per-service/per-host metering) ---- */
 #define LLB_DOCA_METER_PIPE_CAPACITY 256
 
 /* Create meter classification BASIC pipe with FIXED meter_id (no wildcard).
@@ -382,7 +382,7 @@ llb_doca_entry_handle_t llb_doca_meter_pipe_entry_add(
 llb_doca_pipe_handle_t llb_doca_get_meter_pipe(void);
 void llb_doca_set_meter_pipe(llb_doca_pipe_handle_t pipe);
 
-/* ---- Shared meter lifecycle (Phase 38: QoS metering HW offload) ---- */
+/* --- Shared meter lifecycle (: QoS metering HW offload) ---- */
 #define LLB_DOCA_MAX_METERS   64
 #define LLB_DOCA_METER_NONE   0xFFFFFFFF
 
@@ -408,5 +408,5 @@ int llb_doca_entry_query(llb_doca_entry_handle_t entry,
  * cached entry handles are set once during init by llb_doca_rebuild_root_pipe. */
 void llb_doca_diag_dump_root_entries(void);
 
-/* Phase 65 — DOCA counter query bridge declarations (Plan 65-02). */
+/* DOCA counter query bridge declarations (Plan 65-02). */
 #include "loxilb_doca_metrics.h"

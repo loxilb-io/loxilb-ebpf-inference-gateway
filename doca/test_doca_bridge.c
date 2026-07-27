@@ -125,7 +125,7 @@ int main(void)
         uint8_t zero_mac[6] = {0};
         /* Pre-existing technical debt: this test still uses the legacy
          * pre-Phase-35 / pre-Phase-38 short signature. Adding the recent
-         * trailing params (aging_sec, user_ctx, meter_id) plus the Phase 55
+ * trailing params (aging_sec, user_ctx, meter_id) plus the 
          * paired-steer out-param keeps test_doca_bridge in lockstep with the
          * production header so `make test_bridge` still compiles. */
         llb_doca_entry_handle_t entry = llb_doca_entry_add_basic(
@@ -141,7 +141,7 @@ int main(void)
             0,                    /* aging_sec: 0 (no DOCA aging in this test) */
             0,                    /* user_ctx: 0 (test does not exercise aging) */
             0xFFFFFFFF,           /* meter_id: LLB_DOCA_METER_NONE */
-            NULL);                /* Phase 55 P2: out_es_entry — test does not exercise paired steer */
+            NULL);                /* P2: out_es_entry — test does not exercise paired steer */
         if (!entry) {
             TEST_FAIL(6, "llb_doca_entry_add_basic returned NULL");
             goto destroy_basic;

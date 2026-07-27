@@ -18,17 +18,17 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/socket.h>
-#include <netinet/in.h>   /* sockaddr_in / AF_INET (FR-08 real-peer-IP for XFF) */
-#include <arpa/inet.h>    /* inet_ntop / ntohs (FR-08 X-Forwarded-* construction) */
+#include <netinet/in.h>   /* sockaddr_in / AF_INET ( real-peer-IP for XFF) */
+#include <arpa/inet.h>    /* inet_ntop / ntohs ( X-Forwarded-* construction) */
 #include <openssl/ssl.h>
 
 #include "sockproxy_h2.h"
 #include "sockproxy.h"
-#include "sockproxy_l7policy.h" /* Phase 75: l7_route_dispatch (L7 content routing) */
+#include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "notify.h"
 #include "log.h"
 
-// HTTP/HTTPS Tracing Support (Phase 2: Error Trace Emission)
+// HTTP/HTTPS Tracing Support (: Error Trace Emission)
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_ring.h"
 #include "lxb_trace_event.h"
@@ -279,17 +279,17 @@ proxy_h2_on_frame_recv_callback(nghttp2_session *session,
         stream->headers_complete = 1;
         stream->state = H2_STREAM_OPEN;
       }
-      /* FR-07/D-11 (H2 parity): a complete HEADERS frame arrived — clear the connection-level
+      /* (H2 parity): a complete HEADERS frame arrived — clear the connection-level
        * header-accumulation anchor so the tcp_inspect deadline (checked in the H2 client-data
        * branch of proxy_run) no longer fires once real request headers have been received. */
       pfe->l7_hdr_accum_start = 0;
-      /* FR-07 (D-10, H2 parity): arm the member-data idle baseline now that the request HEADERS are
+      /* (H2 parity): arm the member-data idle baseline now that the request HEADERS are
        * complete and the request is about to be relayed to the member. Mirrors the H1 site in
        * sockproxy_http.c: the idle pass (sockproxy_health.c) only evaluates when last_activity>0, but
        * last_activity was historically set ONLY for sticky sessions, so a plain L7 FORWARD never armed
        * the timeoutMemberData deadline and a slow/blackhole member ran the full backend delay. Gated on
-       * the SAME FR-07 condition the idle pass uses (has_l7_policy + timeout_member_data_ms>0) so it is
-       * a pure no-op for the AI peer / un-configured listeners (D-01a/D-14). */
+ * the SAME condition the idle pass uses (has_l7_policy + timeout_member_data_ms>0) so it is
+ * a pure no-op for the AI peer / un-configured listeners. */
       {
         proxy_map_ent_t *l7ent = (proxy_map_ent_t *)pfe->head;
         if (l7ent && l7ent->has_l7_policy && l7ent->arg_ptr &&
@@ -384,8 +384,8 @@ proxy_h2_on_header_callback(nghttp2_session *session,
     stream->has_conv_id = 1;
   }
 
-  // Phase 75 (FR-19): append into the bounded generic L7 header/cookie store on
-  // the per-connection pfe — H1/H2 PARITY with handle_header_val (T-75-06). This
+  // append into the bounded generic L7 header/cookie store on
+  // the per-connection pfe — H1/H2 PARITY with handle_header_val. This
   // is the SAME store l7_policy_evaluate (Plan 03/04) reads, so HTTP/2 requests
   // match arbitrary HEADER/COOKIE conditions exactly like HTTP/1.1. nghttp2's
   // name/value are length-delimited (not NUL-terminated), so use the _n helper;
@@ -880,7 +880,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
 
-    // Phase 76 FR-10 (D-02/D-03/D-04): on the L7_Proxy peer only (D-01a gate),
+    // on the L7_Proxy peer only ( gate),
     // inject a stateless HTTP_COOKIE Set-Cookie into the relayed HEADERS frame
     // BEFORE submit — via the NON-TERMINAL seam proven by 76-03's test_pd C-unit.
     // We append to the SAME mapping->response_headers[] the relay submits below
@@ -889,7 +889,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     // (parity with the H1 \r\n\r\n splice). nghttp2_nv only — never raw bytes
     // (75-LEARNINGS §🟠.2 / defect 097c8dba). has_l7_policy==0 (AI/transit) is
     // byte-for-byte unchanged. Pure no-op unless the matched route's
-    // cookie_persist is set. Nothing stored on proxy_fd_ent (D-02): the token IS
+    // cookie_persist is set. Nothing stored on proxy_fd_ent: the token IS
     // the binding, so affinity survives HA failover.
     if (client_session->pfe) {
       proxy_fd_ent_t *client_pfe = (proxy_fd_ent_t *)client_session->pfe;
@@ -902,7 +902,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
         if (tepval && ep_idx >= 0 && ep_idx < tepval->n_eps &&
             l7_cookie_node_token_for_ep(node, tepval, ep_idx, token,
                                         sizeof(token)) > 0) {
-          /* Build "<name>=<token>; Path=/; HttpOnly[; Secure]" (D-04). HTTPS iff
+          /* Build "<name>=<token>; Path=/; HttpOnly[; Secure]". HTTPS iff
            * the client connection is TLS. nghttp2 deep-copies on submit; the
            * relay's per-mapping cleanup frees the injected nv uniformly. */
           int is_ssl = (client_pfe->ssl != NULL || client_pfe->ktls_enabled);
@@ -924,16 +924,16 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       }
     }
 
-    // FR-33 (Phase 77, D-77-05/06, RFC 6797): HSTS response injection on the H2
+    // (RFC 6797): HSTS response injection on the H2
     // leg. Build the SAME synthesized Strict-Transport-Security value as the H1
-    // seam (l7_hsts_synthesize — one synthesizer, two emit seams, Phase 76) into
+    // seam (l7_hsts_synthesize — one synthesizer, two emit seams) into
     // an nghttp2_nv with the LOWERCASE name "strict-transport-security" (HTTP/2
     // header rule) and inject it via the NON-TERMINAL proxy_h2_inject_resp_headers
     // (Plan 76-03) — appends into mapping->response_headers[] BEFORE the submit
     // below, so END_STREAM and the body DATA frames are untouched. NEVER raw \r\n
     // on an H2 socket (defect 097c8dba) and NEVER nghttp2_submit_response(...NULL)
     // (terminal). SAME triple gate as H1: have_ssl && has_l7_policy &&
-    // hsts_max_age>0 (D-77-06). has_l7_policy==0 (AI/transit) is byte-for-byte
+    // hsts_max_age>0. has_l7_policy==0 (AI/transit) is byte-for-byte
     // unchanged; a plain-HTTP listener (have_ssl==0) skips + logs (RFC 6797).
     if (client_session->pfe) {
       proxy_fd_ent_t *client_pfe = (proxy_fd_ent_t *)client_session->pfe;
@@ -941,7 +941,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       if (node && node->has_l7_policy &&
           node->arg_ptr && node->arg_ptr->hsts_max_age > 0) {
         if (!node->val.have_ssl) {
-          log_debug("[FR-33][HSTS][H2] skip: plain-HTTP listener (have_ssl=0), "
+          log_debug("[HSTS][H2] skip: plain-HTTP listener (have_ssl=0), "
                     "HSTS not injected (RFC 6797)");
         } else {
           char hsts_val[L7_HDR_VALUE_MAX];
@@ -1794,10 +1794,10 @@ proxy_check_and_setup_h2(proxy_fd_ent_t *pfe)
 }
 
 /*
- * proxy_h2_inject_resp_headers — Phase 76 (FR-08/FR-10) NON-TERMINAL response
+ * proxy_h2_inject_resp_headers — NON-TERMINAL response
  * header injector. See sockproxy_h2.h for the full contract.
  *
- * The genuinely net-new C primitive of Phase 76 (76-RESEARCH Pitfall 2 /
+ * The genuinely net-new C primitive of (76-RESEARCH Pitfall 2 /
  * 76-PATTERNS "No Analog Found" / A4). It appends `extra` headers into the
  * per-stream collected response-header set that the backend->client relay
  * (proxy_h2_backend_on_frame_recv_callback, the HEADERS case) submits to the
@@ -1901,7 +1901,7 @@ proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
  * write raw "HTTP/1.1 ..." bytes + shutdown() on pfe->fd; that is correct for H1
  * but is an HTTP/2 protocol violation on an h2 socket — the client's framing layer
  * sees garbage and aborts the whole connection (curl returns 000). This is the
- * T-75-17 H1/H2 parity fix: on an active h2 session we answer the specific stream
+ * H1/H2 parity fix: on an active h2 session we answer the specific stream
  * with a HEADERS-only response (END_STREAM via NULL data provider) and leave the
  * connection open (h2 multiplexes — only this stream closes). The body is omitted
  * on h2: the gate (and Octavia) assert only the status code and, for REDIRECT, the
@@ -2212,11 +2212,11 @@ proxy_h2_data_read_callback(nghttp2_session *session, int32_t stream_id,
 }
 
 // ============================================================================
-// FR-08 (Phase 76, D-07/D-08/D-09) — H2 request-header injection (parity w/ H1)
+// H2 request-header injection (parity w/ H1)
 // ============================================================================
 /*
  * The H2 request HEADERS frame the proxy sends to the backend is built from an
- * nghttp2_nv[] (stream->request_headers). FR-08 augments that array, on the
+ * nghttp2_nv (stream->request_headers). augments that array, on the
  * L7_Proxy peer only (has_l7_policy gated by the caller), via the SAME shared
  * op-selection/validation as H1 — l7_apply_req_filters() in sockproxy_l7policy.c
  * — so there is exactly ONE source of truth (Pitfall 1; never reimplement).
@@ -2313,12 +2313,12 @@ l7h2_emit(void *vctx, int op, const char *name, const char *value)
 }
 
 /*
- * proxy_h2_build_l7_req_headers — produce the FR-08-augmented request nv array
+ * proxy_h2_build_l7_req_headers — produce the -augmented request nv array
  * for the backend HEADERS frame. Caller MUST have gated on ent->has_l7_policy.
  * On success returns a malloc'd nv array (*out_nv / *out_n) and fills *ctx_out
  * with the owned name/value buffers to free AFTER nghttp2_submit_request copies
  * them. Returns -1 (and leaves *out_nv NULL) on OOM — caller submits the
- * original unmodified headers. `fd` is the client socket (real peer IP, D-07).
+ * original unmodified headers. `fd` is the client socket (real peer IP).
  */
 static int
 proxy_h2_build_l7_req_headers(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
@@ -2341,7 +2341,7 @@ proxy_h2_build_l7_req_headers(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   ctx_out->n_out = n_orig;
   ctx_out->cap_out = cap;
 
-  /* Real TCP peer IP for XFF (D-07) — the client socket peer, not any client XFF. */
+  /* Real TCP peer IP for XFF — the client socket peer, not any client XFF. */
   char xff_ip[INET6_ADDRSTRLEN] = {0};
   struct sockaddr_in peer;
   socklen_t plen = sizeof(peer);
@@ -2415,12 +2415,12 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   // P6: Extract path (already available in stream->path, line 331)
   const char *request_path = stream->path[0] ? stream->path : "/";
   
-  // Phase 75 (D-10): L7 content-routing discriminator + dispatch — the H2 seam.
+  // L7 content-routing discriminator + dispatch — the H2 seam.
   // IDENTICAL shared helper to the H1 seam (sockproxy_ep.c) so the two paths
-  // cannot drift (the dominant H1/H2 parity landmine, T-75-12). Runs AFTER the
+  // cannot drift (the dominant H1/H2 parity landmine). Runs AFTER the
   // AI-GW gate (untouched) and BEFORE the AI model selection below; a pure no-op
   // when no L7_POLICY is attached (has_l7_policy==0), leaving the AI path
-  // byte-for-byte unchanged (D-04 / Pitfall 5).
+  // byte-for-byte unchanged (Pitfall 5).
   //
   // The engine is pfe-only, but in HTTP/2 the per-request authority/path/method
   // live on the stream — so mirror them into pfe BEFORE dispatch (the contract
@@ -2450,14 +2450,14 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     }
 #endif
 
-    // T-75-17: tell the synthetic responder (proxy_h2_send_l7_synthetic, invoked
+    // tell the synthetic responder (proxy_h2_send_l7_synthetic, invoked
     // from l7_send_reject/redirect inside dispatch) which stream a REJECT/REDIRECT
     // must answer — l7_send_* carry only `pfe`, not the stream.
     pfe->h2_session->l7_active_stream_id = stream->stream_id;
 
     l7_rc = l7_route_dispatch(pfe, ent, &l7_tepval);
 
-    // Phase 75 diagnostic (T-75-17 H1/H2 parity): make the H2 L7 decision visible
+    // diagnostic ( H1/H2 parity): make the H2 L7 decision visible
     // in loxilbdp.log so a FORWARD-with-no-pool vs a no-match-REJECT is debuggable.
     log_debug("[HTTP/2][L7] stream=%d host='%s' path='%s' rc=%d tepval=%p",
               stream->stream_id, pfe->host_url, pfe->request_path,
@@ -2473,7 +2473,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       return 0;
     } else if (l7_rc == L7_DISPATCH_FORWARD) {
       // FORWARD: a plain pool was resolved; re-enter the existing intra-pool
-      // EP-select WITHOUT touching the AI model engine (D-03). A NULL pool falls
+      // EP-select WITHOUT touching the AI model engine. A NULL pool falls
       // into the existing 502 no-endpoint block below (we still skip the AI LPM).
       tepval = l7_tepval;
       goto h2_have_tepval;
@@ -2568,15 +2568,15 @@ h2_have_tepval:
   }
 #endif  // HAVE_DP_GPU_ROUTING
   
-  // FR-10 (Phase 76, D-02/D-03/D-05): STATELESS HTTP_COOKIE read-back pin — H2
+  // STATELESS HTTP_COOKIE read-back pin — H2
   // parity with the H1 sockproxy_ep.c pin. When the matched L7 route enables
   // cookie_persist and the request carries a valid LB cookie (read from the
   // H1/H2-parity pfe->l7_headers store, populated in Plan 02), re-derive +
   // constant-time-match the token against the LIVE member set and PIN ep_idx to
   // that member. On a forged/stale token (or no cookie) l7_cookie_node_match
   // returns L7_COOKIE_MISS and ep_idx stays -1 so the normal selection below runs
-  // (D-03: never an arbitrary backend). Nothing read/written on proxy_fd_ent
-  // (D-02) — works identically on an HA peer that never saw the original request.
+  // (: never an arbitrary backend). Nothing read/written on proxy_fd_ent
+  // works identically on an HA peer that never saw the original request.
   if (ent && ent->has_l7_policy && l7_cookie_persist_active(pfe, ent)) {
     char presented[LB_COOKIE_TOKEN_MAX];
     if (l7_cookie_read_presented(pfe, presented, sizeof(presented)) == 0) {
@@ -2827,7 +2827,7 @@ h2_have_tepval:
       }
 #endif
       
-      // P2 Phase 2 Task 2.3: Record circuit breaker failure
+      // P2 Task 2.3: Record circuit breaker failure
       if (tepval) {
         circuit_breaker_record_failure(tepval, ep_idx);
       }
@@ -2858,7 +2858,7 @@ h2_have_tepval:
     pfe->rfd[ep_idx] = backend_fd;
     pfe->n_rfd = (ep_idx + 1 > pfe->n_rfd) ? ep_idx + 1 : pfe->n_rfd;
     
-    // P2 Phase 2 Task 2.3: Record circuit breaker success
+    // P2 Task 2.3: Record circuit breaker success
     circuit_breaker_record_success(tepval, ep_idx);
   }
   
@@ -2955,12 +2955,12 @@ h2_have_tepval:
   nghttp2_nv *headers = stream->request_headers;
   size_t nheaders = stream->request_headers_count;
 
-  /* FR-08 (Phase 76, D-07/D-08/D-09): on the L7_Proxy peer (has_l7_policy, D-01a)
+  /* on the L7_Proxy peer (has_l7_policy)
    * build an AUGMENTED nv array — always-overwrite X-Forwarded-For (real TCP peer
    * IP) + X-Forwarded-Port/Proto + insertHeaders SET/ADD/REMOVE — via the SAME
    * shared l7_apply_req_filters() the H1 path uses (Pitfall 1 parity; nghttp2_nv
    * only, never raw \r\n bytes). No-op for the AI peer (has_l7_policy==0): the
-   * original headers are submitted byte-for-byte unchanged (D-14). */
+ * original headers are submitted byte-for-byte unchanged. */
   nghttp2_nv *l7_headers_nv = NULL;
   l7h2_emit_ctx_t l7_hdr_ctx;
   int l7_hdr_built = 0;
@@ -3012,7 +3012,7 @@ h2_have_tepval:
 
   pthread_mutex_unlock(&backend_session->send_lock);
 
-  /* FR-08: nghttp2_submit_request has copied the nv name/value bytes into its own
+  /* nghttp2_submit_request has copied the nv name/value bytes into its own
    * HPACK buffers, so the staging copies + array can be freed now. */
   if (l7_hdr_built) {
     proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
@@ -3024,7 +3024,7 @@ h2_have_tepval:
     log_error("[HTTP/2] stream %d: nghttp2_submit_request failed: %s",
               stream->stream_id, nghttp2_strerror(backend_stream_id));
     
-    // P2 Phase 2 Task 2.3: Record circuit breaker failure
+    // P2 Task 2.3: Record circuit breaker failure
     circuit_breaker_record_failure(tepval, ep_idx);
     
     // Send error to client
@@ -3154,7 +3154,7 @@ h2_have_tepval:
 
   pthread_mutex_unlock(&backend_session->send_lock);
   
-  // P2 Phase 2 Task 2.3: Record circuit breaker success
+  // P2 Task 2.3: Record circuit breaker success
   circuit_breaker_record_success(tepval, ep_idx);
   
   // CRITICAL-1 FIX: Free prefix_key after successful forwarding

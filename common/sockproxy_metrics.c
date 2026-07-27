@@ -41,7 +41,7 @@
 
 /*
  * cmp_proxy_ent - compare two proxy_ent_t for equality (xip/xport/proto).
- * Defined (non-static) in sockproxy.c; moves to sockproxy_conn.c in Phase 3.
+ * Defined (non-static) in sockproxy.c; moves to sockproxy_conn.c in.
  * See sockproxy_refactoring_plan.md §6.2
  */
 bool cmp_proxy_ent(proxy_ent_t *e1, proxy_ent_t *e2);
@@ -163,7 +163,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
         snapshot.conversation_sessions += HASH_COUNT(node->val.conv_map);
         pthread_rwlock_unlock(&node->val.conv_lock);
 
-        /* OBS-01: Count active P/D sessions and trie nodes (Phase 8) */
+        /* OBS-01: Count active P/D sessions and trie nodes */
         {
             proxy_epval_t *tepval, *tmp_epval;
             HASH_ITER(hh, node->val.ephash, tepval, tmp_epval) {
@@ -187,7 +187,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     /* CHWBL load imbalance (optional - GPU routing) */
     snapshot.chwbl_load_imbalance_ratio = 0.0f;
 #ifdef HAVE_DP_GPU_ROUTING
-    /* Implementation deferred -- see Phase 1 GPU integration */
+    /* Implementation deferred -- see GPU integration */
 
     /* P/D Disaggregation counters */
     snapshot.pd_kv_params_overflow = atomic_load(&global_stats.pd_kv_params_overflow);
@@ -198,12 +198,12 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     /* P/D Buffer overflow counter */
     snapshot.pd_kv_params_overflow = atomic_load(&global_stats.pd_kv_params_overflow);
 
-    /* P/D Production Hardening counters (Phase 5) */
+    /* P/D Production Hardening counters */
     snapshot.pd_cb_flips = atomic_load(&global_stats.pd_cb_flips);
     snapshot.pd_fallback_to_normal = atomic_load(&global_stats.pd_fallback_to_normal);
-    /* P/D session and trie gauges — populated from PROXY_LOCK ephash walk above (Phase 8) */
+    /* P/D session and trie gauges — populated from PROXY_LOCK ephash walk above */
 
-    /* Phase 42: KV Tier 1.5 routing diagnostics — storage only in plan 42-01; */
+    /* KV Tier 1.5 routing diagnostics — storage only in plan 42-01; */
     /* increments land in plan 42-02 when pd_kv_exact_select guards call atomic_fetch_add. */
     snapshot.pd_kv_t15_miss_mode_off     = atomic_load(&global_stats.pd_kv_t15_miss_mode_off);
     snapshot.pd_kv_t15_miss_warmup       = atomic_load(&global_stats.pd_kv_t15_miss_warmup);
@@ -215,8 +215,8 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_kv_t15_miss_excluded     = atomic_load(&global_stats.pd_kv_t15_miss_excluded);
     snapshot.pd_kv_t15_fallthrough_total = atomic_load(&global_stats.pd_kv_t15_fallthrough_total);
 
-    /* Phase 96 (OBS-01): CB proactive heal (93-02, global_stats) + per-EP
-     * admission counters (Phase 93, file-static in sockproxy_pd.c — exported
+    /* (OBS-01): CB proactive heal (93-02, global_stats) + per-EP
+ * admission counters (file-static in sockproxy_pd.c — exported
      * via the pd_admission_stats_get accessor; see sockproxy_metrics.h). */
     snapshot.pd_cb_proactive_heal = atomic_load(&global_stats.pd_cb_proactive_heal);
     snapshot.pd_admission_shed    = pd_admission_stats_get(0);
@@ -293,13 +293,13 @@ llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port,
 }
 
 /*
- * llb_ai_ctrl_update_ep - Phase 96 (D-07): store the global-controller advisory
+ * llb_ai_ctrl_update_ep -: store the global-controller advisory
  * packed instruction word for one EP (state bits 31-24, weight bits 7-0 — see
  * PD_CTRL_* in sockproxy.h). Byte-for-byte mirror of llb_ai_update_ep_queue_depth
  * above (PROXY_LOCK + atomic_store, MAX_PROXY_EP bound, pd_disagg + n_eps guard)
  * — the only differences are the field stored (pd_ctrl_ep[ep_index]) and the
  * value source (the Go applier's merged snapshot, validated Go-side in 96-04:
- * weight<=100, state in the aictrl.v1 enum — T-96-07). This function and
+ * weight<=100, state in the aictrl.v1 enum). This function and
  * llb_ai_ctrl_set_mode below are the SOLE writers of the pd_ctrl_* fields; the
  * selection path only ever atomic_load's them. No malloc/free/pointer swap —
  * the Phase-89/90/93 UAF class is structurally excluded.
@@ -327,7 +327,7 @@ llb_ai_ctrl_update_ep(uint32_t service_ip, uint16_t service_port,
 }
 
 /*
- * llb_ai_ctrl_set_mode - Phase 96 (D-07): store the per-service controller mode
+ * llb_ai_ctrl_set_mode -: store the per-service controller mode
  * ladder scalar (0 = controller absent/autonomous => pd_select_prefill skips ALL
  * controller work, the G3 byte-identical hot path). Byte-for-byte mirror of
  * llb_ai_update_ep_queue_depth above (PROXY_LOCK + atomic_store, pd_disagg
@@ -381,8 +381,8 @@ uint64_t get_timestamp_ns(void) {
 
 /*
  * record_latency_sample - record one TTFB latency data point.
- * Called from proxy_try_epxmit; will move to sockproxy_http.c in Phase 4.
- * Non-static so sockproxy.c can call it until Phase 4 extraction.
+ * Called from proxy_try_epxmit; will move to sockproxy_http.c in.
+ * Non-static so sockproxy.c can call it until extraction.
  */
 void record_latency_sample(uint64_t latency_us) {
     for (int i = 0; i < 12; i++) {
@@ -407,7 +407,7 @@ void record_latency_sample(uint64_t latency_us) {
  * reported on BOTH the cache-hit and the cache-miss (Tier-2 fallthrough) path.
  *
  * Off-path accumulation ONLY — a fixed-bucket atomic_fetch_add mirror of
- * record_latency_sample with NO synchronous logging (T-81-01-02: a fprintf in
+ * record_latency_sample with NO synchronous logging (: a fprintf in
  * the timed path would perturb the very latency C3 measures). The bucket bounds
  * reuse latency_bucket_bounds_us[] so the "must match Go CGO bucketBounds"
  * parity note above covers the per-stage histograms too.

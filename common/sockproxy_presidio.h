@@ -611,7 +611,7 @@ const char* presidio_operator_to_string(presidio_operator_type_t type);
 presidio_operator_type_t presidio_operator_from_string(const char *str);
 
 // ============================================================================
-// CUSTOM RECOGNIZER FUNCTIONS (Phase 2.2)
+// CUSTOM RECOGNIZER FUNCTIONS (.2)
 // ============================================================================
 
 /**

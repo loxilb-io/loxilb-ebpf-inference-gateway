@@ -826,7 +826,7 @@ struct mf_xfrm_inf {
   uint16_t nat_xport;
   uint16_t osp;
   uint16_t odp;
-  uint16_t nixl_xport;              // NIXL side-channel port (US-514); 0=use nat_xport
+  uint16_t nixl_xport;              // NIXL side-channel port; 0=use nat_xport
 };
 typedef struct mf_xfrm_inf nxfrm_inf_t;
 
@@ -1010,59 +1010,59 @@ struct dp_proxy_tacts {
   uint16_t pd_kv_params_max;         // Runtime KV params buffer limit (0 = use PD_KV_PARAMS_MAX_LEN)
   // SSE (Server-Sent Events) streaming configuration
   uint8_t  sse_mode;                 // SSE mode: 1=enabled, 0=disabled per-rule
-  uint8_t  kv_exact_mode;            // KV-cache exact routing: 0=off, 1=zmq (Phase 8)
-  uint8_t  kv_hash_algo;             // KV hash algorithm: 0=sha256_cbor, 1=xxhash_cbor (Phase 8)
+  uint8_t  kv_exact_mode;            // KV-cache exact routing: 0=off, 1=zmq 
+  uint8_t  kv_hash_algo;             // KV hash algorithm: 0=sha256_cbor, 1=xxhash_cbor 
   uint8_t  chwbl_prefix_hash_level;  // CHWBL prefix hash level: 1=L1, 2=L1+L2, 3=L1+L2+L3 (replaces pad3)
   uint32_t max_stream_duration_sec;  // Max stream duration cap in seconds (0=use PROXY_SSE_HARD_CAP_SEC)
   uint32_t backend_keepalive_sec;    // Backend TCP keepalive interval (0=disabled)
   uint32_t pd_session_ttl_sec;       // P/D session TTL in seconds (0=default 300s)
-  uint32_t kv_block_size;            // KV token block size (default 16, Phase 8)
-  uint32_t kv_warmup_sec;           // KV warmup seconds before Tier 1.5 activates (Phase 8)
-  uint16_t kv_zmq_port;             // KV ZMQ PUB port (default 5557, Phase 8)
-  // Phase 99 (SGL-03): per-rule engine + SGLang DP rank count. These two u8s
+  uint32_t kv_block_size;            // KV token block size (default 16)
+  uint32_t kv_warmup_sec;           // KV warmup seconds before Tier 1.5 activates 
+  uint16_t kv_zmq_port;             // KV ZMQ PUB port (default 5557)
+  // (SGL-03): per-rule engine + SGLang DP rank count. These two u8s
   // REPLACE the former pad3b(2) explicit padding (chwbl_prefix_hash_level
   // replaces-pad3 idiom) — every offset and the total size are unchanged, so
   // the four _Static_asserts below stay as-is. 0 = vllm default (byte-identical).
-  uint8_t  kv_engine_type;          // KV engine: 0=vllm (default), 1=sglang (Phase 99)
+  uint8_t  kv_engine_type;          // KV engine: 0=vllm (default), 1=sglang 
   uint8_t  kv_dp_rank_count;        // SGLang DP ranks (1..8; 0 defaulted to 1 at CGO fill)
-  // Octavia per-rule connectionLimit ceiling (FR-06/26 / D-74-05). conn_limit is the configured
+  // Octavia per-rule connectionLimit ceiling. conn_limit is the configured
   // concurrent-connection ceiling read by the SYN-time gate in dp_do_nat (0 = unlimited / no
   // gate). The LIVE concurrent count it is compared against (conc_conns) lives in dp_nat_epacts
   // (rule-index-keyed nat_ep_map) so the CT-teardown path in llb_kern_ct.c can decrement it by
   // rule id without re-deriving the VIP key — mirroring the proven active_sess[] / SecurityRate
   // concurrent_conns inc/dec primitive (selector-agnostic, fires for round-robin AND LC). This
-  // single live count also backs the stats active_connections read (D-74-04). conn_limit(u32) +
+  // single live count also backs the stats active_connections read. conn_limit(u32) +
   // pad3c(u32) = net +8 bytes here; the struct was already 8-aligned (a bare u32 would be padded
   // to 8 anyway). Bump ALL FOUR _Static_asserts + the Go CGO mirror in the same commit.
   uint32_t conn_limit;             // Configured concurrent-conn ceiling (0 = unlimited)
   uint32_t pad3c;                  // Alignment padding (keeps struct 8-byte aligned)
-  // Octavia FR-07 (Phase 76, D-10) per-listener member timeouts in MILLISECONDS (native unit).
-  // Additive + default-off (0 ⇒ preserve today's behaviour, D-14). These mirror the proxy_arg
+  // Octavia per-listener member timeouts in MILLISECONDS (native unit).
+  // Additive + default-off (0 ⇒ preserve today's behaviour). These mirror the proxy_arg
   // *_ms fields (sockproxy.h, added by Plan 76-01) and are copied verbatim into proxy_arg by
   // llb_conv_nat2proxy (loxilb_libdp.c). Enforced only on the L7_Proxy peer (has_l7_policy==1).
   // 3×u32 = +12 bytes; the struct was 8-aligned after pad3c so the first u32 fills the 4-byte
   // slot and the last u32 needs a +4 pad to re-align. Bump ALL FOUR _Static_asserts + (no Go
   // mirror — dpebpf_linux.go reads C.struct_dp_proxy_tacts directly via cgo) in the same commit.
-  uint32_t timeout_member_connect_ms; // FR-07: backend connect-poll deadline (0 ⇒ 500ms default)
-  uint32_t timeout_member_data_ms;    // FR-07: member-side relay idle deadline (0 ⇒ existing idle)
-  uint32_t timeout_tcp_inspect_ms;    // FR-07/D-11: header-accumulation deadline (0 ⇒ bounded default)
+  uint32_t timeout_member_connect_ms; // backend connect-poll deadline (0 ⇒ 500ms default)
+  uint32_t timeout_member_data_ms;    // member-side relay idle deadline (0 ⇒ existing idle)
+  uint32_t timeout_tcp_inspect_ms;    // header-accumulation deadline (0 ⇒ bounded default)
   uint32_t pad3d;                     // Alignment padding (keeps struct 8-byte aligned)
-  // Phase 77 TLS-hardening scalars (FR-32 version/cipher pinning, FR-33 HSTS, FR-11 backend
-  // certIds). Additive + default-off (0/empty ⇒ today's behaviour, D-77-COMPAT). Copied verbatim
+  // TLS-hardening scalars ( version/cipher pinning, HSTS, backend
+  // certIds). Additive + default-off (0/empty ⇒ today's behaviour, -COMPAT). Copied verbatim
   // into the proxy_arg fields 77-02 added by llb_conv_nat2proxy. Consumed only on the L7_Proxy
   // peer (has_l7_policy==1); the AI peer is byte-for-byte unchanged. The Go side reads
   // C.struct_dp_proxy_tacts directly via cgo (no separate Go mirror to update).
   // Byte math (non-MTLS region): tls_version_min(1)+tls_version_max(1)+hsts_include_subdomains(1)
   //   +hsts_preload(1)+hsts_max_age(4) = 8 (8-aligned) + tls_ciphers(256) + backend_ca_cert_id(64)
   //   + backend_client_cert_id(64) = +392 bytes. All FOUR _Static_asserts bumped by +392.
-  uint8_t  tls_version_min;           // FR-32 (D-77-03): low-byte 0x03xx ordinal; 0 ⇒ TLS1.2 floor
-  uint8_t  tls_version_max;           // FR-32 (D-77-03): 0 ⇒ TLS1.3 ceiling
-  uint8_t  hsts_include_subdomains;   // FR-33 (D-77-05): 1 ⇒ "; includeSubDomains"
-  uint8_t  hsts_preload;              // FR-33 (D-77-05): 1 ⇒ "; preload"
-  uint32_t hsts_max_age;              // FR-33 (D-77-05): 0 ⇒ no HSTS injection
-  char     tls_ciphers[256];          // FR-32 (D-77-04): inline cipher string; empty ⇒ today's ciphers
-  char     backend_ca_cert_id[64];    // FR-11 (D-77-14): backend CA certId; empty ⇒ system default
-  char     backend_client_cert_id[64];// FR-11 (D-77-14): backend client certId; empty ⇒ none
+  uint8_t  tls_version_min;           // low-byte 0x03xx ordinal; 0 ⇒ TLS1.2 floor
+  uint8_t  tls_version_max;           // 0 ⇒ TLS1.3 ceiling
+  uint8_t  hsts_include_subdomains;   // 1 ⇒ "; includeSubDomains"
+  uint8_t  hsts_preload;              // 1 ⇒ "; preload"
+  uint32_t hsts_max_age;              // 0 ⇒ no HSTS injection
+  char     tls_ciphers[256];          // inline cipher string; empty ⇒ today's ciphers
+  char     backend_ca_cert_id[64];    // backend CA certId; empty ⇒ system default
+  char     backend_client_cert_id[64];// backend client certId; empty ⇒ none
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1070,7 +1070,7 @@ struct dp_proxy_tacts {
   uint8_t  mtls_pad[6];             // Alignment padding
   char     mtls_client_ca_path[256];
   char     mtls_client_cn_pattern[256];
-  // Phase 77 FR-09 (D-77-07): explicit client-cert CRL path → proxy_arg.client_crl_path.
+  // explicit client-cert CRL path → proxy_arg.client_crl_path.
   // Additive/default-off — empty ⇒ 77-04 sibling-crl convention (+256 bytes; HAVE_MTLS asserts).
   char     mtls_client_crl_path[256];
 #endif /* HAVE_MTLS */
@@ -1085,22 +1085,22 @@ struct dp_proxy_tacts {
 //         +pad3a(1)+pd_kv_params_max(2)+sse_mode(1)+kv_exact_mode(1)+kv_hash_algo(1)+chwbl_prefix_hash_level(1)
 //         +max_stream_dur(4)+backend_ka(4)+pd_session_ttl(4)
 //         +kv_block_size(4)+kv_warmup_sec(4)+kv_zmq_port(2)+kv_engine_type(1)+kv_dp_rank_count(1) = 2424
-//         (Phase 99: the two u8 engine fields replaced the former pad3b(2) — size/offsets unchanged)
-//         +conn_limit(4)+pad3c(4) = +8 (Phase 74; struct already 8-aligned) = 2432
+// (: the two u8 engine fields replaced the former pad3b(2) — size/offsets unchanged)
+// +conn_limit(4)+pad3c(4) = +8 (; struct already 8-aligned) = 2432
 //         +timeout_member_connect_ms(4)+timeout_member_data_ms(4)+timeout_tcp_inspect_ms(4)+pad3d(4)
-//           = +16 (Phase 76 FR-07; struct already 8-aligned) = 2448
+// = +16 (; struct already 8-aligned) = 2448
 //         +HAVE_MTLS: +mtls_frontend_mode(1)+mtls_require_client_cn(1)+mtls_pad(6)+ca_path(256)+cn_pat(256) = +520 = 2968
 // If this assertion fails, update the Go CGO struct in pkg/loxinet/dpebpf_linux.go.
-// ABI guard updated for Phase 8: +kv_block_size(4)+kv_warmup_sec(4)+kv_zmq_port(2)+pad3b(2) = +12 bytes
+// ABI guard updated for: +kv_block_size(4)+kv_warmup_sec(4)+kv_zmq_port(2)+pad3b(2) = +12 bytes
 // Old tail padding (4 bytes after pd_session_ttl_sec) consumed by new fields = net +8 bytes: 2416→2424
-// ABI guard updated for Phase 74: +conn_limit(4)+pad3c(4) = +8 bytes (struct already 8-aligned): 2424→2432.
+// ABI guard updated for: +conn_limit(4)+pad3c(4) = +8 bytes (struct already 8-aligned): 2424→2432.
 //   The live conc_conns count lives in dp_nat_epacts (rule-index-keyed), NOT here, so the
 //   CT-teardown decrement can reach it by rule id; conn_limit (the ceiling) is read by the gate.
-// ABI guard updated for Phase 76 (FR-07): +timeout_member_connect_ms(4)+timeout_member_data_ms(4)
+// ABI guard updated for: +timeout_member_connect_ms(4)+timeout_member_data_ms(4)
 //   +timeout_tcp_inspect_ms(4)+pad3d(4) = +16 bytes (struct already 8-aligned): 2432→2448.
 //   These ms timeouts are copied verbatim into proxy_arg by llb_conv_nat2proxy; no Go mirror to
 //   update (dpebpf_linux.go reads C.struct_dp_proxy_tacts directly via cgo).
-// ABI guard updated for Phase 77 (FR-32/33/11): +tls_version_min(1)+tls_version_max(1)
+// ABI guard updated for: +tls_version_min(1)+tls_version_max(1)
 //   +hsts_include_subdomains(1)+hsts_preload(1)+hsts_max_age(4)+tls_ciphers(256)
 //   +backend_ca_cert_id(64)+backend_client_cert_id(64) = +392 bytes (8-aligned region): all four
 //   asserts shift by +392 (2448→2840, 2440→2832, 2968→3360, 2960→3352). These scalars are copied
@@ -1114,7 +1114,7 @@ _Static_assert(sizeof(struct dp_proxy_tacts) == 2832,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// Phase 77 FR-09: +mtls_client_crl_path(256) = +256 (HAVE_MTLS only): 3360→3616, 3352→3608.
+// +mtls_client_crl_path(256) = +256 (HAVE_MTLS only): 3360→3616, 3352→3608.
 #ifndef HAVE_DP_DPU_SLIM
 _Static_assert(sizeof(struct dp_proxy_tacts) == 3616,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
@@ -1130,18 +1130,18 @@ struct dp_nat_epacts {
   struct bpf_spin_lock lock;
 #endif
   uint16_t active_sess[LLB_MAX_NXFRMS];
-  // Octavia per-rule live concurrent-connection count (FR-06/26 / D-74-04/05). Incremented on
+  // Octavia per-rule live concurrent-connection count. Incremented on
   // CT-create and decremented on CT-teardown, SELECTOR-AGNOSTIC (unlike active_sess[] which is
   // only maintained in the least-connections branch). Keyed by rule index (nat_ep_map key), so
   // the CT-teardown path can decrement it by rule id. Read by the connectionLimit gate in
   // dp_do_nat and by the stats active_connections endpoint. Keep the Go CGO mirror in sync.
   uint32_t conc_conns;
-  // Octavia /stats CUMULATIVE counters (FR-21 / D-74-02 / D-74-06). Unlike conc_conns (a live
+  // Octavia /stats CUMULATIVE counters. Unlike conc_conns (a live
   // gauge), these are monotonic totals maintained in the datapath so they capture EVERY flow —
   // including short-lived ones that are created and torn down between two control-plane RulesSync
   // ticks (the live-CT-walk rollup misses those). Read per-rule by DpCtStatsRollup via the
   // nat_ep_map; reset on rule reset/delete (loxilb_libdp.c). Keep the Go CGO mirror in sync.
-  //   total_conns   = ++ on CT-create (D-74-02 "++ on CT-create"); never decremented.
+  // total_conns = ++ on CT-create ( "++ on CT-create"); never decremented.
   //   cum_bytes_in  = Σ client->VIP request bytes, summed from the forward CT at CT-teardown.
   //   cum_bytes_out = Σ VIP->client response bytes, summed from the reverse CT at CT-teardown.
   // u32 conc_conns + u32 total_conns keep the struct 8-byte aligned for the two trailing u64s.

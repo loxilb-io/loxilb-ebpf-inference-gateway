@@ -68,16 +68,16 @@ struct dp_proxy_ct_ent;
 #endif
 
 // ============================================================================
-// L7 POLICY: generic per-connection header/cookie capture (Phase 75, FR-19)
+// L7 POLICY: generic per-connection header/cookie capture 
 // ----------------------------------------------------------------------------
 // The l7_policy_evaluate engine (Plan 03/04) needs ANY request header by name
 // (and cookies via the captured Cookie header), not just the ~8 named headers
 // the handle_header_val cascade retains today. This is a FIXED-CAPACITY store:
 // overflow beyond L7_MAX_CAPTURED_HEADERS is dropped (counted), never grown, so
 // an attacker cannot inflate the already-large proxy_fd_ent_t (rcvbuf is 1MB)
-// via header flooding (T-75-04). Name/value are truncated to the maxes on copy
-// (bounded strncpy idiom, T-75-05). Populated on BOTH the H1 (handle_header_val)
-// and H2 (proxy_h2_on_header_callback) parse paths for protocol parity (T-75-06).
+// via header flooding. Name/value are truncated to the maxes on copy
+// (bounded strncpy idiom). Populated on BOTH the H1 (handle_header_val)
+// and H2 (proxy_h2_on_header_callback) parse paths for protocol parity.
 #ifndef L7_MAX_CAPTURED_HEADERS
 #define L7_MAX_CAPTURED_HEADERS 32   // max headers retained per connection (bounded)
 #endif
@@ -87,7 +87,7 @@ struct dp_proxy_ct_ent;
 #ifndef L7_HDR_VALUE_MAX
 #define L7_HDR_VALUE_MAX 256         // max stored header-value length (incl NUL)
 #endif
-// Octavia FR-07 (Phase 76, D-11): bounded default for timeout_tcp_inspect_ms when unset (0).
+// Octavia: bounded default for timeout_tcp_inspect_ms when unset (0).
 // 10s mirrors a conservative HAProxy `timeout http-request` default — long enough not to trip
 // legitimate slow clients on the L7_Proxy peer, short enough to bound a slowloris hold. Only
 // ever applied when has_l7_policy==1 (the L7 listener); the AI peer is never gated by this.
@@ -132,7 +132,7 @@ typedef struct proxy_global_stats {
     // by the LLB_PD_MAX_TOTAL_INFLIGHT ingress bound (SYN left in the listen backlog).
     _Atomic uint64_t pd_admission_total_inflight;
     _Atomic uint64_t pd_admission_total_blocked;
-    // Phase 42 (KV Tier 1.5 routing diagnostics): per-guard miss counters + fallthrough.
+    // (KV Tier 1.5 routing diagnostics): per-guard miss counters + fallthrough.
     // Allocated in plan 42-01 (storage only); incremented in plan 42-02 (pd_kv_exact_select guards).
     _Atomic uint64_t pd_kv_t15_miss_mode_off;     // kvExactMode=0 (feature not enabled)
     _Atomic uint64_t pd_kv_t15_miss_warmup;       // warmup grace period suppressing routing
@@ -143,7 +143,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_miss_no_worker;    // llb_ai_kv_best_worker returned no candidate
     _Atomic uint64_t pd_kv_t15_miss_excluded;     // candidate EP excluded (health / load)
     _Atomic uint64_t pd_kv_t15_fallthrough_total; // Tier 1.5 skipped entirely -> Tier 2 path
-    // Phase 81-01 (C3): per-stage hot-path µs histograms. One 12-bucket histogram
+    // (C3): per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
     // "must match Go CGO bucketBounds" parity comment (below) holds for these too.
@@ -177,7 +177,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t llamafirewall_code_shield_detections;
 #endif
 #ifdef HAVE_MTLS
-    // mTLS metrics (Phase 1)
+    // mTLS metrics 
     _Atomic uint64_t mtls_frontend_verify_success;   // Successful client cert verifications
     _Atomic uint64_t mtls_frontend_verify_failures;  // Failed client cert verifications
     _Atomic uint64_t mtls_backend_verify_success;    // Successful backend cert verifications
@@ -202,7 +202,7 @@ int proxy_set_service_catalog(uint32_t xip, uint16_t xport, uint8_t protocol, ui
 #define MAX_PROXY_EP 32
 #endif
 
-// Phase 93-04: bounded backpressured admission — per-EP parked-request FIFO.
+// bounded backpressured admission — per-EP parked-request FIFO.
 // PD_MAX_QUEUE_DEPTH is the COMPILE cap (ring capacity); the RUNTIME bound is
 // LLB_PD_QUEUE_DEPTH_PER_EP (<= PD_MAX_QUEUE_DEPTH; 0/unset = feature off).
 #ifndef PD_MAX_QUEUE_DEPTH
@@ -242,7 +242,7 @@ typedef struct {
 #define PREFIX_HAS_RAG_DOC_IDS   (1 << 7)  // RAG document IDs hash (Level 3)
 
 /**
- * LLM Prefix Key Structure - Phase 1: Dynamic Multi-Level Prefix Hashing
+ * LLM Prefix Key Structure -: Dynamic Multi-Level Prefix Hashing
  *
  * Supports 3-level tiered prefix boundaries:
  *   Level 1 (Global): System prompt, model, optional multi-modal/LoRA/salt
@@ -315,7 +315,7 @@ typedef struct ep_load_tracker {
   _Atomic uint32_t swap_pressure;
 } ep_load_tracker_t;
 
-/* Phase 8: Radix trie for cache-aware prefill EP selection (Tier 1) */
+/* Radix trie for cache-aware prefill EP selection (Tier 1) */
 typedef struct pd_trie pd_trie_t;
 
 // P1.3: CHWBL configuration
@@ -354,28 +354,28 @@ typedef struct pd_session_mapping {
   UT_hash_handle hh;
 } pd_session_mapping_t;
 
-// P2 Phase 2: Draining policy types
+// P2: Draining policy types
 typedef enum {
   DRAIN_POLICY_GRACEFUL,   // Never force-close (default) - connections drain naturally
   DRAIN_POLICY_TIMED,      // Force-close after timeout
   DRAIN_POLICY_IMMEDIATE   // Force-close immediately (emergency maintenance)
 } drain_policy_t;
 
-// P2 Phase 2: Draining state per endpoint
+// P2: Draining state per endpoint
 typedef struct ep_drain_state {
   uint8_t is_draining;           // 1 = draining in progress, 0 = not draining
   time_t drain_start_ts;         // Timestamp when draining started (seconds since epoch)
   uint32_t active_conns_at_start; // Connection count when draining started (for logging)
 } ep_drain_state_t;
 
-// P2 Phase 2 Task 2.3: Circuit breaker states
+// P2 Task 2.3: Circuit breaker states
 typedef enum {
   CB_STATE_CLOSED,      // Normal operation - allow traffic
   CB_STATE_OPEN,        // Rejecting traffic - too many failures
   CB_STATE_HALF_OPEN    // Testing recovery - limited traffic
 } circuit_breaker_state_t;
 
-// P2 Phase 2 Task 2.3: Circuit breaker per endpoint
+// P2 Task 2.3: Circuit breaker per endpoint
 typedef struct circuit_breaker {
   circuit_breaker_state_t state;   // Current circuit state
   uint32_t failure_count;          // Consecutive failures in CLOSED state
@@ -392,7 +392,7 @@ typedef struct circuit_breaker {
 } circuit_breaker_t;
 
 // ============================================================================
-// Phase 96 (D-07): global-AI-controller advisory per-EP instruction word.
+// global-AI-controller advisory per-EP instruction word.
 //
 // One packed _Atomic uint32_t per EP (proxy_epval_t.pd_ctrl_ep[]):
 //   bits 31-24 = state (PD_CTRL_ST_*), bits 7-0 = weight [0,100],
@@ -428,10 +428,10 @@ typedef struct proxy_ent {
   uint8_t protocol;
   uint8_t weight;      // P3: Weight for WRR (1-100, 0=default to 1)
   uint8_t pad;         // Explicit alignment pad
-  uint16_t nixl_port;  // NIXL side-channel port (US-514); 0=use xport
+  uint16_t nixl_port;  // NIXL side-channel port; 0=use xport
 } proxy_ent_t;
 
-/* Phase 99 (D-09): kv_exact_mode value for the Tier-1.5 single-role decouple
+/* kv_exact_mode value for the Tier-1.5 single-role decouple
  * seam. Mode 1 (zmq, P/D) semantics are untouched byte-for-byte; value 2 stays
  * reserved for NATS (RESEARCH Pitfall 6) — single-role deliberately takes 3.
  * Twin-defined idempotently in sockproxy_kv_exact.c for the TEST_KV_EXACT
@@ -453,12 +453,12 @@ typedef struct proxy_epval {
   chwbl_ring_t *hash_ring;      // Consistent hash ring (NULL if not CHWBL mode)
   chwbl_config_t *chwbl_config; // CHWBL configuration & load tracking
   
-  // P2 Phase 2: Draining support
+  // P2: Draining support
   ep_drain_state_t drain_state[MAX_PROXY_EP]; // Draining state per endpoint
   drain_policy_t drain_policy;                // Draining policy for this service
   uint32_t drain_timeout_sec;                 // Timeout for timed draining (default: 60)
   
-  // P2 Phase 2 Task 2.3: Circuit breaker support
+  // P2 Task 2.3: Circuit breaker support
   circuit_breaker_t circuit_breakers[MAX_PROXY_EP]; // Circuit breaker per endpoint
   uint8_t cb_enabled;                               // 1 = enabled, 0 = disabled
   
@@ -482,18 +482,18 @@ typedef struct proxy_epval {
   uint32_t backend_keepalive_sec;   // Backend SO_KEEPALIVE+TCP_KEEPIDLE interval (0=disabled)
   uint32_t inactive_timeout_sec;    // Per-rule idle timeout in seconds (0=disabled); suppressed when sse_active=1
 
-  // P/D Disaggregation configuration (US-502)
+  // P/D Disaggregation configuration 
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
   int      n_prefill_eps;          // Count of prefill endpoints
   int      n_decode_eps;           // Count of decode endpoints
-  // US-508: P/D timeout configuration
+  // P/D timeout configuration
   uint32_t pd_prefill_timeout_sec;  // Prefill response timeout (0 = default 30s)
-  uint32_t pd_decode_timeout_sec;   /* US-ERR01: decode stream timeout (0 = use 120s default) */
-  uint32_t pd_idle_cap_sec;         /* Phase 87 FIX-3: generic ESTABLISHED-idle P/D reaper cap
+  uint32_t pd_decode_timeout_sec;   /* decode stream timeout (0 = use 120s default) */
+  uint32_t pd_idle_cap_sec;         /* generic ESTABLISHED-idle P/D reaper cap
                                        (0 = default max(prefill,decode)+slack) */
-  uint32_t pd_decode_idle_cap_sec;  /* Phase 89: backend-idle window before a decode-streaming SSE
+  uint32_t pd_decode_idle_cap_sec;  /* backend-idle window before a decode-streaming SSE
                                        conn is gracefully completed with a synthesized [DONE]
                                        (0 = PROXY_PD_DECODE_IDLE_CAP_SEC default ~25s) */
 
@@ -507,7 +507,7 @@ typedef struct proxy_epval {
   uint32_t pd_session_ttl_sec;         // session TTL in seconds, 0=no expiry
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP]; // independent of chwbl_config_t
 
-  /* Phase 96 (D-07): global-controller advisory influence. Packed per-EP atomic:
+  /* global-controller advisory influence. Packed per-EP atomic:
    * state bits 31-24 (PD_CTRL_ST_*), weight bits 7-0 [0,100]. Zero-init (this
    * struct is calloc'd at proxy_add — sockproxy_http.c:1891/:2270) == mode 0 ==
    * controller absent == BYTE-IDENTICAL Phase-95 selection (G3). Written ONLY by
@@ -520,7 +520,7 @@ typedef struct proxy_epval {
   _Atomic uint32_t pd_ctrl_ep[MAX_PROXY_EP];
   _Atomic uint8_t  pd_ctrl_mode;      /* 0 = absent/autonomous (skip ALL controller work) */
 
-  /* Phase 93-04: bounded backpressured admission. One parked-request FIFO per
+  /* bounded backpressured admission. One parked-request FIFO per
    * prefill EP; pd_parked_lock guards ALL per-EP FIFOs (coarse but the enqueue
    * path is off the hot dispatch path — it only runs when every prefill EP is
    * already at the in-flight cap). Initialized alongside pd_session_lock /
@@ -529,7 +529,7 @@ typedef struct proxy_epval {
   pd_parked_fifo_t      pd_parked[MAX_PROXY_EP];
   pthread_mutex_t       pd_parked_lock;
 
-  /* Phase 8: per-service radix trie for Tier 1 cache affinity */
+  /* per-service radix trie for Tier 1 cache affinity */
   pd_trie_t           *pd_trie;          /* NULL when pd_cache_aware_mode=0 */
   pthread_rwlock_t     pd_trie_lock;     /* Lock order: pd_session_lock BEFORE pd_trie_lock */
 
@@ -537,25 +537,25 @@ typedef struct proxy_epval {
   pd_session_mapping_t *pd_session_map;    // P/D session table (NULL initially)
   pthread_rwlock_t      pd_session_lock;   // separate from conv_lock
 
-  // KV-Cache Exact Routing (Tier 1.5, Phase 6)
-  uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role (Phase 99)
+  // KV-Cache Exact Routing (Tier 1.5)
+  uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 
   uint8_t  kv_hash_algo;         // 0=sha256_cbor, 1=xxhash_cbor
   uint16_t kv_zmq_port;          // ZMQ PUB port per EP (default 5557)
   uint32_t kv_block_size;        // Token block size for hashing (default 16)
   uint32_t kv_warmup_sec;        // Seconds to skip Tier 1.5 after subscriber start
-  /* Phase 99 A1 finding (verified 2026-07-12): kv_warmup_start has NO
+  /* A1 finding (verified 2026-07-12): kv_warmup_start has NO
    * production writer — only test_kv_exact.c stamps it (the CGO bridge and Go
    * subscriber never do; dpebpf_linux.go fills kv_warmup_sec only). GUARD_B
    * (sockproxy_kv_exact.c) therefore never fires in production: kvWarmupSec is
    * equally INERT on BOTH the P/D (mode 1) and single-role (mode 3) paths.
-   * Deliberately NOT stamped in Phase 99 — stamping now would change shipped
-   * vLLM P/D behavior (byte-identical discipline, D-09/D-10). */
+ * Deliberately NOT stamped in — stamping now would change shipped
+ * vLLM P/D behavior (byte-identical discipline). */
   time_t   kv_warmup_start;      // Timestamp when ZMQ subscriber connected (runtime; never set in production — see A1 note)
-  // Phase 99 (SGL-03, D-05/D-06): per-rule KV engine + SGLang DP rank count.
+  // (SGL-03): per-rule KV engine + SGLang DP rank count.
   // Copied field-for-field at proxy_add_entry alongside the five kv_* fields above.
   uint8_t  kv_engine_type;       // 0=vllm (default), 1=sglang
   uint8_t  kv_dp_rank_count;     // SGLang DP ranks (1..8; 0 defaulted to 1 at the CGO fill)
-  /* Phase 99 (SGL-04, RESEARCH Pitfall 2): the calling rule's identity for the
+  /* (SGL-04, RESEARCH Pitfall 2): the calling rule's identity for the
    * Tier-1.5 Go selector. Threaded through llb_ai_kv_best_worker so the Go side
    * scores ONLY this rule's inventories — without it two same-model VIPs can
    * cross-match content and return an epIdx valid in the WRONG rule's EP space
@@ -565,7 +565,7 @@ typedef struct proxy_epval {
    * pval->_id -> here); no new dp-cfg twin is needed. LB rule markers allocate
    * from 1 (rules.go NewMarker(1, ...)), so 0 unambiguously means "no
    * identity" and the Go side keeps today's all-services loop — the seam is
-   * independently default-off (kv_weight twin-lockstep precedent, Phase 96). */
+ * independently default-off (kv_weight twin-lockstep precedent). */
   uint32_t kv_svc_id;            // calling rule identity for the Go selector (0 = no identity)
 
   UT_hash_handle hh;
@@ -609,24 +609,24 @@ typedef struct proxy_map_ent {
   // - NULL if stack-allocated (old code paths)
   struct proxy_arg *arg_ptr;
 
-  // Phase 75 L7 content-routing policy discriminator (CONTEXT D-10).
+  // L7 content-routing policy discriminator (CONTEXT).
   // These live on the per-service proxy_map_ent (the heap struct), NEVER on
   // proxy_arg (the 4096-byte eBPF map value — its _Static_assert stays untouched,
-  // D-09). DECLARED here by Plan 75-04 (the first reader: l7_route_dispatch reads
+  // ). DECLARED here by Plan 75-04 (the first reader: l7_route_dispatch reads
   // has_l7_policy and, when set, runs the L7 engine over l7_routes); POPULATED by
   // Plan 75-05's proxy_attach_l7_policy (deep-copies the position-sorted route
   // array, regcomp's each REGEX once, sets has_l7_policy=1).
   //
   // When has_l7_policy == 0 (the default for every AI/model service) the L7
   // dispatch is a pure no-op and the AI path runs byte-for-byte unchanged
-  // (D-04 / Pitfall 5). l7_routes is an opaque pointer here (void *) to keep
+  // (Pitfall 5). l7_routes is an opaque pointer here (void *) to keep
   // sockproxy.h free of the l7policy IR dependency; sockproxy_l7policy.c casts it
   // to (const l7_route_t *) before calling l7_policy_evaluate.
-  uint8_t has_l7_policy;            // 1 => an L7_POLICY is attached (D-10 discriminator)
+  uint8_t has_l7_policy;            // 1 => an L7_POLICY is attached ( discriminator)
   void   *l7_routes;                // ordered l7_route_t[] (opaque here; cast in the engine)
   int     n_l7_routes;              // number of routes in l7_routes
 
-  // Phase 75 (gap-fix): scratch "resolved sub-pool" used by l7_resolve_pool to
+  // (gap-fix): scratch "resolved sub-pool" used by l7_resolve_pool to
   // forward a matched L7 route to a SPECIFIC subset of the service's endpoints
   // (the route's backendRefs[].ep, honoring weights) instead of the whole pool.
   // It is a struct proxy_epval (allocated lazily at first FORWARD on this service)
@@ -663,19 +663,19 @@ typedef struct ssl_cert_entry {
   UT_hash_handle hh;          // uthash handle for global hash table
 } ssl_cert_entry_t;
 
-// Phase 77 FR-05 (D-77-10/16): the certId registry is the canonical management
+// the certId registry is the canonical management
 // handle for TLS material, LAYERED OVER the hostname-keyed SNI store above. The
 // SNI callback still SELECTS by hostname at handshake (selection path unchanged,
-// D-77-10); certId is purely the upload/rotate/delete handle. On register, the
-// material is persisted to a managed dir (/etc/loxilb/certs/<certId>/, D-77-11),
-// hostnames are auto-derived from the cert SAN/CN (D-77-12), and EACH derived
+// ); certId is purely the upload/rotate/delete handle. On register, the
+// material is persisted to a managed dir (/etc/loxilb/certs/<certId>/),
+// hostnames are auto-derived from the cert SAN/CN, and EACH derived
 // hostname is registered into the SNI store via the EXISTING
 // proxy_add_sni_certificate (no new SNI loader). The certId is also referenced by
-// proxy_arg.backend_*_cert_id for FR-11 backend re-encryption material (D-77-14).
+// proxy_arg.backend_*_cert_id for backend re-encryption material.
 #define CERTID_MAX_HOSTNAMES 8
-// Phase 77 FR-05 (D-77-10/16): max length of an opaque certId management token.
+// max length of an opaque certId management token.
 // proxy_arg references heavy backend TLS material by this short id instead of
-// inline path strings (768 bytes reclaimed — D-77-14). 64 fits the 77-07 token
+// inline path strings (768 bytes reclaimed). 64 fits the 77-07 token
 // format (alphanumeric handle) with NUL terminator headroom. Defined here (ahead
 // of cert_id_entry and proxy_arg, both of which embed certId[CERTID_MAX]).
 #define CERTID_MAX 64
@@ -702,7 +702,7 @@ struct proxy_cache {
 };
 typedef struct proxy_cache proxy_cache_t;
 
-// US-505: P/D disaggregation orchestration phases
+// P/D disaggregation orchestration phases
 typedef enum {
   PD_PHASE_NONE             = 0,  // Not a P/D request (zero-overhead path)
   PD_PHASE_PREFILL_SENDING  = 1,  // Prefill request being sent to prefill EP
@@ -712,7 +712,7 @@ typedef enum {
   PD_PHASE_DECODE_STREAMING = 5,  // Decode response streaming to client
   PD_PHASE_COMPLETE         = 6,  // P/D flow completed
   PD_PHASE_ERROR            = 7,  // P/D flow error
-  PD_PHASE_PARKED           = 8   // Phase 93-04: client parked (all prefill EPs capped),
+  PD_PHASE_PARKED           = 8   // client parked (all prefill EPs capped),
                                   // EPOLLIN-suspended on a per-EP FIFO, awaiting a freed
                                   // slot (dequeue+resume lands in 93-05). NOT connected.
 } pd_phase_t;
@@ -789,7 +789,7 @@ struct proxy_fd_ent {
   int http_path_ok;        // P6: Path extraction flag
   char last_header_name[128];
 
-  // L7 policy generic header/cookie store (Phase 75, FR-19) — bounded fixed
+  // L7 policy generic header/cookie store — bounded fixed
   // capacity; populated by l7_store_header_n() from BOTH the H1 and H2 parse
   // paths; consumed by l7_policy_evaluate (Plan 03/04). Overflow is dropped.
   struct {
@@ -798,18 +798,18 @@ struct proxy_fd_ent {
   } l7_headers[L7_MAX_CAPTURED_HEADERS];
   uint16_t n_l7_headers;        // count of populated l7_headers slots (<= cap)
 
-  // Octavia FR-07 (Phase 76, D-11): header-accumulation deadline anchor (slowloris guard).
+  // Octavia: header-accumulation deadline anchor (slowloris guard).
   // Set to time(NULL) on the FIRST data byte of the request parsing phase (rfd[0]<=0 and
   // http_hok==0). Enforced ONLY on the L7_Proxy peer (has_l7_policy==1) and ONLY while the
   // request headers are still incomplete: if (now - l7_hdr_accum_start) exceeds the listener's
   // timeout_tcp_inspect_ms deadline (ms, or a bounded default when 0) before \r\n\r\n / the full
   // HEADERS frame arrives, the connection is dropped. Cleared (0) once headers complete so it
-  // never bounds body upload. Pure no-op for the AI peer / un-configured listeners (D-01a/D-14).
-  time_t l7_hdr_accum_start;    // FR-07/D-11: first-byte ts of the in-progress request headers (0=unset)
+  // never bounds body upload. Pure no-op for the AI peer / un-configured listeners.
+  time_t l7_hdr_accum_start;    // first-byte ts of the in-progress request headers (0=unset)
 
   llm_prefix_key_t prefix_key;  // LLM prefix extraction (P0.2)
 
-  // Phase 88-03 (B1): request-scoped chat-routing signal + raw-body locator for
+  // (B1): request-scoped chat-routing signal + raw-body locator for
   // the KV-exact tokenize stage. is_chat=1 marks /v1/chat/completions so
   // pd_kv_exact_select routes tokenization to llb_ai_kv_tokenize_chat (raw body
   // + apply_chat_template) instead of the un-templated single-text path.
@@ -817,7 +817,7 @@ struct proxy_fd_ent {
   // extract_llm_prefix call site where body_start/body_len are valid), so the
   // kv-exact stage can pass the contiguous raw body to the chat bridge. These are
   // request-scoped fields on proxy_fd_ent — deliberately NOT added to
-  // llm_prefix_key_t, which participates in hashing/HA sync (threat T-88-06).
+  // llm_prefix_key_t, which participates in hashing/HA sync (threat).
   uint8_t is_chat;              // 1 = /v1/chat/completions; 0 = completions/other (fail-safe default)
   size_t  body_off;            // offset of the raw JSON body within rcvbuf (0 = unset)
   size_t  body_len;            // length of the raw JSON body within rcvbuf (0 = unset)
@@ -832,7 +832,7 @@ struct proxy_fd_ent {
   int has_custom_session_header;          // 1=extracted, 0=not present
   char session_header_name[128];          // Configured session header name (from service config)
   
-  // US-202 Criterion A: Model name from X-Model HTTP request header (fast path)
+  // Criterion A: Model name from X-Model HTTP request header (fast path)
   // Priority for effective model: x_model_header > prefix_key.model > "" (wildcard)
   char x_model_header[MAX_MODEL_LEN];     // Extracted from X-Model: request header; empty = not present
 
@@ -844,7 +844,7 @@ struct proxy_fd_ent {
   uint64_t metric_req_start_ns;
   uint16_t metric_response_status;
 
-  // HTTP/HTTPS Trace Context (Phase 2: Protocol Analyzer)
+  // HTTP/HTTPS Trace Context (: Protocol Analyzer)
 #ifdef HAVE_HTTP_TRACE
   uint64_t trace_id_hi;                   // W3C trace_id (high 64 bits, 128-bit UUID)
   uint64_t trace_id_lo;                   // W3C trace_id (low 64 bits)
@@ -892,9 +892,9 @@ struct proxy_fd_ent {
 
   // AI Gateway per-connection state
   char     x_api_key_raw[256];        // Raw value of X-Api-Key request header (extracted by handle_header_val)
-  char     tenant_id[64];             // Tenant ID from llb_ai_validate_key decision (US-403)
+  char     tenant_id[64];             // Tenant ID from llb_ai_validate_key decision 
 
-  // SSE (Server-Sent Events) per-connection state (US-401)
+  // SSE (Server-Sent Events) per-connection state 
   uint8_t  sse_mode;                  // SSE mode enabled for this rule: copied from proxy_epval_t at accept
   uint32_t max_stream_duration_sec;   // Max stream duration from rule (0=use hard cap)
   uint32_t backend_keepalive_sec;     // Backend keepalive interval from rule (0=disabled)
@@ -907,30 +907,30 @@ struct proxy_fd_ent {
                                       // streams to 0 and NTP steps could skew/negate the delta)
   uint8_t  sse_tail[20];              // Sliding tail buffer for TCP-fragmentation-safe [DONE] scanner
   uint8_t  sse_tail_len;              // Number of valid bytes in sse_tail
-  time_t   pd_last_decode_ts;         // Phase 89: wall-clock of the LAST decode backend byte relayed to the
+  time_t   pd_last_decode_ts;         // wall-clock of the LAST decode backend byte relayed to the
                                       // client. Refreshed per byte during decode streaming so the safety-net
                                       // reaper (sockproxy_health.c) can gate graceful [DONE] synthesis on
                                       // genuine BACKEND-idle (vLLM dropped its [DONE]) instead of
                                       // wall-clock-since-start, which would truncate a slow-but-live stream.
                                       // proxy_fd_ent is not xSync-serialized, so this growth is HA-safe.
 
-  // Phase 90 M1 (REQ-M1): response-leg HTTP_RESPONSE framing latch. Set on a
+  // response-leg HTTP_RESPONSE framing latch. Set on a
   // backend pfe (odir==1) the first time the pd_framing_v2 path lazily inits its
   // HTTP_RESPONSE parser so the init is idempotent and the parser is NOT
   // re-initialized per relayed read (which would discard mid-message state).
   // Append-only growth on proxy_fd_ent (NOT xSync-serialized) — HA-safe per the
-  // pd_last_decode_ts precedent above (D-06 Invariant 2).
+  // pd_last_decode_ts precedent above ( Invariant 2).
   uint8_t  resp_parser_inited;        // 1=backend HTTP_RESPONSE parser initialized (pd_framing_v2 path)
 
-  // vLLM Request-ID management (Phase 5, US-501)
+  // vLLM Request-ID management 
   char     vllm_request_id[256];     // Generated or client-provided request ID
   uint8_t  has_vllm_request_id;      // 1=from client X-Request-Id header
   uint8_t  request_id_injected;      // 1=already injected into forwarded request
 
-  // P/D Disaggregation orchestration state (US-505)
+  // P/D Disaggregation orchestration state 
   pd_phase_t pd_phase;               // Current P/D orchestration phase
   uint8_t  is_pd_decode_backend;     // 1=this pfe is a decode backend (not prefill or client)
-  // Phase 93-04: bounded backpressured admission — park bookkeeping. When this
+  // bounded backpressured admission — park bookkeeping. When this
   // client is parked (all prefill EPs capped, FIFO has room), park_ep_idx is the
   // prefill EP whose FIFO it sits on and park_start_ts is the CLOCK_MONOTONIC ns
   // stamp at enqueue (drives the 93-05 max-park reap). park_ep_idx == -1 (the
@@ -955,7 +955,7 @@ struct proxy_fd_ent {
   size_t   pd_decode_content_length; // Content-Length from non-SSE decode response headers
   size_t   pd_decode_bytes_received; // Decode response body bytes received so far
 
-  /* Phase 99 (D-09/D-10): single-role Tier-1.5 load-accounting bookkeeping.
+  /* single-role Tier-1.5 load-accounting bookkeeping.
    * kv_sr_load_held == 1 marks "this client pfe holds ONE active_conns unit on
    * epv->pd_ep_loads[kv_sr_ep_idx]" (stamped by the single-role KV branch in
    * sockproxy_ep.c on a Tier-1.5 hit). The unit is released EXACTLY once —
@@ -966,7 +966,7 @@ struct proxy_fd_ent {
    * single-role services (the 81-09 hot-spot, 99-RESEARCH Pitfall 1).
    * Append-only growth on proxy_fd_ent (NOT xSync-serialized) — HA-safe per
    * the resp_parser_inited precedent above. Zero-init (pfe_alloc) == not held. */
-  uint8_t  kv_sr_load_held;          // 1 = single-role KV load unit held (Phase 99)
+  uint8_t  kv_sr_load_held;          // 1 = single-role KV load unit held 
   int      kv_sr_ep_idx;             // EP index holding the unit (valid iff kv_sr_load_held)
 
   char     resp_model[MAX_MODEL_LEN]; // Effective model snapshot taken at the keep-alive
@@ -1005,15 +1005,15 @@ void pfe_pool_selftest(void);   /* validation-only pool+gen invariant proof */
 #endif
 
 // ============================================================================
-// L7 POLICY: bounded generic header capture helpers (Phase 75, FR-19)
+// L7 POLICY: bounded generic header capture helpers 
 // ----------------------------------------------------------------------------
 // Append a (name, value) pair into the per-connection fixed-capacity store.
 // Both the H1 parse path (handle_header_val, sockproxy_http.c) and the H2 parse
 // path (proxy_h2_on_header_callback, sockproxy_h2.c) call l7_store_header_n with
 // length-delimited buffers (llhttp/nghttp2 do NOT NUL-terminate). The store is
 // BOUNDED: once n_l7_headers reaches L7_MAX_CAPTURED_HEADERS the append is a
-// no-op (overflow dropped, never grown — T-75-04). Name/value are truncated to
-// L7_HDR_NAME_MAX-1 / L7_HDR_VALUE_MAX-1 and always NUL-terminated (T-75-05).
+// no-op (overflow dropped, never grown). Name/value are truncated to
+// L7_HDR_NAME_MAX-1 / L7_HDR_VALUE_MAX-1 and always NUL-terminated.
 static inline void
 l7_store_header_n(struct proxy_fd_ent *pfe,
                   const char *name, size_t namelen,
@@ -1024,7 +1024,7 @@ l7_store_header_n(struct proxy_fd_ent *pfe,
   if (!pfe || !name)
     return;
   if (pfe->n_l7_headers >= L7_MAX_CAPTURED_HEADERS)
-    return;  // bounded: overflow dropped (T-75-04)
+    return;  // bounded: overflow dropped 
 
   nl = (namelen < (size_t)(L7_HDR_NAME_MAX - 1)) ? namelen : (size_t)(L7_HDR_NAME_MAX - 1);
   vl = (value && valuelen < (size_t)(L7_HDR_VALUE_MAX - 1)) ? valuelen
@@ -1118,31 +1118,31 @@ struct proxy_arg {
   uint8_t backend_protocol_cap;
 
   // ==========================================================================
-  // Phase 77 TLS-hardening scalars (FR-32 version pinning / FR-33 HSTS).
-  // All additive + default-off: 0/empty ⇒ today's hardcoded behaviour (D-77-COMPAT,
-  // mirroring the FR-07 precedent below). Enforced only on the L7_Proxy peer
+  // TLS-hardening scalars ( version pinning / HSTS).
+  // All additive + default-off: 0/empty ⇒ today's hardcoded behaviour (-COMPAT,
+  // mirroring the precedent below). Enforced only on the L7_Proxy peer
   // (has_l7_policy==1); the AI peer is byte-for-byte unchanged. ALPN reuses the
-  // existing backend_protocol_cap enum above (FR-31, D-77-01) — no new field.
+  // existing backend_protocol_cap enum above — no new field.
   // ==========================================================================
 
-  // FR-32 (D-77-03): TLS protocol-version pinning. Encoded as the OpenSSL proto
+  // TLS protocol-version pinning. Encoded as the OpenSSL proto
   // ordinal (TLS1_2_VERSION=0x0303 → store 0x03; 0 ⇒ today's hardcoded
   // TLS1.2..TLS1.3 range). Octavia tls_versions list collapsed to a min..max range.
   uint8_t tls_version_min;  // 0 ⇒ today's TLS1_2_VERSION floor
   uint8_t tls_version_max;  // 0 ⇒ today's TLS1_3_VERSION ceiling
 
-  // FR-33 (D-77-05): HSTS response injection. Data plane synthesizes
+  // HSTS response injection. Data plane synthesizes
   // "Strict-Transport-Security: max-age=N[; includeSubDomains][; preload]" and
-  // injects via the Phase 76 FR-08 L7-gated header path (nghttp2 on H2).
-  uint32_t hsts_max_age;             // 0 ⇒ no HSTS injection (default-off, D-77-05)
+  // injects via the L7-gated header path (nghttp2 on H2).
+  uint32_t hsts_max_age;             // 0 ⇒ no HSTS injection (default-off)
   uint8_t  hsts_include_subdomains;  // 0 ⇒ omit "; includeSubDomains"
   uint8_t  hsts_preload;             // 0 ⇒ omit "; preload"
   uint8_t  _pad_tls77[2];            // 8-byte alignment for the following string
 
-  // FR-32 (D-77-04/16): inline OpenSSL cipher string, passed to BOTH
+  // inline OpenSSL cipher string, passed to BOTH
   // SSL_CTX_set_cipher_list (TLS1.2) and SSL_CTX_set_ciphersuites (TLS1.3).
   // empty ⇒ today's hardcoded cipher lists. Inlined (not id-referenced) because
-  // reclaiming the 768 backend-path bytes (D-77-14) leaves ample headroom under
+  // reclaiming the 768 backend-path bytes leaves ample headroom under
   // the 4096 _Static_assert (Open Question 2 RESOLVED — measured).
   char tls_ciphers[256];             // empty ⇒ today's hardcoded ciphers
 
@@ -1152,18 +1152,18 @@ struct proxy_arg {
   uint32_t backend_keepalive_sec;   // Backend SO_KEEPALIVE+TCP_KEEPIDLE interval in seconds (0=disabled)
   uint32_t inactive_timeout_sec;    // Per-rule idle timeout in seconds (0=disabled); suppressed when sse_active=1
 
-  // FR-07 (Phase 76, D-10): per-listener member timeouts in MILLISECONDS (Octavia native unit).
+  // per-listener member timeouts in MILLISECONDS (Octavia native unit).
   // Additive + default-off: 0 ⇒ preserve today's hardcoded behaviour (zero behaviour change
-  // for un-configured L7 listeners; D-14). Enforced only on the L7_Proxy peer (has_l7_policy==1).
+  // for un-configured L7 listeners;). Enforced only on the L7_Proxy peer (has_l7_policy==1).
   uint32_t timeout_member_connect_ms; // 0 ⇒ 500 (today's sockproxy_conn.c:408 connect-poll literal)
-  uint32_t timeout_member_data_ms;    // 0 ⇒ existing client-idle value (member-side relay idle, D-10)
-  // D-11: header-accumulation deadline — max time to await the complete request headers
+  uint32_t timeout_member_data_ms;    // 0 ⇒ existing client-idle value (member-side relay idle)
+  // header-accumulation deadline — max time to await the complete request headers
   // (\r\n\r\n / full HEADERS frame) before evaluating L7 rules (slowloris protection).
-  // NOTE (D-16 / Pitfall 4): NON-REPRESENTABLE on Gateway-API export (Gateway exposes only
+  // NOTE (Pitfall 4): NON-REPRESENTABLE on Gateway-API export (Gateway exposes only
   // timeouts.request/backendRequest); a future Gateway controller MUST hard-error, never silent-drop.
-  uint32_t timeout_tcp_inspect_ms;    // 0 ⇒ sane bounded default (header-accum deadline, D-11)
+  uint32_t timeout_tcp_inspect_ms;    // 0 ⇒ sane bounded default (header-accum deadline)
 
-  // P/D Disaggregation configuration (US-502)
+  // P/D Disaggregation configuration 
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
@@ -1176,13 +1176,13 @@ struct proxy_arg {
   uint8_t  pad_pd_cache_arg;           // alignment
   uint32_t pd_session_ttl_sec;
 
-  // KV-Cache Exact Routing configuration (Phase 6)
-  uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role (Phase 99)
+  // KV-Cache Exact Routing configuration 
+  uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 
   uint8_t  kv_hash_algo;         // 0=sha256_cbor, 1=xxhash_cbor
   uint16_t kv_zmq_port;          // ZMQ PUB port (default 5557)
   uint32_t kv_block_size;        // Token block size (default 16)
   uint32_t kv_warmup_sec;        // Warmup seconds
-  // Phase 99 (SGL-03, D-05/D-06): per-rule KV engine + SGLang DP rank count.
+  // (SGL-03): per-rule KV engine + SGLang DP rank count.
   uint8_t  kv_engine_type;       // 0=vllm (default), 1=sglang
   uint8_t  kv_dp_rank_count;     // SGLang DP ranks (1..8; 0 defaulted to 1 at the CGO fill)
 
@@ -1192,7 +1192,7 @@ struct proxy_arg {
 
 #ifdef HAVE_MTLS
   // ============================================================================
-  // mTLS Configuration (Phase 1)
+  // mTLS Configuration 
   // ============================================================================
   
   // Frontend mTLS - Client certificate verification
@@ -1201,7 +1201,7 @@ struct proxy_arg {
   uint8_t require_client_cn;        // 1=require CN pattern match, 0=no
   char client_cn_pattern[256];      // CN pattern (e.g., "*.corp.example.com")
   
-  // Phase 77 FR-09 (D-77-07/16): explicit operator-supplied client-cert CRL path (PEM) loaded
+  // explicit operator-supplied client-cert CRL path (PEM) loaded
   // into the verify X509_STORE with leaf-only X509_V_FLAG_CRL_CHECK. This is the explicit
   // drop-in for 77-04's convention-derived sibling crl.pem (mtls_derive_crl_path): when set it
   // is preferred; empty ⇒ fall back to the CA-dir-sibling convention (today's behaviour).
@@ -1210,8 +1210,8 @@ struct proxy_arg {
   // Backend mTLS - Server cert verification + client cert
   uint8_t backend_verify_cert;      // 1=verify server cert, 0=no (SSL_VERIFY_NONE)
 
-  // Phase 77 FR-11 (D-77-14/16): backend re-encryption material is referenced by
-  // a short certId into the FR-05 registry (D-77-10), NOT inline path strings.
+  // backend re-encryption material is referenced by
+  // a short certId into the registry, NOT inline path strings.
   // This reclaims the 768 bytes the three backend_*_path[256] strings occupied
   // (Pitfall 3) — the headroom the rest of the phase's scalars need. The registry
   // resolves the certId → managed-dir paths (/etc/loxilb/certs/<certId>/) at
@@ -1244,7 +1244,7 @@ int proxy_set_circuit_breaker(struct proxy_ent *key, uint8_t enabled,
 
 #ifdef HAVE_MTLS
 // ============================================================================
-// mTLS Configuration API (Phase 1)
+// mTLS Configuration API 
 // ============================================================================
 
 // proxy_config_mtls_frontend - Configure frontend (client-facing) mTLS
@@ -1327,17 +1327,17 @@ void pd_session_store(proxy_epval_t *tepval, const char *key, int prefill_ep, in
 void pd_session_evict(proxy_epval_t *tepval);
 void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
 
-/* 3-tier P/D selection (sockproxy_pd.c) -- Phase 4
+/* 3-tier P/D selection (sockproxy_pd.c) -- 
  * excluded_mask: bitmask of EP indices to skip (0 = no exclusions).
  * Used by mid-cycle failover to retry with a different prefill EP after TCP
  * connect failure, without waiting for the 60-second health-check cycle.
  * Returns 0 on success (*ep_out set), -1 if no healthy prefill EP, or
- * PD_PREFILL_NO_CAPACITY (Phase 93) when ALL healthy prefill EPs are at the
+ * PD_PREFILL_NO_CAPACITY when ALL healthy prefill EPs are at the
  * in-flight admission cap (LLB_PD_MAX_INFLIGHT_PER_EP) -> caller sheds 429. */
 #ifndef PD_PREFILL_NO_CAPACITY
 #define PD_PREFILL_NO_CAPACITY (-2)
 #endif
-/* Phase 93-04: bounded backpressured admission. When ALL healthy prefill EPs are
+/* bounded backpressured admission. When ALL healthy prefill EPs are
  * at the in-flight cap AND a per-EP parked FIFO still has room, pd_select_prefill
  * ENQUEUES the request (hold-don't-drop, vllm-router parity) and returns
  * PD_PREFILL_PARKED instead of shedding a 429. The caller (proxy_setup_ep__ ->
@@ -1348,7 +1348,7 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
 #ifndef PD_PREFILL_PARKED
 #define PD_PREFILL_PARKED (-3)
 #endif
-/* Phase 93-04: setup_proxy_path / proxy_setup_ep__ return contract. They return
+/* setup_proxy_path / proxy_setup_ep__ return contract. They return
  * 0 = wired, -1 = error (caller tears down/closes the fd). PD_SETUP_PARKED is a
  * THIRD outcome: the request was enqueued + the client fd EPOLLIN-suspended and
  * held open — the caller MUST keep the fd (do NOT forward to a backend, do NOT
@@ -1358,7 +1358,7 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
 #endif
 int pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                       uint32_t excluded_mask);
-/* Phase 93-05: bounded-admission FIFO dequeue/reap primitives (sockproxy_pd.c).
+/* bounded-admission FIFO dequeue/reap primitives (sockproxy_pd.c).
  * Pure ring ops on ONE pd_parked_fifo_t — the CALLER must hold tepval->pd_parked_lock.
  * They never touch a pfe, never free, never dispatch (UAF-critical re-drive/teardown
  * stays in the caller, on the pinned owner / via pd_teardown_conn). pop_head/peek_head
@@ -1366,16 +1366,16 @@ int pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
 int pd_parked_pop_head(pd_parked_fifo_t *q, pd_parked_ent_t *out);
 int pd_parked_peek_head(const pd_parked_fifo_t *q, pd_parked_ent_t *out);
 int pd_parked_remove_fd(pd_parked_fifo_t *q, int want_fd, uint64_t want_gen);
-/* Phase 93-05: runtime max-park bound (env LLB_PD_MAX_PARK_SEC; 0/unset = reap off). */
+/* runtime max-park bound (env LLB_PD_MAX_PARK_SEC; 0/unset = reap off). */
 uint32_t pd_max_park_sec(void);
-/* Phase 93-04/05: runtime per-EP parked-FIFO depth (env LLB_PD_QUEUE_DEPTH_PER_EP;
+/* runtime per-EP parked-FIFO depth (env LLB_PD_QUEUE_DEPTH_PER_EP;
  * 0/unset = bounded-admission OFF). The pd_cleanup dequeue hook gates on this. */
 uint32_t pd_queue_depth_per_ep(void);
-/* Phase 93-06 (AC-4): global total in-flight+queued footprint bound (env
+/* (AC-4): global total in-flight+queued footprint bound (env
  * LLB_PD_MAX_TOTAL_INFLIGHT; 0/unset = ingress backpressure OFF, accept() byte-
  * identical). Mirrors pd_max_park_sec (getenv-once, __atomic-cached). */
 uint32_t pd_max_total_inflight(void);
-/* Phase 93-06 (AC-4): the pure accept()-gate decision, factored out so it can be
+/* (AC-4): the pure accept-gate decision, factored out so it can be
  * unit-tested in isolation. Returns 1 = ACCEPT (under bound or feature off),
  * 0 = REFUSE (at/over the bound — leave the SYN in the listen backlog). bound==0
  * (feature off) always ACCEPTs. */

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  *
- * sockproxy_h2_inject_test.c — Phase 76 Plan 03 (FR-08/FR-10) non-terminal PROOF.
+ * sockproxy_h2_inject_test.c — Plan 03 non-terminal PROOF.
  *
  * THE de-risk deliverable of 76-03: prove the net-new C primitive
  * proxy_h2_inject_resp_headers() is NON-TERMINAL *in this plan* (wave 0), so
@@ -157,7 +157,7 @@ int
 main(void)
 {
   int failures = 0;
-  printf("=== sockproxy_h2_inject_test (Phase 76-03 non-terminal proof) ===\n");
+  printf("=== sockproxy_h2_inject_test ( non-terminal proof) ===\n");
 
   /* ---- Build a mockable stream_mapping_t carrying a pre-collected backend
    *      response header (":status: 200") + an ATTACHED body data provider. ---- */

@@ -1,4 +1,4 @@
-/* test_pd_ctrl.c - Unit tests for the Phase 96 (D-07) global-AI-controller
+/* test_pd_ctrl.c - Unit tests for the global-AI-controller
  * advisory influence plumbing in the P/D prefill selector.
  * Standalone ASan test binary that COMPILES the production selector
  * (sockproxy_pd.c) directly, mirroring the test_pd_admission.c mock harness,
@@ -84,7 +84,7 @@
 #define DEFAULT_SWAP_WEIGHT      30
 #endif
 
-/* Phase 93-04: admission verdict + parked-FIFO mock (mirrors sockproxy.h). */
+/* admission verdict + parked-FIFO mock (mirrors sockproxy.h). */
 #ifndef PD_PREFILL_NO_CAPACITY
 #define PD_PREFILL_NO_CAPACITY (-2)
 #endif
@@ -192,12 +192,12 @@ typedef struct proxy_epval {
   uint32_t pd_session_ttl_sec;
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP];
 
-  /* Phase 96 (D-07): the fields under test — controller advisory mirror
+  /* the fields under test — controller advisory mirror
    * (sockproxy.h). memset-0 init == mode 0 == byte-identical selection (G3). */
   _Atomic uint32_t pd_ctrl_ep[MAX_PROXY_EP];
   _Atomic uint8_t  pd_ctrl_mode;
 
-  /* Phase 93-04: bounded backpressured admission — per-EP parked FIFO */
+  /* bounded backpressured admission — per-EP parked FIFO */
   pd_parked_fifo_t  pd_parked[MAX_PROXY_EP];
   pthread_mutex_t   pd_parked_lock;
 
@@ -230,7 +230,7 @@ typedef struct proxy_fd_ent {
 #define log_debug(fmt, ...) ((void)0)
 #define log_info(fmt, ...)  ((void)0)
 
-/* ===== Phase 70 sync-event stubs (sockproxy_pd.c references these) ===== */
+/* ===== sync-event stubs (sockproxy_pd.c references these) ===== */
 typedef enum {
     SYNC_SESSION_CREATE = 0,
     SYNC_SESSION_UPDATE = 1,
@@ -610,7 +610,7 @@ int main(void) {
   unsetenv("LLB_PD_MAX_TOTAL_INFLIGHT");
   unsetenv("LLB_KV_LOADGUARD");
 
-  printf("=== test_pd_ctrl: Phase 96 controller advisory influence (G3/G4) ===\n");
+  printf("=== test_pd_ctrl: controller advisory influence (G3/G4) ===\n");
   test_tc1_g3_identity();
   test_tc2_disabled();
   test_tc3_draining();

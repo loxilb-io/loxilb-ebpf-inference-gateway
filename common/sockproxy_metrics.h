@@ -53,7 +53,7 @@ typedef struct proxy_metrics_snapshot {
     uint64_t latency_sum_us;
     uint64_t latency_count;
 
-    /* Histograms (samples - simplified for Phase 1-3) */
+    /* Histograms (samples - simplified for) */
     uint64_t cache_size_samples[100]; /* Last 100 connections */
     uint32_t cache_size_sample_count;
 
@@ -63,13 +63,13 @@ typedef struct proxy_metrics_snapshot {
     /* P/D Buffer: kv_transfer_params overflow counter */
     uint64_t pd_kv_params_overflow;
 
-    /* P/D Production Hardening gauges (Phase 5) */
+    /* P/D Production Hardening gauges */
     uint64_t pd_sessions_active;            /* OBS-01: Active P/D sessions */
     uint64_t pd_trie_nodes;                 /* OBS-01: Prefix trie node count */
     uint64_t pd_cb_flips;                   /* OBS-03: Circuit breaker state transitions */
     uint64_t pd_fallback_to_normal;         /* RES-02: Non-P/D fallback count */
 
-    /* Phase 42: KV Tier 1.5 routing diagnostics (per-guard miss + fallthrough). */
+    /* KV Tier 1.5 routing diagnostics (per-guard miss + fallthrough). */
     /* Storage allocated in plan 42-01; incremented in plan 42-02. */
     uint64_t pd_kv_t15_miss_mode_off;
     uint64_t pd_kv_t15_miss_warmup;
@@ -81,8 +81,8 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_kv_t15_miss_excluded;
     uint64_t pd_kv_t15_fallthrough_total;
 
-    /* Phase 96 (OBS-01): CB proactive heal (93-02) + per-EP admission layer
-     * counters (Phase 93). TAIL-APPEND ONLY — twin-declared in the cgo preamble
+    /* (OBS-01): CB proactive heal (93-02) + per-EP admission layer
+ * counters. TAIL-APPEND ONLY — twin-declared in the cgo preamble
      * of api/prometheus/sockproxy_metrics.go; keep BOTH in lockstep, same commit. */
     uint64_t pd_cb_proactive_heal;
     uint64_t pd_admission_shed;
@@ -101,7 +101,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void);
 
 /*
  * pd_admission_stats_get - read-only accessor for the Phase-93 file-static
- * admission counters in sockproxy_pd.c (OBS-01 export, Phase 96).
+ * admission counters in sockproxy_pd.c (OBS-01 export).
  * which==0 -> pd_admission_shed_total, which==1 -> pd_admission_queued_total,
  * any other value -> 0. Called from proxy_get_metrics only.
  */

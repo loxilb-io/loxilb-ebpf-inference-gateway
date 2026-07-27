@@ -39,7 +39,7 @@
 #define MAX_NOTIFY_THREADS (8)
 #define MAX_NOTIFY_POLL_TIMEO (10)
 
-/* Phase 93-05 (R1): bound on the per-worker resume-pending MPSC ring. A parked conn
+/* (R1): bound on the per-worker resume-pending MPSC ring. A parked conn
  * occupies one slot from wake-enqueue until the owner worker drains it (sub-ms). The
  * ring is sized well above any plausible simultaneous-resume burst (depth-per-EP is
  * <= PD_MAX_QUEUE_DEPTH=64 and resumes are one-per-slot-free); overflow degrades to
@@ -72,7 +72,7 @@ typedef struct notify_poll_ctx {
   notify_pollfd_t npfds[MAX_NOTIFY_POLL_FDS];
   struct pollfd pfds[MAX_NOTIFY_POLL_FDS];
 
-  /* Phase 93-05 (R1): per-worker wake primitive + resume-pending MPSC ring.
+  /* (R1): per-worker wake primitive + resume-pending MPSC ring.
    * wake_fd is an eventfd registered in THIS worker's pfds[] (so poll() returns on
    * a wake). Any thread appends a parked client fd to rq[] under rq_lock and writes
    * wake_fd; the owner worker drains rq[] in notify_run and calls cbs.resume(fd) on
@@ -144,7 +144,7 @@ notify_ctx_new(notify_cbs_t *cbs, int n_thrs)
   if (cbs) {
     nc->cbs.notify = cbs->notify;
     nc->cbs.pdestroy = cbs->pdestroy;
-    nc->cbs.resume = cbs->resume;   /* Phase 93-05 (R1): owner-worker resume hook */
+    nc->cbs.resume = cbs->resume;   /* (R1): owner-worker resume hook */
   }
 
   if (n_thrs > MAX_NOTIFY_THREADS) {
@@ -154,7 +154,7 @@ notify_ctx_new(notify_cbs_t *cbs, int n_thrs)
 
   nc->n_thrs = n_thrs;
 
-  /* Phase 93-05 (R1): init each worker's resume-pending ring lock + mark wake_fd
+  /* (R1): init each worker's resume-pending ring lock + mark wake_fd
    * uninited. The eventfd itself is created lazily on the worker thread in
    * notify_run (so the fd lives on / is polled by exactly that worker). */
   for (int t = 0; t < MAX_NOTIFY_THREADS; t++) {
@@ -166,7 +166,7 @@ notify_ctx_new(notify_cbs_t *cbs, int n_thrs)
   return nc;
 }
 
-/* Phase 93-05 (R1): the owner worker of `fd` is its `fd % n_thrs` shard unless the
+/* (R1): the owner worker of `fd` is its `fd % n_thrs` shard unless the
  * fd is already registered with a pinned thr_id (Phase-89 pin). Returns -1 on bad
  * ctx/fd. The slot-freeing thread uses this to route a parked fd's resume. */
 int
@@ -187,7 +187,7 @@ notify_owner_thr(void *ctx, int fd)
   return thr;
 }
 
-/* Phase 93-05 (R1): return the registered priv (pfe) for `fd`, with its captured
+/* (R1): return the registered priv (pfe) for `fd`, with its captured
  * gen, UNDER NOTI_LOCK — the same provably-live read the dispatcher uses. The owner
  * worker's resume callback uses this to recover the parked pfe from the fd it was
  * handed. *gen_out receives the registration gen (for the caller's staleness check).
@@ -209,7 +209,7 @@ notify_priv_of_fd(void *ctx, int fd, uint64_t *gen_out)
   return priv;
 }
 
-/* Phase 93-05 (R1): append `fd` to worker `thr_id`'s resume-pending ring and wake it
+/* (R1): append `fd` to worker `thr_id`'s resume-pending ring and wake it
  * by writing its eventfd. MPSC-safe (rq_lock). Returns 0 ok, <0 on bad args / ring
  * full / not-yet-inited wake_fd. On ring-full the caller leaves the conn parked; the
  * next slot-free retries — no loss of correctness, only of promptness. */
@@ -268,7 +268,7 @@ notify_check_slot(void *ctx, int fd)
   return 1;
 }
 
-/* Phase 89 (conc=128 wedge fix, Option A): core add with optional worker pinning.
+/* (conc=128 wedge fix, Option A): core add with optional worker pinning.
  * When pin_fd is a live, already-registered fd, the new fd inherits pin_fd's worker
  * thread (thr_id) instead of the historic `fd % n_thrs` shard. This serializes both
  * legs of one logical connection (client fd + backend rfd) on a SINGLE notify worker,
@@ -315,7 +315,7 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
 
   //nctx->thr_sel++;
   //tslot = ctx->thr_sel % nctx->n_thrs;
-  /* Phase 89 Option A: pin to pin_fd's worker when it is a live registered fd. */
+  /* Option A: pin to pin_fd's worker when it is a live registered fd. */
   if (pin_fd > 0 && pin_fd < MAX_NOTIFY_FDS && nctx->earr[pin_fd].fd > 0) {
     tslot = nctx->earr[pin_fd].thr_id;
     log_debug("notify-pin: fd %d -> worker %d (pinned to fd %d)", fd, tslot, pin_fd);
@@ -360,7 +360,7 @@ notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen)
   return __notify_add_ent(ctx, fd, type, priv, gen, -1);
 }
 
-/* Phase 89 Option A: register fd on the SAME notify worker as pin_fd (its owning
+/* Option A: register fd on the SAME notify worker as pin_fd (its owning
  * client fd), so a connection's client and backend legs serialize on one thread. */
 int
 notify_add_ent_pinned(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen, int pin_fd)
@@ -525,7 +525,7 @@ notify_delete_ent(void *ctx, int fd, int evict)
   return rc;
 }
 
-/* Phase 90 (conc=128 single-owner teardown): deregister a fd from the notifier
+/* (conc=128 single-owner teardown): deregister a fd from the notifier
  * WITHOUT invoking cbs.pdestroy. Identical to notify_delete_ent__ except it
  * neither reads ent->priv nor calls cbs.pdestroy(priv).
  *
@@ -609,7 +609,7 @@ notify_deregister_ent(void *ctx, int fd)
   return 0;
 }
 
-/* Phase 93-05 (R1): drain THIS worker's resume-pending ring and re-drive each parked
+/* (R1): drain THIS worker's resume-pending ring and re-drive each parked
  * fd via cbs.resume — ON THIS (the owner) worker thread. Called from notify_run after
  * the wake eventfd fires. Snapshots fds under rq_lock, then calls cbs.resume OUTSIDE
  * the lock (resume re-drives setup_proxy_path, which itself takes other locks). The
@@ -672,7 +672,7 @@ notify_run(void *ctx, int thread)
   pfds = calloc(1, MAX_NOTIFY_POLL_FDS*sizeof(struct pollfd));
   assert(pfds);
 
-  /* Phase 93-05 (R1): create THIS worker's wake eventfd and register it in this
+  /* (R1): create THIS worker's wake eventfd and register it in this
    * worker's own pfds[] so poll() returns when another thread writes it. Created on
    * the worker thread (here) so it is owned/polled by exactly this worker. When the
    * admission layer never wakes a worker, the eventfd sits idle in poll() — never
@@ -741,7 +741,7 @@ notify_run(void *ctx, int thread)
         continue;
       }
 
-      /* Phase 93-05 (R1): the wake eventfd has NO earr[] entry — handle it BEFORE
+      /* (R1): the wake eventfd has NO earr entry — handle it BEFORE
        * the earr lookup below. A readable wake_fd means parked fds are pending for
        * this owner worker: drain the ring + re-drive each via cbs.resume on THIS
        * thread, then move on (never fall through to the relay dispatch). */

@@ -21,7 +21,7 @@
 void pfe_ent_accouting(proxy_fd_ent_t *pfe, uint64_t bc, int txdir);
 
 /*
- * cmp_proxy_ent: temporary home until sockproxy_conn.c is created in Phase 3.
+ * cmp_proxy_ent: temporary home until sockproxy_conn.c is created in.
  * See sockproxy_refactoring_plan.md §6.2 -- will move to sockproxy_conn.h.
  */
 bool cmp_proxy_ent(proxy_ent_t *e1, proxy_ent_t *e2);
@@ -40,7 +40,7 @@ void proxy_check_release_backpressure(proxy_fd_ent_t *ent);
 
 /*
  * Cache backpressure thresholds.
- * Originally defined in sockproxy.c; moved here in Phase 2 so that
+ * Originally defined in sockproxy.c; moved here in so that
  * sockproxy_cache.c and any future consumer can reference them via this header.
  *
  * ADAPTIVE BACKPRESSURE: Different thresholds for chunked vs non-chunked.

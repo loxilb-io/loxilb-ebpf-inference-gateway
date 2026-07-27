@@ -7,7 +7,7 @@
 /**
  * sockproxy_mtls.c - mTLS (Mutual TLS) Implementation for LoxiLB
  * 
- * Phase 2: Frontend and Backend mTLS Certificate Verification
+ * Frontend and Backend mTLS Certificate Verification
  * 
  * This file implements mutual TLS authentication for the FullProxy mode,
  * including:
@@ -42,7 +42,7 @@
 #include "uthash.h"
 #include "sockproxy.h"
 #include "sockproxy_mtls.h"
-#include "sockproxy_ssl.h"   /* Phase 77 FR-11: proxy_certid_resolve_backend */
+#include "sockproxy_ssl.h"   /* proxy_certid_resolve_backend */
 
 // mTLS constants
 #define MTLS_VERIFY_DEPTH_MAX 10     // Max certificate chain depth
@@ -230,7 +230,7 @@ static int mtls_fnmatch_pattern(const char *pattern, const char *name)
  *
  * Returns: 1 if matches, 0 if not
  *
- * FR-09 (D-77-09): SAN-DNS entries are matched FIRST, then CN as a fallback.
+ * SAN-DNS entries are matched FIRST, then CN as a fallback.
  *   - A modern SAN-only (empty-CN) cert is accepted when one of its SAN-DNS
  *     entries matches the operator's pattern (previously such a cert died at the
  *     cn_len<=0 return — the e2ehttpsproxy-mtls Test-9 starting failure).
@@ -511,7 +511,7 @@ static int mtls_client_verify_callback(int preverify_ok, X509_STORE_CTX *x509_ct
  *
  * Returns: 1 if an existing CRL file was found at the derived path, 0 otherwise.
  *
- * FR-09 / D-77-07 / D-77-16: the CRL is part of the id-referenced TLS-material set
+ * the CRL is part of the id-referenced TLS-material set
  * supplied by the 77-02 managed-cert directory. Until the dedicated CGO/REST
  * plumb lands in 77-07, the CRL is co-located with the client CA bundle as a
  * sibling "crl.pem" in the same managed directory — the same directory the
@@ -555,7 +555,7 @@ static int mtls_derive_crl_path(const char *ca_path, char *crl_out, size_t crl_s
  *
  * Returns: 0 on success, negative error code on failure.
  *
- * D-77-08: LEAF-ONLY revocation — sets X509_V_FLAG_CRL_CHECK only (the chain-wide
+ * LEAF-ONLY revocation — sets X509_V_FLAG_CRL_CHECK only (the chain-wide
  * "...CHECK_ALL" variant is intentionally NOT used), matching the HAProxy/Octavia
  * default which does not require a CRL for every CA in the chain. A revoked client leaf then drives
  * preverify_ok=0 → mtls_client_verify_callback returns 0 → handshake rejected.
@@ -584,7 +584,7 @@ static int mtls_load_frontend_crl(SSL_CTX *ctx, const char *crl_path)
         return -EINVAL;
     }
 
-    // Leaf-only check (D-77-08) — explicitly NOT the chain-wide "...CHECK_ALL" flag.
+    // Leaf-only check — explicitly NOT the chain-wide "...CHECK_ALL" flag.
     if (X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK) != 1) {
         log_error("[mTLS] CRL: failed to set X509_V_FLAG_CRL_CHECK on store");
         return -EINVAL;
@@ -695,14 +695,14 @@ int mtls_configure_frontend(SSL_CTX *ctx, proxy_arg_t *arg)
             log_warn("[mTLS] Failed to set client CA list (handshake may fail)");
         }
 
-        // FR-09 (D-77-07/08/16): leaf-only client-cert CRL revocation.
+        // leaf-only client-cert CRL revocation.
         // Placed AFTER SSL_CTX_load_verify_locations so the CRL rides the same
         // verify X509_STORE the CA bundle just populated. The CRL is the
         // operator-supplied static file in the same managed TLS-material
         // directory as the CA bundle (sibling crl.pem); reloaded here on every
         // (re)configure, mirroring how client_ca_path is re-applied. Absent CRL
         // ⇒ today's behaviour (additive / default-off — no CRL_CHECK flag set).
-        // Phase 77 FR-09 (D-77-07): prefer the EXPLICIT operator-supplied CRL path
+        // prefer the EXPLICIT operator-supplied CRL path
         // (arg->client_crl_path, plumbed by 77-07) when set; otherwise fall back to the
         // 77-04 convention (sibling crl.pem in the CA dir). Both are leaf-only / additive.
         char crl_path[512];
@@ -787,7 +787,7 @@ int mtls_configure_backend(SSL_CTX *ctx, proxy_arg_t *arg)
         return -EINVAL;
     }
 
-    // Phase 77 FR-11 (D-77-14/16): backend CA/client-cert material is referenced
+    // backend CA/client-cert material is referenced
     // by certId, not inline path strings. Resolve the proxy_arg certId refs into
     // managed-dir paths (/etc/loxilb/certs/<certId>/{ca,client}.{crt,key}) here,
     // before the existing load_verify_locations / cert+key load. Absent files
@@ -895,7 +895,7 @@ int mtls_configure_backend(SSL_CTX *ctx, proxy_arg_t *arg)
 
 /**
  * proxy_config_mtls_frontend - Configure frontend mTLS for a service
- * (Stub for Phase 3 - full implementation requires service lookup)
+ * (Stub for - full implementation requires service lookup)
  */
 int proxy_config_mtls_frontend(uint32_t service_id, uint8_t client_cert_mode,
                                 const char *client_ca_path, uint8_t require_client_cn,
@@ -903,13 +903,13 @@ int proxy_config_mtls_frontend(uint32_t service_id, uint8_t client_cert_mode,
 {
     log_info("[mTLS] proxy_config_mtls_frontend called (service=%u, mode=%u)",
              service_id, client_cert_mode);
-    // TODO Phase 3: Implement dynamic configuration
+    // TODO: Implement dynamic configuration
     return -ENOSYS;  // Not yet implemented
 }
 
 /**
  * proxy_config_mtls_backend - Configure backend mTLS for a service
- * (Stub for Phase 3 - full implementation requires service lookup)
+ * (Stub for - full implementation requires service lookup)
  */
 int proxy_config_mtls_backend(uint32_t service_id, uint8_t verify_cert,
                                const char *backend_ca_path,
@@ -918,18 +918,18 @@ int proxy_config_mtls_backend(uint32_t service_id, uint8_t verify_cert,
 {
     log_info("[mTLS] proxy_config_mtls_backend called (service=%u, verify=%u)",
              service_id, verify_cert);
-    // TODO Phase 3: Implement dynamic configuration
+    // TODO: Implement dynamic configuration
     return -ENOSYS;  // Not yet implemented
 }
 
 /**
  * proxy_clear_mtls_config - Clear mTLS configuration for a service
- * (Stub for Phase 3)
+ * (Stub for)
  */
 int proxy_clear_mtls_config(uint32_t service_id)
 {
     log_info("[mTLS] proxy_clear_mtls_config called (service=%u)", service_id);
-    // TODO Phase 3: Implement dynamic configuration
+    // TODO: Implement dynamic configuration
     return -ENOSYS;  // Not yet implemented
 }
 

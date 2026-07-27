@@ -151,7 +151,7 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     }
   }
 
-  /* US-202 Criterion B: If model-specific path LPM found nothing, retry with wildcard model.
+  /* Criterion B: If model-specific path LPM found nothing, retry with wildcard model.
    * This implements two-level model routing: specific pool first, then wildcard pool.
    * Pure C hash-table lookup — zero CGO calls in this path. */
   if (!best_match && model_name && model_name[0] != '\0') {
@@ -178,12 +178,12 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
         break;
       }
     }
-    /* US-206: Fall through to hostname-only and default fallbacks below.
+    /* Fall through to hostname-only and default fallbacks below.
      * IP-based VIPs are registered without a model, so use empty model. */
   }
 
   /* Fallback: Try hostname-only (backward compatibility)
-   * US-206: Use empty model — IP-based VIPs have no model in their key. */
+ * Use empty model — IP-based VIPs have no model in their key. */
   if (!best_match) {
     build_ephash_key(search_key, sizeof(search_key), host, "", "");
     HASH_FIND_STR(ent->val.ephash, search_key, tepval);

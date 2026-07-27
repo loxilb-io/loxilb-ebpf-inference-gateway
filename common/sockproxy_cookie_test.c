@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * sockproxy_cookie_test.c — Phase 76 FR-10 STATELESS cookie token C unit.
+ * sockproxy_cookie_test.c — STATELESS cookie token C unit.
  *
  * Proves the security + HA invariants of sockproxy_cookie.h WITHOUT pulling in
  * the full sockproxy object graph (it includes ONLY the pure header):
@@ -8,7 +8,7 @@
  *   T1  derive is DETERMINISTIC (same member_id + secret ⇒ same token).
  *   T2  a VALID token read-back-matches the RIGHT member (and only it).
  *   T3  a FORGED / STALE token MISSES (→ L7_COOKIE_MISS = rehash, never an
- *       arbitrary member — D-03 / T-76-07-01).
+ * arbitrary member).
  *   T4  the compare is CONSTANT-TIME: it does NOT early-return on the first
  *       mismatched byte (asserted structurally + by an all-but-last-byte-equal
  *       candidate still reported as not-equal).
@@ -17,7 +17,7 @@
  *       per_vip_secret AND a BYTE-IDENTICAL token for the same member
  *       (memcmp == 0) — proving a legitimate user's cookie minted on peer A
  *       read-back-matches on peer B to the SAME backend after failover, with
- *       NO synced secret blob / zero xSync change (D-02).
+ * NO synced secret blob / zero xSync change.
  *
  * Build: $(CC) -Wall -Wextra -o test_cookie sockproxy_cookie_test.c -I. -lssl -lcrypto
  * Run:   ./test_cookie
@@ -87,7 +87,7 @@ peer_match(const peer_fixture_t *p, const char *token)
 int
 main(void)
 {
-  printf("== sockproxy_cookie_test (FR-10 stateless token) ==\n");
+  printf("== sockproxy_cookie_test ( stateless token) ==\n");
 
   /* Peer A: a 3-member VIP. */
   peer_fixture_t A = {
@@ -110,10 +110,10 @@ main(void)
     peer_token_for(&A, 2, t2, sizeof(t2));
     CHECK(strcmp(t0, t1a) != 0 && strcmp(t2, t1a) != 0 && strcmp(t0, t2) != 0,
           "T1: distinct members ⇒ distinct tokens");
-    /* token must NOT contain the raw member id (D-03: no member-id leak) */
+    /* token must NOT contain the raw member id (: no member-id leak) */
     char mid[64];
     member_id_for(&A, 1, mid, sizeof(mid));
-    CHECK(strstr(t1a, mid) == NULL, "T1: token does not leak the raw member id (D-03)");
+    CHECK(strstr(t1a, mid) == NULL, "T1: token does not leak the raw member id ");
   }
 
   /* ---- T2: a valid token matches the RIGHT member ---- */

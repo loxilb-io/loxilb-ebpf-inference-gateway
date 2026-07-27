@@ -1,20 +1,20 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * sockproxy_cookie.h — Phase 76 FR-10 STATELESS LB-generated cookie persistence
+ * sockproxy_cookie.h — STATELESS LB-generated cookie persistence
  * (HTTP_COOKIE mode) primitives.
  *
  * These are PURE functions (no socket I/O, no nghttp2, no proxy_fd_ent state) so
  * they are unit-testable in isolation (sockproxy_cookie_test.c) and can be reused
  * verbatim by sockproxy_l7policy.c (the data-plane caller). They implement the
- * stateless token discipline of CONTEXT D-02/D-03:
+ * stateless token discipline of CONTEXT:
  *
  *   - The binding between a client and its backend lives ONLY in the cookie value
  *     (an opaque keyed-HMAC token of the member identity). NOTHING is stored on
  *     proxy_fd_ent / no per-connection map — so the affinity SURVIVES HA failover
- *     with ZERO xSync wire-format change (D-02 resolves the Phase 75 cookie 🔴).
+ * with ZERO xSync wire-format change ( resolves the cookie 🔴).
  *
  *   - The token is base64url(HMAC-SHA256(per_vip_secret, member_id)[:N]). The raw
- *     member id is NEVER exposed (D-03), so a client cannot read off a backend id
+ * member id is NEVER exposed, so a client cannot read off a backend id
  *     and forge a cookie targeting a chosen backend.
  *
  *   - per_vip_secret is derived DETERMINISTICALLY from already-synced config
@@ -27,10 +27,10 @@
  *     (Security V4 — no early return on first mismatched byte). A forged or stale
  *     token MISSES (returns L7_COOKIE_MISS) → the caller falls through to the
  *     normal LB hash; it can NEVER target an arbitrary/attacker-chosen backend
- *     (D-03 / T-76-07-01).
+ *.
  *
  * Crypto: uses the ALREADY-LINKED openssl libcrypto (HMAC / CRYPTO_memcmp) — the
- * HMAC is NOT hand-rolled (Security V6 / T-76-07-04). Zero new packages (T-76-SC).
+ * HMAC is NOT hand-rolled (Security V6). Zero new packages (T-76-SC).
  */
 #ifndef SOCKPROXY_COOKIE_H
 #define SOCKPROXY_COOKIE_H
@@ -48,7 +48,7 @@
 
 /* Build-time root key for per-VIP secret derivation. It is NOT a secret-of-record
  * (a leak only weakens token unforgeability to "guess a live member id", and a
- * miss still falls through to the normal hash — never a wrong backend, D-03). It
+ * miss still falls through to the normal hash — never a wrong backend). It
  * exists so the token is a KEYED HMAC (not a bare hash) and is identical on both
  * HA peers without any synced blob. */
 #define LB_COOKIE_ROOT_KEY        "loxilb-octavia-http-cookie-v1"
@@ -104,7 +104,7 @@ lb_cookie_b64url(const uint8_t *in, size_t inlen, char *out, size_t outsz)
 
 /* Derive the per-VIP secret deterministically from the VIP:port string. Both HA
  * peers, configured with the same VIP+port, compute a BYTE-IDENTICAL secret with
- * NO synced secret blob (Open-Q2 / D-02). `out` must hold LB_COOKIE_VIP_SECRET_LEN
+ * NO synced secret blob (Open-Q2). `out` must hold LB_COOKIE_VIP_SECRET_LEN
  * bytes. Returns 0 on success, -1 on failure. */
 static inline int
 l7_cookie_derive_vip_secret(const char *vip_port, uint8_t out[LB_COOKIE_VIP_SECRET_LEN])
@@ -158,7 +158,7 @@ l7_cookie_member_id(uint32_t xip_net, uint16_t xport_net, char *buf, size_t bufs
   return (n > 0 && (size_t)n < bufsz) ? 0 : -1;
 }
 
-/* CONSTANT-TIME token comparison (Security V4 / T-76-07-01). Compares the full
+/* CONSTANT-TIME token comparison (Security V4). Compares the full
  * presented token against a candidate over a FIXED span derived from the longer
  * of the two, accumulating a difference WITHOUT early return, so the timing does
  * not leak how many leading bytes matched. Returns 1 on exact match, 0 otherwise. */
@@ -186,7 +186,7 @@ l7_cookie_token_eq_ct(const char *presented, const char *candidate)
 /* Read-back: re-derive every LIVE member's token and constant-time-match it
  * against the presented `token`. Returns the matched member index [0, n_eps), or
  * L7_COOKIE_MISS on no match (the caller MUST then fall through to the normal LB
- * hash — D-03 / T-76-07-01: a forged/stale token NEVER targets an arbitrary
+ * hash —: a forged/stale token NEVER targets an arbitrary
  * backend). `eps` is the live member array (each carrying network-order
  * xip/xport); `member_inv[i]!=0` (optional, may be NULL) marks a member down. */
 static inline int

@@ -17,7 +17,7 @@
 /*
  * sockproxy_conn.c - Connection & FD management for LoxiLB proxy.
  *
- * Phase 3 refactoring: extracted from sockproxy.c.
+ * refactoring: extracted from sockproxy.c.
  * Functions contained:
  *   - FD mapping (fd_in_use, get_random_fd_range, get_mapped_proxy_fd)
  *   - Socket utilities (proxy_sock_setnb, setnodelay, set_opts, server_setup)
@@ -166,7 +166,7 @@ proxy_skmap_key_from_fd(int fd, smap_key_t *skmap_key, int *protocol)
 }
 
 
-// Phase 2 Task 2.2: kTLS integration with sockmap
+// Task 2.2: kTLS integration with sockmap
 // The old proxy_sock_init_ktls() stub has been removed.
 // We now use ktls_try_offload() from sockproxy_ktls.c which properly extracts
 // TLS session keys and enables kernel TLS offload.
@@ -447,10 +447,10 @@ proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
     pfds.fd = fd;
     pfds.events = POLLOUT|POLLERR;
 
-    /* FR-07 (Phase 76, D-10): per-listener backend connect timeout in ms. The value
+    /* per-listener backend connect timeout in ms. The value
      * rides proxy_arg (timeout_member_connect_ms), reached here via the client pfe's
      * proxy_map_ent (pfe->head). It is L7-gated (has_l7_policy): the AI peer and every
-     * un-configured listener keep the historic 500ms literal byte-for-byte (D-01a/D-10,
+ * un-configured listener keep the historic 500ms literal byte-for-byte (
      * Pitfall 3 — NOT Octavia's 5000ms). 0 ⇒ 500 even when an L7 policy is attached. */
     int connect_to_ms = 500;
     {
@@ -648,7 +648,7 @@ pfe_alloc(void)
   pfe_pool_live++;
   pthread_mutex_unlock(&pfe_pool_lock);
 
-  /* Phase 93-06 (AC-4): the global total-footprint gauge — incremented here, the
+  /* (AC-4): the global total-footprint gauge — incremented here, the
    * ONE point loxilb commits to holding a connection's footprint (the pfe
    * checkout), and decremented (>0-guarded) on pfe_recycle, exactly balanced with
    * pfe_pool_live above. Every OOM bail-out below mirrors the matching pfe_pool_live
@@ -702,7 +702,7 @@ pfe_alloc(void)
     return NULL;
   }
 
-  /* Phase 93-04: -1 = "not parked" (the memset above zeroes it, but 0 is a valid
+  /* -1 = "not parked" (the memset above zeroes it, but 0 is a valid
    * prefill EP index, so a zeroed park_ep_idx would falsely look parked-on-EP0). */
   pfe->park_ep_idx = -1;
 
@@ -736,7 +736,7 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   }
   pthread_mutex_unlock(&pfe_pool_lock);
 
-  /* Phase 93-06 (AC-4): release the global total-footprint gauge, paired 1:1 with
+  /* (AC-4): release the global total-footprint gauge, paired 1:1 with
    * the pfe_alloc inc above (the single client-close owner path). >0-guarded to
    * match the pfe_pool_live underflow guard / the active_conns idiom. Gated on the
    * bound being enabled (default-off byte-identical when LLB_PD_MAX_TOTAL_INFLIGHT
@@ -748,7 +748,7 @@ pfe_recycle(proxy_fd_ent_t *pfe)
                               memory_order_relaxed);
 }
 
-/* Phase 93-06 (AC-4): read-only snapshot of the pfe-pool gauges for the bounded-
+/* (AC-4): read-only snapshot of the pfe-pool gauges for the bounded-
  * footprint soak observability (the soak_footprint.sh sampler reads these from a
  * periodic log line — see the proxy_drain_checker_thread emit). Lock-guarded read
  * of the leaf-mutex statics; never mutates. */
@@ -887,7 +887,7 @@ proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
       pthread_rwlock_destroy(&tepval->pd_session_lock);
     }
 
-    /* Phase 8: cleanup radix trie */
+    /* cleanup radix trie */
     if (tepval->pd_trie) {
       pthread_rwlock_wrlock(&tepval->pd_trie_lock);
       pd_trie_free(tepval->pd_trie);
@@ -998,14 +998,14 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   memset(&fd_ent->prefix_key, 0, sizeof(fd_ent->prefix_key));  // P0.2: Reset prefix
   fd_ent->has_conv_id = 0;  // P0.3: Reset conversation ID flag
   memset(fd_ent->conversation_id, 0, sizeof(fd_ent->conversation_id));  // P0.3: Clear conversation ID
-  fd_ent->x_model_header[0] = '\0';  // US-202: Reset X-Model header
+  fd_ent->x_model_header[0] = '\0';  // Reset X-Model header
 
-  // US-501: Reset vLLM request ID state
+  // Reset vLLM request ID state
   fd_ent->vllm_request_id[0] = '\0';
   fd_ent->has_vllm_request_id = 0;
   fd_ent->request_id_injected = 0;
 
-  // US-505: Reset P/D orchestration state and free buffers
+  // Reset P/D orchestration state and free buffers
   pd_cleanup(fd_ent);
 
   // CRITICAL FIX: Reset session learning state
@@ -1024,7 +1024,7 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   }
 
   if (reset) {
-    /* Phase 90 (ASan-found conc=128 root cause): the P/D reapers
+    /* (ASan-found conc=128 root cause): the P/D reapers
      * (check_draining_endpoints / force_close_endpoint_connections) call
      * pd_teardown_legs() — which close()s the client fd and sets
      * fd_ent->fd = -1 — BEFORE invoking proxy_release_fd_ctx(pfe, 1).

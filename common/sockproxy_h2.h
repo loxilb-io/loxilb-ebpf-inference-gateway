@@ -187,7 +187,7 @@ typedef struct proxy_h2_session {
   int active_stream_count;           // Number of active streams
   int max_concurrent_streams;        // Limit (from SETTINGS frame)
 
-  // Phase 75 (T-75-17): the stream id currently under L7 dispatch. Set at the H2
+  // the stream id currently under L7 dispatch. Set at the H2
   // dispatch seam (proxy_h2_forward_to_backend) right before l7_route_dispatch so
   // proxy_h2_send_l7_synthetic() knows which stream to answer a REJECT/REDIRECT on
   // (l7_send_reject/redirect carry only `pfe`, not the stream). 0 = none active.
@@ -279,7 +279,7 @@ int proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream);
 void proxy_h2_cleanup_session(proxy_fd_ent_t *pfe);
 
 /**
- * proxy_h2_inject_resp_headers — Phase 76 (FR-08/FR-10): the ONE net-new C
+ * proxy_h2_inject_resp_headers —: the ONE net-new C
  * primitive of this phase. A **NON-TERMINAL** HTTP/2 response-header injector.
  *
  * Unlike proxy_h2_send_l7_synthetic() (which is TERMINAL: it submits a
@@ -291,7 +291,7 @@ void proxy_h2_cleanup_session(proxy_fd_ent_t *pfe);
  * backend->client relay (proxy_h2_backend_on_frame_recv_callback) submits via
  * nghttp2_submit_headers(). It MUST NOT touch any frame flag: the relay derives
  * END_STREAM from the *backend's* HEADERS frame, so the backend DATA frames keep
- * flowing and the body is preserved (T-76-03-01/02). nghttp2 frames every byte
+ * flowing and the body is preserved. nghttp2 frames every byte
  * (no raw writes on the h2 socket — defect 097c8dba).
  *
  * The names/values are deep-copied onto the heap (malloc + memcpy), exactly like
@@ -300,7 +300,7 @@ void proxy_h2_cleanup_session(proxy_fd_ent_t *pfe);
  * per-stream request DATA source (mapping->data_source) is NEVER touched, so the
  * body data provider stays attached.
  *
- * Gating: the call site is guarded by node->has_l7_policy (D-01a) so the AI /
+ * Gating: the call site is guarded by node->has_l7_policy so the AI /
  * has_l7_policy==0 transit path is byte-for-byte unchanged.
  *
  * @param mapping  The per-stream response-header collection point (the relay hook).

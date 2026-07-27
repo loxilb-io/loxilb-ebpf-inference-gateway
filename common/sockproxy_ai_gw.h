@@ -268,7 +268,7 @@ extern void llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port
                                       int ep_index, uint32_t num_gpu_blocks);
 
 /**
- * llb_ai_ctrl_update_ep – Phase 96 (D-07): store the global-AI-controller
+ * llb_ai_ctrl_update_ep –: store the global-AI-controller
  * advisory packed instruction word for one EP. Mirrors
  * llb_ai_update_ep_queue_depth exactly (PROXY_LOCK + atomic_store, MAX_PROXY_EP
  * bound, pd_disagg + n_eps guard). Sole writer (with llb_ai_ctrl_set_mode) of
@@ -286,7 +286,7 @@ extern void llb_ai_ctrl_update_ep(uint32_t service_ip, uint16_t service_port,
                                   int ep_index, uint32_t packed);
 
 /**
- * llb_ai_ctrl_set_mode – Phase 96 (D-07): store the per-service controller mode
+ * llb_ai_ctrl_set_mode –: store the per-service controller mode
  * scalar. 0 = controller absent/autonomous — pd_select_prefill performs ZERO
  * controller work (the G3 byte-identical hot path). Mirrors
  * llb_ai_update_ep_queue_depth exactly minus the ep_index pair (pd_ctrl_mode is
@@ -300,7 +300,7 @@ extern void llb_ai_ctrl_update_ep(uint32_t service_ip, uint16_t service_port,
 extern void llb_ai_ctrl_set_mode(uint32_t service_ip, uint16_t service_port,
                                  uint8_t mode);
 
-/* Phase 6: KV-Cache Exact Routing CGO exports */
+/* KV-Cache Exact Routing CGO exports */
 
 /*
  * llb_ai_kv_tokenize — tokenize a prompt using a HuggingFace tokenizer.
@@ -322,7 +322,7 @@ extern int llb_ai_kv_tokenize(char *text, char *model_name,
  *
  * Unlike llb_ai_kv_tokenize (which takes a single pre-extracted prompt string),
  * this takes the RAW chat request body (the full JSON carrying messages[]) and
- * the model name. The Go side (Phase 88-02) parses messages in order, renders
+ * the model name. The Go side parses messages in order, renders
  * the model's chat template (ChatML/Qwen2.5 + default-system injection + the
  * generation prompt), and Encodes with WithEncodeSpecialTokens — so the token
  * ids and therefore the 16-token KV block boundaries match vLLM exactly.
@@ -356,7 +356,7 @@ extern int llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
  *                  endpoints); these are skipped before scoring
  *   ep_load        per-EP live in-flight load (active_conns) indexed by the
  *                  ABSOLUTE epIdx 0..n_ep_slots-1 (same index space as
- *                  prefill_mask/excluded_mask bits). Phase 91 (Option B): this
+ * prefill_mask/excluded_mask bits). (Option B): this
  *                  is loxilb's OWN balancer-tracked load from
  *                  tepval->pd_ep_loads[i].active_conns — NOT the dead vLLM
  *                  workerMetrics scraper. NULL = legacy no-load behavior
@@ -364,7 +364,7 @@ extern int llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
  *   ep_cap         per-EP advertised capacity (num_gpu_blocks) indexed by the
  *                  same absolute epIdx. 0/NULL = capacity unknown; the Go side
  *                  clamps to [1,MAX] before any divide (kvClampCapacity).
- *   ep_weight      Phase 96 (D-07): per-EP controller weight [0,100] indexed by
+ * ep_weight: per-EP controller weight [0,100] indexed by
  *                  the same absolute epIdx, sourced from the pd_ctrl_ep[]
  *                  atomics (packed==0 mapped to 100 == no instruction). NULL
  *                  when pd_ctrl_mode==0 (controller absent) — the Go side then
@@ -374,7 +374,7 @@ extern int llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
  *   n_ep_slots     number of valid entries in ep_load[]/ep_cap[]/ep_weight[]
  *                  (0..32). The Go side bounds-checks every epIdx against this
  *                  length.
- *   svc_id         Phase 99 (SGL-04): the calling rule's identity
+ * svc_id (SGL-04): the calling rule's identity
  *                  (tepval->kv_svc_id == the Go-side rule number, kvServices
  *                  key). Non-zero ⇒ the Go selector scores ONLY that rule's
  *                  inventories (closes the cross-VIP contamination seam,
@@ -385,7 +385,7 @@ extern int llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
  *                  discipline: this prototype, the Go //export signature
  *                  (ai_kv_subscriber.go) and the C call site
  *                  (sockproxy_kv_exact.c) change in the SAME commit.
- *   kv_exact_mode  Phase 99 (§9 relief default): the calling rule's
+ * kv_exact_mode (§9 relief default): the calling rule's
  *                  tepval->kv_exact_mode. The Go side uses ONLY the
  *                  single-role predicate (== KV_EXACT_MODE_SINGLE_ROLE 3) to
  *                  gate the Phase-95 fleet-wide pressure-relief pass by

@@ -1,4 +1,4 @@
-/* test_pd_rewriter.c - Unit tests for P/D body rewriting (US-504) and worker selection (US-503)
+/* test_pd_rewriter.c - Unit tests for P/D body rewriting and worker selection 
  * Standalone test binary: no sockproxy.c dependencies.
  * Build: gcc -Wall -Wextra -o test_pd_rewriter test_pd_rewriter.c -I. -DTEST_PD_REWRITER
  */
@@ -384,7 +384,7 @@ static int test_circuit_breaker_skip(void) {
   return 1;
 }
 
-/* ===== Suite C: kv_transfer_params extraction (US-506) ===== */
+/* ===== Suite C: kv_transfer_params extraction ===== */
 
 static int test_kv_extract_typical(void) {
   const char *resp =
@@ -472,7 +472,7 @@ static int test_kv_extract_empty_response(void) {
   return 1;
 }
 
-/* ===== Suite D: Decode body construction (US-507) ===== */
+/* ===== Suite D: Decode body construction ===== */
 
 static int test_decode_body_with_kv(void) {
   const char *orig = "{\"model\":\"llama\",\"max_tokens\":200,\"stream\":true}";
@@ -870,7 +870,7 @@ static int test_kv_extract_content_verification(void) {
 /* ===== Main ===== */
 
 int main(void) {
-  printf("=== Suite A: P/D JSON Rewriting (US-504) ===\n");
+  printf("=== Suite A: P/D JSON Rewriting ===\n");
   RUN_TEST(test_normal_rewrite);
   RUN_TEST(test_space_variant);
   RUN_TEST(test_nested_sampling_params);
@@ -880,14 +880,14 @@ int main(void) {
   RUN_TEST(test_min_tokens_rewrite);
   RUN_TEST(test_stream_options_removal);
 
-  printf("\n=== Suite B: P/D Worker Selection (US-503) ===\n");
+  printf("\n=== Suite B: P/D Worker Selection ===\n");
   RUN_TEST(test_rr_selection);
   RUN_TEST(test_wrr_selection);
   RUN_TEST(test_health_skip);
   RUN_TEST(test_empty_pool);
   RUN_TEST(test_circuit_breaker_skip);
 
-  printf("\n=== Suite C: kv_transfer_params Extraction (US-506) ===\n");
+  printf("\n=== Suite C: kv_transfer_params Extraction ===\n");
   RUN_TEST(test_kv_extract_typical);
   RUN_TEST(test_kv_extract_not_found);
   RUN_TEST(test_kv_extract_deep_nesting);
@@ -896,7 +896,7 @@ int main(void) {
   RUN_TEST(test_kv_extract_empty_response);
   RUN_TEST(test_kv_extract_null_args);
 
-  printf("\n=== Suite D: Decode Body Construction (US-507) ===\n");
+  printf("\n=== Suite D: Decode Body Construction ===\n");
   RUN_TEST(test_decode_body_with_kv);
   RUN_TEST(test_decode_body_empty_kv);
   RUN_TEST(test_decode_body_empty_kv_string);

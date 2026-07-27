@@ -17,7 +17,7 @@
 #include <pthread.h>
 #include <limits.h>
 #include <time.h>
-#include <errno.h>  /* Phase 70.1 Plan 02: EDEADLK for Suite D */
+#include <errno.h>  /* .1 Plan 02: EDEADLK for Suite D */
 
 /* ===== Constants (from sockproxy.h) ===== */
 #define MAX_PROXY_EP      32
@@ -44,7 +44,7 @@
 #define DEFAULT_SWAP_WEIGHT      1
 #endif
 
-/* Phase 93-04: bounded backpressured admission — parked FIFO mock (mirrors
+/* bounded backpressured admission — parked FIFO mock (mirrors
  * sockproxy.h). test_pd_cache_aware never SETs LLB_PD_QUEUE_DEPTH_PER_EP, so the
  * enqueue path in sockproxy_pd.c is never taken here (default-off); these are only
  * needed for the TU to COMPILE the parked-branch references. */
@@ -82,7 +82,7 @@ typedef struct {
 
 typedef struct {
   _Atomic uint32_t active_conns;
-  _Atomic uint32_t queued_requests;  /* Phase 70.1 Plan 02: sync with sockproxy.h:214 (COMP-07) */
+  _Atomic uint32_t queued_requests;  /* .1 Plan 02: sync with sockproxy.h:214 (COMP-07) */
   _Atomic uint64_t total_requests;
   uint64_t last_update_ts;
   int ep_available;
@@ -143,19 +143,19 @@ typedef struct proxy_epval {
   uint8_t  pd_cache_aware_mode;
   uint8_t  pd_cache_threshold;
   uint8_t  pd_balance_abs_threshold;
-  uint8_t  kv_exact_mode;  /* Phase 70.1 Plan 02: KV exact routing mode (0=off, 1=zmq) */
+  uint8_t  kv_exact_mode;  /* .1 Plan 02: KV exact routing mode (0=off, 1=zmq) */
   _Atomic uint32_t pd_tier2_rr;
-  _Atomic uint32_t pd_decode_rr;  /* Phase 70.1 Plan 02: sync with sockproxy.h:377 (P2 TB3/TB4) */
+  _Atomic uint32_t pd_decode_rr;  /* .1 Plan 02: sync with sockproxy.h:377 (P2 TB3/TB4) */
   uint32_t pd_session_ttl_sec;
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP];
 
-  /* Phase 96 (D-07): controller advisory mirror (sockproxy.h) — the #included
+  /* controller advisory mirror (sockproxy.h) — the #included
    * sockproxy_pd.c reads these in pd_select_prefill. memset-0 init == mode 0 ==
    * byte-identical selection (G3), so every existing case is untouched. */
   _Atomic uint32_t pd_ctrl_ep[MAX_PROXY_EP];
   _Atomic uint8_t  pd_ctrl_mode;
 
-  /* Phase 93-04: parked FIFO mock (unused here — default-off) */
+  /* parked FIFO mock (unused here — default-off) */
   pd_parked_fifo_t  pd_parked[MAX_PROXY_EP];
   pthread_mutex_t   pd_parked_lock;
 
@@ -169,17 +169,17 @@ typedef struct proxy_epval {
 } proxy_epval_t;
 
 typedef struct proxy_fd_ent {
-  int      fd;                            /* Phase 70.1 Plan 02: log fd for sockproxy_pd.c */
-  _Atomic uint64_t gen;                   /* Phase 93-04: pfe pool generation (parked staleness guard) */
+  int      fd;                            /* .1 Plan 02: log fd for sockproxy_pd.c */
+  _Atomic uint64_t gen;                   /* pfe pool generation (parked staleness guard) */
   char conversation_id[MAX_CONV_ID_LEN];
   int has_conv_id;
   char user_id[128];
   int  has_user_id;
   llm_prefix_key_t prefix_key;
-  char     x_model_header[MAX_MODEL_LEN]; /* Phase 70.1 Plan 02: model hint header */
+  char     x_model_header[MAX_MODEL_LEN]; /* .1 Plan 02: model hint header */
   int      pd_decode_ep_idx;
-  int      park_ep_idx;                   /* Phase 93-04: parked-behind prefill EP (-1 = not parked) */
-  uint64_t park_start_ts;                 /* Phase 93-04: CLOCK_MONOTONIC ns at park enqueue */
+  int      park_ep_idx;                   /* parked-behind prefill EP (-1 = not parked) */
+  uint64_t park_start_ts;                 /* CLOCK_MONOTONIC ns at park enqueue */
 } proxy_fd_ent_t;
 
 /* ===== Log stubs ===== */
@@ -188,7 +188,7 @@ typedef struct proxy_fd_ent {
 #define log_debug(fmt, ...) ((void)0)
 #define log_info(fmt, ...)  ((void)0)
 
-/* ===== Phase 70 sync-event stubs =====
+/* ===== sync-event stubs =====
  * sockproxy_pd.c references proxy_sync_event_t / SYNC_SESSION_*  /
  * llb_sockproxy_emit_sync_event from sockproxy_internal.h. The test build
  * does NOT pull in sockproxy_internal.h (to avoid the proxy_struct singleton
@@ -197,7 +197,7 @@ typedef struct proxy_fd_ent {
  * pd_session_build_event() compile-clean even when its body is no-op'd by
  * the TEST_PD_CACHE_AWARE guard in sockproxy_pd.c.
  *
- * Phase 70.1 Plan 02 Task 2 (D-05): added to unblock the existing Suite
+ *.1 Plan 02 Task 2: added to unblock the existing Suite
  * A/B/C tests AND to support the new test_concurrent_cleanup_recursive_lock
  * which exercises the two-pass gather-then-evict idiom under concurrent
  * eviction. */
@@ -227,7 +227,7 @@ static inline void llb_sockproxy_emit_sync_event(const proxy_sync_event_t *ev) {
     (void)ev;
 }
 
-/* ===== global_stats stub (Phase 70.1 Plan 02) =====
+/* ===== global_stats stub (.1 Plan 02) =====
  * sockproxy_pd.c:958 references `global_stats.pd_kv_t15_fallthrough_total`
  * (and potentially other atomic counters). Mirror only the fields the
  * P/D code touches — anything else stays absent so the compiler flags
@@ -305,7 +305,7 @@ static void init_cache_aware_epval(proxy_epval_t *ev, int n_prefill, int n_decod
   ev->pd_session_ttl_sec = 300;
   pthread_rwlock_init(&ev->pd_session_lock, NULL);
   pthread_rwlock_init(&ev->pd_trie_lock, NULL);
-  pthread_mutex_init(&ev->pd_parked_lock, NULL);  /* Phase 93-04 (unused: default-off) */
+  pthread_mutex_init(&ev->pd_parked_lock, NULL);  /* (unused: default-off) */
   ev->pd_trie = pd_trie_create();
   ev->pd_session_map = NULL;
 
@@ -719,7 +719,7 @@ static int test_select_decode_session_hint(void) {
   return 1;
 }
 
-/* ===== Suite D: Concurrent cleanup recursive-lock test (Phase 70.1 / D-05) ===== */
+/* ===== Suite D: Concurrent cleanup recursive-lock test (.1) ===== */
 
 /* Mock proxy_struct singleton — file-local. The real proxy_struct lives in
  * sockproxy_ep.c which is NOT linked into this standalone test (verified via
@@ -742,7 +742,7 @@ typedef struct test_pd_tepval {
   UT_hash_handle hh;
 } test_pd_tepval_t;
 
-#define D5_NUM_TEPVALS         80   /* >65 to force heap-spill (CONTEXT D-05) */
+#define D5_NUM_TEPVALS         80   /* >65 to force heap-spill (CONTEXT) */
 #define D5_EVICTOR_THREADS     4    /* concurrent request-path simulators */
 #define D5_EVICTOR_ITERATIONS  500  /* per-thread loop count */
 
@@ -834,7 +834,7 @@ d5_cleanup_thread(void *arg) {
 
   pthread_rwlock_unlock(&proxy_struct_stub.lock);
 
-  /* Evict AFTER unlock — the entire point of D-04. */
+  /* Evict AFTER unlock — the entire point of. */
   for (size_t i = 0; i < n_v; i++) {
     d5_pd_session_evict_stub(st, victims[i]);
   }
@@ -917,7 +917,7 @@ static int test_concurrent_cleanup_recursive_lock(void) {
 
 /* ===== main() ===== */
 
-/* ===== Phase 93: per-EP in-flight admission-cap tests =====
+/* =====: per-EP in-flight admission-cap tests =====
  * Run as a SEPARATE process (argv "cap") with LLB_PD_MAX_INFLIGHT_PER_EP set, because
  * pd_max_inflight_per_ep() caches the env once per process. cap=4 throughout. */
 
@@ -987,7 +987,7 @@ static int test_cap_under_cap_normal(void) {
 
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "cap") == 0) {
-    printf("\n=== Phase 93: P/D Admission-Cap Tests (LLB_PD_MAX_INFLIGHT_PER_EP=4) ===\n\n");
+    printf("\n===: P/D Admission-Cap Tests (LLB_PD_MAX_INFLIGHT_PER_EP=4) ===\n\n");
     RUN_TEST(test_cap_spill_from_over_cap_owner);
     RUN_TEST(test_cap_all_at_cap_sheds);
     RUN_TEST(test_cap_under_cap_normal);
@@ -1023,7 +1023,7 @@ int main(int argc, char **argv) {
   RUN_TEST(test_select_prefill_load_imbalance_guard);
   RUN_TEST(test_select_decode_session_hint);
 
-  printf("\nSuite D: Concurrent Cleanup Recursive-Lock Test (Phase 70.1 / D-05)\n");
+  printf("\nSuite D: Concurrent Cleanup Recursive-Lock Test (.1)\n");
   RUN_TEST(test_concurrent_cleanup_recursive_lock);
 
   printf("\n=== Results: %d/%d tests passed ===\n\n", tests_passed, tests_run);

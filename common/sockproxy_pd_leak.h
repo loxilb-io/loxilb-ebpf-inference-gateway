@@ -1,7 +1,7 @@
-/* sockproxy_pd_leak.h - Pure, unit-testable primitives for the Phase 87
+/* sockproxy_pd_leak.h - Pure, unit-testable primitives for the 
  * P/D streaming-completion connection-leak fix.
  *
- * This header factors the two testable primitives the Phase 87 fixes depend on
+ * This header factors the two testable primitives the fixes depend on
  * into PURE, self-contained `static inline` functions that carry NO dependency
  * on the global proxy machinery, so a unit TU (test_pd_leak.c) can include them
  * directly the way test_pd_rewriter includes sockproxy_pd.c, while the shipped
@@ -14,7 +14,7 @@
  *           - the chunked transfer-coding last-chunk terminator "0\r\n\r\n", OR
  *           - an SSE "[DONE]" done-marker (the in-tree PROXY_SSE_DONE_STR1/2
  *             semantics).
- *         FIX-2 (prefill, sockproxy_http.c:~1099) and FIX-4 (non-SSE decode,
+ * (prefill, sockproxy_http.c:~1099) and (non-SSE decode,
  *         sockproxy_http.c:~1296) call this beside the existing Content-Length
  *         check so chunked / CL-less responses still complete.
  *
@@ -29,7 +29,7 @@
  *         Encodes the safe two-leg teardown SEQUENCE from
  *         force_close_endpoint_connections() (sockproxy_health.c:133-150):
  *         deregister + close + zero each backend rfd[], then the client fd.
- *         FIX-1/3: the Wave 1 reaper sites (US-508 / US-ERR01 in
+ * the Wave 1 reaper sites ( in
  *         sockproxy_health.c) call this helper and then SEPARATELY invoke the
  *         production fd-context release (the proxy_release_*fd_ctx machinery).
  *
@@ -147,9 +147,9 @@ pd_detect_http_msg_end(const uint8_t *buf, size_t len)
  * (correct, just not fragmentation-safe). Bounded strictly by `len`; never reads
  * past msg+len. Returns nonzero iff a complete HTTP message end is present.
  *
- * Phase 89 T3 (Bug A): on the sse_active==0 stall path this is the ONLY decode
+ * T3: on the sse_active==0 stall path this is the ONLY decode
  * completion detector, and a split terminator under load is exactly what stranded
- * the decode leg with the single-packet FIX-4 scan.
+ * the decode leg with the single-packet scan.
  */
 static inline int
 pd_scan_msg_end_window(uint8_t *tail, uint8_t *tail_len,
@@ -190,11 +190,11 @@ pd_scan_msg_end_window(uint8_t *tail, uint8_t *tail_len,
  * a decode-streaming SSE connection whose backend leg has gone silent is reaped
  * with a SYNTHESIZED graceful "data: [DONE]\n\n" terminator instead of hanging.
  *
- * Phase 89 (RESOLVED): vLLM's P/D-disagg path FINISHES generation but omits the
+ * (RESOLVED): vLLM's P/D-disagg path FINISHES generation but omits the
  * closing "data: [DONE]" SSE chunk for ~2.5% of streams under concurrency (loxilb
  * exonerated — its :1198 scanner completes 100% of TERMINATED streams). Without a
  * terminator the decode leg never reaches PD_PHASE_COMPLETE and the client hangs
- * until a wall-clock backstop (US-ERR01 502 @120s / FIX-3 504 @180s) injects a
+ * until a wall-clock backstop ( 502 @120s / 504 @180s) injects a
  * malformed HTTP status line into a live SSE body. This safety-net converts that
  * forever-hang into a protocol-correct completion.
  *

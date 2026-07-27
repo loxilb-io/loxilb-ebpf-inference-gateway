@@ -12,7 +12,7 @@
  * sockproxy_lb.h - Load Balancing Algorithm declarations.
  *
  * Consumers: sockproxy.c (callers of wrr_select_endpoint, chwbl_*),
- *            sockproxy_ep.c (Phase 4).
+ * sockproxy_ep.c.
  *
  * See sockproxy_refactoring_plan.md §6.7
  *

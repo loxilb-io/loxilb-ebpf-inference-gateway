@@ -41,7 +41,7 @@ extern "C" {
 #define PRESIDIO_FAIL_OPEN   0
 #define PRESIDIO_FAIL_CLOSED 1
 
-// === JSON Field Mapping (Phase 2.1) ===
+// === JSON Field Mapping (.1) ===
 #define PRESIDIO_MAX_JSON_FIELDS 32
 #define PRESIDIO_MAX_JSONPATH_LENGTH 128
 #define PRESIDIO_MAX_ENTITY_TYPES_PER_FIELD 8
@@ -127,7 +127,7 @@ typedef struct {
     uint64_t last_update_ts;            // Timestamp of last update
     
     // ========================================================================
-    // V2 EXTENSIONS (Phase 1)
+    // V2 EXTENSIONS 
     // ========================================================================
     
     // === V2 API Control ===
@@ -140,7 +140,7 @@ typedef struct {
     char encryption_key[64];            // Base64-encoded encryption key (AES-256)
     uint32_t encryption_algorithm;      // 0=AES-256-GCM (default), 1=AES-128-GCM
     
-    // === JSON Anonymization (Phase 2.1) ===
+    // === JSON Anonymization (.1) ===
     uint8_t enable_json_detection;      // Auto-detect JSON payloads
     uint8_t json_fallback_to_text;      // Fallback to text mode if JSON parsing fails
     uint8_t json_response_scanning;     // Also scan JSON responses
@@ -153,13 +153,13 @@ typedef struct {
     uint32_t batch_size;                // Items per batch stream (default: 10)
     uint32_t batch_timeout_ms;          // Batch processing timeout
     
-    // === Custom Recognizers (Phase 2.2) ===
+    // === Custom Recognizers (.2) ===
     uint8_t num_custom_recognizers;     // Number of registered custom recognizers
     uint8_t custom_recognizers_enabled; // Enable custom recognizer loading
     uint8_t _padding_custom[2];         // Alignment
     // Note: Custom recognizers stored separately (registered at runtime)
     
-    // === JSON Field Mappings (Phase 2.1) ===
+    // === JSON Field Mappings (.1) ===
     presidio_json_config_t json_config; // JSON anonymization configuration
     
 } presidio_config_shm_t;
@@ -175,7 +175,7 @@ typedef struct {
     void *shm_addr;                     // Mapped memory address
 } presidio_runtime_config_t;
 // ============================================================================
-// CUSTOM RECOGNIZER CONFIGURATION (Phase 2.2)
+// CUSTOM RECOGNIZER CONFIGURATION (.2)
 // ============================================================================
 
 #define PRESIDIO_MAX_CUSTOM_RECOGNIZERS 100
@@ -227,7 +227,7 @@ int presidio_config_is_enabled(void);
 void presidio_config_dump(void);
 void presidio_config_cleanup(void);
 
-// Custom recognizer registry management (Phase 2.2)
+// Custom recognizer registry management (.2)
 int presidio_registry_init(void);
 void presidio_registry_cleanup(void);
 int presidio_registry_add(presidio_custom_recognizer_config_t *recognizer);

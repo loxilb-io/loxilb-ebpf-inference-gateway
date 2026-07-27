@@ -1,36 +1,36 @@
 /* SPDX-License-Identifier: GPL-2.0
  *
- * sockproxy_l7policy.h — Phase 75 L7 content-routing policy engine (public contract).
+ * sockproxy_l7policy.h — L7 content-routing policy engine (public contract).
  *
  * This header declares the STABLE prototype contract for the userspace L7
  * content-routing engine that runs as a SIBLING of the AI model path (CONTEXT
- * D-01..D-03), dispatched AFTER the AI-GW auth/QUOTA gate (D-05) at the two
+ *..), dispatched AFTER the AI-GW auth/QUOTA gate at the two
  * find_endpoint_lpm seams (sockproxy_ep.c:400 / sockproxy_h2.c:1962).
  *
  * Plan 75-01 shipped this as a COMPILING STUB (opaque void* IR). Plan 75-03
  * (this revision) narrows the IR to the concrete TRANSLATION-NEUTRAL SUPERSET
  * types below — a superset of OpenStack Octavia l7policy/l7rule AND the
- * Kubernetes Gateway API HTTPRoute (CONTEXT D-06/D-07/D-08) — and implements
+ * Kubernetes Gateway API HTTPRoute (CONTEXT) — and implements
  * the real ordered first-match-wins evaluation engine in sockproxy_l7policy.c.
  *
- * IR shape (locked, CONTEXT D-06/D-07/D-08):
+ * IR shape (locked, CONTEXT):
  *   - Per-VIP ORDERED list of routes; each route has an explicit `position`.
- *     The engine walks routes position-sorted, FIRST-MATCH-WINS (D-06).
- *   - Each route has matchSets[]: OR ACROSS sets, AND WITHIN a set (D-06).
- *   - Each condition = {field, op, key, value, invert} (D-06).
- *   - One tagged-union action per route: FORWARD / REDIRECT / REJECT (D-07).
- *   - The IR RESERVES a filter slot for Phase 76 (header set/add/remove,
+ * The engine walks routes position-sorted, FIRST-MATCH-WINS.
+ * Each route has matchSets: OR ACROSS sets, AND WITHIN a set.
+ * Each condition = {field, op, key, value, invert}.
+ * One tagged-union action per route: FORWARD / REDIRECT / REJECT.
+ * The IR RESERVES a filter slot for (header set/add/remove,
  *     URLRewrite-without-redirect, RequestMirror) and the SSL_* field-type
- *     space for Phase 79 — neither is implemented here (D-08 deferred).
+ * space for — neither is implemented here ( deferred).
  *
- * REGEX (CONTEXT landmine T-75-07/08 — ReDoS): POSIX <regex.h> has no match
+ * REGEX (CONTEXT landmine — ReDoS): POSIX <regex.h> has no match
  * timeout, so the pattern is compiled ONCE at attach time (regcomp, Plan 05),
  * cached on the condition (re + re_valid), and the operand is length-bounded to
  * L7_REGEX_INPUT_MAX before regexec. The evaluate path NEVER calls regcomp.
  *
  * The 4096-byte proxy_arg _Static_assert (sockproxy.h:750) forbids carrying the
  * variable-length ordered route array inline on proxy_arg — hence the separate
- * proxy_attach_l7_policy() / proxy_detach_l7_policy() CGO attach calls (D-09),
+ * proxy_attach_l7_policy / proxy_detach_l7_policy CGO attach calls,
  * modeled on proxy_update_mtls_config. Those signatures stay STABLE for Plan 05.
  */
 #ifndef __SOCKPROXY_L7POLICY_H__
@@ -64,12 +64,12 @@ extern "C" {
 #define L7_VALUE_MAX           256   /* condition operand value */
 #endif
 #ifndef FILTER_RESERVED_BYTES
-#define FILTER_RESERVED_BYTES  64    /* Phase 75 legacy reserved slot — retained for naming continuity */
+#define FILTER_RESERVED_BYTES  64    /* legacy reserved slot — retained for naming continuity */
 #endif
 
 /* -------------------------------------------------------------------------
- * FR-08 (Phase 76, CONTEXT D-09) — request header insertion filter slot.
- * The Phase-75 IR reserved a per-route filter slot; FR-08 fills it with a
+ * (CONTEXT) — request header insertion filter slot.
+ * The Phase-75 IR reserved a per-route filter slot; fills it with a
  * BOUNDED tagged-op {SET|ADD|REMOVE} filter list (a faithful superset of BOTH
  * Octavia insert_headers (SET/ADD) AND Gateway API RequestHeaderModifier
  * (set/add/remove)). DECLARATIONS ONLY this phase — the SET/ADD/REMOVE engine
@@ -83,13 +83,13 @@ extern "C" {
 #define L7_HDR_VALUE_MAX 256  /* == sockproxy.h L7_HDR_VALUE_MAX (header VALUE, incl NUL) */
 #endif
 #ifndef L7_MAX_HDR_FILTERS
-/* Bounded count of insertHeaders ops per route (DoS bound T-76-01-02). Aligned to
+/* Bounded count of insertHeaders ops per route (DoS bound). Aligned to
  * the L7_MAX_CAPTURED_HEADERS=32-style discipline; chosen 8 (≤32) — enough for the
  * X-Forwarded-* trio plus several custom headers, far below the 32 ceiling. */
 #define L7_MAX_HDR_FILTERS 8
 #endif
 
-/* Tagged op for an insertHeaders filter entry (CONTEXT D-09). */
+/* Tagged op for an insertHeaders filter entry (CONTEXT). */
 typedef enum {
   L7HDR_SET    = 0,  /* set/overwrite the header to `value` (Octavia + Gateway "set") */
   L7HDR_ADD    = 1,  /* append `value` (Octavia + Gateway "add")                       */
@@ -112,19 +112,19 @@ typedef struct {
 /* -------------------------------------------------------------------------
  * l7_route_dispatch outcome sentinels (Plan 04). The shared dispatch helper
  * returns one of these so the two divergent routing seams (H1 ep.c:400 /
- * H2 h2.c:1962) act identically and cannot drift (T-75-12 parity).
+ * H2 h2.c:1962) act identically and cannot drift ( parity).
  * ------------------------------------------------------------------------- */
-#define L7_DISPATCH_FALLTHROUGH 0  /* no L7 policy attached — run the AI/LPM path UNCHANGED (D-04) */
+#define L7_DISPATCH_FALLTHROUGH 0  /* no L7 policy attached — run the AI/LPM path UNCHANGED */
 #define L7_DISPATCH_FORWARD     1  /* FORWARD decision — *tepval_out resolved to a plain pool       */
 #define L7_DISPATCH_TERMINATED  2  /* REJECT/REDIRECT/no-match emitted — caller returns -1 (terminal) */
 
 /* -------------------------------------------------------------------------
- * Match field (CONTEXT D-06). HOST/PATH/HEADER/COOKIE/FILE_TYPE are the Octavia
+ * Match field (CONTEXT). HOST/PATH/HEADER/COOKIE/FILE_TYPE are the Octavia
  * l7rule types; METHOD/QUERY are the Gateway API additions. The SSL_* field-type
  * range (Octavia SSL_CONN_HAS_CERT / SSL_VERIFY_RESULT / SSL_DN_FIELD) is
- * RESERVED for Phase 79 (needs listener-level mTLS) — DO NOT add SSL_*
+ * RESERVED for (needs listener-level mTLS) — DO NOT add SSL_*
  * enumerators here; new SSL_* values must start at L7F__SSL_RESERVED_BASE so the
- * existing wire values never shift (D-08).
+ * existing wire values never shift.
  * ------------------------------------------------------------------------- */
 typedef enum {
   L7F_HOST       = 0,   /* :authority / Host header (port-stripped)   */
@@ -134,11 +134,11 @@ typedef enum {
   L7F_FILE_TYPE  = 4,   /* path file extension (Octavia FILE_TYPE)    */
   L7F_METHOD     = 5,   /* HTTP method (Gateway)                      */
   L7F_QUERY      = 6,   /* URL query param by name (key required)     */
-  /* L7F__SSL_RESERVED_BASE = 64  -- Phase 79 SSL_* field types start here */
+  /* L7F__SSL_RESERVED_BASE = 64 -- SSL_* field types start here */
 } l7_field_t;
 
 /* -------------------------------------------------------------------------
- * Compare op (CONTEXT D-06). Octavia EQUAL_TO/STARTS_WITH/ENDS_WITH/CONTAINS/
+ * Compare op (CONTEXT). Octavia EQUAL_TO/STARTS_WITH/ENDS_WITH/CONTAINS/
  * REGEX ∪ Gateway Exact/PathPrefix/RegularExpression. SEGMENT_PREFIX is the
  * Gateway PathPrefix semantics (prefix must end on a "/" path segment boundary).
  * Per-condition `invert` (Octavia-only) flips the result (see l7_condition_t).
@@ -163,14 +163,14 @@ typedef struct {
   uint8_t    re_valid;            /* 1 if `re` holds a compiled program (set by attach/Plan 05)  */
 } l7_condition_t;
 
-/* A match set: ALL conditions must hold (AND within a set, D-06). */
+/* A match set: ALL conditions must hold (AND within a set). */
 typedef struct {
   l7_condition_t conds[L7_MAX_CONDS_PER_SET];
   uint8_t        n_conds;
 } l7_match_set_t;
 
 /* -------------------------------------------------------------------------
- * Action tagged union (CONTEXT D-07) — covers Octavia + Gateway in one shape.
+ * Action tagged union (CONTEXT) — covers Octavia + Gateway in one shape.
  * ------------------------------------------------------------------------- */
 typedef enum {
   L7A_FORWARD  = 0,   /* route to a (weighted) backend pool                       */
@@ -220,9 +220,9 @@ typedef struct {
 } l7_action_t;
 
 /* -------------------------------------------------------------------------
- * One route (CONTEXT D-06): explicit position + OR-sets + one action, plus the
- * Phase-76 filter slot now realised as a BOUNDED insertHeaders filter (FR-08,
- * D-09) and an HTTP_COOKIE session-persistence marker (FR-10, D-05). Both are
+ * One route (CONTEXT): explicit position + OR-sets + one action, plus the
+ * Phase-76 filter slot now realised as a BOUNDED insertHeaders filter (
+ *) and an HTTP_COOKIE session-persistence marker. Both are
  * ADDITIVE and DECLARATIONS-ONLY here (the engine is Plans 06/07): a route with
  * n_hdr_filters==0 && cookie_persist==0 behaves exactly as a Phase-75 route.
  * These ride the heap route array, NEVER proxy_arg — the 4096-byte eBPF map
@@ -230,13 +230,13 @@ typedef struct {
  * ------------------------------------------------------------------------- */
 typedef struct {
   int             position;       /* explicit precedence; engine sorts ascending */
-  l7_match_set_t  sets[L7_MAX_SETS_PER_ROUTE]; /* OR across sets (D-06)          */
+  l7_match_set_t  sets[L7_MAX_SETS_PER_ROUTE]; /* OR across sets */
   uint8_t         n_sets;
-  l7_action_t     action;         /* the tagged-union action (D-07)              */
-  /* FR-08 (D-09): bounded insertHeaders SET/ADD/REMOVE filter list. */
+  l7_action_t     action;         /* the tagged-union action */
+  /* bounded insertHeaders SET/ADD/REMOVE filter list. */
   l7_hdr_filter_t hdr_filters[L7_MAX_HDR_FILTERS];
   uint8_t         n_hdr_filters;  /* 0 => no header insertion for this route      */
-  /* FR-10 (D-05): HTTP_COOKIE session-persistence marker. 0=off; when set, the
+  /* HTTP_COOKIE session-persistence marker. 0=off; when set, the
    * attach path enables PROXY_AFFINITY_COOKIE (sockproxy.h:773) for this route.
    * Mutually exclusive with APP_COOKIE/SOURCE_IP per pool (Octavia semantics). */
   uint8_t         cookie_persist; /* 0=off, 1=HTTP_COOKIE LB-generated cookie mode */
@@ -300,7 +300,7 @@ int l7_send_redirect(struct proxy_fd_ent *pfe, int status_code,
  * REDIRECT) on the ACTIVE HTTP/2 stream via nghttp2 framing, instead of the raw
  * HTTP/1.1 bytes l7_send_reject/redirect write on H1. Raw "HTTP/1.1 ..." bytes on
  * an h2 socket are an h2 protocol violation (the client aborts the connection —
- * the T-75-17 H1/H2 parity failure this fixes). Headers-only (`:status`, optional
+ * the H1/H2 parity failure this fixes). Headers-only (`:status`, optional
  * `location`, `content-length: 0`, END_STREAM); no fd shutdown (h2 multiplexes —
  * only the one stream is closed). The active stream id is read from
  * proxy_h2_session.l7_active_stream_id (set at the H2 dispatch seam, sockproxy_h2.c).
@@ -317,7 +317,7 @@ int proxy_h2_send_l7_synthetic(struct proxy_fd_ent *pfe, int status_code,
  * proxy_attach_l7_policy — attach the ordered L7 route array to the running
  * proxy_map_ent keyed by `key` (VIP:port:proto), compiling REGEX conditions ONCE
  * at attach time (regcomp -> cond->re / cond->re_valid) and setting
- * has_l7_policy=1. Modeled on proxy_update_mtls_config (D-09). Body: Plan 05.
+ * has_l7_policy=1. Modeled on proxy_update_mtls_config. Body: Plan 05.
  */
 int proxy_attach_l7_policy(struct proxy_ent *key, const l7_route_t *routes,
                            int n_routes);
@@ -331,7 +331,7 @@ int proxy_detach_l7_policy(struct proxy_ent *key);
 /*
  * l7_resolve_pool — map a FORWARD action's target pool to a tepval-equivalent
  * (proxy_epval_t *) so a FORWARD decision re-enters the EXISTING intra-pool
- * endpoint selector (CONTEXT D-03 — a plain pool, never the AI model engine).
+ * endpoint selector (CONTEXT — a plain pool, never the AI model engine).
  * Returns NULL when there is no usable pool. Defined in sockproxy_l7policy.c.
  */
 struct proxy_epval *l7_resolve_pool(struct proxy_map_ent *ent,
@@ -340,12 +340,12 @@ struct proxy_epval *l7_resolve_pool(struct proxy_map_ent *ent,
 /*
  * l7_route_dispatch — the SINGLE shared discriminator + dispatch helper invoked
  * at BOTH routing seams (H1 sockproxy_ep.c:400 and H2 sockproxy_h2.c:1962) so the
- * two paths cannot drift (the dominant H1/H2 parity landmine, T-75-12).
+ * two paths cannot drift (the dominant H1/H2 parity landmine).
  *
- * Discriminator (D-10): if `ent` has no attached L7 policy (has_l7_policy==0,
+ * Discriminator: if `ent` has no attached L7 policy (has_l7_policy==0,
  * the default for every AI service), this is a PURE NO-OP returning
  * L7_DISPATCH_FALLTHROUGH — the caller then runs the AI/LPM path byte-for-byte
- * unchanged (D-04 / Pitfall 5 / T-75-11).
+ * unchanged (Pitfall 5).
  *
  * Otherwise it runs l7_policy_evaluate and acts on the decision:
  *   REJECT / REDIRECT / no-match -> emit terminal response, return
@@ -360,7 +360,7 @@ int l7_route_dispatch(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
                       struct proxy_epval **tepval_out);
 
 /* -------------------------------------------------------------------------
- * FR-08 (Phase 76, CONTEXT D-07/D-08/D-09) — request header insertion.
+ * (CONTEXT) — request header insertion.
  *
  * THE SINGLE SHARED applier consumed by BOTH the H1 (sockproxy_http.c) and the
  * H2 (sockproxy_h2.c) request-egress seams (Pitfall 1 H1/H2 parity — the
@@ -375,7 +375,7 @@ int l7_route_dispatch(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
  * the applier links into both the H1-only and the H2 object graphs.
  * ------------------------------------------------------------------------- */
 
-/* CRLF / header-injection guards (T-76-06-02). A name/value containing a CR, LF,
+/* CRLF / header-injection guards. A name/value containing a CR, LF,
  * NUL, or any other ASCII control char (<0x20 or 0x7f) is REJECTED at apply time
  * — defence-in-depth behind the REST-handler 400, because the IR could also be
  * driven by a future internal caller. Empty name is invalid. Return 1=valid. */
@@ -383,16 +383,16 @@ int l7_hdr_name_valid(const char *name);
 int l7_hdr_value_valid(const char *value);
 
 /*
- * FR-33 (Phase 77, D-77-05) — synthesize the HSTS header VALUE from the
+ * synthesize the HSTS header VALUE from the
  * proxy_arg HSTS scalars. Protocol-neutral string build shared by BOTH emit
  * seams (H1 \r\n splice in sockproxy_http.c, H2 nghttp2_nv in sockproxy_h2.c) —
- * the one-synthesizer/two-emit-seams pattern (Phase 76). Writes
+ * the one-synthesizer/two-emit-seams pattern. Writes
  * "max-age=N[; includeSubDomains][; preload]" into `out` (NUL-terminated).
  * Returns the written length (>0) on success, or 0 when max_age==0 (caller MUST
  * NOT inject — default-off, RFC 6797) or on a buffer overflow. The caller pairs
  * the value with the header NAME at its seam ("Strict-Transport-Security" on H1,
  * lowercase "strict-transport-security" on H2). Callers gate on
- * have_ssl && has_l7_policy before calling (D-77-06).
+ * have_ssl && has_l7_policy before calling.
  */
 size_t l7_hsts_synthesize(uint32_t max_age, uint8_t include_subdomains,
                           uint8_t preload, char *out, size_t outlen);
@@ -404,14 +404,14 @@ typedef void (*l7_hdr_emit_fn)(void *ctx, int op, const char *name,
                                const char *value);
 
 /*
- * l7_apply_req_filters — emit the FR-08 request-header op set for `pfe` on the
+ * l7_apply_req_filters — emit the request-header op set for `pfe` on the
  * L7_Proxy peer `ent`. Emits, IN ORDER:
- *   1. SET X-Forwarded-For  = `xff_ip`   (the REAL TCP peer IP — D-07, always
+ * 1. SET X-Forwarded-For = `xff_ip` (the REAL TCP peer IP —, always
  *                                          overwrites any client-supplied XFF)
- *   2. SET X-Forwarded-Port = `listener_port` (the listener port — D-08)
+ * 2. SET X-Forwarded-Port = `listener_port` (the listener port)
  *   3. SET X-Forwarded-Proto= `xfproto`  ("http"/"https" — actual client scheme)
  *   4. each insertHeaders op of the FIRST MATCHING route's hdr_filters[]
- *      (validated; bounded by L7_MAX_HDR_FILTERS) — D-09.
+ * (validated; bounded by L7_MAX_HDR_FILTERS) —.
  * Invalid (control-char) names/values are SKIPPED (never emitted). The XFF/XFP/
  * XFProto trio uses SET semantics (strip-any-existing + add) so the client can
  * never spoof them. `xff_ip`/`xfproto` are caller-provided (the peer IP and
@@ -438,11 +438,11 @@ int extract_query_param_value(const char *url, const char *param_name,
                               char *value, size_t value_size);
 
 /* -------------------------------------------------------------------------
- * FR-10 (Phase 76, CONTEXT D-02/D-03/D-04/D-05) — STATELESS HTTP_COOKIE
+ * (CONTEXT) — STATELESS HTTP_COOKIE
  * persistence node-level bridges (definitions in sockproxy_l7policy.c). The PURE
  * token primitives live in sockproxy_cookie.h; these marshal the data-plane
  * structs (proxy_map_ent / proxy_epval) into them. NOTHING is stored on
- * proxy_fd_ent — the cookie value IS the binding (D-02 / survives HA failover).
+ * proxy_fd_ent — the cookie value IS the binding (survives HA failover).
  * The per-VIP secret is derived deterministically from node->key (VIP:port) so
  * both HA peers compute byte-identical tokens with zero xSync change.
  * ------------------------------------------------------------------------- */

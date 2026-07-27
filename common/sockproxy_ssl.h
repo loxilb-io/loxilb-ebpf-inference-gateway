@@ -25,16 +25,16 @@
 #define PROXY_SSL_CERT_DIR "/opt/loxilb/cert"
 #define PROXY_SSL_CA_DIR   "/etc/ssl/certs"
 
-/* Phase 77 FR-05 (D-77-11): managed dir for certId-referenced TLS material.
+/* managed dir for certId-referenced TLS material.
  * Each certId lives under PROXY_SSL_CERTID_DIR/<certId>/ holding the PEM material
  * persisted by the Go REST handler (77-07): server.crt + server.key for frontend
- * certs; ca.crt + client.crt + client.key for FR-11 backend re-encryption. The
+ * certs; ca.crt + client.crt + client.key for backend re-encryption. The
  * Go handler owns dir creation with restrictive perms (0700 dir / 0600 keys,
- * T-77-02-KAR); the C side only reads. */
+ *); the C side only reads. */
 #define PROXY_SSL_CERTID_DIR "/etc/loxilb/certs"
 
 /* SSL context initialization / configuration */
-/* FR-32 (D-77-03/04/04b): @arg drives version-range + cipher pinning; pass NULL
+/* @arg drives version-range + cipher pinning; pass NULL
  * for the legacy default-CTX path (today's hardcoded TLS1.2..1.3 + ciphers). */
 SSL_CTX *proxy_server_ssl_ctx_init(const proxy_arg_t *arg);
 int proxy_ssl_cfg_opts(SSL_CTX *ctx, const char *site_path, int mtls_en);
@@ -63,7 +63,7 @@ int proxy_list_sni_certificates_with_path(void (*callback)(const char *hostname,
                                            void *user_data);
 
 /* =========================================================================
- * Phase 77 FR-05 (D-77-10..13): certId registry — management handle layered
+ * (..13): certId registry — management handle layered
  * OVER the hostname-keyed SNI store. The CGO layer (77-07) drives these after
  * persisting the inline-PEM upload to PROXY_SSL_CERTID_DIR/<certId>/. Selection
  * at handshake stays by hostname (the SNI callback is unchanged); certId is
@@ -72,13 +72,13 @@ int proxy_list_sni_certificates_with_path(void (*callback)(const char *hostname,
 
 /* proxy_register_cert - Register a certId. Loads server.crt/server.key from the
  * managed dir, auto-derives the hostname(s) from the leaf cert SAN-DNS (CN
- * fallback, D-77-12), and registers EACH derived hostname into the SNI store via
- * the existing proxy_add_sni_certificate (D-77-10 — no new loader).
+ * fallback), and registers EACH derived hostname into the SNI store via
+ * the existing proxy_add_sni_certificate (no new loader).
  * @certId: opaque management handle (<= CERTID_MAX-1 chars)
  * Returns: number of hostnames registered (>=1) on success, negative errno on failure. */
 int proxy_register_cert(const char *certId);
 
-/* proxy_rotate_cert - Atomic zero-downtime rotation (D-77-13). Loads a fresh
+/* proxy_rotate_cert - Atomic zero-downtime rotation. Loads a fresh
  * SSL_CTX from the (already-updated) managed dir and swaps it into each SNI store
  * entry under the global_cert_lock write-lock; in-flight connections keep the old
  * SSL_CTX until they close (the old ctx is freed only after the swap).
@@ -90,7 +90,7 @@ int proxy_rotate_cert(const char *certId);
  * Returns: 0 on success, negative errno on failure. */
 int proxy_delete_cert(const char *certId);
 
-/* proxy_certid_resolve_backend - FR-11 (D-77-14): resolve a backend certId into
+/* proxy_certid_resolve_backend -: resolve a backend certId into
  * the managed-dir CA / client-cert / client-key paths for the backend SSL_CTX
  * builder. Writes ca.crt / client.crt / client.key under
  * PROXY_SSL_CERTID_DIR/<certId>/ into the caller buffers (each >= 512 bytes).

@@ -18,7 +18,7 @@
  * sockproxy_ssl.c - SSL/TLS context management, SNI certificate CRUD,
  *                   and ALPN/SNI callbacks for LoxiLB proxy.
  *
- * Extracted from sockproxy.c as Phase 3 of the refactoring plan.
+ * Extracted from sockproxy.c as of the refactoring plan.
  * Contains:
  *   - alpn_select_callback (ALPN protocol selection during TLS handshake)
  *   - sni_servername_callback (SNI certificate selection callback)
@@ -153,9 +153,9 @@ alpn_select_callback(SSL *ssl,
 
 
 // Default cipher strings (preserved verbatim from the historical hardcoded
-// behaviour). Used as the fallback when a Phase 77 L7 rule does NOT pin
+// behaviour). Used as the fallback when a L7 rule does NOT pin
 // arg->tls_ciphers, so the AI peer (has_l7_policy==0) and un-configured L7
-// listeners keep byte-for-byte identical TLS (D-77-COMPAT).
+// listeners keep byte-for-byte identical TLS (-COMPAT).
 static const char *proxy_default_tls13_ciphers =
   "TLS_AES_256_GCM_SHA384:"           // Strongest (256-bit)
   "TLS_CHACHA20_POLY1305_SHA256:"     // Best for mobile/ARM
@@ -185,16 +185,16 @@ proxy_tls_proto_from_ordinal(uint8_t ord)
 }
 
 /**
- * proxy_apply_tls_version_cipher - FR-32 (D-77-03/04/04b): pin TLS version range
+ * proxy_apply_tls_version_cipher -: pin TLS version range
  * + cipher strings on @ctx from @arg when the L7 rule sets them; otherwise apply
  * today's hardcoded TLS1.2..TLS1.3 + default cipher lists. Shared by the frontend
  * (proxy_server_ssl_ctx_init) and backend (proxy_client_ssl_ctx_init) builders so
- * both legs are pinned identically (D-77-04b).
+ * both legs are pinned identically.
  *
  * @arg may be NULL (frontend default-CTX path / proxy_load_ssl_ctx_for_host) — in
  * which case the hardcoded defaults are applied, preserving legacy behaviour.
  * No allowlist pre-validation: an empty cipher intersection is rejected by the
- * existing `!= 1` failure path (faithful Octavia semantics, D-77-04).
+ * existing `!= 1` failure path (faithful Octavia semantics).
  *
  * Returns 0 on success, -1 on failure (caller frees the ctx).
  */
@@ -204,14 +204,14 @@ proxy_apply_tls_version_cipher(SSL_CTX *ctx, const proxy_arg_t *arg)
   int vmin = arg ? proxy_tls_proto_from_ordinal(arg->tls_version_min) : 0;
   int vmax = arg ? proxy_tls_proto_from_ordinal(arg->tls_version_max) : 0;
 
-  // FR-32 (D-77-03): pin min/max version when the rule sets them; else today's
+  // pin min/max version when the rule sets them; else today's
   // TLS1.2..TLS1.3 range (0 ⇒ literal default).
   SSL_CTX_set_min_proto_version(ctx, vmin ? vmin : TLS1_2_VERSION);
   SSL_CTX_set_max_proto_version(ctx, vmax ? vmax : TLS1_3_VERSION);
 
-  // FR-32 (D-77-04): when arg->tls_ciphers is set, pass it to BOTH the TLS1.3
+  // when arg->tls_ciphers is set, pass it to BOTH the TLS1.3
   // ciphersuites and the TLS1.2 cipher_list; else keep the hardcoded defaults.
-  // Pinning BOTH on every leg (D-77-04b). No allowlist — the `!= 1` reject below
+  // Pinning BOTH on every leg. No allowlist — the `!= 1` reject below
   // is the no-overlap rejection (faithful Octavia).
   const char *cfg_ciphers = (arg && arg->tls_ciphers[0] != '\0')
                               ? arg->tls_ciphers : NULL;
@@ -245,7 +245,7 @@ proxy_server_ssl_ctx_init(const proxy_arg_t *arg)
       return NULL;
     }
 
-    // FR-32 (D-77-03/04/04b): version-range + cipher pinning from the L7 rule when
+    // version-range + cipher pinning from the L7 rule when
     // set; falls back to today's TLS1.2..TLS1.3 + hardcoded ciphers when arg is
     // NULL or the fields are unset (AI peer / un-configured listener unchanged).
     if (proxy_apply_tls_version_cipher(ctx, arg) != 0) {
@@ -394,7 +394,7 @@ proxy_client_ssl_ctx_init(proxy_arg_t *arg)
     return NULL;
   }
 
-  // FR-32 (D-77-04b): pin the SAME version range + cipher strings on the backend
+  // pin the SAME version range + cipher strings on the backend
   // (re-encryption) leg as the frontend listener, driven from arg when set; else
   // today's TLS1.2..TLS1.3 + hardcoded ciphers. arg is non-NULL here (the caller
   // always passes the rule's proxy_arg), so an L7 rule pins both legs.
@@ -412,11 +412,11 @@ proxy_client_ssl_ctx_init(proxy_arg_t *arg)
   SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
   
   // Configure ALPN for HTTP/2 support (client mode - to backend).
-  // FR-31 (D-77-02): gate the advertised list on the pool's backend_protocol_cap.
+  // gate the advertised list on the pool's backend_protocol_cap.
   // loxilb has NO h2→h1 backend downgrade engine, so h2 must NEVER be advertised
   // to an h1-only pool (an h2 client + h1-only pool would otherwise yield an empty
   // body — RESEARCH Pitfall 2). The cap is mapped from Octavia alpn_protocols in
-  // the control plane (D-77-01, plan 77-07); here the data plane HONORS it:
+  // the control plane (plan 77-07); here the data plane HONORS it:
   //   cap==0 → http/1.1 only   cap==1 → h2 only   cap==2 → h2 + http/1.1
   // arg==NULL ⇒ legacy unconditional h2+http/1.1 (AI peer byte-for-byte unchanged).
   static const unsigned char alpn_both[]  = "\x02h2\x08http/1.1";
@@ -440,11 +440,11 @@ proxy_client_ssl_ctx_init(proxy_arg_t *arg)
 
 #ifdef HAVE_MTLS
   // ============================================================================
-  // Phase 3: Backend mTLS Integration
+  // Backend mTLS Integration
   // ============================================================================
   if (arg != NULL) {
     // Configure backend mTLS (server cert verification + client cert).
-    // Phase 77 FR-11 (D-77-14): the backend material is referenced by certId;
+    // the backend material is referenced by certId;
     // mtls_configure_backend resolves the certId → managed-dir paths.
     if (arg->backend_verify_cert || arg->backend_client_cert_id[0] != '\0') {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -581,7 +581,7 @@ proxy_load_ssl_ctx_for_host(const char *host_url, int mtls_en)
 
   // Create new SSL context with kTLS support.
   // NULL arg ⇒ legacy default version/cipher (this hostname-keyed loader is the
-  // SNI default-CTX path; per-rule FR-32 pinning happens at proxy_add_entry).
+  // SNI default-CTX path; per-rule pinning happens at proxy_add_entry).
   ctx = proxy_server_ssl_ctx_init(NULL);
   if (!ctx) {
     log_error("Failed to create SSL context for hostname '%s'", host_url);
@@ -806,13 +806,13 @@ proxy_get_ssl_ctx_for_hostname(const char *hostname)
 }
 
 // ============================================================================
-// Phase 77 FR-05 (D-77-10..16): certId registry LAYERED OVER the SNI store.
+// (..16): certId registry LAYERED OVER the SNI store.
 //
 // The certId is the canonical management handle for ALL TLS material (frontend
-// certs, backend CA/client certs — D-77-16), referenced by short id instead of
+// certs, backend CA/client certs), referenced by short id instead of
 // inline path strings (the 768 proxy_arg bytes reclaimed in Task 1). Selection
 // at handshake stays BY HOSTNAME (the SNI callback is byte-for-byte unchanged,
-// T-77-02-FG); certId only drives upload/rotate/delete and backend resolution.
+// ); certId only drives upload/rotate/delete and backend resolution.
 //
 // Concurrency: the certId map shares proxy_struct->global_cert_lock with the SNI
 // store (one lock domain, lock priority 8) so register/rotate/delete mutate both
@@ -830,13 +830,13 @@ proxy_certid_dir(const char *certId, char *out, size_t out_sz)
 
 /**
  * proxy_certid_derive_hostnames - Read the leaf cert at <dir>/server.crt and
- * extract its hostnames: every SAN-DNS entry first (D-77-09/12), CN as the
+ * extract its hostnames: every SAN-DNS entry first, CN as the
  * fallback when no SAN-DNS is present. Modern SAN-only certs (empty CN) are
  * handled via their SAN. We deliberately do NOT use the OpenSSL single-name
  * host-match helper here — it matches one supplied name and would not ENUMERATE
  * the cert's own names, which is exactly what SNI registration needs (the
  * registry needs the LIST of names the cert speaks for). Pattern semantics from
- * the FR-09 CN-pattern path are preserved by reading SAN-DNS / CN directly.
+ * the CN-pattern path are preserved by reading SAN-DNS / CN directly.
  *
  * @dir_path: managed dir containing server.crt
  * @out:      caller array of [CERTID_MAX_HOSTNAMES][256]
@@ -864,7 +864,7 @@ proxy_certid_derive_hostnames(const char *dir_path,
     return -EINVAL;
   }
 
-  // SAN-DNS first (preferred, RFC 6125; D-77-12).
+  // SAN-DNS first (preferred, RFC 6125;).
   GENERAL_NAMES *sans =
     (GENERAL_NAMES *)X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
   if (sans) {
@@ -884,7 +884,7 @@ proxy_certid_derive_hostnames(const char *dir_path,
     GENERAL_NAMES_free(sans);
   }
 
-  // CN fallback only when no SAN-DNS was found (legacy CN-only certs; D-77-12).
+  // CN fallback only when no SAN-DNS was found (legacy CN-only certs;).
   if (n == 0) {
     X509_NAME *subj = X509_get_subject_name(cert);
     if (subj) {
@@ -903,7 +903,7 @@ proxy_certid_derive_hostnames(const char *dir_path,
 }
 
 /**
- * proxy_register_cert - FR-05 register entry point (D-77-10/11/12).
+ * proxy_register_cert - register entry point.
  *
  * Preconditions: the Go REST handler (77-07) has already persisted the PEM
  * material to PROXY_SSL_CERTID_DIR/<certId>/ (server.crt + server.key). This
@@ -980,14 +980,14 @@ proxy_register_cert(const char *certId)
 }
 
 /**
- * proxy_rotate_cert - FR-05 atomic rotation (D-77-13).
+ * proxy_rotate_cert - atomic rotation.
  *
  * The Go handler has already swapped fresh PEM into the managed dir. For each
  * hostname this certId owns, load a NEW SSL_CTX and swap it into the SNI store
  * entry under the global_cert_lock WRITE-lock. The OLD ctx is freed only AFTER
  * it is unlinked — in-flight connections already hold their own reference via
  * SSL_set_SSL_CTX-derived SSL objects, so a torn read of a half-swapped cert is
- * impossible (T-77-02-ROT mitigated). Zero-downtime: the swap is a pointer
+ * impossible ( mitigated). Zero-downtime: the swap is a pointer
  * assignment under the lock.
  */
 int
@@ -1048,7 +1048,7 @@ proxy_rotate_cert(const char *certId)
 }
 
 /**
- * proxy_delete_cert - FR-05 delete entry point. Scoped: removes ONLY this
+ * proxy_delete_cert - delete entry point. Scoped: removes ONLY this
  * certId's derived hostnames from the SNI store and frees the registry entry.
  */
 int
@@ -1086,11 +1086,11 @@ proxy_delete_cert(const char *certId)
 }
 
 /**
- * proxy_certid_resolve_backend - FR-11 (D-77-14): resolve a backend certId into
+ * proxy_certid_resolve_backend -: resolve a backend certId into
  * the managed-dir CA / client-cert / client-key paths. A path is emitted only
  * when its file exists under PROXY_SSL_CERTID_DIR/<certId>/; absent files yield
  * "" so the backend builder falls back to its today's behaviour (system CA / no
- * client cert). This is the per-service-with-certId-references landing (D-77-14
+ * client cert). This is the per-service-with-certId-references landing (
  * sanctioned fallback); a true per-pool backend SSL_CTX cache is a documented
  * residual (Open Question 1).
  */

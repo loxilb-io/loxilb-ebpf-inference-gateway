@@ -28,7 +28,7 @@ struct proxy_fd_ent;
 /* Hash algorithm identifiers (matches kv_hash_algo field) */
 #define KV_HASH_SHA256_CBOR   0
 #define KV_HASH_XXHASH_CBOR  1
-/* Phase 99 (SGL-02, D-15): SGLang radix-page hash. Value 2 is FREE in THIS
+/* (SGL-02): SGLang radix-page hash. Value 2 is FREE in THIS
  * enum (the NATS "2" reservation lives on the kv_exact_mode MODE enum in
  * sockproxy.h — Pitfall 6 applies there only). Contract pinned to sglang
  * python/sglang/srt/mem_cache/cpp_utils/hash_binding.cpp @ d8ef76682e:
@@ -67,7 +67,7 @@ struct proxy_fd_ent;
  * (test_kv_exact.c, which #includes sockproxy_kv_exact.c → this header) can
  * call it without a 3rd CGO crossing.
  *
- * V5 guards (T-81-07-01): capacity_i is clamped to [1, KV_CAPACITY_CLAMP_MAX]
+ * V5 guards: capacity_i is clamped to [1, KV_CAPACITY_CLAMP_MAX]
  * before any division and the caller's total_cap is built from clamped values
  * so it is always ≥ n_eps ≥ 1 — a buggy vLLM advertising NumGPUBlocks=0 (or a
  * huge value) can never divide-by-zero or overflow. The result is floored at 1
@@ -90,7 +90,7 @@ struct proxy_fd_ent;
  * pd_kv_clamp_capacity — bound an advertised capacity into
  * [1, KV_CAPACITY_CLAMP_MAX]. A 0 (absent/malicious NumGPUBlocks) becomes 1 so
  * the EP still participates with the smallest positive weight and can never
- * zero the weighted sum (T-81-07-01). Mirrors Go kvClampCapacity.
+ * zero the weighted sum. Mirrors Go kvClampCapacity.
  */
 static inline uint64_t
 pd_kv_clamp_capacity(uint32_t capacity)
@@ -115,7 +115,7 @@ pd_kv_clamp_capacity(uint32_t capacity)
  *
  * MUST stay numerically identical to Go kvCapFor (ai_kv_unified.go): the
  * head-to-head A/B compares the C-side P/D path against the Go-side overlap
- * path on ONE build (D-25) — a divergent cap would split the measurement.
+ * path on ONE build — a divergent cap would split the measurement.
  */
 static inline uint64_t
 pd_capacity_weighted_cap(uint64_t total_load, uint64_t clamped_cap_i,
