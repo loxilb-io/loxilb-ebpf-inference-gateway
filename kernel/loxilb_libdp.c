@@ -4091,6 +4091,45 @@ loxilb_set_loglevel(struct ebpfcfg *cfg)
   log_warn("ebpf: new loglevel %d", cfg->loglevel);
 }
 
+/* A previous container run can leak an entire eBPF program/map generation in
+ * the host kernel (bpffs pins and/or lingering program references survive the
+ * container restart). The stale generation's maps carry outdated config —
+ * e.g. a default-disabled sec_rate_cfg — which masquerades as a config
+ * split-brain during debugging while the attached programs correctly use the
+ * pinned live set. Detection only, deliberately: automatic cleanup would have
+ * to prove it never touches the active pinned set, so stale generations are
+ * reported and left for the operator. sec_rate_cfg is used as the canary
+ * because it is a singleton per generation. */
+static void
+llb_warn_stale_bpf_generations(void)
+{
+  __u32 id = 0;
+  int n_sec_rate_cfg = 0;
+
+  while (bpf_map_get_next_id(id, &id) == 0) {
+    struct bpf_map_info info = { 0 };
+    __u32 ilen = sizeof(info);
+    int fd = bpf_map_get_fd_by_id(id);
+    if (fd < 0) {
+      continue;
+    }
+    if (bpf_obj_get_info_by_fd(fd, &info, &ilen) == 0 &&
+        strcmp(info.name, "sec_rate_cfg") == 0) {
+      n_sec_rate_cfg++;
+    }
+    close(fd);
+  }
+
+  if (n_sec_rate_cfg > 1) {
+    log_warn("stale eBPF generation: %d sec_rate_cfg map instances in the "
+             "kernel (expected 1). A previous loxilb run leaked its "
+             "programs/maps; their stale config can shadow the live one "
+             "during debugging. Inspect with 'bpftool map show name "
+             "sec_rate_cfg' and remove stale (non-attached) pin dirs.",
+             n_sec_rate_cfg);
+  }
+}
+
 int
 loxilb_main(struct ebpfcfg *cfg)
 {
@@ -4150,6 +4189,10 @@ loxilb_main(struct ebpfcfg *cfg)
   }
 
   llb_xh_init(xh);
+
+  if (!xh->have_noebpf) {
+    llb_warn_stale_bpf_generations();
+  }
 
   return 0;
 }
