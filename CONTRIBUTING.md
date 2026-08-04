@@ -7,6 +7,15 @@ Please note we have a code of conduct, please follow it in all your interactions
 
 ## Pull Request Process
 
+> **Branch protection.** `main` is protected — all changes land through pull
+> requests; direct pushes and force-pushes are disabled. Every PR needs at least
+> one approving review and DCO sign-off (`git commit -s`) before it can be merged.
+> This repository is the inference-gateway fork of upstream
+> [`loxilb-io/loxilb-ebpf`](https://github.com/loxilb-io/loxilb-ebpf) and is
+> consumed downstream as a submodule pin by
+> [`loxilb-inference-gateway`](https://github.com/loxilb-io/loxilb-inference-gateway);
+> upstream syncs also arrive as PRs (see `.github/workflows/upstream-sync.yml`).
+
 1. Ensure any install or build dependencies are removed before the end of the layer when doing a 
    build.
 2. Update the README.md with details of changes to the interface, this includes new environment 
