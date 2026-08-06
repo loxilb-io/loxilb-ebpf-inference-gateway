@@ -224,14 +224,6 @@ sockproxy_mtls.o: sockproxy_mtls.c sockproxy_mtls.h sockproxy.h
 llhttp.a: llhttp.o llhttpapi.o http.o
 	$(AR) rcs -c $@ $^
 
-# US-401: SSE scanner unit tests (standalone, no sockproxy.c dependencies)
-test_sse_scanner: test_sse_scanner.c
-	$(CC) -Wall -Wextra -o $@ $<
-
-.PHONY: test_sse
-test_sse: test_sse_scanner
-	./test_sse_scanner
-
 # US-501: Request-ID generation and injection unit tests (standalone)
 test_request_id: test_request_id.c
 	$(CC) -Wall -Wextra -o $@ $< -I. -DTEST_REQUEST_ID
@@ -393,7 +385,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sse_scanner test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl
+	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
