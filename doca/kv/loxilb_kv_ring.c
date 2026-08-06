@@ -15,11 +15,18 @@
  */
 
 /*
- * loxilb_kv_ring.c -- SPMC lockfree ring buffer for inter-stage handoff.
+ * loxilb_kv_ring.c -- MPMC lockfree ring buffer for inter-stage handoff.
  *
- * Single-producer multi-consumer design:
- *   - push: single producer, relaxed head writes with release fence
- *   - pop: multi-consumer safe via CAS loop on tail
+ * Bounded multi-producer multi-consumer queue (Vyukov): every cell carries
+ * a sequence counter that publishes ownership, so a producer never exposes
+ * a cell before writing it and never reuses one before a consumer has
+ * drained it.
+ *
+ * Both stage handoffs need this. decomp_to_deq_ring is 1 producer (the poll
+ * thread) to N consumers (dequantize workers); deq_to_dma_ring is N
+ * producers (those same workers) to 1 consumer -- and the poll thread also
+ * re-pushes an element it popped for another session, so that ring has
+ * concurrent producers even when worker_count == 1.
  *
  * Non-blocking: returns -1 on full (push) or empty (pop).
  * POSIX-only (stdatomic.h), no DOCA dependency.
@@ -41,9 +48,13 @@ int llb_kv_ring_init(llb_kv_ring_t *r, uint32_t capacity)
     if (!r || !is_power_of_2(capacity))
         return LLB_KV_ERR_BOUNDS;
 
-    r->elems = calloc(capacity, sizeof(llb_kv_ring_elem_t));
-    if (!r->elems)
+    r->cells = calloc(capacity, sizeof(llb_kv_ring_cell_t));
+    if (!r->cells)
         return LLB_KV_ERR_NOMEM;
+
+    /* Cell i starts writable by the producer holding ticket i. */
+    for (uint32_t i = 0; i < capacity; i++)
+        atomic_store_explicit(&r->cells[i].seq, i, memory_order_relaxed);
 
     r->capacity = capacity;
     atomic_store_explicit(&r->head, 0, memory_order_relaxed);
@@ -53,38 +64,73 @@ int llb_kv_ring_init(llb_kv_ring_t *r, uint32_t capacity)
 
 int llb_kv_ring_push(llb_kv_ring_t *r, const llb_kv_ring_elem_t *e)
 {
+    const uint64_t mask = r->capacity - 1;
     uint64_t h = atomic_load_explicit(&r->head, memory_order_relaxed);
-    uint64_t t = atomic_load_explicit(&r->tail, memory_order_acquire);
 
-    if ((h - t) >= r->capacity)
-        return -1;  /* full -- backpressure */
+    for (;;) {
+        llb_kv_ring_cell_t *c = &r->cells[h & mask];
+        uint64_t seq = atomic_load_explicit(&c->seq, memory_order_acquire);
+        int64_t  diff = (int64_t)seq - (int64_t)h;
 
-    r->elems[h & (r->capacity - 1)] = *e;
-    atomic_store_explicit(&r->head, h + 1, memory_order_release);
-    return 0;
+        if (diff == 0) {
+            /* Cell is free and ours if we win the ticket. */
+            if (atomic_compare_exchange_weak_explicit(
+                    &r->head, &h, h + 1,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                c->elem = *e;
+                /* Release: publishes the payload before the consumer may
+                 * observe seq == h + 1 and read it. */
+                atomic_store_explicit(&c->seq, h + 1, memory_order_release);
+                return 0;
+            }
+            /* CAS failed -- h now holds the current head, retry. */
+        } else if (diff < 0) {
+            /* Cell still holds an undrained element: the ring is full.
+             * Non-blocking contract -- caller applies backpressure. */
+            return -1;
+        } else {
+            /* Another producer already claimed this ticket. Re-read. */
+            h = atomic_load_explicit(&r->head, memory_order_relaxed);
+        }
+    }
 }
 
 int llb_kv_ring_pop(llb_kv_ring_t *r, llb_kv_ring_elem_t *e)
 {
-    uint64_t t, h;
+    const uint64_t mask = r->capacity - 1;
+    uint64_t t = atomic_load_explicit(&r->tail, memory_order_relaxed);
 
-    do {
-        t = atomic_load_explicit(&r->tail, memory_order_relaxed);
-        h = atomic_load_explicit(&r->head, memory_order_acquire);
-        if (t == h)
+    for (;;) {
+        llb_kv_ring_cell_t *c = &r->cells[t & mask];
+        uint64_t seq = atomic_load_explicit(&c->seq, memory_order_acquire);
+        int64_t  diff = (int64_t)seq - (int64_t)(t + 1);
+
+        if (diff == 0) {
+            /* Cell is filled and ours if we win the ticket. */
+            if (atomic_compare_exchange_weak_explicit(
+                    &r->tail, &t, t + 1,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                *e = c->elem;
+                /* Release: hands the cell to the producer one lap ahead,
+                 * only after we have finished copying the payload out. */
+                atomic_store_explicit(&c->seq, t + mask + 1,
+                                      memory_order_release);
+                return 0;
+            }
+            /* CAS failed -- t now holds the current tail, retry. */
+        } else if (diff < 0) {
             return -1;  /* empty */
-        *e = r->elems[t & (r->capacity - 1)];
-    } while (!atomic_compare_exchange_weak_explicit(
-        &r->tail, &t, t + 1,
-        memory_order_release, memory_order_relaxed));
-
-    return 0;
+        } else {
+            /* Another consumer already claimed this ticket. Re-read. */
+            t = atomic_load_explicit(&r->tail, memory_order_relaxed);
+        }
+    }
 }
 
 void llb_kv_ring_destroy(llb_kv_ring_t *r)
 {
     if (!r)
         return;
-    free(r->elems);
+    free(r->cells);
     memset(r, 0, sizeof(*r));
 }
