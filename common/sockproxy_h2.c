@@ -21,6 +21,7 @@
 #include <netinet/in.h>   /* sockaddr_in / AF_INET ( real-peer-IP for XFF) */
 #include <arpa/inet.h>    /* inet_ntop / ntohs ( X-Forwarded-* construction) */
 #include <openssl/ssl.h>
+#include <openssl/err.h>  /* ERR_get_error / ERR_error_string (TLS error logging) */
 
 #include "sockproxy_h2.h"
 #include "sockproxy.h"
