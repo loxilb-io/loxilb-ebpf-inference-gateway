@@ -209,7 +209,7 @@ static int lxb_catalog_init(void) {
     return 0;
   }
   
-  int fd = open("/dev/shm/loxilb-catalog-config", O_RDONLY);
+  int fd = open("/dev/shm/loxilb-catalog-config", O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     log_error("[Catalog] Failed to open shared memory (errno=%d)", errno);
     return -1;
@@ -299,7 +299,7 @@ static int lxb_catalog_reload(void) {
     return -1;
   }
   
-  int fd = open("/dev/shm/loxilb-catalog-config", O_RDONLY);
+  int fd = open("/dev/shm/loxilb-catalog-config", O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     return -1; // Failed to open
   }
@@ -490,14 +490,14 @@ int lxb_capture_body_to_tmpfs(uint64_t trace_id_hi, uint64_t span_id,
   int truncated = (body_len > max_body_size);
 
   // Open file (O_EXCL prevents collision)
-  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_EXCL, 0600);
+  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) {
     if (errno == EEXIST) {
       // File exists (collision, very rare) - add random suffix
       log_warn("[BodyCapture] File collision: %s (trying with retry)", path);
       snprintf(path, sizeof(path), "/dev/shm/lxb-body-%016lx-%d.json",
                span_id, rand() % 10000);
-      fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_EXCL, 0600);
+      fd = open(path, O_CREAT | O_WRONLY | O_TRUNC | O_EXCL | O_CLOEXEC, 0600);
       if (fd < 0) {
         log_error("[BodyCapture] Failed to create file after retry: %s (errno=%d)", 
                   path, errno);

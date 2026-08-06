@@ -42,7 +42,7 @@ static presidio_runtime_config_t g_presidio_runtime = {
  */
 int presidio_config_init(void) {
     // Open shared memory file (read-only)
-    int fd = open(PRESIDIO_CONFIG_SHM_PATH, O_RDONLY);
+    int fd = open(PRESIDIO_CONFIG_SHM_PATH, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) {
             log_info("[Presidio-Config] Shared memory not found - using defaults");

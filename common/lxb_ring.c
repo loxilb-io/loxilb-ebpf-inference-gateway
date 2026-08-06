@@ -92,7 +92,7 @@ int lxb_ring_init(int num_workers) {
     
     // Create/open shared memory file (O_CREAT | O_RDWR)
     // Permissions: 0644 (owner RW, group/other R)
-    int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    int shm_fd = shm_open(shm_path, O_CREAT | O_RDWR | O_TRUNC | O_CLOEXEC, 0644);
     if (shm_fd < 0) {
       log_error("[LXB_RING] Failed to create shm %s: %s", shm_path, strerror(errno));
       goto cleanup;
@@ -135,7 +135,7 @@ int lxb_ring_init(int num_workers) {
     // Create eventfd for notification (optional)
     // EFD_NONBLOCK: non-blocking writes/reads
     // EFD_SEMAPHORE: semaphore-style counter semantics
-    rb->eventfd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
+    rb->eventfd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE | EFD_CLOEXEC);
     if (rb->eventfd < 0) {
       log_warn("[LXB_RING] Failed to create eventfd for ring %d: %s (continuing without notification)",
                i, strerror(errno));

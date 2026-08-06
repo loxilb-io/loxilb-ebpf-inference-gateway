@@ -54,7 +54,7 @@ static int cgroup_join_from_top(char *cgroup_path)
 	snprintf(cgroup_procs_path, sizeof(cgroup_procs_path),
 		 "%s/cgroup.procs", cgroup_path);
 
-	fd = open(cgroup_procs_path, O_WRONLY);
+	fd = open(cgroup_procs_path, O_WRONLY | O_CLOEXEC);
 	if (fd < 0) {
 		cgroup_log("Opening Cgroup Procs: %s", cgroup_procs_path);
 		return 1;
@@ -131,7 +131,7 @@ int cgroup_create_get(const char *path)
 		return -1;
 	}
 
-	fd = open(cgroup_path, O_RDONLY);
+	fd = open(cgroup_path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		cgroup_log("Opening Cgroup");
 		return -1;
@@ -205,7 +205,7 @@ int cgroup_control_enable(char *cgroup_path)
 	ssize_t len;
 
 	snprintf(path, sizeof(path), "%s/cgroup.controllers", cgroup_path);
-	fd = open(path, O_RDONLY);
+	fd = open(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		printf("Opening cgroup.controllers: %s\n", path);
 		return 1;
@@ -225,7 +225,7 @@ int cgroup_control_enable(char *cgroup_path)
 		return 0;
 
 	snprintf(path, sizeof(path), "%s/cgroup.subtree_control", cgroup_path);
-	cfd = open(path, O_RDWR);
+	cfd = open(path, O_RDWR | O_CLOEXEC);
 	if (cfd < 0) {
 		cgroup_log("Opening cgroup.subtree_control: %s", path);
 		return 1;
