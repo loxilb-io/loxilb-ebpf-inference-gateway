@@ -35,6 +35,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 
 /* ------------------------------------------------------------------ */
 /* Test assertion macro                                                */
@@ -60,7 +62,7 @@ static int test_ring_init(void)
     /* Power-of-2 capacity should succeed */
     ASSERT(llb_kv_ring_init(&r, 128) == LLB_KV_OK);
     ASSERT(r.capacity == 128);
-    ASSERT(r.elems != NULL);
+    ASSERT(r.cells != NULL);
     llb_kv_ring_destroy(&r);
 
     /* Non-power-of-2 should fail */
@@ -243,6 +245,184 @@ static int test_ring_multi_consumer(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Test 7: Multi-producer concurrent push (4 threads)                  */
+/*                                                                     */
+/* Regression guard: the ring was documented SPMC but the dequantize   */
+/* pool pushes from worker_count threads, and the pipeline poll thread */
+/* re-pushes alongside them. Two producers reading the same head then  */
+/* both writing that slot silently dropped one element. Under the old  */
+/* implementation this test loses elements; under MPMC it must not.    */
+/* ------------------------------------------------------------------ */
+
+#define MP_PRODUCERS   4
+#define MP_PER_THREAD  500
+#define MP_TOTAL       (MP_PRODUCERS * MP_PER_THREAD)
+
+typedef struct {
+    llb_kv_ring_t *ring;
+    uint32_t       base;    /* this producer owns ids [base, base+count) */
+    int            count;
+    int            pushed;
+} mp_prod_arg_t;
+
+static void *mp_producer(void *arg)
+{
+    mp_prod_arg_t *a = (mp_prod_arg_t *)arg;
+
+    for (int i = 0; i < a->count; i++) {
+        llb_kv_ring_elem_t e = {
+            .slot_idx   = a->base + (uint32_t)i,
+            .data_len   = 0,
+            .session_id = a->base + (uint32_t)i,
+        };
+        /* Ring is smaller than the payload, so spin through backpressure. */
+        while (llb_kv_ring_push(a->ring, &e) != 0)
+            sched_yield();
+        a->pushed++;
+    }
+    return NULL;
+}
+
+static int test_ring_multi_producer(void)
+{
+    printf("  test_ring_multi_producer ... ");
+    llb_kv_ring_t r;
+    ASSERT(llb_kv_ring_init(&r, 64) == LLB_KV_OK);
+
+    static uint8_t seen[MP_TOTAL];
+    memset(seen, 0, sizeof(seen));
+
+    pthread_t     tid[MP_PRODUCERS];
+    mp_prod_arg_t args[MP_PRODUCERS];
+
+    for (int p = 0; p < MP_PRODUCERS; p++) {
+        args[p].ring   = &r;
+        args[p].base   = (uint32_t)(p * MP_PER_THREAD);
+        args[p].count  = MP_PER_THREAD;
+        args[p].pushed = 0;
+        pthread_create(&tid[p], NULL, mp_producer, &args[p]);
+    }
+
+    /* Drain on this thread while the producers run, then finish the tail. */
+    int drained = 0;
+    int idle    = 0;
+    while (drained < MP_TOTAL && idle < 10000000) {
+        llb_kv_ring_elem_t e;
+        if (llb_kv_ring_pop(&r, &e) == 0) {
+            ASSERT(e.slot_idx < MP_TOTAL);
+            seen[e.slot_idx]++;
+            drained++;
+            idle = 0;
+        } else {
+            idle++;
+        }
+    }
+
+    for (int p = 0; p < MP_PRODUCERS; p++)
+        pthread_join(tid[p], NULL);
+
+    /* Every producer completed, and every element arrived exactly once. */
+    for (int p = 0; p < MP_PRODUCERS; p++)
+        ASSERT(args[p].pushed == MP_PER_THREAD);
+    ASSERT(drained == MP_TOTAL);
+    for (int i = 0; i < MP_TOTAL; i++)
+        ASSERT(seen[i] == 1);
+
+    /* Ring must be fully drained and internally consistent afterwards. */
+    llb_kv_ring_elem_t leftover;
+    ASSERT(llb_kv_ring_pop(&r, &leftover) == -1);
+
+    llb_kv_ring_destroy(&r);
+    printf("PASS\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Test 8: MPMC stress -- 3 producers x 3 consumers                    */
+/*                                                                     */
+/* Mirrors the real deq_to_dma topology (N workers + poll-thread       */
+/* requeue) with concurrency on both ends at once.                     */
+/* ------------------------------------------------------------------ */
+
+#define MPMC_PRODUCERS  3
+#define MPMC_CONSUMERS  3
+#define MPMC_PER_THREAD 400
+#define MPMC_TOTAL      (MPMC_PRODUCERS * MPMC_PER_THREAD)
+
+typedef struct {
+    llb_kv_ring_t   *ring;
+    _Atomic int     *remaining;   /* elements still in flight */
+    uint8_t         *seen;        /* MPMC_TOTAL counters, one per id */
+    _Atomic int     *popped;
+} mpmc_cons_arg_t;
+
+static void *mpmc_consumer(void *arg)
+{
+    mpmc_cons_arg_t *a = (mpmc_cons_arg_t *)arg;
+    llb_kv_ring_elem_t e;
+
+    while (atomic_load(a->remaining) > 0) {
+        if (llb_kv_ring_pop(a->ring, &e) == 0) {
+            /* Ids are unique and each is popped by exactly one consumer,
+             * so no two threads touch the same counter -- as long as the
+             * ring is correct. A duplicate here means it is not. */
+            a->seen[e.slot_idx]++;
+            atomic_fetch_sub(a->remaining, 1);
+            atomic_fetch_add(a->popped, 1);
+        } else {
+            sched_yield();
+        }
+    }
+    return NULL;
+}
+
+static int test_ring_mpmc_stress(void)
+{
+    printf("  test_ring_mpmc_stress ... ");
+    llb_kv_ring_t r;
+    ASSERT(llb_kv_ring_init(&r, 32) == LLB_KV_OK);
+
+    static uint8_t seen[MPMC_TOTAL];
+    memset(seen, 0, sizeof(seen));
+
+    _Atomic int remaining = MPMC_TOTAL;
+    _Atomic int popped    = 0;
+
+    pthread_t       ptid[MPMC_PRODUCERS], ctid[MPMC_CONSUMERS];
+    mp_prod_arg_t   pargs[MPMC_PRODUCERS];
+    mpmc_cons_arg_t cargs[MPMC_CONSUMERS];
+
+    /* Start consumers first so producers meet a draining ring. */
+    for (int c = 0; c < MPMC_CONSUMERS; c++) {
+        cargs[c].ring      = &r;
+        cargs[c].remaining = &remaining;
+        cargs[c].seen      = seen;
+        cargs[c].popped    = &popped;
+        pthread_create(&ctid[c], NULL, mpmc_consumer, &cargs[c]);
+    }
+    for (int p = 0; p < MPMC_PRODUCERS; p++) {
+        pargs[p].ring   = &r;
+        pargs[p].base   = (uint32_t)(p * MPMC_PER_THREAD);
+        pargs[p].count  = MPMC_PER_THREAD;
+        pargs[p].pushed = 0;
+        pthread_create(&ptid[p], NULL, mp_producer, &pargs[p]);
+    }
+
+    for (int p = 0; p < MPMC_PRODUCERS; p++)
+        pthread_join(ptid[p], NULL);
+    for (int c = 0; c < MPMC_CONSUMERS; c++)
+        pthread_join(ctid[c], NULL);
+
+    ASSERT(atomic_load(&popped) == MPMC_TOTAL);
+    for (int i = 0; i < MPMC_TOTAL; i++)
+        ASSERT(seen[i] == 1);
+
+    llb_kv_ring_destroy(&r);
+    printf("PASS\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -257,6 +437,8 @@ int main(void)
     fail |= test_ring_empty();
     fail |= test_ring_wraparound();
     fail |= test_ring_multi_consumer();
+    fail |= test_ring_multi_producer();
+    fail |= test_ring_mpmc_stress();
 
     if (fail) {
         printf("SOME TESTS FAILED\n");

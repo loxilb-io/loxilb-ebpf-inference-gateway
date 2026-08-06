@@ -382,7 +382,7 @@ _Static_assert(sizeof(llb_kv_comch_msg_t) <= 256,
                "ComCh message must fit within minimum message size");
 
 /* ------------------------------------------------------------------ */
-/* Ring buffer (SPMC -- single-producer multi-consumer via CAS)        */
+/* Ring buffer (MPMC -- multi-producer multi-consumer, lock-free)      */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
@@ -391,11 +391,25 @@ typedef struct {
     uint64_t session_id;
 } llb_kv_ring_elem_t;
 
+/*
+ * One ring cell: the payload plus its Vyukov sequence counter.
+ *
+ * seq encodes the cell's lifecycle position, not just "full/empty":
+ *   seq == pos      -> writable by the producer claiming ticket pos
+ *   seq == pos + 1  -> readable by the consumer claiming ticket pos
+ * Any other value means another thread owns this cell right now, so the
+ * caller must re-read the head/tail ticket and try again.
+ */
 typedef struct {
-    _Atomic uint64_t head;      /* written by producer */
-    _Atomic uint64_t tail;      /* CAS-updated by consumers */
+    _Atomic uint64_t   seq;
+    llb_kv_ring_elem_t elem;
+} llb_kv_ring_cell_t;
+
+typedef struct {
+    _Atomic uint64_t head;      /* producer ticket, CAS-claimed */
+    _Atomic uint64_t tail;      /* consumer ticket, CAS-claimed */
     uint32_t         capacity;  /* must be power of 2 */
-    llb_kv_ring_elem_t *elems;
+    llb_kv_ring_cell_t *cells;
 } llb_kv_ring_t;
 
 /* ------------------------------------------------------------------ */
