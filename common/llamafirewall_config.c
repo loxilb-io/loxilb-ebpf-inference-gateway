@@ -39,7 +39,7 @@ static llamafirewall_runtime_config_t g_llamafirewall_runtime = {
  */
 int llamafirewall_config_init(void) {
     // Open shared memory file (read-only)
-    int fd = open(LLAMAFIREWALL_CONFIG_SHM_PATH, O_RDONLY);
+    int fd = open(LLAMAFIREWALL_CONFIG_SHM_PATH, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT) {
             log_info("[LlamaFirewall-Config] Shared memory not found - using defaults");

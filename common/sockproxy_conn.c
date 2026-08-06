@@ -411,7 +411,14 @@ proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
   epaddr.sin_port = epport;
   epaddr.sin_addr.s_addr = epip;
 
-  fd = socket(AF_INET, SOCK_STREAM, protocol);
+  /* SOCK_CLOEXEC: loxilb's control plane forks helpers via Go os/exec (ipsec
+   * start, systemctl, sysctl, bash -c for bgp). os/exec relies on close-on-exec
+   * to avoid leaking descriptors, and fds created here in C do not have it by
+   * default, so without this flag every proxy socket is inherited by those
+   * children. The strongswan starter then daemonizes and outlives loxilb still
+   * holding them.
+   */
+  fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, protocol);
   if (fd < 0) {
     log_error("proxy_setup_ep_connect: socket() failed: %s", strerror(errno));
     return -1;
@@ -553,7 +560,12 @@ proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol)
   switch (protocol) {
   case IPPROTO_TCP:
   case IPPROTO_SCTP:
-    listen_sd = socket(AF_INET, SOCK_STREAM, protocol);
+    /* SOCK_CLOEXEC is load-bearing here: this is the VIP LISTEN socket. A
+     * forked helper that inherits it keeps the port bound after loxilb exits,
+     * so the next loxilb start fails `bind: Address already in use` on every
+     * L7 rule while L4 comes up clean — a silent, partial outage.
+     */
+    listen_sd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, protocol);
     break;
   default:
     return -1;

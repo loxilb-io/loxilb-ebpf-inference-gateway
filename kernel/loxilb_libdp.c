@@ -1294,7 +1294,7 @@ llb_set_dev_up(char *ifname, bool up)
   struct ifreq ifr;
   int fd;
 
-  if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+  if ((fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0) {
     return -1;
   }
 
@@ -1330,7 +1330,7 @@ llb_set_dev_hw_ether(char *ifname, uint8_t *mac)
   struct ifreq ifr;
   int fd;
 
-  if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+  if ((fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0) {
     return -1;
   }
 
@@ -1360,7 +1360,7 @@ llb_loader_init(llb_dp_struct_t *xh)
   char *dev = "/dev/net/tun";
   uint8_t mac[6] = { 0x00, 0x00, 0xca, 0xfe, 0xfa, 0xce };
   
-  if ((fd = open(dev, O_RDWR)) < 0 ) {
+  if ((fd = open(dev, O_RDWR | O_CLOEXEC)) < 0 ) {
     return fd;
   }
 

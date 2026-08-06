@@ -6456,8 +6456,11 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     }
   }
 
-  // Accept new connection
-  new_sd = accept(fd, NULL, NULL);
+  // Accept new connection. accept4(SOCK_CLOEXEC) rather than accept(): accepted
+  // fds do NOT inherit the listener's close-on-exec flag, so a plain accept()
+  // leaks every live client connection into any helper loxilb forks, holding
+  // those connections open past their proxy session.
+  new_sd = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
 
   if (new_sd < 0) {
     if (errno != EWOULDBLOCK) {

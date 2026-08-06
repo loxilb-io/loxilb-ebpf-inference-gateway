@@ -678,7 +678,7 @@ notify_run(void *ctx, int thread)
    * admission layer never wakes a worker, the eventfd sits idle in poll() — never
    * readable — so the relay path is byte-identical to pre-93-05 (default-off). */
   {
-    int wfd = eventfd(0, EFD_NONBLOCK);
+    int wfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (wfd < 0) {
       log_error("notify:eventfd:error(%s) — worker %d resume-wake disabled",
                 strerror_r(errno, estr, sizeof(estr)), thread);

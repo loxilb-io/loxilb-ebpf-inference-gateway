@@ -141,7 +141,7 @@ xmit_raw(void *packet, size_t plen, struct mkr_args *args)
   int sent_bytes;
 
   if (args->v6 == 0) {
-    if ((raw_socket = socket(AF_INET, SOCK_RAW, args->protocol)) < 0) {
+    if ((raw_socket = socket(AF_INET, SOCK_RAW | SOCK_CLOEXEC, args->protocol)) < 0) {
       return -1;
     }
 
@@ -157,7 +157,7 @@ xmit_raw(void *packet, size_t plen, struct mkr_args *args)
     caddr.sin_addr.s_addr = htonl(args->dip[0]);
     sockaddr = &caddr;
   } else {
-    if ((raw_socket = socket(AF_INET6, SOCK_RAW, IPPROTO_UDP)) < 0) {
+    if ((raw_socket = socket(AF_INET6, SOCK_RAW | SOCK_CLOEXEC, IPPROTO_UDP)) < 0) {
       return -1;
     }
 
