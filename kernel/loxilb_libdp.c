@@ -1409,6 +1409,17 @@ llb_loader_init(llb_dp_struct_t *xh)
   return 0;
 }
 
+/* Report WHAT failed before dying. A bare assert(0) names no cause, and is
+ * compiled out entirely under -DNDEBUG - which would let a half-initialised
+ * data path keep running instead of stopping. Always abort, always say why.
+ */
+#define LLB_INIT_FATAL(_what)                                       \
+  do {                                                              \
+    log_error("ebpf: fatal: %s failed during init - aborting",      \
+              (_what));                                             \
+    abort();                                                        \
+  } while (0)
+
 static void
 llb_xh_init(llb_dp_struct_t *xh)
 {
@@ -1695,7 +1706,7 @@ llb_xh_init(llb_dp_struct_t *xh)
 
   if (xh->have_loader) {
     if (llb_loader_init(xh) != 0) {
-      assert(0);
+      LLB_INIT_FATAL("llb_loader_init (loading eBPF programs needs root/CAP_BPF)");
     }
   } else {
     if (!xh->have_noebpf) {
@@ -1705,26 +1716,26 @@ llb_xh_init(llb_dp_struct_t *xh)
 
   if (xh->have_mtrace) {
     if (llb_setup_kern_mon() != 0) {
-      assert(0);
+      LLB_INIT_FATAL("llb_setup_kern_mon");
     }
   }
 
   if (xh->have_sockrwr) {
     if (llb_setup_kern_sock(xh->cgroup_dfl_path) != 0) {
-      assert(0);
+      LLB_INIT_FATAL("llb_setup_kern_sock");
     }
   }
 
   if (xh->have_sockmap) {
     if (llb_setup_kern_sockmap(xh->cgroup_dfl_path) != 0) {
-      assert(0);
+      LLB_INIT_FATAL("llb_setup_kern_sockmap");
     }
   }
 
   init_throttler(&xh->cpt, 50);
 
   if (proxy_main(xh->have_sockmap ? llb_sockmap_op : NULL, xh->have_ktls)) {
-    assert(0);
+    LLB_INIT_FATAL("proxy_main");
   }
 
   return;
@@ -4148,13 +4159,23 @@ loxilb_main(struct ebpfcfg *cfg)
   /* Save any special config parameters */
   if (cfg) {
 
-    fp = fopen (LOXILB_DP_LOGF, "a");
-    assert(fp);
-
     if (cfg->loglevel < 0 ||  cfg->loglevel >= LOG_FATAL) {
       cfg->loglevel = LOG_INFO;
     }
     log_set_level(cfg->loglevel);
+
+    /* An unwritable datapath log stays FATAL - losing it silently would cost
+     * us the postmortem log in production. But do not express that with
+     * assert(): assert() is compiled out under -DNDEBUG, which would hand a
+     * NULL FILE * to log_add_fp() in exactly the builds that ship. Check
+     * explicitly, say which path and why, then abort.
+     */
+    fp = fopen (LOXILB_DP_LOGF, "a");
+    if (!fp) {
+      log_error("ebpf: fatal: cannot open datapath log \"%s\" (%s) - aborting",
+                LOXILB_DP_LOGF, strerror(errno));
+      abort();
+    }
     log_add_fp(fp, cfg->loglevel);
 
     xh->have_loader = !cfg->no_loader;
