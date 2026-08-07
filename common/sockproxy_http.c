@@ -1338,6 +1338,15 @@ skip_deferred_masking:
                        MSG_DONTWAIT | MSG_NOSIGNAL);
                 }
               }
+              /* Record the decode failure (errorPhase=2) — this call site sent
+               * the 503 but never recorded it, so decode-init failures on THIS
+               * path were invisible to loxilb_ai_pd_requests_total (found by
+               * the LC-6.1 failover leg; the :5937 call site already records). */
+              {
+                const char *pd_dec_model = proxy_effective_model(rfd_ent);
+                int d_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
+                llb_ai_pd_record((char *)pd_dec_model, 0, 0, d_kv, 2);
+              }
               rfd_ent->pd_phase = PD_PHASE_ERROR;
               pd_cleanup(rfd_ent);
             }
@@ -1564,6 +1573,14 @@ skip_deferred_masking:
     if (ent->odir == 1 &&
         rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING &&
         !rfd_ent->sse_active) {
+      if (len > 0) {
+        /* Universal decode-activity stamp: (a) the FO-1 zero-byte
+         * discriminator at the decode-EOF site (pd_last_decode_ts == 0 ⇒ the
+         * decode leg died before ONE response byte was relayed), and (b)
+         * extends the idle-based reaper basis (F-GPU-6) to non-SSE decode
+         * responses — the SSE path stamps in the [DONE] scanner. */
+        rfd_ent->pd_last_decode_ts = time(NULL);
+      }
       if (rfd_ent->pd_decode_content_length == 0 && len > 16) {
         /* First packet — extract Content-Length and count body bytes */
         const uint8_t *cl_pos = memmem(msg, len < 2048 ? len : 2048,
@@ -3288,6 +3305,42 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     return -1;
   }
 
+  /* FO-2: the decode EP was picked at ADMISSION but is only connected NOW,
+   * after prefill completed — a seconds-wide window under long-context
+   * prefill during which the EP can die. Until this check, only index
+   * bounds were re-validated, so a decode node dying during prefill meant a
+   * connect to a known-dead EP (sync 503, or async zero-byte EOF = FO-1).
+   * Re-check inv/CB and re-select via pd_select_decode (min-load among
+   * healthy decode EPs — the admission scorer) with the stale hint cleared.
+   * On re-selection, MOVE the admission-time active_conns unit so
+   * pd_cleanup's decrement of the final pd_decode_ep_idx stays balanced.
+   * Runs BEFORE the buffer claims below, so the -1 path (no healthy decode
+   * EP) leaves saved body/headers for the caller's 503+cleanup. */
+  if (tepval->eps[d_idx].inv ||
+      (tepval->cb_enabled &&
+       tepval->circuit_breakers[d_idx].state == CB_STATE_OPEN)) {
+    int stale_idx = d_idx;
+    int re_idx = -1;
+    client_pfe->pd_decode_ep_idx = -1;  /* clear hint: force fresh min-load pick */
+    if (pd_select_decode(tepval, client_pfe, &re_idx) == 0) {
+      log_error("FO-2: decode EP%d went unhealthy during prefill — "
+                "re-selected healthy decode EP%d (client_fd=%d)",
+                stale_idx, re_idx, client_pfe->fd);
+      uint32_t cur_stale =
+          atomic_load(&tepval->pd_ep_loads[stale_idx].active_conns);
+      if (cur_stale > 0)
+        atomic_fetch_sub(&tepval->pd_ep_loads[stale_idx].active_conns, 1);
+      atomic_fetch_add(&tepval->pd_ep_loads[re_idx].active_conns, 1);
+      d_idx = re_idx;  /* pd_select_decode already stored it in the pfe */
+    } else {
+      client_pfe->pd_decode_ep_idx = stale_idx;  /* restore for cleanup/logs */
+      log_error("FO-2: decode EP%d unhealthy after prefill and NO healthy "
+                "replacement — failing decode init (client_fd=%d)",
+                stale_idx, client_pfe->fd);
+      return -1;
+    }
+  }
+
   /* (conc=128 UAF fix): pd_initiate_decode runs on the PREFILL worker
    * and reads three heap buffers (pd_prefill_resp_buf / pd_saved_body /
    * pd_saved_headers) off the shared client pfe, while pd_cleanup() can free the
@@ -3883,6 +3936,37 @@ proxy_pdestroy(void *priv)
           /* Detach client from this backend so proxy_release_rfd_ctx skips it */
           pfe->rfd_ent[pd_i] = NULL;
           pfe->n_rfd--;
+        } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
+                   client_pfe->pd_last_decode_ts == 0 &&
+                   client_pfe->pd_decode_content_length == 0 &&
+                   client_pfe->pd_decode_bytes_received == 0) {
+          /* FO-1: decode backend EOF before ONE response byte was relayed —
+           * the async-connect-failure signature of a dead decode EP. This was
+           * unconditionally treated as "non-streaming decode complete": phase
+           * → COMPLETE, llb_ai_pd_record(status 0), while the client received
+           * ZERO bytes — failover-invisible and metric-corrupting. Send a
+           * real 502 and record errorPhase=2 (decode_error) instead. */
+          static const char pd_decode_err[] =
+              "HTTP/1.1 502 Bad Gateway\r\n"
+              "Content-Type: application/json\r\n"
+              "Connection: close\r\n"
+              "\r\n"
+              "{\"error\":\"pd_decode_backend_died\","
+              "\"detail\":\"decode backend closed before any response bytes\"}";
+          log_error("FO-1: decode backend EOF with ZERO response bytes — "
+                    "client_fd=%d decode_fd=%d (502 sent, decode_error recorded)",
+                    client_pfe->fd, pfe->fd);
+          if (client_pfe->fd > 0) {
+            send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
+                 MSG_DONTWAIT | MSG_NOSIGNAL);
+          }
+          {
+            const char *pd_model = proxy_effective_model(client_pfe);
+            int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+            llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
+          }
+          client_pfe->pd_phase = PD_PHASE_ERROR;
+          pd_cleanup(client_pfe);
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
           /* Decode backend EOF — non-streaming decode complete */
           client_pfe->pd_phase = PD_PHASE_COMPLETE;
