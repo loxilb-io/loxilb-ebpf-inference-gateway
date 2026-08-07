@@ -915,6 +915,13 @@ dp_ct_sctp_sm(void *ctx, struct xfi *xf,
       goto end;
     }
 
+    if (dir == CT_DIR_IN && tdat->xi.nat_flags && s->vtag != 0 &&
+        (c->type == SCTP_DATA || c->type == SCTP_SACK ||
+         c->type == SCTP_HB_REQ || c->type == SCTP_HB_ACK)) {
+      nstate = CT_SCTP_EST;
+      goto end;
+    }
+
     if (c->type != SCTP_INIT_CHUNK || dir != CT_DIR_IN) {
       nstate = CT_SCTP_ERR;
       goto end;
