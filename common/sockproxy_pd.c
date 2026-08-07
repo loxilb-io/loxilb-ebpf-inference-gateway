@@ -26,6 +26,36 @@ extern void pd_kv_overflow_inc(void);
 static inline void pd_kv_overflow_inc(void) {}
 #endif
 
+#if !defined(TEST_PD_REWRITER) && !defined(TEST_PD_CACHE_AWARE)
+/* LLB_KV_HASH_DEBUG gate — file-local mirror of kv_hash_debug_on()
+ * (sockproxy_kv_exact.c) rather than an exported symbol, because the
+ * test_pd_* unit binaries compile this file without sockproxy_kv_exact.c.
+ * Emits one [PD_KV_PARAMS] line per successful kv_transfer_params
+ * extraction; the G2 sizing sweep (LC-3.1, uint16→uint32 widening
+ * decision) parses this exact format — keep it stable. */
+static _Atomic int pd_kv_dbg_initialized = 0;
+static int pd_kv_dbg = 0;
+static int
+pd_kv_hash_debug_on(void)
+{
+  int init = atomic_load_explicit(&pd_kv_dbg_initialized,
+                                  memory_order_acquire);
+  if (init) return pd_kv_dbg;
+  const char *v = getenv("LLB_KV_HASH_DEBUG");
+  pd_kv_dbg = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+  atomic_store_explicit(&pd_kv_dbg_initialized, 1, memory_order_release);
+  return pd_kv_dbg;
+}
+#define PD_KV_PARAMS_DBG(len, cap) do {                                   \
+    if (pd_kv_hash_debug_on())                                            \
+      log_info("[PD_KV_PARAMS] len=%zu cap=%zu pct=%zu",                  \
+               (size_t)(len), (size_t)(cap),                              \
+               ((size_t)(len) * 100) / (size_t)(cap));                    \
+  } while (0)
+#else
+#define PD_KV_PARAMS_DBG(len, cap) ((void)0)
+#endif
+
 /* KV transfer params to inject into prefill body */
 #define PD_KV_TRANSFER_PARAMS \
   ",\"kv_transfer_params\":{\"do_remote_decode\":true,\"do_remote_prefill\":false}"
@@ -364,6 +394,8 @@ pd_extract_kv_params(const uint8_t *resp_buf, size_t resp_len,
   memcpy(kv_out, val_start, val_len);
   kv_out[val_len] = '\0';
   *kv_out_len = val_len;
+
+  PD_KV_PARAMS_DBG(val_len, kv_capacity);
 
   return 0;
 }
