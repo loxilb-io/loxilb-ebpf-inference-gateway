@@ -783,6 +783,13 @@ struct proxy_fd_ent {
   int http_body_complete;
   size_t http_content_length;
   int is_streamable;  // Flag: Content can be streamed (not JSON/form-urlencoded)
+  /* F-GPU-4: outstanding request-body bytes of a STREAMED request (early
+   * backend connect forwarded the headers before the body finished arriving).
+   * While >0, client reads are raw-relayed to rfd[0] — they are BODY, not a
+   * new request — and the KA-FIX stale-leg release must not fire (the
+   * streamed-forward path resets rcv_off to 0, which otherwise makes
+   * mid-body look exactly like a keep-alive request boundary). */
+  size_t stream_body_remaining;
   char host_url[256];
   char request_path[256];  // P6: Request URL path ("/v1/users")
   char url_path[512];      // Full URL with query string for query parameter extraction

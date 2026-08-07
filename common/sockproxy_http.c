@@ -7050,6 +7050,32 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       }
     }
 
+    /* F-GPU-4: a STREAMED request (early-backend-connect) reaches this reset
+     * with only its headers (+ any first-segment body fragment) forwarded —
+     * http_pok==0 because llhttp never saw message-complete. The reset below
+     * erases every marker of that in-flight body, so without this tracker the
+     * next read (a) trips the KA-FIX stale-leg release (rcv_off==0 looks like
+     * a request boundary), and (b) re-enters the parse phase, where body bytes
+     * become garbage "requests" sprayed across Tier-2 backends (live signature:
+     * backend 400 "Invalid HTTP request received" / json_invalid, one fresh
+     * backend conn per 64KB chunk). Record the outstanding body byte count;
+     * the read path relays exactly that many bytes before parsing again. */
+    pfe->stream_body_remaining = 0;
+    if (pfe->is_streamable && !pfe->http_pok && pfe->http_content_length > 0) {
+      uint8_t *sb_hdr_end = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
+      size_t sb_hdr_len = sb_hdr_end ? (size_t)(sb_hdr_end + 4 - pfe->rcvbuf)
+                                     : pfe->rcv_off;
+      size_t sb_body_fwd = pfe->rcv_off > sb_hdr_len ?
+                           pfe->rcv_off - sb_hdr_len : 0;
+      if (pfe->http_content_length > sb_body_fwd) {
+        pfe->stream_body_remaining = pfe->http_content_length - sb_body_fwd;
+        log_info("[STREAM_BODY_TRACK] fd=%d streamed request: %zu of %zu body "
+                 "bytes forwarded with headers, %zu outstanding — relay mode "
+                 "until drained", pfe->fd, sb_body_fwd,
+                 pfe->http_content_length, pfe->stream_body_remaining);
+      }
+    }
+
     // Reset buffer and parser for next request (HTTP keep-alive)
     pfe->rcv_off = 0;
     pfe->parsed_off = 0;
@@ -7406,6 +7432,46 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         continue;
       }
 
+      /* F-GPU-4: outstanding body of a STREAMED request — these bytes are BODY,
+       * not a new request. Relay them raw to the already-connected backend leg;
+       * do NOT let the KA-FIX below release that leg (rcv_off==0 here is the
+       * streamed-forward reset, not a request boundary) and do NOT re-enter the
+       * parser (which would turn body bytes into garbage Tier-2 "requests").
+       * Bytes past the declared Content-Length in the same read are the next
+       * pipelined request: shift them to the buffer head and fall through. */
+      if (pfe->stream_body_remaining > 0 && rc > 0) {
+        if (pfe->rfd[0] <= 0) {
+          /* backend leg died mid-body: the request is unrecoverable (its
+           * framing lives on that leg) — drop the connection cleanly. */
+          log_error("[STREAM_BODY_TRACK] fd=%d backend leg gone with %zu body "
+                    "bytes outstanding — closing", pfe->fd,
+                    pfe->stream_body_remaining);
+          return -1;
+        }
+        size_t sb_take = ((size_t)rc <= pfe->stream_body_remaining) ?
+                         (size_t)rc : pfe->stream_body_remaining;
+        PROXY_ENT_LOCK(pfe);
+        pfe_ent_accouting(pfe, sb_take, 0);
+        PROXY_ENT_UNLOCK(pfe);
+        if (proxy_multiplexor(pfe, pfe->rcvbuf, sb_take)) {
+          log_error("[STREAM_BODY_TRACK] fd=%d relay of %zu body bytes failed",
+                    pfe->fd, sb_take);
+          return -1;
+        }
+        pfe->stream_body_remaining -= sb_take;
+        if (pfe->stream_body_remaining == 0) {
+          log_info("[STREAM_BODY_TRACK] fd=%d streamed body fully relayed",
+                   pfe->fd);
+        }
+        if ((size_t)rc > sb_take) {
+          memmove(pfe->rcvbuf, pfe->rcvbuf + sb_take, (size_t)rc - sb_take);
+          rc = (int)((size_t)rc - sb_take);
+          /* fall through: remaining bytes start the next request (parse) */
+        } else {
+          continue;   /* body chunk fully consumed — next burst read */
+        }
+      }
+
       /* KA-FIX (81-09): release the stale backend leg of a COMPLETED P/D request
        * before parsing the next keep-alive request. rfd[]/n_rfd are cleared ONLY by
        * proxy_release_rfd_ctx (via proxy_pdestroy = full close); pd_cleanup() leaves
@@ -7415,7 +7481,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * (RCA 81-09: REUSE ~22% hangs vs FRESH 0%.) pd_phase==NONE (set by pd_cleanup at
        * decode-completion, sockproxy_http.c:1468/1556) + n_rfd>0 + disagg uniquely marks
        * a completed P/D request with a stale leg; rcv_off==0 confines this to a request
-       * boundary (mid-body relay has rcv_off>0; mid-P/D has pd_phase!=NONE). Runs on the
+       * boundary (mid-body relay has rcv_off>0; mid-P/D has pd_phase!=NONE) and
+       * stream_body_remaining==0 above excludes the streamed-forward mid-body reset
+       * (F-GPU-4). Runs on the
        * client fd's worker holding no lock; proxy_release_rfd_ctx locks only each backend.
        * After release rfd[0]==-1 so this SAME read falls into the parse branch and reframes
        * cleanly. No race with the Phase-89-pinned decode path: req N+1 only arrives after
