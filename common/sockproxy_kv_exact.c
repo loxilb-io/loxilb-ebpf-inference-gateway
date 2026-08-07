@@ -690,7 +690,15 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   if (pfe->prefix_key.valid == 1 && pfe->prefix_key.prefix[0] != '\0') {
     text = pfe->prefix_key.prefix;
     text_src = "prefix_key";
-  } else if (pfe->rcvbuf != NULL && ((char *)pfe->rcvbuf)[0] != '\0') {
+  } else if (!pfe->is_streamable &&
+             pfe->rcvbuf != NULL && ((char *)pfe->rcvbuf)[0] != '\0') {
+    /* D-LC3: a STREAMED request (oversize JSON via JSON_STREAM_FALLBACK, or
+     * any non-inspected content type) deliberately skipped body inspection —
+     * rcvbuf holds the raw HTTP request line + headers, and tokenizing those
+     * bytes can never match a published block chain. Without the streamable
+     * gate every oversize request burned a full tokenize (up to KV_MAX_TOKENS)
+     * on garbage before missing anyway; with it, GUARD_C attributes the miss
+     * and the request falls through to Tier-2 immediately. */
     text = (char *)pfe->rcvbuf;
     text_src = "rcvbuf";
     log_info("[KV_T15] fd=%d FALLBACK_TEXT_RCVBUF prefix_valid=%u",
@@ -773,11 +781,32 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   int n_tokens;
   if (pfe->is_chat) {
     char *raw_body = text;  /* fail-safe default */
+    /* D-LC4: llb_ai_kv_tokenize_chat takes a C string — Go's C.GoString reads
+     * until the first NUL, and body_len is NOT part of the CGO contract. The
+     * body span inside rcvbuf is not NUL-terminated: on a keep-alive
+     * connection whose PREVIOUS request was longer, the bytes past this body
+     * are that request's stale tail, and without a bound they were tokenized
+     * as part of THIS request (wrong hashes -> mis-route/miss). Save the byte
+     * at body end, NUL-bound the span for the CGO call, restore after.
+     * body_off+body_len == rcv_off < SP_SOCK_MSG_LEN (95%-fill guard), so the
+     * write is in-bounds; restore keeps pipelined bytes intact. */
+    char kv_saved_end = 0;
+    size_t kv_body_end = 0;
+    int kv_restore = 0;
     if (pfe->rcvbuf != NULL && pfe->body_len > 0 &&
         ((char *)pfe->rcvbuf)[pfe->body_off] != '\0') {
       raw_body = (char *)pfe->rcvbuf + pfe->body_off;
+      kv_body_end = pfe->body_off + pfe->body_len;
+      if (kv_body_end < SP_SOCK_MSG_LEN) {
+        kv_saved_end = ((char *)pfe->rcvbuf)[kv_body_end];
+        ((char *)pfe->rcvbuf)[kv_body_end] = '\0';
+        kv_restore = 1;
+      }
     }
     n_tokens = llb_ai_kv_tokenize_chat(raw_body, model, tokens, KV_MAX_TOKENS);
+    if (kv_restore) {
+      ((char *)pfe->rcvbuf)[kv_body_end] = kv_saved_end;
+    }
   } else {
     n_tokens = llb_ai_kv_tokenize(text, model, tokens, KV_MAX_TOKENS);
   }

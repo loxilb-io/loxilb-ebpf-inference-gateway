@@ -872,6 +872,15 @@ struct proxy_fd_ent {
   llhttp_t parser;
   llhttp_settings_t settings;
 #define SP_SOCK_MSG_LEN (1024 * 1024)  // 1MB - handles file uploads + LLM requests
+/* D-LC3: largest JSON body the proxy will BUFFER for body inspection (prefix
+ * extraction / KV-exact tokenize). A JSON request above this streams instead:
+ * inspection is skipped and routing falls through to Tier-2 (fail-open). The
+ * cap MUST sit safely under the 95%-of-SP_SOCK_MSG_LEN overflow guard in
+ * sockproxy_http.c (972KB) — before this cap existed, a long-context JSON
+ * request (coding-assistant, >~972KB) could never complete in rcvbuf, hit that
+ * guard, and had its CONNECTION RESET instead of being served. 3/4 of the
+ * buffer leaves 256KB headroom for headers + the final read burst. */
+#define SP_JSON_INSPECT_MAX (SP_SOCK_MSG_LEN / 4 * 3)
   /* D2 root fix (B-split): the 1MB receive buffer is heap-allocated per
    * connection (pfe_alloc calloc's it, pfe_recycle frees it) rather than embedded
    * inline, so the pooled pfe shell stays small (~KB) and grow-only residency is

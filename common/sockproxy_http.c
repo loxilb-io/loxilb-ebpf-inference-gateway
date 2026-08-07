@@ -1277,6 +1277,26 @@ skip_deferred_masking:
             size_t pr_content_len = (size_t)atol((char *)(pr_cl + 16));
             if (rfd_ent->pd_prefill_resp_len >= pr_hdr_len + pr_content_len) {
               pr_complete = 1;
+            } else if (pr_hdr_len + pr_content_len > rfd_ent->pd_prefill_resp_cap) {
+              /* D-LC5 (long-context wedge): the declared prefill response can
+               * NEVER fit the buffer, so the >= completion check above could
+               * never fire and the flow sat in PREFILL_WAITING until the client
+               * timed out — NO response at all (live-proven at 64KB cap:
+               * resp<=32KB fine, resp>=64KB total wedge). A prefill response
+               * this large is off the P/D contract (prefill is max_tokens=1;
+               * kv_transfer_params JSON is small) — but the proxy must FAIL
+               * OPEN, not hang: force completion once the header block is in.
+               * pd_extract_kv_params on the truncated body then degrades
+               * exactly like the existing overflow path ("decode will recompute
+               * prefill"). Late-arriving prefill bytes are DISCARDED by the
+               * decode-phase guard below so they can't interleave into the
+               * client's decode stream. */
+              log_warn("Prefill response (hdr %zu + CL %zu) exceeds buffer cap %zu"
+                       " — forcing completion, decode will recompute prefill"
+                       " (client_fd=%d)",
+                       pr_hdr_len, pr_content_len, rfd_ent->pd_prefill_resp_cap,
+                       rfd_ent->fd);
+              pr_complete = 1;
             }
           } else if (pd_detect_http_msg_end(rfd_ent->pd_prefill_resp_buf,
                                             rfd_ent->pd_prefill_resp_len)) {
@@ -1327,6 +1347,22 @@ skip_deferred_masking:
       }
       PROXY_ENT_UNLOCK(rfd_ent);
       return 0; /* Don't forward prefill response to client */
+    }
+
+    /* D-LC5 (second half): once the decode phase is live, any bytes still
+     * arriving on the PREFILL leg (client rfd slot 0; decode legs start at
+     * slot 1) have no legitimate destination — they are the tail of an
+     * over-cap prefill response whose completion was forced above. Forwarding
+     * them would interleave prefill garbage into the client's decode stream.
+     * Discard them. In the contract-conformant flow the prefill backend is
+     * idle after its (small, complete) response, so this branch never fires. */
+    if (ent->odir == 1 && rfd_ent != NULL &&
+        (rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING ||
+         rfd_ent->pd_phase == PD_PHASE_DECODE_STREAMING) &&
+        rfd_ent->n_rfd > 1 && ent->fd == rfd_ent->rfd[0]) {
+      log_debug("[PD_LATE_PREFILL_DISCARD] client_fd=%d prefill_fd=%d len=%zu",
+                rfd_ent->fd, ent->fd, len);
+      return 0;
     }
 
     /* C-1: SSE stream activation — detect "Content-Type: text/event-stream" in the
@@ -7545,7 +7581,26 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               needs_body_inspection = 1;
             }
           }
-          
+
+          // D-LC3: a JSON body larger than SP_JSON_INSPECT_MAX can NEVER finish
+          // buffering — rcvbuf is SP_SOCK_MSG_LEN and the partial-request path
+          // below hard-fails ("return -1", connection reset) at 95% fill. Before
+          // this cap, a long-context request above ~972KB (coding-assistant
+          // window dumps) was therefore KILLED, not served. Above the cap we
+          // stream it like any other large upload: body inspection (prefix
+          // extraction / KV-exact tokenize) is skipped and routing falls
+          // through to Tier-2 — fail-open, same degradation contract as every
+          // other KV miss path. Requires Content-Length (chunked TE has none;
+          // those already skip inspection via the content_length==0 gate).
+          if (needs_body_inspection &&
+              pfe->http_content_length > SP_JSON_INSPECT_MAX) {
+            log_info("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
+                     "inspect cap %d - streaming, body inspection skipped "
+                     "(Tier-2 fail-open)",
+                     fd, pfe->http_content_length, SP_JSON_INSPECT_MAX);
+            needs_body_inspection = 0;
+          }
+
           int is_streamable = !needs_body_inspection;
           
           if (pfe->http_hok && is_streamable && pfe->http_content_length > (64 * 1024)) {
