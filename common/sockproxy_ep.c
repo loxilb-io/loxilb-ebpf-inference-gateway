@@ -833,9 +833,12 @@ pd_fallback_normal:
             ns_used_learned = 1;
             log_info("[NS_STICKY_HIT] key='%s' -> ep[%d] (DFL)", ns_session_key, ns_bound);
           } else if (algorithm_selection < 0) {
-            /* PRIORITY 1: deterministic hash of the header value until learned. */
+            /* PRIORITY 1: deterministic hash of the header value until learned.
+             * Health check includes the circuit breaker: a condemned EP leaves
+             * algorithm_selection unset so the round-robin fallback below picks
+             * a healthy one; the hash re-pins unchanged once the EP heals. */
             int h = (int)(session_key_hash(ns_session_key) % (uint32_t)tepval->n_eps);
-            if (tepval->eps[h].inv == 0) algorithm_selection = h;
+            if (is_endpoint_healthy(tepval, h)) algorithm_selection = h;
           }
         } else if (tepval->select == PROXY_SEL_STICKY && algorithm_selection < 0) {
           /* PRIORITY 2: IP-based persistence (RR_PERSIST with no session header) —
@@ -845,7 +848,8 @@ pd_fallback_normal:
           snprintf(ns_ipkey, sizeof(ns_ipkey), "ip_%s",
                    inet_ntoa(*(struct in_addr *)(&client_ip)));
           int h = (int)(session_key_hash(ns_ipkey) % (uint32_t)tepval->n_eps);
-          if (tepval->eps[h].inv == 0) algorithm_selection = h;
+          /* Same health semantics as the session-header hash above. */
+          if (is_endpoint_healthy(tepval, h)) algorithm_selection = h;
         }
 
         // If algorithm didn't select an endpoint, use round-robin
@@ -984,6 +988,9 @@ pd_fallback_normal:
                 sel = fc_prefill;
                 log_info("US-PD804: P/D mid-cycle failover → prefill=EP%d decode=EP%d (attempt %d)",
                          fc_prefill, fc_decode, pd_retry + 1);
+                /* Counted HERE, not at pd_failover_ok — the normal
+                 * connect-success path falls through that label too. */
+                atomic_fetch_add(&global_stats.pd_connect_failover, 1);
                 goto pd_failover_ok;
               }
               /* This candidate also unreachable — clean up and try next */
@@ -1019,7 +1026,8 @@ pd_fallback_normal:
           return -1;
         }
 
-pd_failover_ok: /* mid-cycle failover succeeded; sel == winning prefill EP */
+pd_failover_ok: /* NORMAL success path falls through this label too — the
+                 * goto above only skips the connect-failure handling block. */
         // P2 Task 2.3: Record connection success for circuit breaker
         circuit_breaker_record_success(tepval, sel);
 

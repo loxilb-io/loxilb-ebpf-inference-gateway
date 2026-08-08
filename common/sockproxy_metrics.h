@@ -87,6 +87,16 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_cb_proactive_heal;
     uint64_t pd_admission_shed;
     uint64_t pd_admission_queued;
+
+    /* Failover observability counters. TAIL-APPEND ONLY — twin-declared in
+     * the cgo preamble of api/prometheus/sockproxy_metrics.go AND in
+     * api/prometheus/proxy_metrics_stub.c; keep ALL THREE in lockstep,
+     * same commit. */
+    uint64_t pd_prefill_ep_died;
+    uint64_t pd_decode_ep_died;
+    uint64_t pd_decode_zero_byte_eof;
+    uint64_t pd_connect_failover;
+    uint64_t lb_select_failure_shutdown;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

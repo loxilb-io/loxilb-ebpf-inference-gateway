@@ -201,6 +201,13 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     /* P/D Production Hardening counters */
     snapshot.pd_cb_flips = atomic_load(&global_stats.pd_cb_flips);
     snapshot.pd_fallback_to_normal = atomic_load(&global_stats.pd_fallback_to_normal);
+
+    /* Failover observability counters */
+    snapshot.pd_prefill_ep_died         = atomic_load(&global_stats.pd_prefill_ep_died);
+    snapshot.pd_decode_ep_died          = atomic_load(&global_stats.pd_decode_ep_died);
+    snapshot.pd_decode_zero_byte_eof    = atomic_load(&global_stats.pd_decode_zero_byte_eof);
+    snapshot.pd_connect_failover        = atomic_load(&global_stats.pd_connect_failover);
+    snapshot.lb_select_failure_shutdown = atomic_load(&global_stats.lb_select_failure_shutdown);
     /* P/D session and trie gauges — populated from PROXY_LOCK ephash walk above */
 
     /* KV Tier 1.5 routing diagnostics — storage only in plan 42-01; */

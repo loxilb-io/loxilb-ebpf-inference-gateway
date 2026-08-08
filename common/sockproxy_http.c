@@ -1321,6 +1321,7 @@ skip_deferred_masking:
             if (pd_initiate_decode(rfd_ent) < 0) {
               log_error("Failed to initiate decode — client_fd=%d",
                         rfd_ent->fd);
+              atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
               /* P5-fix: Send 503 (not 502) — decode endpoint unreachable means
                * the P/D backend pool is unavailable, not a proxy protocol error. */
               static const char pd_dec_err[] =
@@ -3883,6 +3884,7 @@ proxy_pdestroy(void *priv)
               "{\"error\":\"pd_pool_unavailable\",\"detail\":\"prefill backend connection dropped\"}";
           log_error("Prefill backend died — client_fd=%d backend_fd=%d "
                     "phase=%d", client_pfe->fd, pfe->fd, client_pfe->pd_phase);
+          atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
           if (client_pfe->fd > 0) {
             send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
                  MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -3971,9 +3973,11 @@ proxy_pdestroy(void *priv)
               "\r\n"
               "{\"error\":\"pd_decode_backend_died\","
               "\"detail\":\"decode backend closed before any response bytes\"}";
-          log_error("FO-1: decode backend EOF with ZERO response bytes — "
+          log_error("decode backend EOF with ZERO response bytes — "
                     "client_fd=%d decode_fd=%d (502 sent, decode_error recorded)",
                     client_pfe->fd, pfe->fd);
+          atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+          atomic_fetch_add(&global_stats.pd_decode_zero_byte_eof, 1);
           if (client_pfe->fd > 0) {
             send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
                  MSG_DONTWAIT | MSG_NOSIGNAL);
@@ -5298,6 +5302,10 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     }
 #endif
     
+    /* Selection/connect failed and the client gets a raw shutdown with no
+     * HTTP error body. Counted so this contract gap is visible in metrics
+     * until a generalized connect-retry + 502/503 lands for non-P/D paths. */
+    atomic_fetch_add(&global_stats.lb_select_failure_shutdown, 1);
     proxy_destroy_eps(pfe->fd, &ep_sel);
     shutdown(pfe->fd, SHUT_RDWR);
     return -1;
@@ -6000,6 +6008,7 @@ handle_on_message_complete(llhttp_t* parser)
         if (pd_initiate_decode(client_pfe) < 0) {
           log_error("Failed to initiate decode — client_fd=%d",
                     client_pfe->fd);
+          atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
           /* Record P/D decode failure metrics before cleanup */
           {
             const char *pd_dec_model = proxy_effective_model(client_pfe);

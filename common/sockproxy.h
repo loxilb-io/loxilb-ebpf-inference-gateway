@@ -143,6 +143,14 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_miss_no_worker;    // llb_ai_kv_best_worker returned no candidate
     _Atomic uint64_t pd_kv_t15_miss_excluded;     // candidate EP excluded (health / load)
     _Atomic uint64_t pd_kv_t15_fallthrough_total; // Tier 1.5 skipped entirely -> Tier 2 path
+    // Failover observability: endpoint-death and failover EVENTS (as detected
+    // per connection), distinct from the request-outcome counters in
+    // loxilb_ai_pd_requests_total. Zero increments == no failovers happened.
+    _Atomic uint64_t pd_prefill_ep_died;        // prefill backend died mid-request (client got 503)
+    _Atomic uint64_t pd_decode_ep_died;         // decode EP failure: init-connect failure or zero-byte EOF
+    _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
+    _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
+    _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
     // (C3): per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
