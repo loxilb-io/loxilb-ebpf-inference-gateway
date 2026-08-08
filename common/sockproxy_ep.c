@@ -858,7 +858,11 @@ pd_fallback_normal:
             int candidate = (tepval->ep_sel + attempts) % tepval->n_eps;
             if (candidate >= MAX_PROXY_EP) break;
             
-            if (tepval->eps[candidate].inv == 0) {  // Check if active
+            /* Honor the circuit breaker too — every other selector path
+             * (CHWBL/sticky/h2) goes through is_endpoint_healthy; checking
+             * inv alone kept feeding CB-condemned endpoints until the
+             * health prober flipped inv. */
+            if (is_endpoint_healthy(tepval, candidate)) {
               sel = candidate;
               found_active = 1;
               tepval->ep_sel = candidate + 1;  // Update for next round-robin
