@@ -2071,6 +2071,15 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->pd_balance_abs_threshold = arg->pd_balance_abs_threshold ? arg->pd_balance_abs_threshold : 3;
         tepval->pd_session_ttl_sec = arg->pd_session_ttl_sec;
 
+        /* Per-endpoint circuit breaker (opt-in per rule). Initialize each
+         * breaker when enabling — a zero-initialized breaker would trip OPEN
+         * on the first recorded failure (failure_threshold 0). */
+        tepval->cb_enabled = arg->cb_enable;
+        if (tepval->cb_enabled) {
+          for (int cb_i = 0; cb_i < tepval->n_eps && cb_i < MAX_PROXY_EP; cb_i++)
+            circuit_breaker_init(&tepval->circuit_breakers[cb_i]);
+        }
+
         // KV-Cache Exact Routing (: gap closure)
         tepval->kv_exact_mode = arg->kv_exact_mode;
         tepval->kv_hash_algo  = arg->kv_hash_algo;
@@ -2468,6 +2477,15 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   tepval->pd_cache_threshold = arg->pd_cache_threshold ? arg->pd_cache_threshold : 20;
   tepval->pd_balance_abs_threshold = arg->pd_balance_abs_threshold ? arg->pd_balance_abs_threshold : 3;
   tepval->pd_session_ttl_sec = arg->pd_session_ttl_sec;
+
+  /* Per-endpoint circuit breaker (opt-in per rule). Initialize each breaker
+   * when enabling — a zero-initialized breaker would trip OPEN on the first
+   * recorded failure (failure_threshold 0). */
+  tepval->cb_enabled = arg->cb_enable;
+  if (tepval->cb_enabled) {
+    for (int cb_i = 0; cb_i < tepval->n_eps && cb_i < MAX_PROXY_EP; cb_i++)
+      circuit_breaker_init(&tepval->circuit_breakers[cb_i]);
+  }
 
   // KV-Cache Exact Routing (Tier 1.5) — propagate five kv_* fields on
   // the new-tepval path. Mirrors the update-existing-tepval branch at L1384-1388.

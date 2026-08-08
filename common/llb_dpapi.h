@@ -1035,7 +1035,11 @@ struct dp_proxy_tacts {
   // pad3c(u32) = net +8 bytes here; the struct was already 8-aligned (a bare u32 would be padded
   // to 8 anyway). Bump ALL FOUR _Static_asserts + the Go CGO mirror in the same commit.
   uint32_t conn_limit;             // Configured concurrent-conn ceiling (0 = unlimited)
-  uint32_t pad3c;                  // Alignment padding (keeps struct 8-byte aligned)
+  // Per-endpoint circuit breaker enable (0=disabled, 1=enabled). Takes the first
+  // byte of the former pad3c(4) — offsets and total size unchanged, so the
+  // _Static_asserts below stay as-is (same idiom as kv_engine_type/pad3b).
+  uint8_t  cb_enable;
+  uint8_t  pad3c[3];               // Alignment padding (keeps struct 8-byte aligned)
   // Octavia per-listener member timeouts in MILLISECONDS (native unit).
   // Additive + default-off (0 ⇒ preserve today's behaviour). These mirror the proxy_arg
   // *_ms fields (sockproxy.h, added by Plan 76-01) and are copied verbatim into proxy_arg by

@@ -1191,7 +1191,7 @@ struct proxy_arg {
   uint8_t  pd_cache_aware_mode;
   uint8_t  pd_cache_threshold;
   uint8_t  pd_balance_abs_threshold;
-  uint8_t  pad_pd_cache_arg;           // alignment
+  uint8_t  cb_enable;                  // per-endpoint circuit breaker (replaces pad_pd_cache_arg)
   uint32_t pd_session_ttl_sec;
 
   // KV-Cache Exact Routing configuration 
