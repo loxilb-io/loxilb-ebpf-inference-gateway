@@ -4404,8 +4404,23 @@ proxy_pdestroy(void *priv)
             llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv, 0);
           }
           pd_cleanup(client_pfe);
+        } else if (client_pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
+                   pfe->is_pd_decode_backend) {
+          /* Decode backend EOF mid-stream. A completed stream leaves
+           * DECODE_STREAMING via the SSE [DONE] scanner before its backend
+           * closes (pd_phase NONE ⇒ the detach branch above), so reaching
+           * here means the stream was CUT with no terminator. Completion
+           * stays with the reaper paths (graceful-[DONE] synthesizes the
+           * terminator after the idle cap), but the EP death itself must be
+           * visible to the failover counters — without this tick a
+           * mid-stream decode crash is recorded as a clean success. */
+          log_error("decode backend EOF mid-stream — client_fd=%d "
+                    "decode_fd=%d (stream cut before [DONE]; reaper will "
+                    "complete the client)",
+                    client_pfe->fd, pfe->fd);
+          atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
         }
-        /* DECODE_STREAMING: streaming completion handled by SSE [DONE] scanner */
+        /* DECODE_STREAMING completion (non-cut) handled by SSE [DONE] scanner */
       }
     }
 
