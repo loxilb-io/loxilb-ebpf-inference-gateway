@@ -167,6 +167,11 @@ void pd_cleanup(proxy_fd_ent_t *fd_ent);
  * alone (key via proxy_skmap_key_from_fd; phurl via pfe->host_url), and re-drives
  * pd_setup_and_forward. Never runs off-owner (the Phase-89/90 cross-thread UAF invariant). */
 void pd_resume_parked(int fd);
+/* drain (pop + owner-worker wake) EVERY parked-admission entry for an EP that
+ * just became ineligible for selection (health inv-flip, circuit-breaker
+ * OPEN). The slot-free dequeue pops one head per dying conn — this releases
+ * the rest so they re-select instead of stranding until the max-park reap. */
+void pd_parked_drain_ep(proxy_epval_t *tepval, int ep_index, const char *why);
 void proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe);
 
 /* =========================================================================

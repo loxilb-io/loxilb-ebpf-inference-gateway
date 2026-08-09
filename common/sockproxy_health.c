@@ -1010,6 +1010,8 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
         pd_trie_remove_ep(tepval->pd_trie, ep_index);
         pthread_rwlock_unlock(&tepval->pd_trie_lock);
       }
+      /* release clients parked on the tripped EP for re-selection */
+      pd_parked_drain_ep(tepval, ep_index, "cb-open");
     }
     break;
     
@@ -1027,6 +1029,8 @@ circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index)
       pd_trie_remove_ep(tepval->pd_trie, ep_index);
       pthread_rwlock_unlock(&tepval->pd_trie_lock);
     }
+    /* release clients parked on the tripped EP for re-selection */
+    pd_parked_drain_ep(tepval, ep_index, "cb-open");
     break;
     
   case CB_STATE_OPEN:

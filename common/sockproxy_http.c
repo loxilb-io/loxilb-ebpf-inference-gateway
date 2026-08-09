@@ -2673,6 +2673,54 @@ proxy_delete_entry(proxy_ent_t *ent, proxy_arg_t *arg)
 }
 /* Drain management moved to sockproxy_health.c */
 
+/* pd_parked_drain_ep — pop EVERY parked-admission entry for ep_index and wake
+ * each owner worker to re-drive selection. The slot-free dequeue (pd_cleanup)
+ * pops only ONE parked head per dying in-flight conn, so a FIFO deeper than
+ * the dying-conn count stranded the remainder until the max-park reap 503'd
+ * them. Called on the transitions that make the EP ineligible for selection
+ * (health inv-flip, circuit-breaker OPEN): every woken conn re-drives
+ * selection on its own owner worker (gen-validated in pd_resume_parked; a
+ * recycled fd is dropped, an already-resumed conn is a no-op) and selection
+ * excludes this EP, so the queue fails over instead of timing out. Entries
+ * are popped under pd_parked_lock, wakes issued after, mirroring the
+ * slot-free dequeue pattern. Empty FIFO (feature off included) = no-op. */
+void
+pd_parked_drain_ep(proxy_epval_t *tepval, int ep_index, const char *why)
+{
+  pd_parked_ent_t drained[PD_MAX_QUEUE_DEPTH];
+  uint32_t n_drained = 0;
+
+  if (!tepval || ep_index < 0 || ep_index >= tepval->n_eps ||
+      !proxy_struct || !proxy_struct->ns) {
+    return;
+  }
+
+  pthread_mutex_lock(&tepval->pd_parked_lock);
+  while (n_drained < PD_MAX_QUEUE_DEPTH &&
+         pd_parked_pop_head(&tepval->pd_parked[ep_index],
+                            &drained[n_drained])) {
+    n_drained++;
+  }
+  pthread_mutex_unlock(&tepval->pd_parked_lock);
+
+  for (uint32_t di = 0; di < n_drained; di++) {
+    if (drained[di].fd <= 0) continue;
+    int owner = notify_owner_thr(proxy_struct->ns, drained[di].fd);
+    int wrc = (owner >= 0)
+        ? notify_wake_worker(proxy_struct->ns, owner, drained[di].fd)
+        : -1;
+    if (wrc != 0) {
+      log_warn("[PD_ADMISSION] %s drain: wake failed (rc=%d) for parked "
+               "fd=%d (owner=%d) — relying on max-park reap",
+               why, wrc, drained[di].fd, owner);
+    }
+  }
+  if (n_drained > 0) {
+    log_info("[PD_ADMISSION] %s drain: ep=%d released %u parked conn(s) "
+             "for re-selection", why, ep_index, n_drained);
+  }
+}
+
 // P2 Task 1.3: Lightweight endpoint health update with graceful draining
 //
 // This function ONLY updates the inactive flag without full rule reconfiguration
@@ -2746,6 +2794,10 @@ proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
             pd_trie_remove_ep(tepval->pd_trie, ep_index);
             pthread_rwlock_unlock(&tepval->pd_trie_lock);
           }
+
+          /* Release every client parked on the now-dead EP for
+           * re-selection (see pd_parked_drain_ep). */
+          pd_parked_drain_ep(tepval, ep_index, "ep-down");
         }
 
         // P2: Handle draining based on policy
