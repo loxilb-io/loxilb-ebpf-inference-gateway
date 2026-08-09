@@ -800,8 +800,21 @@ check_draining_endpoints(void)
 
         if (pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
             pfe->pd_phase_start_ts > 0) {
-          time_t elapsed = now - pfe->pd_phase_start_ts;
-          uint32_t timeout = 120; /* default 120s for decode streaming */
+          /* Idle-based, NOT duration-based (F-GPU-6): pd_last_decode_ts is
+           * refreshed on every relayed decode byte (sockproxy_http.c [DONE]
+           * scanner), so an ACTIVE stream keeps pushing this deadline out no
+           * matter how long the generation runs. Measuring from
+           * pd_phase_start_ts truncated every legitimate >120s generation
+           * mid-stream (8192-token SSE died at exactly 120s with no [DONE],
+           * no finish_reason). Only a decode backend that has gone SILENT for
+           * the full timeout — the EP-crash hang this sweep exists for —
+           * still trips it. */
+          time_t basis = pfe->pd_phase_start_ts;
+          if (pfe->pd_last_decode_ts > basis) {
+            basis = pfe->pd_last_decode_ts;
+          }
+          time_t elapsed = now - basis;
+          uint32_t timeout = 120; /* default 120s decode-stream SILENCE */
           if (pfe->epv) {
             proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
             if (epv->pd_decode_timeout_sec > 0) {
@@ -809,7 +822,7 @@ check_draining_endpoints(void)
             }
           }
           if (elapsed >= (time_t)timeout) {
-            log_error("ERR-01: P/D decode stream timeout — fd=%d elapsed=%lds",
+            log_error("ERR-01: P/D decode stream timeout — fd=%d idle=%lds",
                       pfe->fd, (long)elapsed);
             if (pfe->fd > 0) {
               send(pfe->fd, pd_decode_timeout_resp,
@@ -876,7 +889,16 @@ check_draining_endpoints(void)
             idle_cap = base + 60; /* +60s slack beyond the specific reapers */
           }
 
-          time_t elapsed = now - pfe->pd_phase_start_ts;
+          /* Same activity basis as ERR-01 (F-GPU-6): an actively-relaying
+           * DECODE_STREAMING flow must not be reaped on total duration —
+           * without this the +60s slack only bought a stream 180s before
+           * this sweep killed what ERR-01 spared. */
+          time_t basis = pfe->pd_phase_start_ts;
+          if (pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
+              pfe->pd_last_decode_ts > basis) {
+            basis = pfe->pd_last_decode_ts;
+          }
+          time_t elapsed = now - basis;
           if (elapsed >= (time_t)idle_cap) {
             log_error("generic P/D idle reaper — fd=%d pd_phase=%d "
                       "elapsed=%lds >= cap=%us",

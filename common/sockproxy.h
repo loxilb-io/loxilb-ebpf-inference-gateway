@@ -783,6 +783,13 @@ struct proxy_fd_ent {
   int http_body_complete;
   size_t http_content_length;
   int is_streamable;  // Flag: Content can be streamed (not JSON/form-urlencoded)
+  /* F-GPU-4: outstanding request-body bytes of a STREAMED request (early
+   * backend connect forwarded the headers before the body finished arriving).
+   * While >0, client reads are raw-relayed to rfd[0] — they are BODY, not a
+   * new request — and the KA-FIX stale-leg release must not fire (the
+   * streamed-forward path resets rcv_off to 0, which otherwise makes
+   * mid-body look exactly like a keep-alive request boundary). */
+  size_t stream_body_remaining;
   char host_url[256];
   char request_path[256];  // P6: Request URL path ("/v1/users")
   char url_path[512];      // Full URL with query string for query parameter extraction
@@ -872,6 +879,15 @@ struct proxy_fd_ent {
   llhttp_t parser;
   llhttp_settings_t settings;
 #define SP_SOCK_MSG_LEN (1024 * 1024)  // 1MB - handles file uploads + LLM requests
+/* D-LC3: largest JSON body the proxy will BUFFER for body inspection (prefix
+ * extraction / KV-exact tokenize). A JSON request above this streams instead:
+ * inspection is skipped and routing falls through to Tier-2 (fail-open). The
+ * cap MUST sit safely under the 95%-of-SP_SOCK_MSG_LEN overflow guard in
+ * sockproxy_http.c (972KB) — before this cap existed, a long-context JSON
+ * request (coding-assistant, >~972KB) could never complete in rcvbuf, hit that
+ * guard, and had its CONNECTION RESET instead of being served. 3/4 of the
+ * buffer leaves 256KB headroom for headers + the final read burst. */
+#define SP_JSON_INSPECT_MAX (SP_SOCK_MSG_LEN / 4 * 3)
   /* D2 root fix (B-split): the 1MB receive buffer is heap-allocated per
    * connection (pfe_alloc calloc's it, pfe_recycle frees it) rather than embedded
    * inline, so the pooled pfe shell stays small (~KB) and grow-only residency is

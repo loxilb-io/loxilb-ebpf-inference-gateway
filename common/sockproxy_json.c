@@ -29,6 +29,7 @@
 #include "log.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_json.h"
+#include "sockproxy_json_unescape.h"
 
 // ============================================================================
 // P0.2: JSON Prefix Extraction Functions
@@ -616,13 +617,20 @@ int extract_llm_prefix(const char *json_body, size_t len,
     if (jsoneq(json_body, &tokens[i], "prompt") == 0) {
       i++;  // Move to prompt value
       if (tokens[i].type == JSMN_STRING) {
-        // Extract prompt text for prefix hashing
-        size_t prompt_len = tokens[i].end - tokens[i].start;
-        if (prompt_len > sizeof(prefix_key->prefix) - 1) {
-          prompt_len = sizeof(prefix_key->prefix) - 1;
-        }
-        strncpy(prefix_key->prefix, json_body + tokens[i].start, prompt_len);
-        prefix_key->prefix[prompt_len] = '\0';
+        // Extract prompt text for prefix hashing.
+        // D-LC2: DECODE the JSON escapes while copying (see
+        // sockproxy_json_unescape.h). The raw strncpy that used to live here
+        // fed still-escaped bytes ("line1\\nline2") to the Tier-1.5 tokenizer
+        // while the publisher/vLLM hash the DECODED text — so any prompt with
+        // an escape (every real coding-assistant prompt) silently never
+        // matched. The helper also guarantees the MAX_PREFIX_LEN truncation
+        // never ends mid-escape or mid-UTF-8, keeping the truncated prefix a
+        // byte-exact prefix of the full decoded prompt (what block-hash
+        // prefix routing needs). Pass the FULL raw span — the copy bounds
+        // itself by the destination capacity.
+        kv_json_unescape_copy(json_body + tokens[i].start,
+                              (size_t)(tokens[i].end - tokens[i].start),
+                              prefix_key->prefix, sizeof(prefix_key->prefix));
         prefix_key->valid = 1;
         
 #ifdef HAVE_PROXY_EXTRA_DEBUG

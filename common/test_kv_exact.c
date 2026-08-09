@@ -50,6 +50,8 @@
 
 #define MAX_PROXY_EP      32
 #define MAX_PREFIX_LEN    512
+/* D-LC4: rcvbuf capacity bound read by the chat-body NUL-bounding code. */
+#define SP_SOCK_MSG_LEN   (1024 * 1024)
 #define MAX_MODEL_LEN     128
 #define MAX_LORA_LEN      128
 #define MAX_HASH_LEN      64
@@ -147,6 +149,8 @@ typedef struct proxy_fd_ent {
   uint8_t is_chat;
   size_t  body_off;
   size_t  body_len;
+  /* D-LC3: streamable-request gate read by the rcvbuf-fallback branch. */
+  uint8_t is_streamable;
   char x_model_header[MAX_MODEL_LEN];
   void *rcvbuf;
 } proxy_fd_ent_t;
@@ -1964,6 +1968,96 @@ test_sglang_parity_vectors(void)
                          SGL_V5_N_BLOCKS);
 }
 
+/* ---- D-LC2: JSON unescape + escape/UTF-8-safe truncation ---------------- */
+/* The Tier-1.5 tokenize input for /v1/completions is prefix_key.prefix, which
+ * sockproxy_json.c now fills through kv_json_unescape_copy. These pin the
+ * decode table AND the two truncation guarantees (never mid-escape, never
+ * mid-UTF-8) that keep the truncated prefix a byte-exact prefix of the full
+ * decoded prompt — the property block-hash prefix routing depends on. */
+#include "sockproxy_json_unescape.h"
+
+static void
+test_json_unescape(void)
+{
+  char out[64];
+  size_t n;
+
+  /* plain passthrough */
+  n = kv_json_unescape_copy("hello", 5, out, sizeof(out));
+  ASSERT_EQ((int)n, 5, "unescape: plain length");
+  ASSERT_MEM_EQ(out, "hello", 6, "unescape: plain bytes+NUL");
+
+  /* the full simple-escape table — the coding-assistant reality (\n, \t, \") */
+  n = kv_json_unescape_copy("a\\nb\\tc\\\"d\\\\e\\/f\\bg\\fh\\ri", 25,
+                            out, sizeof(out));
+  ASSERT_EQ((int)n, 17, "unescape: simple escapes length");
+  ASSERT_MEM_EQ(out, "a\nb\tc\"d\\e/f\bg\fh\ri", 18,
+                "unescape: simple escapes bytes");
+
+  /* A -> 'A' (BMP ASCII) */
+  n = kv_json_unescape_copy("x\\u0041y", 8, out, sizeof(out));
+  ASSERT_EQ((int)n, 3, "unescape: u0041 length");
+  ASSERT_MEM_EQ(out, "xAy", 4, "unescape: u0041 bytes");
+
+  /* é -> 2-byte UTF-8 (c3 a9) */
+  n = kv_json_unescape_copy("\\u00e9", 6, out, sizeof(out));
+  ASSERT_EQ((int)n, 2, "unescape: u00e9 length");
+  ASSERT_MEM_EQ(out, "\xc3\xa9", 3, "unescape: u00e9 bytes");
+
+  /* surrogate pair 😀 -> U+1F600 (f0 9f 98 80) */
+  n = kv_json_unescape_copy("\\ud83d\\ude00", 12, out, sizeof(out));
+  ASSERT_EQ((int)n, 4, "unescape: surrogate pair length");
+  ASSERT_MEM_EQ(out, "\xf0\x9f\x98\x80", 5, "unescape: surrogate pair bytes");
+
+  /* lone high surrogate -> STOP (copy nothing after the preceding byte) */
+  n = kv_json_unescape_copy("a\\ud83dZZZ", 10, out, sizeof(out));
+  ASSERT_EQ((int)n, 1, "unescape: lone surrogate stops");
+  ASSERT_MEM_EQ(out, "a", 2, "unescape: lone surrogate keeps prefix");
+
+  /* dangling '\' at the source cut -> dropped, clean NUL */
+  n = kv_json_unescape_copy("ab\\", 3, out, sizeof(out));
+  ASSERT_EQ((int)n, 2, "unescape: dangling backslash dropped");
+  ASSERT_MEM_EQ(out, "ab", 3, "unescape: dangling backslash bytes");
+
+  /* partial \uXX at the source cut -> dropped */
+  n = kv_json_unescape_copy("ab\\u00", 6, out, sizeof(out));
+  ASSERT_EQ((int)n, 2, "unescape: partial uXXXX dropped");
+
+  /* dst-cap truncation NEVER splits a 2-byte char: room for 1, char needs 2 */
+  n = kv_json_unescape_copy("a\\u00e9", 7, out, 3); /* cap: 2 bytes + NUL */
+  ASSERT_EQ((int)n, 1, "unescape: cap stops before split char");
+  ASSERT_MEM_EQ(out, "a", 2, "unescape: cap keeps whole chars only");
+
+  /* raw (unescaped) multi-byte UTF-8 passes through atomically */
+  n = kv_json_unescape_copy("a\xc3\xa9z", 4, out, sizeof(out));
+  ASSERT_EQ((int)n, 4, "unescape: raw utf8 passthrough length");
+  ASSERT_MEM_EQ(out, "a\xc3\xa9z", 5, "unescape: raw utf8 passthrough bytes");
+
+  /* raw multi-byte char cut by srclen -> dropped, not half-copied */
+  n = kv_json_unescape_copy("a\xc3", 2, out, sizeof(out));
+  ASSERT_EQ((int)n, 1, "unescape: raw utf8 cut by srclen dropped");
+
+  /* raw multi-byte char that would split at dstcap -> dropped */
+  n = kv_json_unescape_copy("ab\xc3\xa9", 4, out, 3); /* cap: 2 + NUL */
+  ASSERT_EQ((int)n, 2, "unescape: raw utf8 split at dstcap dropped");
+  ASSERT_MEM_EQ(out, "ab", 3, "unescape: raw utf8 split bytes");
+
+  /* unknown escape (\x) -> STOP: never guess, keep the parity-exact prefix */
+  n = kv_json_unescape_copy("ok\\xZZ", 6, out, sizeof(out));
+  ASSERT_EQ((int)n, 2, "unescape: unknown escape stops");
+
+  /* truncated-prefix property: decode(full)[0:n] == decode(capped) for a
+   * code-shaped prompt — what block-hash prefix routing depends on. */
+  {
+    const char *code = "def f(x):\\n\\treturn x\\u00e9 + 1\\n# tail comment";
+    char full[64], capped[16];
+    size_t nf = kv_json_unescape_copy(code, strlen(code), full, sizeof(full));
+    size_t nc = kv_json_unescape_copy(code, strlen(code), capped, sizeof(capped));
+    ASSERT_EQ(nc <= nf ? 1 : 0, 1, "unescape: capped shorter than full");
+    ASSERT_MEM_EQ(capped, full, nc, "unescape: capped is byte-exact prefix");
+  }
+}
+
 /* ---- Main ---- */
 int
 main(int argc, char **argv)
@@ -1972,6 +2066,7 @@ main(int argc, char **argv)
   (void)argv;
   printf("=== KV Exact Routing Unit Tests ===\n\n");
 
+  test_json_unescape();
   test_cbor_basic();
   test_cbor_large_tokens();
   test_cbor_xxhash_parent();

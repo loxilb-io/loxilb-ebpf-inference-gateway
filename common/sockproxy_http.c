@@ -1277,6 +1277,26 @@ skip_deferred_masking:
             size_t pr_content_len = (size_t)atol((char *)(pr_cl + 16));
             if (rfd_ent->pd_prefill_resp_len >= pr_hdr_len + pr_content_len) {
               pr_complete = 1;
+            } else if (pr_hdr_len + pr_content_len > rfd_ent->pd_prefill_resp_cap) {
+              /* D-LC5 (long-context wedge): the declared prefill response can
+               * NEVER fit the buffer, so the >= completion check above could
+               * never fire and the flow sat in PREFILL_WAITING until the client
+               * timed out — NO response at all (live-proven at 64KB cap:
+               * resp<=32KB fine, resp>=64KB total wedge). A prefill response
+               * this large is off the P/D contract (prefill is max_tokens=1;
+               * kv_transfer_params JSON is small) — but the proxy must FAIL
+               * OPEN, not hang: force completion once the header block is in.
+               * pd_extract_kv_params on the truncated body then degrades
+               * exactly like the existing overflow path ("decode will recompute
+               * prefill"). Late-arriving prefill bytes are DISCARDED by the
+               * decode-phase guard below so they can't interleave into the
+               * client's decode stream. */
+              log_warn("Prefill response (hdr %zu + CL %zu) exceeds buffer cap %zu"
+                       " — forcing completion, decode will recompute prefill"
+                       " (client_fd=%d)",
+                       pr_hdr_len, pr_content_len, rfd_ent->pd_prefill_resp_cap,
+                       rfd_ent->fd);
+              pr_complete = 1;
             }
           } else if (pd_detect_http_msg_end(rfd_ent->pd_prefill_resp_buf,
                                             rfd_ent->pd_prefill_resp_len)) {
@@ -1318,6 +1338,15 @@ skip_deferred_masking:
                        MSG_DONTWAIT | MSG_NOSIGNAL);
                 }
               }
+              /* Record the decode failure (errorPhase=2) — this call site sent
+               * the 503 but never recorded it, so decode-init failures on THIS
+               * path were invisible to loxilb_ai_pd_requests_total (found by
+               * the LC-6.1 failover leg; the :5937 call site already records). */
+              {
+                const char *pd_dec_model = proxy_effective_model(rfd_ent);
+                int d_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
+                llb_ai_pd_record((char *)pd_dec_model, 0, 0, d_kv, 2);
+              }
               rfd_ent->pd_phase = PD_PHASE_ERROR;
               pd_cleanup(rfd_ent);
             }
@@ -1327,6 +1356,22 @@ skip_deferred_masking:
       }
       PROXY_ENT_UNLOCK(rfd_ent);
       return 0; /* Don't forward prefill response to client */
+    }
+
+    /* D-LC5 (second half): once the decode phase is live, any bytes still
+     * arriving on the PREFILL leg (client rfd slot 0; decode legs start at
+     * slot 1) have no legitimate destination — they are the tail of an
+     * over-cap prefill response whose completion was forced above. Forwarding
+     * them would interleave prefill garbage into the client's decode stream.
+     * Discard them. In the contract-conformant flow the prefill backend is
+     * idle after its (small, complete) response, so this branch never fires. */
+    if (ent->odir == 1 && rfd_ent != NULL &&
+        (rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING ||
+         rfd_ent->pd_phase == PD_PHASE_DECODE_STREAMING) &&
+        rfd_ent->n_rfd > 1 && ent->fd == rfd_ent->rfd[0]) {
+      log_debug("[PD_LATE_PREFILL_DISCARD] client_fd=%d prefill_fd=%d len=%zu",
+                rfd_ent->fd, ent->fd, len);
+      return 0;
     }
 
     /* C-1: SSE stream activation — detect "Content-Type: text/event-stream" in the
@@ -1528,6 +1573,14 @@ skip_deferred_masking:
     if (ent->odir == 1 &&
         rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING &&
         !rfd_ent->sse_active) {
+      if (len > 0) {
+        /* Universal decode-activity stamp: (a) the FO-1 zero-byte
+         * discriminator at the decode-EOF site (pd_last_decode_ts == 0 ⇒ the
+         * decode leg died before ONE response byte was relayed), and (b)
+         * extends the idle-based reaper basis (F-GPU-6) to non-SSE decode
+         * responses — the SSE path stamps in the [DONE] scanner. */
+        rfd_ent->pd_last_decode_ts = time(NULL);
+      }
       if (rfd_ent->pd_decode_content_length == 0 && len > 16) {
         /* First packet — extract Content-Length and count body bytes */
         const uint8_t *cl_pos = memmem(msg, len < 2048 ? len : 2048,
@@ -3252,6 +3305,42 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     return -1;
   }
 
+  /* FO-2: the decode EP was picked at ADMISSION but is only connected NOW,
+   * after prefill completed — a seconds-wide window under long-context
+   * prefill during which the EP can die. Until this check, only index
+   * bounds were re-validated, so a decode node dying during prefill meant a
+   * connect to a known-dead EP (sync 503, or async zero-byte EOF = FO-1).
+   * Re-check inv/CB and re-select via pd_select_decode (min-load among
+   * healthy decode EPs — the admission scorer) with the stale hint cleared.
+   * On re-selection, MOVE the admission-time active_conns unit so
+   * pd_cleanup's decrement of the final pd_decode_ep_idx stays balanced.
+   * Runs BEFORE the buffer claims below, so the -1 path (no healthy decode
+   * EP) leaves saved body/headers for the caller's 503+cleanup. */
+  if (tepval->eps[d_idx].inv ||
+      (tepval->cb_enabled &&
+       tepval->circuit_breakers[d_idx].state == CB_STATE_OPEN)) {
+    int stale_idx = d_idx;
+    int re_idx = -1;
+    client_pfe->pd_decode_ep_idx = -1;  /* clear hint: force fresh min-load pick */
+    if (pd_select_decode(tepval, client_pfe, &re_idx) == 0) {
+      log_error("FO-2: decode EP%d went unhealthy during prefill — "
+                "re-selected healthy decode EP%d (client_fd=%d)",
+                stale_idx, re_idx, client_pfe->fd);
+      uint32_t cur_stale =
+          atomic_load(&tepval->pd_ep_loads[stale_idx].active_conns);
+      if (cur_stale > 0)
+        atomic_fetch_sub(&tepval->pd_ep_loads[stale_idx].active_conns, 1);
+      atomic_fetch_add(&tepval->pd_ep_loads[re_idx].active_conns, 1);
+      d_idx = re_idx;  /* pd_select_decode already stored it in the pfe */
+    } else {
+      client_pfe->pd_decode_ep_idx = stale_idx;  /* restore for cleanup/logs */
+      log_error("FO-2: decode EP%d unhealthy after prefill and NO healthy "
+                "replacement — failing decode init (client_fd=%d)",
+                stale_idx, client_pfe->fd);
+      return -1;
+    }
+  }
+
   /* (conc=128 UAF fix): pd_initiate_decode runs on the PREFILL worker
    * and reads three heap buffers (pd_prefill_resp_buf / pd_saved_body /
    * pd_saved_headers) off the shared client pfe, while pd_cleanup() can free the
@@ -3847,6 +3936,37 @@ proxy_pdestroy(void *priv)
           /* Detach client from this backend so proxy_release_rfd_ctx skips it */
           pfe->rfd_ent[pd_i] = NULL;
           pfe->n_rfd--;
+        } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
+                   client_pfe->pd_last_decode_ts == 0 &&
+                   client_pfe->pd_decode_content_length == 0 &&
+                   client_pfe->pd_decode_bytes_received == 0) {
+          /* FO-1: decode backend EOF before ONE response byte was relayed —
+           * the async-connect-failure signature of a dead decode EP. This was
+           * unconditionally treated as "non-streaming decode complete": phase
+           * → COMPLETE, llb_ai_pd_record(status 0), while the client received
+           * ZERO bytes — failover-invisible and metric-corrupting. Send a
+           * real 502 and record errorPhase=2 (decode_error) instead. */
+          static const char pd_decode_err[] =
+              "HTTP/1.1 502 Bad Gateway\r\n"
+              "Content-Type: application/json\r\n"
+              "Connection: close\r\n"
+              "\r\n"
+              "{\"error\":\"pd_decode_backend_died\","
+              "\"detail\":\"decode backend closed before any response bytes\"}";
+          log_error("FO-1: decode backend EOF with ZERO response bytes — "
+                    "client_fd=%d decode_fd=%d (502 sent, decode_error recorded)",
+                    client_pfe->fd, pfe->fd);
+          if (client_pfe->fd > 0) {
+            send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
+                 MSG_DONTWAIT | MSG_NOSIGNAL);
+          }
+          {
+            const char *pd_model = proxy_effective_model(client_pfe);
+            int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+            llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
+          }
+          client_pfe->pd_phase = PD_PHASE_ERROR;
+          pd_cleanup(client_pfe);
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
           /* Decode backend EOF — non-streaming decode complete */
           client_pfe->pd_phase = PD_PHASE_COMPLETE;
@@ -7014,6 +7134,32 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       }
     }
 
+    /* F-GPU-4: a STREAMED request (early-backend-connect) reaches this reset
+     * with only its headers (+ any first-segment body fragment) forwarded —
+     * http_pok==0 because llhttp never saw message-complete. The reset below
+     * erases every marker of that in-flight body, so without this tracker the
+     * next read (a) trips the KA-FIX stale-leg release (rcv_off==0 looks like
+     * a request boundary), and (b) re-enters the parse phase, where body bytes
+     * become garbage "requests" sprayed across Tier-2 backends (live signature:
+     * backend 400 "Invalid HTTP request received" / json_invalid, one fresh
+     * backend conn per 64KB chunk). Record the outstanding body byte count;
+     * the read path relays exactly that many bytes before parsing again. */
+    pfe->stream_body_remaining = 0;
+    if (pfe->is_streamable && !pfe->http_pok && pfe->http_content_length > 0) {
+      uint8_t *sb_hdr_end = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
+      size_t sb_hdr_len = sb_hdr_end ? (size_t)(sb_hdr_end + 4 - pfe->rcvbuf)
+                                     : pfe->rcv_off;
+      size_t sb_body_fwd = pfe->rcv_off > sb_hdr_len ?
+                           pfe->rcv_off - sb_hdr_len : 0;
+      if (pfe->http_content_length > sb_body_fwd) {
+        pfe->stream_body_remaining = pfe->http_content_length - sb_body_fwd;
+        log_info("[STREAM_BODY_TRACK] fd=%d streamed request: %zu of %zu body "
+                 "bytes forwarded with headers, %zu outstanding — relay mode "
+                 "until drained", pfe->fd, sb_body_fwd,
+                 pfe->http_content_length, pfe->stream_body_remaining);
+      }
+    }
+
     // Reset buffer and parser for next request (HTTP keep-alive)
     pfe->rcv_off = 0;
     pfe->parsed_off = 0;
@@ -7370,6 +7516,46 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         continue;
       }
 
+      /* F-GPU-4: outstanding body of a STREAMED request — these bytes are BODY,
+       * not a new request. Relay them raw to the already-connected backend leg;
+       * do NOT let the KA-FIX below release that leg (rcv_off==0 here is the
+       * streamed-forward reset, not a request boundary) and do NOT re-enter the
+       * parser (which would turn body bytes into garbage Tier-2 "requests").
+       * Bytes past the declared Content-Length in the same read are the next
+       * pipelined request: shift them to the buffer head and fall through. */
+      if (pfe->stream_body_remaining > 0 && rc > 0) {
+        if (pfe->rfd[0] <= 0) {
+          /* backend leg died mid-body: the request is unrecoverable (its
+           * framing lives on that leg) — drop the connection cleanly. */
+          log_error("[STREAM_BODY_TRACK] fd=%d backend leg gone with %zu body "
+                    "bytes outstanding — closing", pfe->fd,
+                    pfe->stream_body_remaining);
+          return -1;
+        }
+        size_t sb_take = ((size_t)rc <= pfe->stream_body_remaining) ?
+                         (size_t)rc : pfe->stream_body_remaining;
+        PROXY_ENT_LOCK(pfe);
+        pfe_ent_accouting(pfe, sb_take, 0);
+        PROXY_ENT_UNLOCK(pfe);
+        if (proxy_multiplexor(pfe, pfe->rcvbuf, sb_take)) {
+          log_error("[STREAM_BODY_TRACK] fd=%d relay of %zu body bytes failed",
+                    pfe->fd, sb_take);
+          return -1;
+        }
+        pfe->stream_body_remaining -= sb_take;
+        if (pfe->stream_body_remaining == 0) {
+          log_info("[STREAM_BODY_TRACK] fd=%d streamed body fully relayed",
+                   pfe->fd);
+        }
+        if ((size_t)rc > sb_take) {
+          memmove(pfe->rcvbuf, pfe->rcvbuf + sb_take, (size_t)rc - sb_take);
+          rc = (int)((size_t)rc - sb_take);
+          /* fall through: remaining bytes start the next request (parse) */
+        } else {
+          continue;   /* body chunk fully consumed — next burst read */
+        }
+      }
+
       /* KA-FIX (81-09): release the stale backend leg of a COMPLETED P/D request
        * before parsing the next keep-alive request. rfd[]/n_rfd are cleared ONLY by
        * proxy_release_rfd_ctx (via proxy_pdestroy = full close); pd_cleanup() leaves
@@ -7379,7 +7565,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * (RCA 81-09: REUSE ~22% hangs vs FRESH 0%.) pd_phase==NONE (set by pd_cleanup at
        * decode-completion, sockproxy_http.c:1468/1556) + n_rfd>0 + disagg uniquely marks
        * a completed P/D request with a stale leg; rcv_off==0 confines this to a request
-       * boundary (mid-body relay has rcv_off>0; mid-P/D has pd_phase!=NONE). Runs on the
+       * boundary (mid-body relay has rcv_off>0; mid-P/D has pd_phase!=NONE) and
+       * stream_body_remaining==0 above excludes the streamed-forward mid-body reset
+       * (F-GPU-4). Runs on the
        * client fd's worker holding no lock; proxy_release_rfd_ctx locks only each backend.
        * After release rfd[0]==-1 so this SAME read falls into the parse branch and reframes
        * cleanly. No race with the Phase-89-pinned decode path: req N+1 only arrives after
@@ -7545,7 +7733,26 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               needs_body_inspection = 1;
             }
           }
-          
+
+          // D-LC3: a JSON body larger than SP_JSON_INSPECT_MAX can NEVER finish
+          // buffering — rcvbuf is SP_SOCK_MSG_LEN and the partial-request path
+          // below hard-fails ("return -1", connection reset) at 95% fill. Before
+          // this cap, a long-context request above ~972KB (coding-assistant
+          // window dumps) was therefore KILLED, not served. Above the cap we
+          // stream it like any other large upload: body inspection (prefix
+          // extraction / KV-exact tokenize) is skipped and routing falls
+          // through to Tier-2 — fail-open, same degradation contract as every
+          // other KV miss path. Requires Content-Length (chunked TE has none;
+          // those already skip inspection via the content_length==0 gate).
+          if (needs_body_inspection &&
+              pfe->http_content_length > SP_JSON_INSPECT_MAX) {
+            log_info("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
+                     "inspect cap %d - streaming, body inspection skipped "
+                     "(Tier-2 fail-open)",
+                     fd, pfe->http_content_length, SP_JSON_INSPECT_MAX);
+            needs_body_inspection = 0;
+          }
+
           int is_streamable = !needs_body_inspection;
           
           if (pfe->http_hok && is_streamable && pfe->http_content_length > (64 * 1024)) {
