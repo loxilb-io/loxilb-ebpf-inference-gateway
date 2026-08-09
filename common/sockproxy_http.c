@@ -5698,10 +5698,15 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     }
 #endif
     
-    /* Selection/connect failed and the client gets a raw shutdown with no
-     * HTTP error body. Counted so this contract gap is visible in metrics
-     * until a generalized connect-retry + 502/503 lands for non-P/D paths. */
-    atomic_fetch_add(&global_stats.lb_select_failure_shutdown, 1);
+    /* Selection/connect failed. Every rule-matched failure path now emits an
+     * HTTP error body first (P/D 429/503, generalized connect-retry 502,
+     * all-down 503) and marks lb_err_body_sent — so this counter now ticks
+     * ONLY for a genuinely silent raw reset (no-rule paths, or a new failure
+     * path that forgot its error body). Nonzero == contract gap. */
+    if (!pfe->lb_err_body_sent) {
+      atomic_fetch_add(&global_stats.lb_select_failure_shutdown, 1);
+    }
+    pfe->lb_err_body_sent = 0;
     proxy_destroy_eps(pfe->fd, &ep_sel);
     shutdown(pfe->fd, SHUT_RDWR);
     return -1;

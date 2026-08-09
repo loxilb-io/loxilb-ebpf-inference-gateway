@@ -985,6 +985,10 @@ struct proxy_fd_ent {
                                      // request survives in pd_saved_headers/pd_saved_body,
                                      // so ONE re-dispatch against a re-selected EP is safe;
                                      // a second death fails the request (503).
+  uint8_t  lb_err_body_sent;         // An HTTP error body already went to this client for
+                                     // the current selection/connect failure — the caller's
+                                     // raw-shutdown accounting (lb_select_failure_shutdown)
+                                     // must then NOT count it as a silent reset.
 
   /* single-role Tier-1.5 load-accounting bookkeeping.
    * kv_sr_load_held == 1 marks "this client pfe holds ONE active_conns unit on

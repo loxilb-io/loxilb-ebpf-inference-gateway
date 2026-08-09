@@ -428,6 +428,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "\"detail\":\"L7 FORWARD resolved no backend pool\"}\r\n";
                   send(pfe->fd, l7_no_pool_resp, strlen(l7_no_pool_resp),
                        MSG_DONTWAIT | MSG_NOSIGNAL);
+                  pfe->lb_err_body_sent = 1;
                 }
                 return -1;
               }
@@ -457,6 +458,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                    MSG_DONTWAIT | MSG_NOSIGNAL);
               log_info("[MODEL_ROUTING] 503 sent for model='%s' on fd=%d",
                        effective_model, pfe->fd);
+              pfe->lb_err_body_sent = 1;
               return -1;
             }
             // PB-4 FIX: When find_endpoint_lpm returns NULL (no path prefix matched,
@@ -475,6 +477,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                    MSG_DONTWAIT | MSG_NOSIGNAL);
               log_info("[PROXY_NO_ROUTE] 503 sent: no prefix match for path='%s' on fd=%d",
                        request_path ? request_path : "", pfe->fd);
+              pfe->lb_err_body_sent = 1;
               return -1;
             }
             // Non-HTTP path (raw TCP, no pfe): keep backward-compat fallback
@@ -689,6 +692,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\"detail\":\"all prefill endpoints at in-flight capacity\"}\r\n";
               send(pfe->fd, pd_429_resp, strlen(pd_429_resp),
                    MSG_DONTWAIT | MSG_NOSIGNAL);
+              pfe->lb_err_body_sent = 1;
             }
             return -1;
           }
@@ -716,6 +720,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\"detail\":\"no healthy prefill or decode endpoint\"}\r\n";
               send(pfe->fd, pd_503_resp, strlen(pd_503_resp),
                    MSG_DONTWAIT | MSG_NOSIGNAL);
+              pfe->lb_err_body_sent = 1;
             }
             return -1;
           }
@@ -877,6 +882,21 @@ pd_fallback_normal:
           if (!found_active) {
             log_error("proxy_find_ep: All endpoints inactive for service %s:%u",
                       inet_ntoa(*(struct in_addr *)(&xip)), ntohs(xport));
+            /* A real HTTP error, not a raw reset — the whole pool
+             * is down/CB-open at selection time (the detection-window shape on
+             * a small rule: one dead EP can be the entire pool). */
+            if (pfe) {
+              const char *lb_all_down_503 =
+                  "HTTP/1.1 503 Service Unavailable\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Connection: close\r\n"
+                  "\r\n"
+                  "{\"error\":\"no_healthy_backend\","
+                  "\"detail\":\"all backend endpoints down or circuit-broken\"}\r\n";
+              send(pfe->fd, lb_all_down_503, strlen(lb_all_down_503),
+                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              pfe->lb_err_body_sent = 1;
+            }
             return -1;  // No active endpoints available
           }
         } else {
@@ -1021,6 +1041,94 @@ pd_fallback_normal:
             /* Clear EP indices so pd_cleanup() skips double-decrement */
             pfe->pd_prefill_ep_idx = -1;
             pfe->pd_decode_ep_idx  = -1;
+            pfe->lb_err_body_sent = 1;
+          } else if (pfe) {
+            /* Generic mid-cycle failover for non-P/D rules — the sibling of
+             * the US-PD804 block above. Until now a backend connect failure on
+             * a single-role/normal rule during the health-detection window was
+             * a raw shutdown with NO HTTP error and NO retry: every request
+             * routed to the dead EP became a TCP reset. The failed selection's
+             * load state is already unwound above (CB record, chwbl_dec_load,
+             * single-role unit release), so walk the remaining healthy EPs
+             * round-robin; a successful connect re-applies the selector's load
+             * accounting for the replacement (paired with the ep_num-keyed
+             * teardown decrements). Only when every candidate is exhausted
+             * does the client get an HTTP 502. */
+            int nx_orig = sel;
+            uint32_t nx_excluded =
+                (sel >= 0 && sel < 32) ? (1u << (unsigned)sel) : 0;
+            int nx_fd = -1, nx_sel = -1;
+
+            for (int nx_try = 0; nx_try < tepval->n_eps; nx_try++) {
+              int cand = -1;
+              for (int a = 0; a < tepval->n_eps && a < 32; a++) {
+                int c = (tepval->ep_sel + a) % tepval->n_eps;
+                if (c < 0 || c >= 32) continue;
+                if (nx_excluded & (1u << (unsigned)c)) continue;
+                if (!is_endpoint_healthy(tepval, c)) continue;
+                cand = c;
+                break;
+              }
+              if (cand < 0) break;  /* no healthy candidates left */
+
+              nx_fd = proxy_setup_ep_connect(tepval->eps[cand].xip,
+                                             tepval->eps[cand].xport,
+                                             tepval->eps[cand].protocol,
+                                             ssl_ctx, ssl, pfe, pp2hdr, pp2len);
+              if (nx_fd >= 0) {
+                nx_sel = cand;
+                tepval->ep_sel = cand + 1;  /* keep RR rotation moving */
+                break;
+              }
+              /* This candidate is also unreachable — condemn and continue. */
+              circuit_breaker_record_failure(tepval, cand);
+              nx_excluded |= 1u << (unsigned)cand;
+            }
+
+            if (nx_fd >= 0) {
+#ifdef HAVE_DP_GPU_ROUTING
+              /* CHWBL/WRR_HASH charge their load inside selection; teardown
+               * decrements by ep_num — re-apply for the replacement so the
+               * pairing holds (the failed EP's unit was released above). */
+              if ((tepval->select == PROXY_SEL_CHWBL ||
+                   tepval->select == PROXY_SEL_WRR_HASH) && tepval->chwbl_config) {
+                atomic_fetch_add(
+                    &tepval->chwbl_config->ep_loads[nx_sel].active_conns, 1);
+              }
+#endif /* HAVE_DP_GPU_ROUTING */
+              /* Single-role Tier-1.5: re-claim the active_conns unit on the
+               * replacement so the adaptive/CHWBL blend keeps a true load
+               * signal (the failed EP's unit was released above). */
+              if (tepval->kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE) {
+                atomic_fetch_add(&tepval->pd_ep_loads[nx_sel].active_conns, 1);
+                pfe->kv_sr_load_held = 1;
+                pfe->kv_sr_ep_idx = nx_sel;
+                if (!pfe->epv) pfe->epv = tepval;
+              }
+              ep_sel->ep_cfds[0].ep_cfd = nx_fd;
+              sel = nx_sel;
+              log_info("LB mid-cycle failover: EP%d unreachable -> EP%d (fd=%d)",
+                       nx_orig, nx_sel, pfe->fd);
+              /* Same counting rule as the P/D block: inside the retry path,
+               * never at the shared fall-through label. */
+              atomic_fetch_add(&global_stats.pd_connect_failover, 1);
+              goto pd_failover_ok;
+            }
+
+            /* All candidates exhausted — a real HTTP error, not a raw reset. */
+            log_error("LB mid-cycle failover exhausted all EPs (orig=EP%d) — 502",
+                      nx_orig);
+            {
+              const char *lb_502 =
+                  "HTTP/1.1 502 Bad Gateway\r\n"
+                  "Content-Type: application/json\r\n"
+                  "Connection: close\r\n"
+                  "\r\n"
+                  "{\"error\":\"backend_unreachable\","
+                  "\"detail\":\"no healthy backend endpoint accepted the connection\"}\r\n";
+              send(pfe->fd, lb_502, strlen(lb_502), MSG_DONTWAIT | MSG_NOSIGNAL);
+            }
+            pfe->lb_err_body_sent = 1;
           }
 
           return -1;
