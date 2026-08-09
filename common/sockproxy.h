@@ -980,6 +980,11 @@ struct proxy_fd_ent {
   uint64_t pd_decode_start_ns;       // Monotonic timestamp for decode latency
   size_t   pd_decode_content_length; // Content-Length from non-SSE decode response headers
   size_t   pd_decode_bytes_received; // Decode response body bytes received so far
+  uint8_t  pd_prefill_retries;       // Prefill mid-request failovers consumed (budget: 1).
+                                     // Prefill is side-effect-idempotent and the complete
+                                     // request survives in pd_saved_headers/pd_saved_body,
+                                     // so ONE re-dispatch against a re-selected EP is safe;
+                                     // a second death fails the request (503).
 
   /* single-role Tier-1.5 load-accounting bookkeeping.
    * kv_sr_load_held == 1 marks "this client pfe holds ONE active_conns unit on

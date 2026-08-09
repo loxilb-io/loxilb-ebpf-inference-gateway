@@ -3742,6 +3742,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
   fd_ent->pd_decode_start_ns = 0;
   fd_ent->pd_decode_content_length = 0;
   fd_ent->pd_decode_bytes_received = 0;
+  fd_ent->pd_prefill_retries = 0;
 }
 
 /* Update Content-Length header in HTTP request buffer.
@@ -3788,6 +3789,315 @@ pd_update_content_length(uint8_t *buf, size_t *buf_len, size_t buf_capacity,
 
 /* proxy_release_fd_ctx moved to sockproxy_conn.c */
 
+/* Rewrite the prefill address inside a P/D request-id receipt
+ * (___prefill_addr_<ep>___decode_addr_<ep>_<uuid>) within an HTTP header
+ * block. buf/len describe the full request; the search is bounded to the
+ * header region. Returns 0 when a rewrite happened, -1 otherwise. */
+static int
+pd_receipt_rewrite(uint8_t *buf, size_t *len, size_t cap, const char *n_addr)
+{
+  uint8_t *he = memmem(buf, *len, "\r\n\r\n", 4);
+  size_t hdr_len = he ? (size_t)(he + 4 - buf) : 0;
+  char *tag = hdr_len ? memmem(buf, hdr_len, "___prefill_addr_", 16) : NULL;
+  char *a_start = tag ? tag + 16 : NULL;
+  char *a_end = a_start ? memmem(a_start, (size_t)((char *)buf + hdr_len - a_start),
+                                 "___decode_addr_", 15) : NULL;
+  if (!a_start || !a_end) return -1;
+
+  int n_len = (int)strlen(n_addr);
+  int o_len = (int)(a_end - a_start);
+  int shift = n_len - o_len;
+  if (n_len <= 0 || *len + (size_t)(shift > 0 ? shift : 0) > cap) return -1;
+  if (shift != 0) {
+    memmove(a_end + shift, a_end, *len - (size_t)(a_end - (char *)buf));
+    *len = (size_t)((ssize_t)*len + shift);
+  }
+  memcpy(a_start, n_addr, (size_t)n_len);
+  return 0;
+}
+
+/* P/D prefill mid-request failover.
+ *
+ * When the prefill backend dies while the request is still in
+ * PREFILL_SENDING/PREFILL_WAITING, the COMPLETE original request survives on
+ * the client pfe (pd_saved_headers + pd_saved_body) and prefill is
+ * side-effect-idempotent (max_tokens=1 KV-warm), so the request is re-driven
+ * ONCE against a freshly selected healthy prefill EP instead of surfacing a
+ * 503. Runs AFTER proxy_pdestroy drops PROXY_LOCK (registering the
+ * replacement leg re-takes it, and the lock is not recursive). This is safe
+ * against client teardown because every backend fd is pinned to its client
+ * fd's notify worker (the Option-A pinning in setup_proxy_path), so the dying
+ * prefill leg's proxy_pdestroy and any client-side relay/close serialize on
+ * this same thread.
+ *
+ * hdrs/body are heap COPIES taken under PROXY_LOCK and owned (always freed)
+ * here — the originals stay on the client pfe for the decode phase, and the
+ * cross-thread reaper can never see a half-donated buffer.
+ *
+ * On any failure this function completes the legacy contract itself: 503 to
+ * the client, prefill_error recorded, pd state cleaned, client closed. */
+static void
+pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
+                 uint8_t *hdrs, size_t hdrs_len,
+                 uint8_t *body, size_t body_len)
+{
+  proxy_epval_t *tepval;
+  uint8_t *prefill_buf = NULL;
+  uint8_t *req = NULL;
+  size_t req_len = 0;
+  int new_idx = -1;
+  int ep_cfd = -1;
+
+  if (!client_pfe || !client_pfe->epv) goto fail;
+  tepval = (proxy_epval_t *)client_pfe->epv;
+
+  if (client_pfe->pd_phase != PD_PHASE_PREFILL_SENDING &&
+      client_pfe->pd_phase != PD_PHASE_PREFILL_WAITING) goto fail;
+
+  {
+    uint32_t excluded = 0;
+    int saved_decode = client_pfe->pd_decode_ep_idx;
+    if (dead_idx >= 0 && dead_idx < 32) excluded |= 1u << (unsigned)dead_idx;
+
+    for (int attempt = 0; attempt < tepval->n_prefill_eps; attempt++) {
+      int cand = -1;
+      int rc = pd_select_prefill(tepval, client_pfe, &cand, excluded);
+      /* A Tier-0 session hit inside pd_select_prefill may overwrite the
+       * decode hint; the decode EP for THIS request was already chosen at
+       * admission and its selection must stand — always restore it. */
+      client_pfe->pd_decode_ep_idx = saved_decode;
+      if (rc != 0 || cand < 0)
+        break;  /* no healthy candidates (park/shed count as none mid-request) */
+
+      /* PROXY protocol v2 parity with the admission-time prefill leg. */
+      uint8_t pp2buf[28];
+      int pp2len = 0;
+      {
+        proxy_map_ent_t *hent = (proxy_map_ent_t *)client_pfe->head;
+        if (hent && hent->val.ppv2) {
+          struct sockaddr_in cli, vip;
+          socklen_t cl = sizeof(cli), vl = sizeof(vip);
+          if (getpeername(client_pfe->fd, (struct sockaddr *)&cli, &cl) == 0 &&
+              getsockname(client_pfe->fd, (struct sockaddr *)&vip, &vl) == 0 &&
+              cli.sin_family == AF_INET && vip.sin_family == AF_INET) {
+            pp2len = proxy_build_ppv2_v4(pp2buf, sizeof(pp2buf),
+                                         cli.sin_addr.s_addr, cli.sin_port,
+                                         vip.sin_addr.s_addr, vip.sin_port);
+          }
+        }
+      }
+      ep_cfd = proxy_setup_ep_connect(tepval->eps[cand].xip,
+                                      tepval->eps[cand].xport,
+                                      IPPROTO_TCP, NULL, NULL, client_pfe,
+                                      (pp2len ? pp2buf : NULL), pp2len);
+      if (ep_cfd >= 0) { new_idx = cand; break; }
+      /* Sync connect failure — condemn and try the next candidate. */
+      circuit_breaker_record_failure(tepval, cand);
+      if (cand >= 0 && cand < 32) excluded |= 1u << (unsigned)cand;
+    }
+
+    if (ep_cfd < 0 || new_idx < 0) goto fail;
+
+    /* Rebuild the prefill request exactly as at admission: deterministic
+     * max_tokens=1/stream=false rewrite of the ORIGINAL body under the
+     * ORIGINAL headers (same X-Request-Id), with Content-Length re-fitted. */
+    size_t prefill_cap = body_len + 4096;
+    size_t prefill_len = 0;
+    prefill_buf = malloc(prefill_cap);
+    if (!prefill_buf ||
+        pd_prepare_prefill_body(body, body_len, prefill_buf, &prefill_len,
+                                prefill_cap) != 0) {
+      log_error("prefill failover: body rewrite failed (client_fd=%d)",
+                client_pfe->fd);
+      close(ep_cfd);
+      goto fail;
+    }
+    size_t req_cap = hdrs_len + prefill_len + 256;
+    req = malloc(req_cap);
+    if (!req) { close(ep_cfd); goto fail; }
+    memcpy(req, hdrs, hdrs_len);
+    memcpy(req + hdrs_len, prefill_buf, prefill_len);
+    req_len = hdrs_len + prefill_len;
+    pd_update_content_length(req, &req_len, req_cap, prefill_len);
+
+    /* The request-id receipt (___prefill_addr_<ep>___decode_addr_<ep>_<uuid>)
+     * was stamped at admission and names the DEAD prefill EP. Point it at the
+     * replacement (same nixl_port-else-xport formatting as admission) in BOTH
+     * the retried prefill request and the SAVED headers — the decode request
+     * is rebuilt from the saved headers and the client-visible response id
+     * echoes it, so a prefill-only rewrite would still report the dead node
+     * as the request's prefill server. uuid tail + decode addr stay,
+     * preserving trace continuity. */
+    {
+      char n_addr[64];
+      struct in_addr n_in = { .s_addr = tepval->eps[new_idx].xip };
+      uint16_t n_port = tepval->eps[new_idx].nixl_port ?
+                        ntohs(tepval->eps[new_idx].nixl_port) :
+                        ntohs(tepval->eps[new_idx].xport);
+      snprintf(n_addr, sizeof(n_addr), "%s:%u", inet_ntoa(n_in), n_port);
+      pd_receipt_rewrite(req, &req_len, req_cap, n_addr);
+
+      size_t sh_cap = hdrs_len + 80;
+      uint8_t *sh = malloc(sh_cap);
+      if (sh) {
+        memcpy(sh, hdrs, hdrs_len);
+        size_t sh_len = hdrs_len;
+        if (pd_receipt_rewrite(sh, &sh_len, sh_cap, n_addr) == 0) {
+          /* Single-owner swap (pd_free_claim discipline): a racing cleanup
+           * claims-or-sees-NULL and never double-frees. */
+          uint8_t *old_sh = __atomic_exchange_n(&client_pfe->pd_saved_headers,
+                                                NULL, __ATOMIC_ACQ_REL);
+          free(old_sh);
+          client_pfe->pd_saved_headers_len = sh_len;
+          __atomic_store_n(&client_pfe->pd_saved_headers, sh, __ATOMIC_RELEASE);
+        } else {
+          free(sh);
+        }
+      }
+    }
+
+    proxy_fd_ent_t *bpfe = pfe_alloc();
+    if (!bpfe) { close(ep_cfd); goto fail; }
+    bpfe->stype = PROXY_SOCK_ACTIVE;
+    bpfe->pd_decode_ep_idx = -1;
+    bpfe->fd = ep_cfd;
+    bpfe->rfd[0] = client_pfe->fd;
+    bpfe->rfd_ent[0] = client_pfe;
+    bpfe->seltype = client_pfe->seltype;
+    bpfe->ep_num = -1;
+    bpfe->odir = 1;
+    bpfe->n_rfd = 1;
+    bpfe->head = client_pfe->head;
+    bpfe->sse_mode = client_pfe->sse_mode;
+    bpfe->max_stream_duration_sec = client_pfe->max_stream_duration_sec;
+    bpfe->backend_keepalive_sec = client_pfe->backend_keepalive_sec;
+    /* Same framer setup as the decode leg: legacy HTTP_BOTH +
+     * handle_on_message_complete (the odir==1 PREFILL_WAITING branch drives
+     * completion), lazily re-inited as HTTP_RESPONSE under pd_framing_v2. */
+    if (pd_framing_v2_on()) {
+      pd_resp_parser_init(bpfe);
+    } else {
+      llhttp_init(&bpfe->parser, HTTP_BOTH, &bpfe->settings);
+      bpfe->settings.on_message_complete = handle_on_message_complete;
+      bpfe->settings.uarg = bpfe;
+    }
+
+    /* Move the admission active_conns unit dead -> replacement so
+     * pd_cleanup's decrement of the final pd_prefill_ep_idx stays balanced. */
+    if (dead_idx >= 0 && dead_idx < tepval->n_eps) {
+      uint32_t cur = atomic_load(&tepval->pd_ep_loads[dead_idx].active_conns);
+      if (cur > 0)
+        atomic_fetch_sub(&tepval->pd_ep_loads[dead_idx].active_conns, 1);
+    }
+    atomic_fetch_add(&tepval->pd_ep_loads[new_idx].active_conns, 1);
+    client_pfe->pd_prefill_ep_idx = new_idx;
+
+    /* Link the replacement leg (the dead leg's slot was detached in
+     * proxy_pdestroy) and restart the prefill state machine. Any partial
+     * response from the dead EP is dropped by resetting the resp length. */
+    if (client_pfe->n_rfd < MAX_PROXY_EP) {
+      int slot = client_pfe->n_rfd;
+      client_pfe->rfd[slot] = ep_cfd;
+      client_pfe->rfd_ent[slot] = bpfe;
+      client_pfe->n_rfd++;
+    }
+    client_pfe->pd_prefill_resp_len = 0;
+    client_pfe->pd_phase = PD_PHASE_PREFILL_WAITING;
+    client_pfe->pd_phase_start_ts = time(NULL);
+    {
+      struct timespec _ts;
+      clock_gettime(CLOCK_MONOTONIC, &_ts);
+      client_pfe->pd_prefill_start_ns =
+          (uint64_t)_ts.tv_sec * 1000000000ULL + (uint64_t)_ts.tv_nsec;
+    }
+
+    {
+      proxy_map_ent_t *hent = (proxy_map_ent_t *)client_pfe->head;
+      if (hent) {
+        PROXY_LOCK();
+        bpfe->next = hent->val.fdlist;
+        hent->val.fdlist = bpfe;
+        hent->val.nfds++;
+        PROXY_UNLOCK();
+        /* Option-A pinning: relay + teardown for the new leg serialize on the
+         * client fd's worker, like every other backend leg. */
+        notify_add_ent_pinned(proxy_struct->ns, ep_cfd,
+                              NOTI_TYPE_IN|NOTI_TYPE_HUP, bpfe, bpfe->gen,
+                              client_pfe->fd);
+      }
+    }
+
+    {
+      size_t sent = 0;
+      while (sent < req_len) {
+        ssize_t n = write(ep_cfd, req + sent, req_len - sent);
+        if (n <= 0) {
+          if (errno == EINTR || errno == EAGAIN) continue;
+          /* The registered leg will error out and its proxy_pdestroy runs the
+           * exhausted-budget 503 path (pd_prefill_retries already consumed). */
+          log_error("prefill failover: send to EP%d failed: %s",
+                    new_idx, strerror(errno));
+          goto done;
+        }
+        sent += (size_t)n;
+      }
+    }
+
+    /* Re-pin the session to the healthy pair (admission failover parity). */
+    {
+      const char *sk = NULL;
+      if (client_pfe->has_user_id && client_pfe->user_id[0] != '\0')
+        sk = client_pfe->user_id;
+      if (client_pfe->has_conv_id && client_pfe->conversation_id[0] != '\0' &&
+          strncmp(client_pfe->conversation_id, "auto-", 5) != 0)
+        sk = client_pfe->conversation_id;
+      if (sk) pd_session_store(tepval, sk, new_idx, saved_decode);
+    }
+
+    atomic_fetch_add(&global_stats.pd_connect_failover, 1);
+    log_info("prefill mid-request failover: EP%d died -> EP%d "
+             "(client_fd=%d req=%zuB)",
+             dead_idx, new_idx, client_pfe->fd, req_len);
+  }
+  goto done;
+
+fail:
+  if (client_pfe) {
+    static const char pd_prefill_err[] =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"error\":\"pd_pool_unavailable\",\"detail\":\"prefill backend connection dropped\"}";
+    log_error("prefill failover exhausted — 503 to client_fd=%d (dead EP%d)",
+              client_pfe->fd, dead_idx);
+    {
+      const char *pd_model = proxy_effective_model(client_pfe);
+      int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+      llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 1 /*prefill error*/);
+    }
+    if (client_pfe->fd > 0) {
+      if (client_pfe->ssl) {
+        SSL_write(client_pfe->ssl, pd_prefill_err, sizeof(pd_prefill_err) - 1);
+      } else {
+        send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
+             MSG_DONTWAIT | MSG_NOSIGNAL);
+      }
+    }
+    pd_cleanup(client_pfe);
+    client_pfe->pd_phase = PD_PHASE_ERROR;
+    /* The client was detached from the dying leg before the retry, so its
+     * teardown no longer cascades — close it explicitly. */
+    notify_delete_ent(proxy_struct->ns, client_pfe->fd, 0);
+  }
+
+done:
+  free(prefill_buf);
+  free(req);
+  free(hdrs);
+  free(body);
+}
+
 static void
 proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
 {
@@ -3830,6 +4140,17 @@ proxy_pdestroy(void *priv)
   proxy_fd_ent_t *pfe = priv;
   proxy_fd_ent_t *fd_ent;
   int is_listener = 0;
+
+  /* Prefill mid-request failover work is COLLECTED under PROXY_LOCK below and
+   * EXECUTED after the final PROXY_UNLOCK (pd_retry_prefill re-takes the
+   * non-recursive lock to register the replacement leg). */
+  struct {
+    proxy_fd_ent_t *cpfe;
+    int dead_idx;
+    uint8_t *hdrs; size_t hdrs_len;
+    uint8_t *body; size_t body_len;
+  } pd_retry_pend[MAX_PROXY_EP];
+  int n_pd_retry_pend = 0;
 
   assert(pfe);
 
@@ -3874,23 +4195,89 @@ proxy_pdestroy(void *priv)
         if (client_pfe &&
             client_pfe->pd_phase >= PD_PHASE_PREFILL_SENDING &&
             client_pfe->pd_phase <= PD_PHASE_PREFILL_DONE) {
-          /* P5-fix: 503 (not 502) — prefill backend connection drop means
-           * the P/D backend pool is unavailable, not a proxy protocol error. */
-          static const char pd_prefill_err[] =
-              "HTTP/1.1 503 Service Unavailable\r\n"
-              "Content-Type: application/json\r\n"
-              "Connection: close\r\n"
-              "\r\n"
-              "{\"error\":\"pd_pool_unavailable\",\"detail\":\"prefill backend connection dropped\"}";
           log_error("Prefill backend died — client_fd=%d backend_fd=%d "
                     "phase=%d", client_pfe->fd, pfe->fd, client_pfe->pd_phase);
           atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
-          if (client_pfe->fd > 0) {
-            send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
-                 MSG_DONTWAIT | MSG_NOSIGNAL);
+
+          /* Prefill mid-request failover: the complete request survives in
+           * pd_saved_headers/pd_saved_body and prefill is idempotent, so
+           * defer ONE re-dispatch against a re-selected EP instead of
+           * failing the client. Buffers are heap-COPIED here (under
+           * PROXY_LOCK) so the decode phase keeps the originals. TLS backend
+           * legs are excluded for parity with the decode leg (which connects
+           * plaintext). */
+          int pd_deferred = 0;
+          if ((client_pfe->pd_phase == PD_PHASE_PREFILL_SENDING ||
+               client_pfe->pd_phase == PD_PHASE_PREFILL_WAITING) &&
+              client_pfe->pd_prefill_retries == 0 &&
+              client_pfe->epv && !pfe->ssl &&
+              client_pfe->pd_saved_headers &&
+              client_pfe->pd_saved_headers_len > 0 &&
+              client_pfe->pd_saved_body &&
+              client_pfe->pd_saved_body_len > 0 &&
+              n_pd_retry_pend < MAX_PROXY_EP) {
+            uint8_t *rh = malloc(client_pfe->pd_saved_headers_len);
+            uint8_t *rb = rh ? malloc(client_pfe->pd_saved_body_len) : NULL;
+            if (rh && rb) {
+              memcpy(rh, client_pfe->pd_saved_headers,
+                     client_pfe->pd_saved_headers_len);
+              memcpy(rb, client_pfe->pd_saved_body,
+                     client_pfe->pd_saved_body_len);
+              client_pfe->pd_prefill_retries = 1;
+              /* Detach both directions so this leg's teardown below cannot
+               * cascade-close the client (US-H202 idiom). */
+              for (int j = 0; j < MAX_PROXY_EP; j++) {
+                if (client_pfe->rfd_ent[j] == pfe) {
+                  client_pfe->rfd_ent[j] = NULL;
+                  client_pfe->rfd[j] = -1;
+                  if (client_pfe->n_rfd > 0) client_pfe->n_rfd--;
+                  break;
+                }
+              }
+              pd_retry_pend[n_pd_retry_pend].cpfe = client_pfe;
+              pd_retry_pend[n_pd_retry_pend].dead_idx =
+                  client_pfe->pd_prefill_ep_idx;
+              pd_retry_pend[n_pd_retry_pend].hdrs = rh;
+              pd_retry_pend[n_pd_retry_pend].hdrs_len =
+                  client_pfe->pd_saved_headers_len;
+              pd_retry_pend[n_pd_retry_pend].body = rb;
+              pd_retry_pend[n_pd_retry_pend].body_len =
+                  client_pfe->pd_saved_body_len;
+              n_pd_retry_pend++;
+              pfe->rfd_ent[pd_i] = NULL;
+              pfe->n_rfd--;
+              pd_deferred = 1;
+            } else {
+              free(rh);
+              free(rb);
+            }
           }
-          pd_cleanup(client_pfe);
-          client_pfe->pd_phase = PD_PHASE_ERROR;
+
+          if (!pd_deferred) {
+            /* P5-fix: 503 (not 502) — prefill backend connection drop means
+             * the P/D backend pool is unavailable, not a proxy protocol
+             * error. */
+            static const char pd_prefill_err[] =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"pd_pool_unavailable\",\"detail\":\"prefill backend connection dropped\"}";
+            /* Record the failed lifecycle so prefill-death 503s are visible
+             * in the P/D request metrics (previously logs-only). */
+            {
+              const char *pd_model = proxy_effective_model(client_pfe);
+              int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+              llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv,
+                               1 /*prefill error*/);
+            }
+            if (client_pfe->fd > 0) {
+              send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,
+                   MSG_DONTWAIT | MSG_NOSIGNAL);
+            }
+            pd_cleanup(client_pfe);
+            client_pfe->pd_phase = PD_PHASE_ERROR;
+          }
         }
       }
 
@@ -4045,6 +4432,15 @@ proxy_pdestroy(void *priv)
     }
   }
   PROXY_UNLOCK();
+
+  /* Deferred prefill mid-request failovers (collected above under
+   * PROXY_LOCK). Same-thread with the dying leg's teardown — the client pfe
+   * cannot be concurrently torn down (Option-A worker pinning). */
+  for (int ri = 0; ri < n_pd_retry_pend; ri++) {
+    pd_retry_prefill(pd_retry_pend[ri].cpfe, pd_retry_pend[ri].dead_idx,
+                     pd_retry_pend[ri].hdrs, pd_retry_pend[ri].hdrs_len,
+                     pd_retry_pend[ri].body, pd_retry_pend[ri].body_len);
+  }
 }
 
 static void
