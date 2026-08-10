@@ -143,6 +143,14 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_miss_no_worker;    // llb_ai_kv_best_worker returned no candidate
     _Atomic uint64_t pd_kv_t15_miss_excluded;     // candidate EP excluded (health / load)
     _Atomic uint64_t pd_kv_t15_fallthrough_total; // Tier 1.5 skipped entirely -> Tier 2 path
+    // Failover observability: endpoint-death and failover EVENTS (as detected
+    // per connection), distinct from the request-outcome counters in
+    // loxilb_ai_pd_requests_total. Zero increments == no failovers happened.
+    _Atomic uint64_t pd_prefill_ep_died;        // prefill backend died mid-request (client got 503)
+    _Atomic uint64_t pd_decode_ep_died;         // decode EP failure: init-connect failure or zero-byte EOF
+    _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
+    _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
+    _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
     // (C3): per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
@@ -972,6 +980,15 @@ struct proxy_fd_ent {
   uint64_t pd_decode_start_ns;       // Monotonic timestamp for decode latency
   size_t   pd_decode_content_length; // Content-Length from non-SSE decode response headers
   size_t   pd_decode_bytes_received; // Decode response body bytes received so far
+  uint8_t  pd_prefill_retries;       // Prefill mid-request failovers consumed (budget: 1).
+                                     // Prefill is side-effect-idempotent and the complete
+                                     // request survives in pd_saved_headers/pd_saved_body,
+                                     // so ONE re-dispatch against a re-selected EP is safe;
+                                     // a second death fails the request (503).
+  uint8_t  lb_err_body_sent;         // An HTTP error body already went to this client for
+                                     // the current selection/connect failure — the caller's
+                                     // raw-shutdown accounting (lb_select_failure_shutdown)
+                                     // must then NOT count it as a silent reset.
 
   /* single-role Tier-1.5 load-accounting bookkeeping.
    * kv_sr_load_held == 1 marks "this client pfe holds ONE active_conns unit on
@@ -1191,7 +1208,7 @@ struct proxy_arg {
   uint8_t  pd_cache_aware_mode;
   uint8_t  pd_cache_threshold;
   uint8_t  pd_balance_abs_threshold;
-  uint8_t  pad_pd_cache_arg;           // alignment
+  uint8_t  cb_enable;                  // per-endpoint circuit breaker (replaces pad_pd_cache_arg)
   uint32_t pd_session_ttl_sec;
 
   // KV-Cache Exact Routing configuration 

@@ -2479,6 +2479,9 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->pd_balance_abs_threshold = dat->pd_balance_abs_threshold;
   pval->pd_session_ttl_sec = dat->pd_session_ttl_sec;
 
+  // Per-endpoint circuit breaker enable (opt-in per rule)
+  pval->cb_enable = dat->cb_enable;
+
   // KV-Cache Exact Routing configuration (: gap closure)
   pval->kv_exact_mode  = dat->kv_exact_mode;
   pval->kv_hash_algo   = dat->kv_hash_algo;
