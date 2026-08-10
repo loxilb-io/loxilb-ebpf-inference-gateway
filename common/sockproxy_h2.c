@@ -883,7 +883,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
 
     // on the L7_Proxy peer only ( gate),
     // inject a stateless HTTP_COOKIE Set-Cookie into the relayed HEADERS frame
-    // BEFORE submit — via the NON-TERMINAL seam proven by 76-03's test_pd C-unit.
+    // BEFORE submit — via the NON-TERMINAL seam proven by an earlier cycle's test_pd C-unit.
     // We append to the SAME mapping->response_headers[] the relay submits below
     // and touch no frame flag, so the backend's END_STREAM bit (computed just
     // below from frame->hd.flags) and the body DATA frames are unaffected
@@ -930,7 +930,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     // seam (l7_hsts_synthesize — one synthesizer, two emit seams) into
     // an nghttp2_nv with the LOWERCASE name "strict-transport-security" (HTTP/2
     // header rule) and inject it via the NON-TERMINAL proxy_h2_inject_resp_headers
-    // (Plan 76-03) — appends into mapping->response_headers[] BEFORE the submit
+    // (Plan ) — appends into mapping->response_headers[] BEFORE the submit
     // below, so END_STREAM and the body DATA frames are untouched. NEVER raw \r\n
     // on an H2 socket (defect 097c8dba) and NEVER nghttp2_submit_response(...NULL)
     // (terminal). SAME triple gate as H1: have_ssl && has_l7_policy &&
@@ -2425,8 +2425,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   //
   // The engine is pfe-only, but in HTTP/2 the per-request authority/path/method
   // live on the stream — so mirror them into pfe BEFORE dispatch (the contract
-  // from 75-03-SUMMARY). The generic HEADER/COOKIE store (pfe->l7_headers) is
-  // already H2-populated by Plan 75-02's proxy_h2_on_header_callback.
+  // from -SUMMARY). The generic HEADER/COOKIE store (pfe->l7_headers) is
+  // already H2-populated by Plan an earlier cycle's proxy_h2_on_header_callback.
   if (ent && ent->has_l7_policy) {
     proxy_epval_t *l7_tepval = NULL;
     int l7_rc;

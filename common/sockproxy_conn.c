@@ -660,15 +660,15 @@ pfe_alloc(void)
   pfe_pool_live++;
   pthread_mutex_unlock(&pfe_pool_lock);
 
-  /* (AC-4): the global total-footprint gauge — incremented here, the
+  /* : the global total-footprint gauge — incremented here, the
    * ONE point loxilb commits to holding a connection's footprint (the pfe
    * checkout), and decremented (>0-guarded) on pfe_recycle, exactly balanced with
    * pfe_pool_live above. Every OOM bail-out below mirrors the matching pfe_pool_live
    * decrement so the gauge can never leak (a leak would wedge accept() intake).
    *
-   * 93-06 (default-off): maintain this gauge ONLY when the total-inflight bound is
+   * (default-off): maintain this gauge ONLY when the total-inflight bound is
    * enabled (LLB_PD_MAX_TOTAL_INFLIGHT > 0). With the knob unset there is NO hot-
-   * path mutation here ⇒ the pfe_alloc/recycle path is byte-identical to pre-93-06
+   * path mutation here ⇒ the pfe_alloc/recycle path is byte-identical to pre-
    * (the proven-stable p93d2). pd_max_total_inflight() is getenv-once cached and
    * CONSTANT for the process lifetime, so this inc and the dec in pfe_recycle are
    * gated identically and always stay paired 1:1. */
@@ -748,7 +748,7 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   }
   pthread_mutex_unlock(&pfe_pool_lock);
 
-  /* (AC-4): release the global total-footprint gauge, paired 1:1 with
+  /* : release the global total-footprint gauge, paired 1:1 with
    * the pfe_alloc inc above (the single client-close owner path). >0-guarded to
    * match the pfe_pool_live underflow guard / the active_conns idiom. Gated on the
    * bound being enabled (default-off byte-identical when LLB_PD_MAX_TOTAL_INFLIGHT
@@ -760,7 +760,7 @@ pfe_recycle(proxy_fd_ent_t *pfe)
                               memory_order_relaxed);
 }
 
-/* (AC-4): read-only snapshot of the pfe-pool gauges for the bounded-
+/* : read-only snapshot of the pfe-pool gauges for the bounded-
  * footprint soak observability (the soak_footprint.sh sampler reads these from a
  * periodic log line — see the proxy_drain_checker_thread emit). Lock-guarded read
  * of the leaf-mutex statics; never mutates. */

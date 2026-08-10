@@ -1,5 +1,5 @@
 /*
- * test_cb_heal.c — 93-02 (D1) proactive circuit-breaker recovery unit test.
+ * test_cb_heal.c — (D1) proactive circuit-breaker recovery unit test.
  *
  * Asserts: an OPEN circuit breaker that has been open past open_timeout_sec
  * reaches HALF_OPEN and then CLOSED driven by the 1 Hz HEALTH PASS ALONE — i.e.
@@ -165,7 +165,7 @@ static int test_half_open_failure_reopens(void) {
 }
 
 int main(void) {
-  printf("=== 93-02 proactive circuit-breaker recovery (health-pass self-heal) ===\n");
+  printf("=== proactive circuit-breaker recovery (health-pass self-heal) ===\n");
   RUN_TEST(test_heal_noop_when_closed);
   RUN_TEST(test_heal_noop_within_timeout);
   RUN_TEST(test_heal_drives_half_open);

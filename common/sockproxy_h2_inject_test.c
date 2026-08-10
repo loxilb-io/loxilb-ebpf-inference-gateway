@@ -2,9 +2,9 @@
  *
  * sockproxy_h2_inject_test.c — Plan 03 non-terminal PROOF.
  *
- * THE de-risk deliverable of 76-03: prove the net-new C primitive
+ * THE de-risk deliverable of : prove the net-new C primitive
  * proxy_h2_inject_resp_headers() is NON-TERMINAL *in this plan* (wave 0), so
- * Plans 06 (wave 2) and 07 (wave 3) may depend on `76-03` for a PROVEN
+ * Plans 06 (wave 2) and 07 (wave 3) may depend on `` for a PROVEN
  * non-terminal emitter — the body+header coexistence proof is NOT deferred to
  * Plan 08 (wave 4).
  *

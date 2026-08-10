@@ -63,7 +63,7 @@ int handle_client_data(int fd, proxy_fd_ent_t *pfe,
 /* -------------------------------------------------------------------------
  * pd_framing_v2 runtime feature-flag (REQ-R2)
  * pd_framing_v2_test_set — force the LLB_PD_FRAMING_V2 gate without
- * setenv/unsetenv races in unit tests (test_resp_framing.c, 90-02) and the
+ * setenv/unsetenv races in unit tests (test_resp_framing.c) and the
  * mismatched-flag HA variant. Mirrors kv_hash_debug_test_set.
  * ------------------------------------------------------------------------- */
 void pd_framing_v2_test_set(int on);

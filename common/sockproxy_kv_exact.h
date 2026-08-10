@@ -54,7 +54,7 @@ struct proxy_fd_ent;
 /* Default warmup period after ZMQ subscriber connects (seconds) */
 #define KV_WARMUP_DEFAULT_SEC 30
 
-/* ---------- C2 (81-07): capacity-weighted bounded-load cap ----------
+/* ---------- capacity-weighted bounded-load cap ----------
  *
  * The C-side mirror of the Go pure-Go cap math in
  * pkg/loxinet/ai_kv_unified.go (kvClampCapacity / kvCapFor). It lights up
@@ -139,7 +139,7 @@ pd_capacity_weighted_cap(uint64_t total_load, uint64_t clamped_cap_i,
 /*
  * pd_capacity_blend_score — the C2 selection score for a prefill EP, lighting
  * up the reserved PROXY_SEL_GPU_AWARE weights (sockproxy.h, defined but never
- * consumed before 81-07). Lower is better — drop-in for the COMP-07
+ * consumed before ). Lower is better — drop-in for the COMP-07
  * (active_conns + queued_requests) Tier-2 score in pd_select_prefill, but
  * capacity-aware: a larger-capacity EP is penalised LESS for the same live
  * load. With the default weights (KV_CACHE 20 / QUEUE 50 / SWAP 30) and equal
@@ -182,7 +182,7 @@ pd_capacity_blend_score(uint32_t active_conns, uint32_t queued, uint32_t swap,
   return score;
 }
 
-/* ---------- Per-stage hot-path instrumentation (C3) ---------- */
+/* ---------- Per-stage hot-path instrumentation ---------- */
 /*
  * The 4 Tier-1.5 stages timed in pd_kv_exact_select (the C3 "routing overhead"
  * breakdown). Each stage carries an independent µs latency histogram, split by
@@ -193,9 +193,9 @@ pd_capacity_blend_score(uint32_t active_conns, uint32_t queued, uint32_t swap,
  *   KV_STAGE_CGO       llb_ai_kv_best_worker  (CGO crossing; the scan stage is
  *                                              folded in here C-side — the
  *                                              inventory scan is timed Go-side
- *                                              in plan 81-02)
+ * in the design)
  *   KV_STAGE_SCAN      reserved for a C-side scan split (Go-side scan timing is
- *                      plan 81-02); kept in the enum so the histogram array and
+ * the design); kept in the enum so the histogram array and
  *                      the Go-parity bucket layout already carry the 4th slot.
  */
 enum kv_stage {
@@ -218,7 +218,7 @@ enum kv_stage {
 /*
  * record_kv_stage — accumulate one per-stage µs timing into the off-path
  * histogram for (stage, is_hit). Off-path only: a fixed-bucket atomic_fetch_add
- * mirror of record_latency_sample — NO synchronous logging (C3 anti-perturbation).
+ * mirror of record_latency_sample — NO synchronous logging (anti-perturbation rule).
  *
  *   stage       one of KV_STAGE_TOKENIZE/HASH/CGO/SCAN
  *   is_hit      1 = Tier-1.5 hit path, 0 = Tier-2 miss/fallthrough path

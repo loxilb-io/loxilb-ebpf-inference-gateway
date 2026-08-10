@@ -81,7 +81,7 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_kv_t15_miss_excluded;
     uint64_t pd_kv_t15_fallthrough_total;
 
-    /* (OBS-01): CB proactive heal (93-02) + per-EP admission layer
+    /* (OBS-01): CB proactive heal  + per-EP admission layer
  * counters. TAIL-APPEND ONLY — twin-declared in the cgo preamble
      * of api/prometheus/sockproxy_metrics.go; keep BOTH in lockstep, same commit. */
     uint64_t pd_cb_proactive_heal;

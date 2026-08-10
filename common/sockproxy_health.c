@@ -50,7 +50,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
-#include "circuit_breaker_heal.h"  /* 93-02 (D1): shared proactive-heal predicate (also unit-tested) */
+#include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
 #include "sockproxy_health.h"
 #include "sockproxy_ai_gw.h"
 #include "notify.h"
@@ -185,7 +185,7 @@ proxy_drain_checker_thread(void *arg)
  
   while (1) {
     /* Tick at 1Hz.: timeoutMemberData is enforced inside
-     * check_draining_endpoints' per-rule idle pass, and 76-04 documented the deadline as
+     * check_draining_endpoints' per-rule idle pass, and documented the deadline as
      * "rounded UP to whole seconds because this pass ticks once per second". The loop previously
      * slept 5s, so a sub-5s member stall (e.g. the gate's 3s slow backend with a 1500ms→2s deadline)
      * completed BEFORE the next pass and was never cut. All work here is wall-clock-threshold based
@@ -196,16 +196,16 @@ proxy_drain_checker_thread(void *arg)
     sleep(1);
     check_draining_endpoints();
 
-    /* (AC-4): bounded-footprint soak observability. Every ~10s emit a
+    /* : bounded-footprint soak observability. Every ~10s emit a
      * single line carrying the pfe-pool high-water gauges + the global admission
      * gauge/blocked counter so soak_footprint.sh can sample pfe_pool_live (and the
      * accept-gate activity) from `docker logs` alongside RSS. Observability-only:
      * a plain read of leaf-mutex statics + relaxed atomics — it changes NO relay /
      * accept behavior.
      *
-     * 93-06 (default-off): gated on the total-inflight bound being enabled
+     * (default-off): gated on the total-inflight bound being enabled
      * (LLB_PD_MAX_TOTAL_INFLIGHT > 0). With the knob unset the health thread takes
-     * NO extra pfe_pool_lock and emits nothing ⇒ byte-identical to pre-93-06. The
+     * NO extra pfe_pool_lock and emits nothing ⇒ byte-identical to pre-. The
      * soak harness sets the bound to observe pfe_pool_live / accept-gate activity. */
     if (pd_max_total_inflight() != 0) {
       static unsigned int fp_tick;
@@ -383,7 +383,7 @@ check_draining_endpoints(void)
           }
         }
 
-        /* 93-02 (D1): proactive circuit-breaker recovery in the 1 Hz health pass.
+        /* (D1): proactive circuit-breaker recovery in the 1 Hz health pass.
          *
          * The P/D selection path reads circuit_breakers[].state RAW (== CB_STATE_OPEN
          * -> skip) at every tier (sockproxy_pd.c:934/978/1010/1029/1055/1106/1121/1239,
@@ -408,7 +408,7 @@ check_draining_endpoints(void)
           time_t open_for = now - cb->open_ts;  /* captured before the transition for the log */
           if (circuit_breaker_proactive_heal(cb, now)) {
             atomic_fetch_add(&global_stats.pd_cb_flips, 1);          /* OBS-03: OPEN->HALF_OPEN */
-            atomic_fetch_add(&global_stats.pd_cb_proactive_heal, 1); /* 93-02: health-pass heal */
+            atomic_fetch_add(&global_stats.pd_cb_proactive_heal, 1); /* : health-pass heal */
             log_info("[CB heal] ep[%d] OPEN->HALF_OPEN driven by 1Hz health pass "
                      "(open %lds >= %us) — EP re-enters rotation, next relay success closes it",
                      ep_idx, (long)open_for, cb->open_timeout_sec);
@@ -1065,7 +1065,7 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
       cb->state = CB_STATE_CLOSED;
       cb->failure_count = 0;
       atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: HALF_OPEN→CLOSED */
-      /* 93-02 (D1): complete the recovery observability triad. The OPEN→HALF_OPEN
+      /* (D1): complete the recovery observability triad. The OPEN→HALF_OPEN
        * heal ([CB heal], sockproxy_health.c) and CLOSED→OPEN trip already log; this
        * makes the CLOSE observable too, so a full self-heal cycle is visible in the
        * docker logs without inferring it from the absence of misses (per

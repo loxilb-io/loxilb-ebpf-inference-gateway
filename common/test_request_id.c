@@ -174,11 +174,11 @@ static void test_uuid_v4_bits(void) {
    * Bits 12-15 of hi correspond to hex digit at position:
    *   hi >> 12 & 0xF = digit at position (16 - 1 - 12/4) = position 12/4 from right
    *   In "%016llx": digit 0 is MSB. Bits 63-60 = digit 0.
-   *   Bits 12-15 = digit (63-12)/4 = digit 12.75...
+   * Bits 12-15 = digit /4 = digit 12.75...
    *   Actually: digit_index = (60 - bit_position) / 4 ... no.
    *   Digit 0 = bits 63-60, digit 1 = bits 59-56, ...
    *   Digit k = bits (63 - 4k) to (60 - 4k)
-   *   For bits 12-15: k = (63-15)/4 = 12, so digit 12 */
+   * For bits 12-15: k = /4 = 12, so digit 12 */
   version = pfe.vllm_request_id[12];
   if (version != '4') {
     char errbuf[64];

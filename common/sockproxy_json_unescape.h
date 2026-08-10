@@ -9,7 +9,7 @@
 /*
  * sockproxy_json_unescape.h — bounded JSON string unescape (header-only).
  *
- * D-LC2 root fix: extract_llm_prefix() used to strncpy the RAW (still-escaped)
+ * root fix: extract_llm_prefix used to strncpy the RAW (still-escaped)
  * JSON bytes of the "prompt" value into prefix_key.prefix. The Tier-1.5
  * KV-exact selector then tokenized that RAW text — so any prompt containing a
  * JSON escape (`\n`, `\t`, `\"` … i.e. every real coding-assistant prompt)

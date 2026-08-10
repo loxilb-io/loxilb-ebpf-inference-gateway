@@ -2639,7 +2639,7 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
     pval->require_client_cn = dat->mtls_require_client_cn;
     strncpy(pval->client_cn_pattern, dat->mtls_client_cn_pattern, sizeof(pval->client_cn_pattern) - 1);
     pval->client_cn_pattern[sizeof(pval->client_cn_pattern) - 1] = '\0';
-    // explicit client-cert CRL path (empty ⇒ 77-04 sibling-crl convention).
+    // explicit client-cert CRL path (empty ⇒ sibling-crl convention).
     strncpy(pval->client_crl_path, dat->mtls_client_crl_path, sizeof(pval->client_crl_path) - 1);
     pval->client_crl_path[sizeof(pval->client_crl_path) - 1] = '\0';
 

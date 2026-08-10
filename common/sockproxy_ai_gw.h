@@ -251,7 +251,7 @@ extern void llb_ai_update_ep_queue_depth(uint32_t service_ip, uint16_t service_p
                                          int ep_index, uint32_t queued_requests);
 
 /**
- * llb_ai_update_ep_capacity – C2 (81-07): update per-EP advertised KV capacity
+ * llb_ai_update_ep_capacity – update per-EP advertised KV capacity
  * (vLLM cache_config_info num_gpu_blocks) from the Go vLLM scraper. Mirrors
  * llb_ai_update_ep_queue_depth exactly (PROXY_LOCK + atomic_store, MAX_PROXY_EP
  * bound, pd_disagg + n_eps guard) so pd_select_prefill's capacity-weighted
@@ -394,7 +394,7 @@ extern int llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
  *                  preserved; explicit env on/off overrides globally). A hot
  *                  single-cached prefix yields a SINGLETON positive-overlap
  *                  candidate set whose self-cap (1+ε)·L ≥ L can never spill —
- *                  relief is the only unpin mechanism (99-10 §9 evidence:
+ * relief is the only unpin mechanism ( §9 evidence:
  *                  goodput 0.22→0.95 at rate 1.0). 0 (legacy/uninitialized)
  *                  ⇒ not single-role ⇒ byte-identical pre-99 behavior.
  *                  Twin-lockstep discipline: this prototype, the Go //export

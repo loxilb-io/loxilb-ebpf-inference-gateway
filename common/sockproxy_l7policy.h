@@ -7,7 +7,7 @@
  *..), dispatched AFTER the AI-GW auth/QUOTA gate at the two
  * find_endpoint_lpm seams (sockproxy_ep.c:400 / sockproxy_h2.c:1962).
  *
- * Plan 75-01 shipped this as a COMPILING STUB (opaque void* IR). Plan 75-03
+ * Plan shipped this as a COMPILING STUB (opaque void* IR). Plan 
  * (this revision) narrows the IR to the concrete TRANSLATION-NEUTRAL SUPERSET
  * types below — a superset of OpenStack Octavia l7policy/l7rule AND the
  * Kubernetes Gateway API HTTPRoute (CONTEXT) — and implements
@@ -426,7 +426,7 @@ void l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
 
 /* -------------------------------------------------------------------------
  * Operand extractors REUSED from sockproxy_http.c (RESEARCH §Don't Hand-Roll).
- * Plan 75-03 narrows the L7 engine to consume these proven helpers instead of
+ * Plan narrows the L7 engine to consume these proven helpers instead of
  * hand-rolling a cookie/query parser. They were file-static in sockproxy_http.c;
  * this header gives them external linkage so sockproxy_l7policy.c can call them.
  * Definitions remain in sockproxy_http.c (the `static` qualifier is dropped
