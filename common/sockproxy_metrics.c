@@ -33,7 +33,7 @@
 /* Internal shared types */
 #include "sockproxy_internal.h"    /* proxy_struct_t, proxy_struct, PROXY_LOCK */
 #include "sockproxy_metrics.h"
-#include "sockproxy_kv_exact.h"    /* KV_STAGE_* enum + record_kv_stage contract (C3, 81-01) */
+#include "sockproxy_kv_exact.h"    /* KV_STAGE_* enum + record_kv_stage contract */
 
 /* =========================================================================
  * Internal forward declarations
@@ -222,7 +222,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_kv_t15_miss_excluded     = atomic_load(&global_stats.pd_kv_t15_miss_excluded);
     snapshot.pd_kv_t15_fallthrough_total = atomic_load(&global_stats.pd_kv_t15_fallthrough_total);
 
-    /* (OBS-01): CB proactive heal (93-02, global_stats) + per-EP
+    /* (OBS-01): CB proactive heal (global_stats) + per-EP
  * admission counters (file-static in sockproxy_pd.c — exported
      * via the pd_admission_stats_get accessor; see sockproxy_metrics.h). */
     snapshot.pd_cb_proactive_heal = atomic_load(&global_stats.pd_cb_proactive_heal);
@@ -270,7 +270,7 @@ llb_ai_update_ep_queue_depth(uint32_t service_ip, uint16_t service_port,
 }
 
 /*
- * llb_ai_update_ep_capacity - C2 (81-07): update per-EP advertised KV capacity
+ * llb_ai_update_ep_capacity - update per-EP advertised KV capacity
  * (num_gpu_blocks) from the Go vLLM scraper. Byte-for-byte mirror of
  * llb_ai_update_ep_queue_depth above (PROXY_LOCK + atomic_store, MAX_PROXY_EP
  * bound, pd_disagg + n_eps guard) — the only differences are the field stored
@@ -305,7 +305,7 @@ llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port,
  * PD_CTRL_* in sockproxy.h). Byte-for-byte mirror of llb_ai_update_ep_queue_depth
  * above (PROXY_LOCK + atomic_store, MAX_PROXY_EP bound, pd_disagg + n_eps guard)
  * — the only differences are the field stored (pd_ctrl_ep[ep_index]) and the
- * value source (the Go applier's merged snapshot, validated Go-side in 96-04:
+ * value source (the Go applier's merged snapshot, validated Go-side in :
  * weight<=100, state in the aictrl.v1 enum). This function and
  * llb_ai_ctrl_set_mode below are the SOLE writers of the pd_ctrl_* fields; the
  * selection path only ever atomic_load's them. No malloc/free/pointer swap —
@@ -402,7 +402,7 @@ void record_latency_sample(uint64_t latency_us) {
 }
 
 /* =========================================================================
- * Per-stage hot-path histogram (C3, plan 81-01)
+ * Per-stage hot-path histogram
  * ========================================================================= */
 
 /*

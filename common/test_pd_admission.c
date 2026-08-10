@@ -7,19 +7,19 @@
  *        test_pd_admission.c -I. -DTEST_PD_ADMISSION -lpthread
  *
  * Cases:
- *   - smoke   mocked active_conns inc/dec (the 93-03 scaffold invariant)         -> 93-03
- *   - AC-1    default-off: env UNSET -> all-capped returns PD_PREFILL_NO_CAPACITY -> 93-04
- *   - AC-2    enqueue when all-capped (depth < bound) -> PARKED, NOT 429,
- *             chosen EP's parked FIFO count increments                            -> 93-04
- *   - AC-3    429 ONLY when the per-EP FIFO is also full (overflow valve)         -> 93-04
- *   - AC-5a/b dequeue + max-park reap                                             -> 93-05
+ *   - smoke: mocked active_conns inc/dec (the scaffold invariant)
+ *   - default-off: env UNSET -> all-capped returns PD_PREFILL_NO_CAPACITY
+ *   - enqueue when all-capped (depth < bound) -> PARKED, NOT 429,
+ *     the chosen EP's parked FIFO count increments
+ *   - 429 ONLY when the per-EP FIFO is also full (overflow valve)
+ *   - AC-5a/b: dequeue + max-park reap
  *
  * The TU is ASan-clean and wired into the `test_pd` aggregate gate.
  *
  * IMPORTANT: sockproxy_pd.c's env resolvers (pd_max_inflight_per_ep,
  * pd_queue_depth_per_ep) cache getenv-once. This binary therefore SETs both env
  * vars BEFORE the first pd_select_prefill call and uses the SAME values for every
- * case; AC-1 (env-unset) runs in a forked child so its caching is isolated.
+ * case; (env-unset) runs in a forked child so its caching is isolated.
  */
 
 #define _GNU_SOURCE
@@ -55,7 +55,7 @@
 #define CB_STATE_OPEN      1
 #define CB_STATE_HALF_OPEN 2
 
-/* C2 capacity-aware (81-07) symbols referenced by pd_select_prefill's Tier-2
+/* C2 capacity-aware symbols referenced by pd_select_prefill's Tier-2
  * scorer — only needed for sockproxy_pd.c to compile here (never exercised). */
 #ifndef PROXY_SEL_GPU_AWARE
 #define PROXY_SEL_GPU_AWARE      4
@@ -235,7 +235,7 @@ static inline void llb_sockproxy_emit_sync_event(const proxy_sync_event_t *ev) {
 typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_fallthrough_total;
     _Atomic uint64_t conversation_ttl_expirations;
-    /* 93-06 (AC-4): mirror the production gauge+counter so pd_max_total_inflight /
+    /* : mirror the production gauge+counter so pd_max_total_inflight /
      * pd_admission_should_accept compile against the included sockproxy_pd.c and the
      * counter-balance test can exercise the alloc/recycle inc/dec pattern. */
     _Atomic uint64_t pd_admission_total_inflight;
@@ -315,7 +315,7 @@ static void init_admission_pfe(proxy_fd_ent_t *pfe, int fd) {
   atomic_store(&pfe->gen, 1ULL);
 }
 
-/* ===== smoke (93-03 scaffold) ===== */
+/* ===== smoke ( scaffold) ===== */
 static void test_active_conns_inc_dec(void) {
   ep_load_tracker_t ep;
   atomic_store(&ep.active_conns, 0u);
@@ -337,7 +337,7 @@ static void saturate_prefill(proxy_epval_t *ev, int n_prefill, uint32_t cap) {
     atomic_store(&ev->pd_ep_loads[i].active_conns, cap);
 }
 
-/* ===== AC-1: default-off (env UNSET) -> all-capped sheds, NEVER parks ===== *
+/* ===== : default-off (env UNSET) -> all-capped sheds, NEVER parks ===== *
  * Runs in a forked child so this process's getenv-once cache (which the SET
  * cases below need) is not poisoned by the unset state. */
 static void test_ac1_default_off_child(void) {
@@ -368,7 +368,7 @@ static void test_ac1_default_off(void) {
         "AC-1: env-UNSET all-capped returns PD_PREFILL_NO_CAPACITY (sheds, never parks)");
 }
 
-/* ===== AC-2: all-capped + FIFO has room -> PARKED (not 429), count++ ===== */
+/* ===== : all-capped + FIFO has room -> PARKED (not 429), count++ ===== */
 static void test_ac2_enqueue_not_shed(proxy_epval_t *ev) {
   /* env: cap=2, depth=2. All 2 prefill EPs saturated. */
   proxy_fd_ent_t pfe;
@@ -377,16 +377,16 @@ static void test_ac2_enqueue_not_shed(proxy_epval_t *ev) {
 
   int ep = -123;
   int rc = pd_select_prefill(ev, &pfe, &ep, 0);
-  CHECK(rc == PD_PREFILL_PARKED, "AC-2: all-capped + FIFO room returns PD_PREFILL_PARKED (not 429)");
-  CHECK(ep >= 0 && ep < 2, "AC-2: parked EP index exposed (a prefill EP)");
+  CHECK(rc == PD_PREFILL_PARKED, ": all-capped + FIFO room returns PD_PREFILL_PARKED (not 429)");
+  CHECK(ep >= 0 && ep < 2, ": parked EP index exposed (a prefill EP)");
   /* exactly one of the two prefill FIFOs took the entry */
   uint32_t total = ev->pd_parked[0].count + ev->pd_parked[1].count;
-  CHECK(total == 1u, "AC-2: chosen EP's parked FIFO count incremented (held, not shed)");
-  CHECK(ep >= 0 && ev->pd_parked[ep].count == 1u, "AC-2: the increment landed on the exposed EP");
-  CHECK(pfe.park_ep_idx == ep, "AC-2: pfe->park_ep_idx records the parked EP");
-  CHECK(pfe.park_start_ts != 0, "AC-2: pfe->park_start_ts stamped at enqueue");
-  CHECK(ev->pd_parked[ep].slot[0].fd == 200, "AC-2: parked entry carries the client fd");
-  CHECK(ev->pd_parked[ep].slot[0].gen == 1u, "AC-2: parked entry carries the pfe gen (staleness guard)");
+  CHECK(total == 1u, ": chosen EP's parked FIFO count incremented (held, not shed)");
+  CHECK(ep >= 0 && ev->pd_parked[ep].count == 1u, ": the increment landed on the exposed EP");
+  CHECK(pfe.park_ep_idx == ep, ": pfe->park_ep_idx records the parked EP");
+  CHECK(pfe.park_start_ts != 0, ": pfe->park_start_ts stamped at enqueue");
+  CHECK(ev->pd_parked[ep].slot[0].fd == 200, ": parked entry carries the client fd");
+  CHECK(ev->pd_parked[ep].slot[0].gen == 1u, ": parked entry carries the pfe gen (staleness guard)");
 
   /* active_conns invariant: parking charges NO EP (charged<=>dispatched). */
   CHECK(atomic_load(&ev->pd_ep_loads[0].active_conns) == 2u,
@@ -395,7 +395,7 @@ static void test_ac2_enqueue_not_shed(proxy_epval_t *ev) {
         "AC-2: parking leaves prefill EP1 active_conns unchanged");
 }
 
-/* ===== AC-3: all-capped + every FIFO at bound -> overflow 429 ===== */
+/* ===== : all-capped + every FIFO at bound -> overflow 429 ===== */
 static void test_ac3_overflow_shed(proxy_epval_t *ev) {
   /* depth bound = 2. Fill BOTH prefill FIFOs to the bound. */
   for (int e = 0; e < 2; e++) {
@@ -419,7 +419,7 @@ static void test_ac3_overflow_shed(proxy_epval_t *ev) {
         "AC-3: all-capped + every FIFO full returns PD_PREFILL_NO_CAPACITY (overflow 429)");
   CHECK(ev->pd_parked[0].count == 2u && ev->pd_parked[1].count == 2u,
         "AC-3: FIFOs unchanged on overflow (no enqueue past the bound)");
-  CHECK(pfe.park_ep_idx == -1, "AC-3: overflow request is NOT parked (park_ep_idx stays -1)");
+  CHECK(pfe.park_ep_idx == -1, ": overflow request is NOT parked (park_ep_idx stays -1)");
 }
 
 /* ===== AC-5a: enqueue -> slot-free dequeue -> entry removed (FIFO pop, gen-guard) =====
@@ -537,7 +537,7 @@ static void test_ac5b_max_park_reap(void) {
   CHECK(q.count == 1u, "AC-5b: count unchanged on the no-op re-remove (no underflow)");
 }
 
-/* ===== AC-4 (93-06): global total-footprint bound + accept() backpressure ===== */
+/* =====  : global total-footprint bound + accept backpressure ===== */
 
 /* Mirror the production pfe_alloc/pfe_recycle gauge mutation (sockproxy_conn.c) so
  * the inc/dec balance + the >0 underflow guard are exercised without compiling the
@@ -553,7 +553,7 @@ static void admission_gauge_recycle(void) {
                               memory_order_relaxed);
 }
 
-/* AC-4: the global gauge increments on a pfe_alloc-equivalent, decrements on a
+/* : the global gauge increments on a pfe_alloc-equivalent, decrements on a
  * pfe_recycle-equivalent, is balanced (returns to baseline), and NEVER underflows
  * (a dec below 0 is a guarded no-op). */
 static void test_ac4_gauge_balanced(void) {
@@ -578,7 +578,7 @@ static void test_ac4_gauge_balanced(void) {
         "AC-4: gauge never underflows below 0 (>0-guarded dec)");
 }
 
-/* AC-4: pd_admission_should_accept — the pure accept()-gate decision.
+/* : pd_admission_should_accept — the pure accept-gate decision.
  *  - bound==0 (feature off): ALWAYS accept (byte-identical accept path).
  *  - under the bound: accept.
  *  - at / over the bound: refuse (SYN stays in the listen backlog). */
@@ -597,7 +597,7 @@ static void test_ac4_gate_decision(void) {
         "AC-4: over the bound (9>=8) -> REFUSE");
 }
 
-/* AC-4: pd_max_total_inflight env resolver — forked so the parent's getenv-once
+/* : pd_max_total_inflight env resolver — forked so the parent's getenv-once
  * cache (already resolved for cap/depth/max-park) is not poisoned. */
 static void test_ac4_resolver_unset_child(void) {
   unsetenv("LLB_PD_MAX_TOTAL_INFLIGHT");
@@ -619,15 +619,15 @@ static void run_forked(void (*child)(void), const char *msg) {
 }
 
 int main(void) {
-  printf("=== 93-04/05/06 admission-layer unit tests (test_pd_admission) ===\n");
+  printf("=== /05/06 admission-layer unit tests (test_pd_admission) ===\n");
 
-  /* smoke + AC-1 first (AC-1 forks; the parent's getenv cache is still pristine). */
+  /* smoke + first ( forks; the parent's getenv cache is still pristine). */
   test_active_conns_inc_dec();
   test_ac1_default_off();
 
   /* Now SET the env vars (cap=2, depth=2, max-park=5s) for the SET cases. The
    * getenv-once caches resolve on the first call below and hold for all of them.
-   * depth=2 keeps AC-3's overflow-at-bound=2 valid; AC-5a parks 2 clients (one per
+   * depth=2 keeps 's overflow-at-bound=2 valid; AC-5a parks 2 clients (one per
    * EP) so both fit within the bound. */
   setenv("LLB_PD_MAX_INFLIGHT_PER_EP", "2", 1);
   setenv("LLB_PD_QUEUE_DEPTH_PER_EP", "2", 1);
@@ -655,7 +655,7 @@ int main(void) {
   /* AC-5b: max-park reap (FIFO removal by age + survivor preservation). */
   test_ac5b_max_park_reap();
 
-  /* AC-4 (93-06): global total-footprint bound + accept() backpressure decision.
+  /*  : global total-footprint bound + accept backpressure decision.
    * The pure gate + gauge tests are env-independent; the resolver tests fork so
    * the getenv-once cache (this process already resolved cap/depth/max-park) is
    * never poisoned by the SET/UNSET probes. */

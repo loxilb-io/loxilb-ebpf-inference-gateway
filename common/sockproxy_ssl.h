@@ -27,7 +27,7 @@
 
 /* managed dir for certId-referenced TLS material.
  * Each certId lives under PROXY_SSL_CERTID_DIR/<certId>/ holding the PEM material
- * persisted by the Go REST handler (77-07): server.crt + server.key for frontend
+ * persisted by the Go REST handler : server.crt + server.key for frontend
  * certs; ca.crt + client.crt + client.key for backend re-encryption. The
  * Go handler owns dir creation with restrictive perms (0700 dir / 0600 keys,
  *); the C side only reads. */
@@ -64,7 +64,7 @@ int proxy_list_sni_certificates_with_path(void (*callback)(const char *hostname,
 
 /* =========================================================================
  * (..13): certId registry — management handle layered
- * OVER the hostname-keyed SNI store. The CGO layer (77-07) drives these after
+ * OVER the hostname-keyed SNI store. The CGO layer drives these after
  * persisting the inline-PEM upload to PROXY_SSL_CERTID_DIR/<certId>/. Selection
  * at handshake stays by hostname (the SNI callback is unchanged); certId is
  * purely the upload/rotate/delete handle.

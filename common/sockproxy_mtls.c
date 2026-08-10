@@ -512,8 +512,8 @@ static int mtls_client_verify_callback(int preverify_ok, X509_STORE_CTX *x509_ct
  * Returns: 1 if an existing CRL file was found at the derived path, 0 otherwise.
  *
  * the CRL is part of the id-referenced TLS-material set
- * supplied by the 77-02 managed-cert directory. Until the dedicated CGO/REST
- * plumb lands in 77-07, the CRL is co-located with the client CA bundle as a
+ * supplied by the managed-cert directory. Until the dedicated CGO/REST
+ * plumb lands, the CRL is co-located with the client CA bundle as a
  * sibling "crl.pem" in the same managed directory — the same directory the
  * certId-referenced material set provides. Operator-supplied, static, reloaded
  * whenever mtls_configure_frontend re-runs on a config update (mirroring how
@@ -703,8 +703,8 @@ int mtls_configure_frontend(SSL_CTX *ctx, proxy_arg_t *arg)
         // (re)configure, mirroring how client_ca_path is re-applied. Absent CRL
         // ⇒ today's behaviour (additive / default-off — no CRL_CHECK flag set).
         // prefer the EXPLICIT operator-supplied CRL path
-        // (arg->client_crl_path, plumbed by 77-07) when set; otherwise fall back to the
-        // 77-04 convention (sibling crl.pem in the CA dir). Both are leaf-only / additive.
+        // (arg->client_crl_path) when set; otherwise fall back to the
+        // convention (sibling crl.pem in the CA dir). Both are leaf-only / additive.
         char crl_path[512];
         int have_crl = 0;
         if (arg->client_crl_path[0] != '\0') {

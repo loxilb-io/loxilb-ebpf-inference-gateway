@@ -33,7 +33,7 @@
 #define CB_STATE_OPEN      1
 #define CB_STATE_HALF_OPEN 2
 
-/* C2 capacity-aware (81-07) symbols referenced by pd_select_prefill's Tier-2 scorer.
+/* C2 capacity-aware symbols referenced by pd_select_prefill's Tier-2 scorer.
  * The mock never sets ep_sel = PROXY_SEL_GPU_AWARE, so the C2 branch is not exercised
  * by these tests — these only need to be DECLARED for sockproxy_pd.c to compile here.
  * (Previously absent -> this whole target failed to build; un-blocks it.) */
@@ -86,8 +86,8 @@ typedef struct {
   _Atomic uint64_t total_requests;
   uint64_t last_update_ts;
   int ep_available;
-  _Atomic uint32_t num_gpu_blocks;   /* C2 (81-07): capacity-weighted scorer input */
-  _Atomic uint32_t swap_pressure;    /* C2 (81-07): capacity-weighted scorer input */
+  _Atomic uint32_t num_gpu_blocks;   /* capacity-weighted scorer input */
+  _Atomic uint32_t swap_pressure;    /* capacity-weighted scorer input */
 } ep_load_tracker_t;
 
 typedef struct llm_prefix_key {

@@ -50,7 +50,7 @@
 
 #define MAX_PROXY_EP      32
 #define MAX_PREFIX_LEN    512
-/* D-LC4: rcvbuf capacity bound read by the chat-body NUL-bounding code. */
+/* rcvbuf capacity bound read by the chat-body NUL-bounding code. */
 #define SP_SOCK_MSG_LEN   (1024 * 1024)
 #define MAX_MODEL_LEN     128
 #define MAX_LORA_LEN      128
@@ -59,7 +59,7 @@
 #define CB_STATE_CLOSED   0
 #define CB_STATE_OPEN     1
 
-/* C2 (81-07): mirror the PROXY_SEL_GPU_AWARE weights from sockproxy.h (which
+/* mirror the PROXY_SEL_GPU_AWARE weights from sockproxy.h (which
  * the harness does NOT include — it uses its own minimal struct mirror). Values
  * MUST match sockproxy.h DEFAULT_{QUEUE,SWAP,KV_CACHE}_WEIGHT so the blend-score
  * vectors below pin the SAME arithmetic the data path runs. */
@@ -134,7 +134,7 @@ typedef struct proxy_epval {
    * (the byte-identical path). */
   _Atomic uint32_t pd_ctrl_ep[MAX_PROXY_EP];
   _Atomic uint8_t  pd_ctrl_mode;
-  /* (99-06, SGL-04): calling rule identity mirror — the #included
+  /* (SGL-04): calling rule identity mirror — the #included
    * sockproxy_kv_exact.c threads tepval->kv_svc_id to llb_ai_kv_best_worker.
    * Zero-init (kv_reset_tepval memset) == "no identity" == legacy loop. */
   uint32_t kv_svc_id;
@@ -149,7 +149,7 @@ typedef struct proxy_fd_ent {
   uint8_t is_chat;
   size_t  body_off;
   size_t  body_len;
-  /* D-LC3: streamable-request gate read by the rcvbuf-fallback branch. */
+  /* streamable-request gate read by the rcvbuf-fallback branch. */
   uint8_t is_streamable;
   char x_model_header[MAX_MODEL_LEN];
   void *rcvbuf;
@@ -195,12 +195,12 @@ static uint32_t stub_token_ids[4096];
 static int stub_token_count = 0;
 static int stub_best_ep = -1;
 static int stub_best_score = 0;
-/* (99-01 Task 3): capture the masks pd_kv_exact_select passes to the
+/* : capture the masks pd_kv_exact_select passes to the
  * best-worker CGO stub so the mask-build regression cases can pin them.
  * Sentinel-reset by each test; 0xdeadbeef == "stub never reached". */
 static uint32_t stub_last_prefill_mask = 0xdeadbeefu;
 static uint32_t stub_last_excluded_mask = 0xdeadbeefu;
-/* (99-06 Task 1, SGL-04): capture the svc_id pd_kv_exact_select
+/* ( Task 1, SGL-04): capture the svc_id pd_kv_exact_select
  * threads to the best-worker CGO stub — pins the cross-VIP contamination fix's
  * C half (tepval->kv_svc_id reaches the Go selector intact, 0 by default). */
 static uint32_t stub_last_svc_id = 0xdeadbeefu;
@@ -227,7 +227,7 @@ llb_ai_kv_tokenize(char *text, char *model_name,
  * The C unit cannot run a real tokenizer/template, so it returns the
  * caller-loaded stub_token_ids (the vLLM apply_chat_template golden vector).
  * This proves the C-side block-boundary math is parity-correct GIVEN vLLM ids;
- * real tokenize/template parity is proven Go-side in 88-01/88-02. */
+ * real tokenize/template parity is proven Go-side in the design. */
 int
 llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
                          uint32_t *out_ids, int max_ids)
@@ -913,7 +913,7 @@ static void test_prefill_mask_from_ep_role(void) {
 }
 
 /* ===========================================================================
- * (99-01 Task 3): candidate-mask regression cases for the
+ * : candidate-mask regression cases for the
  * Tier-1.5 single-role decouple seam. Unlike test_prefill_mask_from_ep_role
  * (a construction mirror), these drive the REAL pd_kv_exact_select and pin the
  * mask it actually passes to llb_ai_kv_best_worker via the stub capture —
@@ -1045,7 +1045,7 @@ test_mask_mode3_single_role_admits_all(void)
   }
 }
 
-/* (99-06 Task 1, SGL-04): svc-id threading through the CGO seam.
+/* ( Task 1, SGL-04): svc-id threading through the CGO seam.
  * Arm 1: a stamped tepval->kv_svc_id must reach llb_ai_kv_best_worker intact
  * (the cross-VIP contamination fix's C half). Arm 2: a zero-init tepval passes
  * 0 ("no identity") — the Go side then keeps today's all-services loop, so the
@@ -1095,7 +1095,7 @@ test_kv_svc_id_threading(void)
 }
 
 /* ============================================================================
- * C2 (81-07): capacity-weighted bounded-load cap (the reserved
+ * capacity-weighted bounded-load cap (the reserved
  * PROXY_SEL_GPU_AWARE weights lit up). These drive the pure header helper
  * pd_capacity_weighted_cap / pd_kv_clamp_capacity directly (no datapath) so
  * the cap math is proven in isolation. The capacity-skew assert is RED until
@@ -1205,7 +1205,7 @@ void record_kv_stage(int stage, int is_hit, uint64_t latency_us) {
 }
 
 /* ===========================================================================
- * Task 1 (C3): per-stage µs histogram accumulation.
+ * Task 1: per-stage µs histogram accumulation.
  *
  * record_kv_stage(stage, is_hit, latency_us) must accumulate into the correct
  * per-(stage,outcome) 12-bucket histogram + sum/count — the mirror of
@@ -1657,7 +1657,7 @@ test_hash_vectors_from_json(void)
  *   - block 0's stored hash equals the hash recomputed from ONLY the first
  *     min(16,n) golden ids (independent path). A deliberately SHIFTED vector
  *     would change block 0's first-16 ids and thus this hash → the assert FAILS.
- * Real tokenize/template parity is proven Go-side (88-01/88-02); here we lock the
+ * Real tokenize/template parity is proven Go-side ; here we lock the
  * C-side block-boundary math against the authoritative token ids.
  *
  * block_size is fixed at 16 (the KV block size); hash algo is sha256_cbor.
@@ -1698,7 +1698,7 @@ kv_assert_block0_boundary(const char *label, const uint32_t *ids, int n_ids)
 
 /* SPECIAL-TOKEN fixture: leading <|im_end|>=151645 must be a single id at index
  * 0 (not split into 6 normal tokens), and 11 ids < 16 → exactly 1 (partial)
- * block whose hash covers all 11 ids. (88-01 vllm_authoritative_ids.) */
+ * block whose hash covers all 11 ids. ( vllm_authoritative_ids.) */
 static void
 test_block_boundary_special_token(void)
 {
@@ -1723,7 +1723,7 @@ test_block_boundary_special_token(void)
 
 /* CHAT fixture: apply_chat_template multi_turn → 52 templated ids = 3 full
  * 16-token blocks + 1 partial (4) → 4 blocks total. block 0's first 16 ids are
- * the ChatML system preamble. (88-02 templated_ids, multi_turn.) */
+ * the ChatML system preamble. ( templated_ids, multi_turn.) */
 static void
 test_block_boundary_chat(void)
 {
@@ -1968,7 +1968,7 @@ test_sglang_parity_vectors(void)
                          SGL_V5_N_BLOCKS);
 }
 
-/* ---- D-LC2: JSON unescape + escape/UTF-8-safe truncation ---------------- */
+/* ---: JSON unescape + escape/UTF-8-safe truncation ---------------- */
 /* The Tier-1.5 tokenize input for /v1/completions is prefix_key.prefix, which
  * sockproxy_json.c now fills through kv_json_unescape_copy. These pin the
  * decode table AND the two truncation guarantees (never mid-escape, never

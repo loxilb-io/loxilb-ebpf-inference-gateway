@@ -36,7 +36,7 @@
  * pd_queue_depth_per_ep, pd_kv_loadguard_on, ...) cache getenv-once. EVERY
  * case here wants them DISABLED (the default), so main() unsetenv()s the lot
  * BEFORE the first pd_select_prefill call and no case ever sets them — no
- * fork isolation is required (unlike test_pd_admission.c's AC-1, there is no
+ * fork isolation is required (unlike test_pd_admission.c's , there is no
  * env mutation between cases to isolate). */
 
 #define _GNU_SOURCE
@@ -72,7 +72,7 @@
 #define CB_STATE_OPEN      1
 #define CB_STATE_HALF_OPEN 2
 
-/* C2 capacity-aware (81-07) symbols referenced by pd_select_prefill's Tier-2
+/* C2 capacity-aware symbols referenced by pd_select_prefill's Tier-2
  * scorer. TC-4 EXERCISES the GPU_AWARE branch, so unlike test_pd_admission.c
  * the blend math must be REAL — pd_kv_clamp_capacity/pd_capacity_blend_score
  * come from sockproxy_kv_exact.h below (the production static inlines), and

@@ -156,7 +156,7 @@ void proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe);
  * free() it to the heap, so a stale notify dispatch reading pfe->gen is safe. */
 proxy_fd_ent_t *pfe_alloc(void);
 void pfe_recycle(proxy_fd_ent_t *pfe);
-/* (AC-4): read-only snapshot of the pfe-pool high-water gauges for the
+/* : read-only snapshot of the pfe-pool high-water gauges for the
  * bounded-footprint soak (live = shells checked out now; total = shells ever made).
  * Lock-guarded, never mutates. NULL out-params are skipped. */
 void pfe_pool_snapshot(unsigned long *live, unsigned long *total);

@@ -676,7 +676,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
            * Checked BEFORE the NO_CAPACITY 429 fork (NO_CAPACITY is now overflow-only). */
           if (pf_rc == PD_PREFILL_PARKED) {
             /* The enqueue + park_start_ts stamp already happened in the selector;
-             * mark epv so a later teardown (93-05 max-park reap) can find the EP. */
+             * mark epv so a later teardown ( max-park reap) can find the EP. */
             if (pfe && !pfe->epv) pfe->epv = tepval;
             return PD_SETUP_PARKED;
           }
@@ -764,7 +764,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
            *   HIT  -> route to the KV winner + hold one active_conns unit.
            *           Unified CHWBL hard-cap and adaptive ε/λ key on
            *           pd_ep_loads[].active_conns — without this accounting the
-           *           blend runs blind (the 81-09 hot-spot, RESEARCH Pitfall 1).
+           * blend runs blind (the hot-spot, RESEARCH Pitfall 1).
            *   MISS -> algorithm_selection is left untouched, so the rule's own
            *           configured selector (CHWBL/adaptive/RR — already run in
            *           the select switch above) is the natural fallback ladder.
@@ -795,7 +795,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
              * two changes together make the unit span the backend generation, so
              * the adaptive/CHWBL selector once again sees real concurrency
              * instead of a near-zero load signal (the single-role sibling of the
-             * 81-09 blind-blend hot-spot). __atomic_exchange keeps single-owner
+             * blind-blend hot-spot). __atomic_exchange keeps single-owner
              * discipline vs the connect-failure / teardown claimants. */
             if (__atomic_exchange_n(&pfe->kv_sr_load_held, 0, __ATOMIC_ACQ_REL)) {
               int prev_sr_ep = pfe->kv_sr_ep_idx;
@@ -1632,9 +1632,9 @@ proxy_conversation_cleanup_thread(void *arg)
     now = time(NULL);
     total_removed = 0;
     
-    /* .1 — CR-04 / two-pass gather-then-evict for P/D-enabled
+    /* .1 — / two-pass gather-then-evict for P/D-enabled
      * ephash entries. Closes the recursive-rwlock UB documented in
-     * .planning/phases/70-sockproxy-ha-sync/70-REVIEW.md (CR-04).
+     *.planning/phases/70-sockproxy-ha-sync/70-REVIEW.md.
      *
      * Lock hierarchy: sockproxy_internal.h:89-100 declares Pri-1 (proxy_struct->lock)
      * is the lowest-priority lock that any thread may hold. pd_session_evict()
@@ -1724,7 +1724,7 @@ proxy_conversation_cleanup_thread(void *arg)
        * PROXY_LOCK Pri-1 wrlock). pd_session_evict() is called AFTER the
        * PROXY_UNLOCK() below to avoid recursive Pri-1 rdlock via
        * pd_session_resolve_service_key. See block-header comment for the
- * full lock-hierarchy rationale (CR-04). */
+ * full lock-hierarchy rationale. */
       {
         proxy_epval_t *tepval, *tv_tmp;
         HASH_ITER(hh, node->val.ephash, tepval, tv_tmp) {

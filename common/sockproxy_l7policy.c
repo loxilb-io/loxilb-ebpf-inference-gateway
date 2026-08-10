@@ -2,7 +2,7 @@
  *
  * sockproxy_l7policy.c — L7 content-routing policy engine.
  *
- * Plan 75-01 shipped this as a compiling STUB; Plan 75-03 (this revision)
+ * Plan shipped this as a compiling STUB; Plan (this revision)
  * implements the real ORDERED FIRST-MATCH-WINS evaluation engine over the
  * concrete superset IR defined in sockproxy_l7policy.h (CONTEXT).
  *
@@ -14,7 +14,7 @@
  *     - A condition matches when its compare op holds between the request operand
  *       and the operand value; `invert` flips the per-condition result.
  *     - Operands are resolved from the parsed request on `pfe` and the bounded
- *       generic header/cookie store populated in Plan 75-02 (pfe->l7_headers /
+ * generic header/cookie store populated in Plan (pfe->l7_headers /
  *       n_l7_headers). Cookie/query extraction REUSES the proven sockproxy_http.c
  *       helpers (RESEARCH §Don't Hand-Roll) — never hand-rolled here.
  *     - REGEX uses the PRE-COMPILED, cached cond->re (compiled ONCE at attach,
@@ -143,7 +143,7 @@ l7_op_matches(l7_op_t op, const char *operand, const char *value,
  * hook mirrors the active stream's authority/path/method into pfe before calling
  * l7_policy_evaluate, keeping this engine protocol-neutral and pfe-only. The
  * HEADER/COOKIE store (pfe->l7_headers) is already populated for BOTH protocols
- * by Plan 75-02 (handle_header_val + proxy_h2_on_header_callback).
+ * by Plan (handle_header_val + proxy_h2_on_header_callback).
  * ------------------------------------------------------------------------- */
 static const char *
 l7_resolve_operand(struct proxy_fd_ent *pfe, const l7_condition_t *cond,
@@ -613,7 +613,7 @@ l7_resolve_pool(proxy_map_ent_t *ent, l7_forward_t *fwd)
  * decision from the matched route's redirect IR (`redir`) plus the LIVE request
  * context on `pfe` (scheme / Host / path). Runs in l7_route_dispatch so it sees the
  * real per-connection (H1) or stream-mirrored (H2) request fields — the engine is
- * pfe-only (75-03/75-04). Writes a NUL-terminated, snprintf-bounded, CRLF-free URL
+ * pfe-only . Writes a NUL-terminated, snprintf-bounded, CRLF-free URL
  * into `out` (capacity `outsz`, expected L7_REDIRECT_LOCATION_MAX).
  *
  * Field resolution (per the IR contract, sockproxy_l7policy.h):

@@ -416,7 +416,7 @@ proxy_client_ssl_ctx_init(proxy_arg_t *arg)
   // loxilb has NO h2→h1 backend downgrade engine, so h2 must NEVER be advertised
   // to an h1-only pool (an h2 client + h1-only pool would otherwise yield an empty
   // body — RESEARCH Pitfall 2). The cap is mapped from Octavia alpn_protocols in
-  // the control plane (plan 77-07); here the data plane HONORS it:
+  // the control plane (the design); here the data plane HONORS it:
   //   cap==0 → http/1.1 only   cap==1 → h2 only   cap==2 → h2 + http/1.1
   // arg==NULL ⇒ legacy unconditional h2+http/1.1 (AI peer byte-for-byte unchanged).
   static const unsigned char alpn_both[]  = "\x02h2\x08http/1.1";
@@ -905,7 +905,7 @@ proxy_certid_derive_hostnames(const char *dir_path,
 /**
  * proxy_register_cert - register entry point.
  *
- * Preconditions: the Go REST handler (77-07) has already persisted the PEM
+ * Preconditions: the Go REST handler has already persisted the PEM
  * material to PROXY_SSL_CERTID_DIR/<certId>/ (server.crt + server.key). This
  * function derives the hostname(s) from the leaf SAN/CN and registers EACH into
  * the SNI store via the EXISTING proxy_add_sni_certificate (NO new loader), then

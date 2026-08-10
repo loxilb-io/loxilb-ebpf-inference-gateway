@@ -1,5 +1,5 @@
 /*
- * circuit_breaker_heal.h — 93-02 (D1) proactive circuit-breaker recovery predicate.
+ * circuit_breaker_heal.h — (D1) proactive circuit-breaker recovery predicate.
  *
  * Pure, dependency-free transition shared VERBATIM by production
  * (sockproxy_health.c, the 1 Hz health pass) and the unit test (test_cb_heal.c),

@@ -2,11 +2,11 @@
  * HTTP-response message-framing regression units for the M1 response-leg parser.
  *
  * These lock the property the three hand-rolled memmem detectors (the SSE/chunked
- * scanners replaced in M1, 90-04) NEVER had: an HTTP_RESPONSE llhttp parser fed
+ * scanners replaced in M1) NEVER had: an HTTP_RESPONSE llhttp parser fed
  * adversarially-fragmented responses fires EXACTLY ONE on_message_complete per
  * message — no double-fire, no miss — regardless of where the TCP read boundaries
  * land. This is the falsifiable proof the new parser path is fragmentation-immune,
- * the regression lock M1's cutover (90-04) and the deletion (90-06) must keep
+ * the regression lock M1's cutover and the deletion must keep
  * GREEN.
  *
  * Case 5 is the LOAD-BEARING proof for Pitfall #3: a keep-alive socket that goes

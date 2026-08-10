@@ -1042,7 +1042,7 @@ struct dp_proxy_tacts {
   uint8_t  pad3c[3];               // Alignment padding (keeps struct 8-byte aligned)
   // Octavia per-listener member timeouts in MILLISECONDS (native unit).
   // Additive + default-off (0 ⇒ preserve today's behaviour). These mirror the proxy_arg
-  // *_ms fields (sockproxy.h, added by Plan 76-01) and are copied verbatim into proxy_arg by
+  // *_ms fields (sockproxy.h, added by Plan ) and are copied verbatim into proxy_arg by
   // llb_conv_nat2proxy (loxilb_libdp.c). Enforced only on the L7_Proxy peer (has_l7_policy==1).
   // 3×u32 = +12 bytes; the struct was 8-aligned after pad3c so the first u32 fills the 4-byte
   // slot and the last u32 needs a +4 pad to re-align. Bump ALL FOUR _Static_asserts + (no Go
@@ -1053,7 +1053,7 @@ struct dp_proxy_tacts {
   uint32_t pad3d;                     // Alignment padding (keeps struct 8-byte aligned)
   // TLS-hardening scalars ( version/cipher pinning, HSTS, backend
   // certIds). Additive + default-off (0/empty ⇒ today's behaviour, -COMPAT). Copied verbatim
-  // into the proxy_arg fields 77-02 added by llb_conv_nat2proxy. Consumed only on the L7_Proxy
+  // into the proxy_arg fields added by llb_conv_nat2proxy. Consumed only on the L7_Proxy
   // peer (has_l7_policy==1); the AI peer is byte-for-byte unchanged. The Go side reads
   // C.struct_dp_proxy_tacts directly via cgo (no separate Go mirror to update).
   // Byte math (non-MTLS region): tls_version_min(1)+tls_version_max(1)+hsts_include_subdomains(1)
@@ -1075,7 +1075,7 @@ struct dp_proxy_tacts {
   char     mtls_client_ca_path[256];
   char     mtls_client_cn_pattern[256];
   // explicit client-cert CRL path → proxy_arg.client_crl_path.
-  // Additive/default-off — empty ⇒ 77-04 sibling-crl convention (+256 bytes; HAVE_MTLS asserts).
+  // Additive/default-off — empty ⇒ sibling-crl convention (+256 bytes; HAVE_MTLS asserts).
   char     mtls_client_crl_path[256];
 #endif /* HAVE_MTLS */
 };
@@ -1108,7 +1108,7 @@ struct dp_proxy_tacts {
 //   +hsts_include_subdomains(1)+hsts_preload(1)+hsts_max_age(4)+tls_ciphers(256)
 //   +backend_ca_cert_id(64)+backend_client_cert_id(64) = +392 bytes (8-aligned region): all four
 //   asserts shift by +392 (2448→2840, 2440→2832, 2968→3360, 2960→3352). These scalars are copied
-//   verbatim into the proxy_arg fields 77-02 added by llb_conv_nat2proxy; no Go mirror (cgo direct).
+// verbatim into the proxy_arg fields added by llb_conv_nat2proxy; no Go mirror (cgo direct).
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
 _Static_assert(sizeof(struct dp_proxy_tacts) == 2840,

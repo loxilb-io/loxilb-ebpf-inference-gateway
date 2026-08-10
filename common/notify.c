@@ -676,7 +676,7 @@ notify_run(void *ctx, int thread)
    * worker's own pfds[] so poll() returns when another thread writes it. Created on
    * the worker thread (here) so it is owned/polled by exactly this worker. When the
    * admission layer never wakes a worker, the eventfd sits idle in poll() — never
-   * readable — so the relay path is byte-identical to pre-93-05 (default-off). */
+   * readable — so the relay path is byte-identical to pre- (default-off). */
   {
     int wfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (wfd < 0) {

@@ -145,7 +145,7 @@ static const char *strnstr_portable(const char *haystack, const char *needle, si
  *            NOT a behavior change — M1/M2 gate on it in later plans).
  * "1"      → the v2 (parser-owned) request/response framing path (wired later).
  *
- * Default MUST be OFF. As of 90-01 this gate is DEFINED ONLY — it is not
+ * Default MUST be OFF. As of this gate is DEFINED ONLY — it is not
  * consulted anywhere yet. Per Invariant 2 any future per-message framing
  * state goes on proxy_fd_ent (NOT on proxy_sync_event_t / llm_prefix_key_t),
  * which is not xSync-serialized (sockproxy.h pd_last_decode_ts precedent).
@@ -153,7 +153,7 @@ static const char *strnstr_portable(const char *haystack, const char *needle, si
 static _Atomic int llb_pd_framing_v2_initialized = 0;
 static int llb_pd_framing_v2 = 0;
 
-/* Defined-only in 90-01 (consulted by M1/M2 in later plans); the unused
+/* Defined-only in (consulted by M1/M2 in later plans); the unused
  * attribute keeps -Wall quiet until the first call site lands. */
 static int pd_framing_v2_on(void) __attribute__((unused));
 static int
@@ -171,7 +171,7 @@ pd_framing_v2_on(void)
 }
 
 /* Test hook: force the pd_framing_v2 gate without setenv/unsetenv races in unit
- * tests (test_resp_framing.c, 90-02) and the mismatched-flag HA variant. */
+ * tests (test_resp_framing.c) and the mismatched-flag HA variant. */
 void
 pd_framing_v2_test_set(int on)
 {
@@ -181,7 +181,7 @@ pd_framing_v2_test_set(int on)
 }
 
 /* ---------------------------------------------------------------------------
- * [FRAME_MISMATCH] round-2 Bug-B instrument (REQ-R2 /, 90-01 Task 2)
+ * [FRAME_MISMATCH] round-2 Bug-B instrument (REQ-R2 /, Task 2)
  *
  * LOG-ONLY. Emits one [FRAME_MISMATCH] line at each request-forward site to
  * discriminate the three Bug-B candidates (BUGB-RCA.md §"Round-2 instrument"):
@@ -710,7 +710,7 @@ l7_inject_set_cookie_h1(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen,
 /*
  * (RFC 6797) — H1 RESPONSE-side HSTS injection.
  * Synthesizes "Strict-Transport-Security: max-age=N[; includeSubDomains]
- * [; preload]" from the proxy_arg HSTS scalars (added 77-02) and splices it onto
+ * [; preload]" from the proxy_arg HSTS scalars (added ) and splices it onto
  * the backend→client response header block via the SAME response-side seam as the
  * Set-Cookie injector (l7h1_splice_header), NOT the request-egress
  * l7_inject_req_headers_h1 (Pitfall 1: HSTS is a RESPONSE header).
@@ -1278,7 +1278,7 @@ skip_deferred_masking:
             if (rfd_ent->pd_prefill_resp_len >= pr_hdr_len + pr_content_len) {
               pr_complete = 1;
             } else if (pr_hdr_len + pr_content_len > rfd_ent->pd_prefill_resp_cap) {
-              /* D-LC5 (long-context wedge): the declared prefill response can
+              /* (long-context wedge): the declared prefill response can
                * NEVER fit the buffer, so the >= completion check above could
                * never fire and the flow sat in PREFILL_WAITING until the client
                * timed out — NO response at all (live-proven at 64KB cap:
@@ -1359,7 +1359,7 @@ skip_deferred_masking:
       return 0; /* Don't forward prefill response to client */
     }
 
-    /* D-LC5 (second half): once the decode phase is live, any bytes still
+    /* (second half): once the decode phase is live, any bytes still
      * arriving on the PREFILL leg (client rfd slot 0; decode legs start at
      * slot 1) have no legitimate destination — they are the tail of an
      * over-cap prefill response whose completion was forced above. Forwarding
@@ -1575,7 +1575,7 @@ skip_deferred_masking:
         rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING &&
         !rfd_ent->sse_active) {
       if (len > 0) {
-        /* Universal decode-activity stamp: (a) the FO-1 zero-byte
+        /* Universal decode-activity stamp: (a) the zero-byte
          * discriminator at the decode-EOF site (pd_last_decode_ts == 0 ⇒ the
          * decode leg died before ONE response byte was relayed), and (b)
          * extends the idle-based reaper basis (F-GPU-6) to non-SSE decode
@@ -3376,11 +3376,11 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     return -1;
   }
 
-  /* FO-2: the decode EP was picked at ADMISSION but is only connected NOW,
+  /* the decode EP was picked at ADMISSION but is only connected NOW,
    * after prefill completed — a seconds-wide window under long-context
    * prefill during which the EP can die. Until this check, only index
    * bounds were re-validated, so a decode node dying during prefill meant a
-   * connect to a known-dead EP (sync 503, or async zero-byte EOF = FO-1).
+   * connect to a known-dead EP (sync 503, or async zero-byte EOF =).
    * Re-check inv/CB and re-select via pd_select_decode (min-load among
    * healthy decode EPs — the admission scorer) with the stale hint cleared.
    * On re-selection, MOVE the admission-time active_conns unit so
@@ -3394,7 +3394,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     int re_idx = -1;
     client_pfe->pd_decode_ep_idx = -1;  /* clear hint: force fresh min-load pick */
     if (pd_select_decode(tepval, client_pfe, &re_idx) == 0) {
-      log_error("FO-2: decode EP%d went unhealthy during prefill — "
+      log_error("decode EP%d went unhealthy during prefill — "
                 "re-selected healthy decode EP%d (client_fd=%d)",
                 stale_idx, re_idx, client_pfe->fd);
       uint32_t cur_stale =
@@ -3405,7 +3405,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
       d_idx = re_idx;  /* pd_select_decode already stored it in the pfe */
     } else {
       client_pfe->pd_decode_ep_idx = stale_idx;  /* restore for cleanup/logs */
-      log_error("FO-2: decode EP%d unhealthy after prefill and NO healthy "
+      log_error("decode EP%d unhealthy after prefill and NO healthy "
                 "replacement — failing decode init (client_fd=%d)",
                 stale_idx, client_pfe->fd);
       return -1;
@@ -3723,7 +3723,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
        * keeps the re-drive on the parked fd's own worker (Landmine 1). The popped entry's
        * (fd,gen) is gen-validated at resume time (pd_resume_parked) — a recycled fd is
        * dropped. Default-off: pd_queue_depth_per_ep()==0 ⇒ the FIFO is never touched ⇒
-       * byte-identical to pre-93-05. No buffer free here, so pd_free_claim is untouched
+       * byte-identical to pre-. No buffer free here, so pd_free_claim is untouched
        * (Landmine 2). */
       if (cur_pre > 0 && pd_queue_depth_per_ep() > 0) {
         int e = fd_ent->pd_prefill_ep_idx;
@@ -4399,7 +4399,7 @@ proxy_pdestroy(void *priv)
                    client_pfe->pd_last_decode_ts == 0 &&
                    client_pfe->pd_decode_content_length == 0 &&
                    client_pfe->pd_decode_bytes_received == 0) {
-          /* FO-1: decode backend EOF before ONE response byte was relayed —
+          /* decode backend EOF before ONE response byte was relayed —
            * the async-connect-failure signature of a dead decode EP. This was
            * unconditionally treated as "non-streaming decode complete": phase
            * → COMPLETE, llb_ai_pd_record(status 0), while the client received
@@ -5728,7 +5728,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
    * fd (EPOLLIN-pause, HUP-only — the exact form at the backpressure pause site) and
    * hold it open. Do NOT proxy_destroy_eps, do NOT shutdown. The caller translates
    * PD_SETUP_PARKED into "keep fd, do NOT forward to backend, do NOT close". The
-   * dequeue+resume (re-arm EPOLLIN + re-drive) lands in 93-05. */
+   * dequeue+resume (re-arm EPOLLIN + re-drive) is not wired yet. */
   if (psep_rc == PD_SETUP_PARKED) {
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
@@ -6539,7 +6539,7 @@ handle_on_message_complete(llhttp_t* parser)
  * replaces the three hand-rolled memmem detectors (sockproxy_http.c:1085-1355)
  * on the backend (decode/prefill) response leg. They run BEHIND pd_framing_v2:
  * with the flag OFF none of this is consulted and the legacy detectors own
- * completion byte-for-byte ( deletion is 90-06, gated on the live oracle).
+ * completion byte-for-byte ( deletion is , gated on the live oracle).
  *
  * Registered on a BACKEND pfe (odir==1) initialized with HTTP_RESPONSE (NOT
  * HTTP_BOTH) so 1xx/204/304/HEAD framing rules key off parser->type correctly
@@ -6551,7 +6551,7 @@ handle_on_message_complete(llhttp_t* parser)
 /* on_headers_complete seam — the fragmentation-immune replacement for the
  * single-read "Content-Type: text/event-stream" memmem sniff at :1157 (the
  * Bug-A response-splitting source). OBSERVE-only here; the SSE-gauge
- * side effects stay on the legacy detectors until 90-06. */
+ * side effects stay on the legacy detectors until . */
 static int
 handle_resp_headers_complete(llhttp_t *parser)
 {
@@ -7041,7 +7041,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   proxy_fd_ent_t *npfe1 = NULL;
   SSL *ssl = NULL;
 
-  /* (AC-4): global total-footprint ingress backpressure (knob
+  /* : global total-footprint ingress backpressure (knob
    * LLB_PD_MAX_TOTAL_INFLIGHT). BEFORE accept(), if the bound is enabled
    * (pd_max_total_inflight() > 0, i.e. LLB_PD_MAX_TOTAL_INFLIGHT set) and the
    * global in-flight gauge has reached it, REFUSE this accept() — return WITHOUT
@@ -7353,7 +7353,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
   {
     int sp_rc = setup_proxy_path(key, rkey, pfe, phurl);
     /* parked = held/suspended. Keep the fd, do NOT forward
-     * to a backend (there is none yet), do NOT close. 93-05 resumes it. */
+     * to a backend (there is none yet), do NOT close. resumes it. */
     if (sp_rc == PD_SETUP_PARKED) return SP_FWD_PARKED;
     if (sp_rc) {
       return SP_FWD_RESTART; // Restart
@@ -7691,7 +7691,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->has_vllm_request_id = 0;
     pfe->request_id_injected = 0;
 
-    // 81-09 TRUNCATION FIX: reset per-request SSE/streaming state at the keep-alive
+    // TRUNCATION FIX: reset per-request SSE/streaming state at the keep-alive
     // boundary. The resets above clear HTTP-parse + (below) P/D-orchestration state, but
     // NOTHING clears the SSE stream fields — neither this boundary nor pd_cleanup(). So on
     // a REUSED keep-alive connection request N+1 inherited request N's sse_active=1 and
@@ -8051,13 +8051,13 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
       }
 
-      /* KA-FIX (81-09): release the stale backend leg of a COMPLETED P/D request
+      /* KA-FIX : release the stale backend leg of a COMPLETED P/D request
        * before parsing the next keep-alive request. rfd[]/n_rfd are cleared ONLY by
        * proxy_release_rfd_ctx (via proxy_pdestroy = full close); pd_cleanup() leaves
        * them set. Without this, request N+1 on a reused connection sees rfd[0]>0,
        * SKIPS the rfd[0]<=0 parse phase below, and is mis-framed (cl=0) -> headers-only
        * PLAIN forward -> backend waits for a body that never comes -> client hang.
-       * (RCA 81-09: REUSE ~22% hangs vs FRESH 0%.) pd_phase==NONE (set by pd_cleanup at
+       * (RCA : REUSE ~22% hangs vs FRESH 0%.) pd_phase==NONE (set by pd_cleanup at
        * decode-completion, sockproxy_http.c:1468/1556) + n_rfd>0 + disagg uniquely marks
        * a completed P/D request with a stale leg; rcv_off==0 confines this to a request
        * boundary (mid-body relay has rcv_off>0; mid-P/D has pd_phase!=NONE) and
@@ -8071,7 +8071,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->pd_phase == PD_PHASE_NONE &&
           pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) {
         log_info("[KA_FIX] fd=%d releasing stale P/D backend leg before next keep-alive "
-                 "request (n_rfd=%d rfd0=%d) — 81-09 reframe fix",
+                 "request (n_rfd=%d rfd0=%d) — reframe fix",
                  pfe->fd, pfe->n_rfd, pfe->rfd[0]);
         proxy_release_rfd_ctx(pfe);
       }
@@ -8229,7 +8229,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             }
           }
 
-          // D-LC3: a JSON body larger than SP_JSON_INSPECT_MAX can NEVER finish
+          // a JSON body larger than SP_JSON_INSPECT_MAX can NEVER finish
           // buffering — rcvbuf is SP_SOCK_MSG_LEN and the partial-request path
           // below hard-fails ("return -1", connection reset) at 95% fill. Before
           // this cap, a long-context request above ~972KB (coding-assistant
@@ -8432,11 +8432,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             // Setup backend connection + forward.: the dispatch+forward
             // sequence is factored into pd_setup_and_forward() so the bounded-admission
             // RESUME path (pd_resume_parked) re-drives the EXACT same code as a fresh
-            // dispatch. PARKED => held/suspended (keep fd, no forward, no close — 93-05
+            // dispatch. PARKED => held/suspended (keep fd, no forward, no close — 
             // resumes via the owner-worker wake). DONE => forwarded (break the loop).
             {
               int fwd_rc = pd_setup_and_forward(fd, pfe, key, rkey, phurl);
-              if (fwd_rc == SP_FWD_PARKED)  return 0;   /* held — 93-04/05 admission */
+              if (fwd_rc == SP_FWD_PARKED)  return 0;   /* held — parked admission */
               if (fwd_rc == SP_FWD_RESTART) return -1;  /* error — restart/close */
               if (fwd_rc == SP_FWD_DONE)    break;      /* forwarded — wait for backend */
               /* SP_FWD_NOBACKEND: setup ok but rfd[0]<=0 — fall through to `continue`. */
@@ -8482,7 +8482,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->has_vllm_request_id = 0;
           pfe->request_id_injected = 0;
 
-          // 81-09 TRUNCATION FIX: also clear stale SSE/streaming state on the parse-error reset
+          // TRUNCATION FIX: also clear stale SSE/streaming state on the parse-error reset
           // path (same omission as the success-path keep-alive reset above).
           pfe->sse_active = 0;
           pfe->stream_start_ts = 0;
@@ -8501,7 +8501,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         {
           int sp_rc = setup_proxy_path(key, rkey, pfe, phurl);
           /* parked = held/suspended. Keep the fd, do NOT forward, do
-           * NOT close. 93-05 dequeues+resumes when a prefill slot frees. */
+           * NOT close. dequeues+resumes when a prefill slot frees. */
           if (sp_rc == PD_SETUP_PARKED) return 0;
           if (sp_rc) {
             return -1; // Restart

@@ -618,7 +618,7 @@ int extract_llm_prefix(const char *json_body, size_t len,
       i++;  // Move to prompt value
       if (tokens[i].type == JSMN_STRING) {
         // Extract prompt text for prefix hashing.
-        // D-LC2: DECODE the JSON escapes while copying (see
+        // DECODE the JSON escapes while copying (see
         // sockproxy_json_unescape.h). The raw strncpy that used to live here
         // fed still-escaped bytes ("line1\\nline2") to the Tier-1.5 tokenizer
         // while the publisher/vLLM hash the DECODED text — so any prompt with

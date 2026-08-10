@@ -891,7 +891,7 @@ pd_session_evict_key(proxy_epval_t *tepval, const char *key)
  * Returns 0 on success (*ep_out set), -1 if no healthy prefill EP found.
  */
 
-/* 81-09 KV-exact load-balancing experiment toggles (cached getenv, read once).
+/* KV-exact load-balancing experiment toggles (cached getenv, read once).
  * Default 0 = the shipped unguarded KV-exact (Tier 1.5 routes purely by KV-cache
  * overlap, no load awareness — diagnosed prefill hot-spot, C1 TTFT p90 ~2x RR).
  *   LLB_KV_LOADGUARD=1  Approach A: hard load-imbalance guard at the T1.5 call site,
@@ -934,7 +934,7 @@ pd_kv_loadguard_on(void)
 /* PD_CTRL_* packed-word constants + accessors. Normally provided
  * by sockproxy.h; absent under the TEST_PD_CACHE_AWARE unit build — define
  * idempotently (PD_PREFILL_NO_CAPACITY precedent). State values are lockstep with
- * the frozen loxilb.aictrl.v1 EpState enum (96-02): 1=ACTIVE 2=DRAINING 3=DISABLED,
+ * the frozen loxilb.aictrl.v1 EpState enum : 1=ACTIVE 2=DRAINING 3=DISABLED,
  * 0=no-instruction. Packed layout: state bits 31-24, weight bits 7-0 [0,100]. */
 #ifndef PD_CTRL_ST_NONE
 #define PD_CTRL_ST_NONE     0
@@ -976,7 +976,7 @@ static _Atomic uint64_t pd_admission_shed_total = 0;
 /* bounded backpressured admission — per-EP parked FIFO depth (env
  * LLB_PD_QUEUE_DEPTH_PER_EP, cached getenv-once; mirrors pd_max_inflight_per_ep
  * EXACTLY). 0/unset = DISABLED -> the all-capped branch sheds a 429 exactly as
- * 93-01 (byte-identical back-compat). When >0 (clamped to PD_MAX_QUEUE_DEPTH),
+ * (byte-identical back-compat). When >0 (clamped to PD_MAX_QUEUE_DEPTH),
  * the all-capped branch ENQUEUES the request onto the least-loaded eligible EP's
  * FIFO (hold-don't-drop) and returns PD_PREFILL_PARKED; 429 then fires ONLY when
  * every candidate FIFO is also full (overflow valve).: non-static so the
@@ -1023,7 +1023,7 @@ static _Atomic uint64_t pd_ctrl_fold_transitions_total = 0;
  * The accessor route is deliberate — the Phase-93 comments above explicitly
  * avoided global_stats struct churn, so the counters stay file-static and are
  * exported through this one seam (migration to global_stats noted as debt in
- * 96-01-SUMMARY). which==0 -> shed_total, which==1 -> queued_total, any other
+ * -SUMMARY). which==0 -> shed_total, which==1 -> queued_total, any other
  * value -> 0. Prototype lives next to proxy_get_metrics in sockproxy_metrics.h. */
 uint64_t
 pd_admission_stats_get(int which)
@@ -1036,7 +1036,7 @@ pd_admission_stats_get(int which)
 }
 
 /* CLOCK_MONOTONIC nanoseconds (matches the sockproxy_http.c reaper
- * idiom). Stamped on each parked entry's enqueue_ns for the 93-05 max-park reap. */
+ * idiom). Stamped on each parked entry's enqueue_ns for the max-park reap. */
 static uint64_t
 pd_now_ns(void)
 {
@@ -1083,7 +1083,7 @@ pd_queued_or_fill(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_fill)
  *
  * These are pure ring-buffer ops on a single pd_parked_fifo_t. They do NOT take
  * pd_parked_lock — the CALLER holds it (the production callers run them under
- * tepval->pd_parked_lock, exactly like the 93-04 enqueue). They never touch a
+ * tepval->pd_parked_lock, exactly like the enqueue). They never touch a
  * pfe, never free, never dispatch: the UAF-critical re-drive/teardown happens in
  * the caller (sockproxy_http.c dequeue hook on the pinned owner; sockproxy_health.c
  * reap via the single-owner pd_teardown_conn). Single-sourcing the FIFO math here
@@ -1165,15 +1165,15 @@ pd_max_park_sec(void)
   return (uint32_t)v;
 }
 
-/* (AC-4): global total in-flight+queued footprint bound (env
+/* : global total in-flight+queued footprint bound (env
  * LLB_PD_MAX_TOTAL_INFLIGHT), cached getenv-once — mirrors pd_max_park_sec
  * EXACTLY. 0/unset = DISABLED ⇒ accept() is byte-identical (no gate, no counter
  * check). When >0, accept() refuses a new client connection once the global
  * pd_admission_total_inflight gauge has reached this bound, leaving the SYN in
  * the listen(fd,32) backlog so the kernel applies natural TCP backpressure (the
  * XDP-safest primitive under --net=host — no established-conn epoll/XDP state is
- * touched). This is a SEPARATE outer guard from the per-EP cap (93-01) and the
- * per-EP FIFO (93-04/05). */
+ * touched). This is a SEPARATE outer guard from the per-EP cap and the
+ * per-EP FIFO (/05). */
 uint32_t
 pd_max_total_inflight(void)
 {
@@ -1190,7 +1190,7 @@ pd_max_total_inflight(void)
   return (uint32_t)v;
 }
 
-/* (AC-4): the pure accept-gate decision, factored out so it is
+/* : the pure accept-gate decision, factored out so it is
  * unit-testable in isolation (the accept loop itself is hard to drive standalone
  * — integration is covered by the live conc=128 gate + footprint soak). Returns
  * 1 = ACCEPT, 0 = REFUSE. bound==0 (feature off) ALWAYS accepts (byte-identical).
@@ -1204,7 +1204,7 @@ pd_admission_should_accept(uint64_t cur_inflight, uint32_t bound)
 
 /* advisory DRAINING predicate for NEW-session assignment.
  *
- * Design rationale (96-03 Task 2B): the controller path deliberately does NOT
+ * Design rationale : the controller path deliberately does NOT
  * write tepval->drain_state[] — that array is owned by the local health
  * machinery (proxy_update_ep_health writer, check_draining_endpoints reaper),
  * and a second writer would need origin tracking to clear safely. (Survey
@@ -1317,7 +1317,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
         /* All healthy prefill EPs at the in-flight cap. */
         uint32_t depth = pd_queue_depth_per_ep();
         if (depth == 0) {
-          /* Default-off: shed (retriable) exactly as 93-01. Byte-identical. */
+          /* Default-off: shed (retriable) exactly as . Byte-identical. */
           uint64_t n = atomic_fetch_add(&pd_admission_shed_total, 1) + 1;
           (void)n;  /* consumed by log_info below (no-op in unit-test builds) */
           log_info("[PD_ADMISSION] fd=%d shed: all %d healthy prefill EPs at in-flight "
@@ -1469,7 +1469,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
 
   /* -- Tier 1.5: KV block-hash exact routing --- */
   if (tepval->kv_exact_mode == 1) {
-    /* 81-09 Approach A (env LLB_KV_LOADGUARD=1): hard load-imbalance guard that
+    /* Approach A (env LLB_KV_LOADGUARD=1): hard load-imbalance guard that
      * mirrors the Tier-1 (radix-trie) guard above. KV-exact has NO load awareness,
      * so under a shared-prefix trace it hot-spots the cache-owner prefill EP. Only
      * honor cache affinity while prefill load is balanced; once
@@ -1523,7 +1523,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     uint64_t best_score = UINT64_MAX;
     int candidates[MAX_PROXY_EP], n_cand = 0;
 
-    /* C2 (81-07): capacity-weighted bounded-load scoring is the GPU-aware arm.
+    /* capacity-weighted bounded-load scoring is the GPU-aware arm.
      * It is engaged ONLY when ep_sel == PROXY_SEL_GPU_AWARE; otherwise the
      * scorer below is byte-identical to the shipped COMP-07 path (C1), so the
  * A/B is one build flag-toggled. When engaged we pre-sum the clamped

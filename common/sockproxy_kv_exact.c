@@ -57,7 +57,7 @@
 /* PD_CTRL_* packed-word constants + accessors. Normally from
  * sockproxy.h; absent under the TEST_KV_EXACT unit build — define idempotently
  * (the sockproxy_pd.c PD_PREFILL_NO_CAPACITY precedent). Lockstep with the
- * frozen aictrl.v1 EpState enum (96-02). */
+ * frozen aictrl.v1 EpState enum . */
 #ifndef PD_CTRL_ST_NONE
 #define PD_CTRL_ST_NONE     0
 #define PD_CTRL_ST_ACTIVE   1
@@ -227,7 +227,7 @@ kv_hash_debug_test_set(int on)
 }
 
 /* kv_now_us — monotonic microsecond clock for the per-stage hot-path timers
- * (C3, plan 81-01). CLOCK_MONOTONIC is the same source the P/D decode-latency
+ * (design note). CLOCK_MONOTONIC is the same source the P/D decode-latency
  * timers use (sockproxy_http.c:3033). Returns 0 only if clock_gettime fails,
  * which makes the stage delta degrade to 0 (a no-perturbation safe value)
  * rather than a wild number. */
@@ -651,7 +651,7 @@ kv_compute_block_hashes(uint8_t hash_algo, const uint32_t *tokens,
  * via the kv_load[]/kv_cap[] arrays below) for its load cap. skip_load_balance
  * MUST remain 0 on this path (sockproxy_lb.c:524) — that flag is for the strict
  * pure-locality prefix_hash mode and DISABLES the bounded-load cap, which would
- * re-introduce the single-EP prefill hot-spot fixes (81-09 a417f037).
+ * re-introduce the single-EP prefill hot-spot fixes ( an earlier fix).
  * This path never enters the C chwbl ring and never enables skip_load_balance
  * (asserted in test/audit): selection is the Go export, the cap is the blend. */
 int
@@ -692,7 +692,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
     text_src = "prefix_key";
   } else if (!pfe->is_streamable &&
              pfe->rcvbuf != NULL && ((char *)pfe->rcvbuf)[0] != '\0') {
-    /* D-LC3: a STREAMED request (oversize JSON via JSON_STREAM_FALLBACK, or
+    /* a STREAMED request (oversize JSON via JSON_STREAM_FALLBACK, or
      * any non-inspected content type) deliberately skipped body inspection —
      * rcvbuf holds the raw HTTP request line + headers, and tokenizing those
      * bytes can never match a published block chain. Without the streamable
@@ -738,7 +738,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   log_info("[KV_T15] fd=%d PRE_TOKENIZE text_src=%s model_src=%s model='%s' text_len=%zu",
            pfe->fd, text_src, model_src, model, strlen(text));
 
-  /* C3 per-stage timing (plan 81-01): monotonic µs deltas around the 4 stages.
+  /* C3 per-stage timing (the design): monotonic µs deltas around the 4 stages.
    * `measured[]` tracks which stages actually ran so a miss-path early-return
    * flushes ONLY the stages it reached. record_kv_stage is the always-on,
    * off-path atomic add (NO synchronous logging in the timed windows — the
@@ -771,7 +771,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
    * the ChatML/system/role wrappers), so pass the RAW JSON body to the chat bridge
    * (llb_ai_kv_tokenize_chat) which renders the template + Encodes in Go to vLLM
    * parity. Completions keep the existing single-text path. The chat bridge owns
-   * the WithEncodeSpecialTokens mode (88-01/88-02 resolved: one tokenizer mode
+   * the WithEncodeSpecialTokens mode (the design resolved: one tokenizer mode
    * serves both paths), so no per-path mode is needed C-side. On -1 (no messages /
    * no known template / tokenize fail) GUARD_E below falls back — never routes a
    * mis-hashed request through KV-exact. The raw body is reachable contiguously
@@ -781,7 +781,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   int n_tokens;
   if (pfe->is_chat) {
     char *raw_body = text;  /* fail-safe default */
-    /* D-LC4: llb_ai_kv_tokenize_chat takes a C string — Go's C.GoString reads
+    /* llb_ai_kv_tokenize_chat takes a C string — Go's C.GoString reads
      * until the first NUL, and body_len is NOT part of the CGO contract. The
      * body span inside rcvbuf is not NUL-terminated: on a keep-alive
      * connection whose PREVIOUS request was longer, the bytes past this body
@@ -873,7 +873,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
    * same index space as prefill_mask/excluded_mask). This replaces the dead
    * vLLM workerMetrics scraper path (rules.go:3423 builds it with updateFn=nil
    * → load was always 0 → the blend ran BLIND → single-EP prefill hot-spot, the
-   * 81-09 root cause a417f037). kv_load[i] = live in-flight active_conns,
+   * root cause an earlier fix). kv_load[i] = live in-flight active_conns,
    * kv_cap[i] = advertised num_gpu_blocks. Fixed-width [32] reuses the
    * MAX_PROXY_EP<=32 _Static_assert above; an empty/degenerate set stays
    * all-zero (Tier-2-safe). atomic_load idiom copied verbatim from
@@ -899,7 +899,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
    * as 0 and degrades to the smallest positive share Go-side (kvClampCapacity's
    * >=1 floor — true removal is a STATE, not a weight). Weights come from the
    * C pd_ctrl_ep[] atomics, NOT the scraper map (same provenance rule as the
-   * 81-09 blind-blend fix for kv_load/kv_cap above). */
+   * blind-blend fix for kv_load/kv_cap above). */
   uint32_t kv_weight[32];
   const uint32_t *kv_weight_ptr = NULL;
   if (atomic_load(&tepval->pd_ctrl_mode) != 0) {
@@ -912,7 +912,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
   }
 
   /* STAGE 3: CGO crossing into the Go inventory scorer. The best_worker scan
-   * (STAGE 4) runs INSIDE this call; it is timed Go-side in plan 81-02, so it
+   * (STAGE 4) runs INSIDE this call; it is timed Go-side in the design, so it
    * is folded into the CGO delta here (the enum reserves the 4th slot).
  * (SGL-04, Pitfall 2): tepval->kv_svc_id threads the calling rule's
    * identity across the CGO seam so the Go selector scores ONLY this rule's

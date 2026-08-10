@@ -124,8 +124,8 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_params_overflow;
     _Atomic uint64_t pd_fallback_to_normal;  // RES-02: Non-P/D fallback counter
     _Atomic uint64_t pd_cb_flips;            // OBS-03: Circuit breaker state transition count
-    _Atomic uint64_t pd_cb_proactive_heal;   // 93-02 (D1): OPEN→HALF_OPEN driven by the 1Hz health pass (no organic traffic)
-    // 93-06 (AC-4): global total-footprint admission. pd_admission_total_inflight is a
+    _Atomic uint64_t pd_cb_proactive_heal;   // OPEN→HALF_OPEN driven by the 1Hz health pass (no organic traffic)
+    // : global total-footprint admission. pd_admission_total_inflight is a
     // GAUGE — incremented once per pfe_alloc (loxilb commits to holding a connection's
     // footprint) and decremented (>0-guarded) once per pfe_recycle, so it is balanced
     // like pfe_pool_live. pd_admission_total_blocked is a COUNTER of accept()s refused
@@ -151,7 +151,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
     _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
-    // (C3): per-stage hot-path µs histograms. One 12-bucket histogram
+    //: per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
     // "must match Go CGO bucketBounds" parity comment (below) holds for these too.
@@ -218,13 +218,13 @@ int proxy_set_service_catalog(uint32_t xip, uint16_t xport, uint8_t protocol, ui
 #endif
 
 /* A single parked client. We store (fd, gen) — NOT a pfe pointer — so dequeue
- * (93-05) re-resolves the pfe and validates pfe->gen == gen (Phase-89 staleness
+ * re-resolves the pfe and validates pfe->gen == gen (Phase-89 staleness
  * guard): a recycled fd yields a gen mismatch and the entry is dropped safely.
- * enqueue_ns feeds the 93-05 max-park reap (LLB_PD_MAX_PARK_SEC). */
+ * enqueue_ns feeds the max-park reap (LLB_PD_MAX_PARK_SEC). */
 typedef struct {
   int      fd;          /* parked client fd */
   uint64_t gen;         /* pfe->gen snapshot at enqueue — staleness guard on dequeue */
-  uint64_t enqueue_ns;  /* CLOCK_MONOTONIC stamp — for the 93-05 max-park reap */
+  uint64_t enqueue_ns;  /* CLOCK_MONOTONIC stamp — for the max-park reap */
 } pd_parked_ent_t;
 
 /* One bounded ring per prefill EP. head/tail/count index slot[]; the whole
@@ -312,13 +312,13 @@ typedef struct ep_load_tracker {
   // unknown instead of trusting a dead EP's last value forever.
   _Atomic uint64_t last_update_ts;
   int ep_available;                 // Endpoint health flag
-  // C2 (81-07): vLLM-advertised KV capacity (cache_config_info num_gpu_blocks),
+  // vLLM-advertised KV capacity (cache_config_info num_gpu_blocks),
   // fed by llb_ai_update_ep_capacity (mirrors the queue-depth bridge). Consumed
   // by pd_select_prefill's capacity-weighted bounded-load scorer (the reserved
   // PROXY_SEL_GPU_AWARE weights lit up). 0 = not advertised (clamped to 1 by
   // pd_kv_clamp_capacity before any divide — V5 guard, never divide-by-zero).
   _Atomic uint32_t num_gpu_blocks;
-  // C2 (81-07): swap-space pressure signal for the SWAP_WEIGHT term (0 when the
+  // swap-space pressure signal for the SWAP_WEIGHT term (0 when the
   // scraper does not advertise it — the SWAP term then contributes nothing).
   _Atomic uint32_t swap_pressure;
 } ep_load_tracker_t;
@@ -406,7 +406,7 @@ typedef struct circuit_breaker {
 //   bits 31-24 = state (PD_CTRL_ST_*), bits 7-0 = weight [0,100],
 //   bits 23-8 reserved (0). packed == 0 => NO instruction => every guard skips.
 // State values MUST stay in lockstep with the frozen loxilb.aictrl.v1 EpState
-// enum (pkg/aictrl, 96-02): 1=ACTIVE, 2=DRAINING, 3=DISABLED, 0=none.
+// enum (pkg/aictrl): 1=ACTIVE, 2=DRAINING, 3=DISABLED, 0=none.
 // ============================================================================
 #ifndef PD_CTRL_ST_NONE
 #define PD_CTRL_ST_NONE     0  /* no instruction (zero-init / cleared)          */
@@ -620,9 +620,9 @@ typedef struct proxy_map_ent {
   // L7 content-routing policy discriminator (CONTEXT).
   // These live on the per-service proxy_map_ent (the heap struct), NEVER on
   // proxy_arg (the 4096-byte eBPF map value — its _Static_assert stays untouched,
-  // ). DECLARED here by Plan 75-04 (the first reader: l7_route_dispatch reads
+  // ). DECLARED here by Plan (the first reader: l7_route_dispatch reads
   // has_l7_policy and, when set, runs the L7 engine over l7_routes); POPULATED by
-  // Plan 75-05's proxy_attach_l7_policy (deep-copies the position-sorted route
+  // Plan an earlier cycle's proxy_attach_l7_policy (deep-copies the position-sorted route
   // array, regcomp's each REGEX once, sets has_l7_policy=1).
   //
   // When has_l7_policy == 0 (the default for every AI/model service) the L7
@@ -683,7 +683,7 @@ typedef struct ssl_cert_entry {
 #define CERTID_MAX_HOSTNAMES 8
 // max length of an opaque certId management token.
 // proxy_arg references heavy backend TLS material by this short id instead of
-// inline path strings (768 bytes reclaimed). 64 fits the 77-07 token
+// inline path strings (768 bytes reclaimed). 64 fits the token
 // format (alphanumeric handle) with NUL terminator headroom. Defined here (ahead
 // of cert_id_entry and proxy_arg, both of which embed certId[CERTID_MAX]).
 #define CERTID_MAX 64
@@ -722,7 +722,7 @@ typedef enum {
   PD_PHASE_ERROR            = 7,  // P/D flow error
   PD_PHASE_PARKED           = 8   // client parked (all prefill EPs capped),
                                   // EPOLLIN-suspended on a per-EP FIFO, awaiting a freed
-                                  // slot (dequeue+resume lands in 93-05). NOT connected.
+                                  // slot (dequeue+resume is not wired yet). NOT connected.
 } pd_phase_t;
 
 struct proxy_fd_ent {
@@ -887,7 +887,7 @@ struct proxy_fd_ent {
   llhttp_t parser;
   llhttp_settings_t settings;
 #define SP_SOCK_MSG_LEN (1024 * 1024)  // 1MB - handles file uploads + LLM requests
-/* D-LC3: largest JSON body the proxy will BUFFER for body inspection (prefix
+/* largest JSON body the proxy will BUFFER for body inspection (prefix
  * extraction / KV-exact tokenize). A JSON request above this streams instead:
  * inspection is skipped and routing falls through to Tier-2 (fail-open). The
  * cap MUST sit safely under the 95%-of-SP_SOCK_MSG_LEN overflow guard in
@@ -959,10 +959,10 @@ struct proxy_fd_ent {
   // bounded backpressured admission — park bookkeeping. When this
   // client is parked (all prefill EPs capped, FIFO has room), park_ep_idx is the
   // prefill EP whose FIFO it sits on and park_start_ts is the CLOCK_MONOTONIC ns
-  // stamp at enqueue (drives the 93-05 max-park reap). park_ep_idx == -1 (the
+  // stamp at enqueue (drives the max-park reap). park_ep_idx == -1 (the
   // pooled-pfe default) means "not parked". No parallel struct — reuse the pfe.
   int      park_ep_idx;              // prefill EP index this request is parked behind (-1 = not parked)
-  uint64_t park_start_ts;            // CLOCK_MONOTONIC ns at park enqueue (max-park reap, 93-05)
+  uint64_t park_start_ts;            // CLOCK_MONOTONIC ns at park enqueue (max-park reap)
   int      pd_prefill_ep_idx;        // Selected prefill endpoint index
   int      pd_decode_ep_idx;         // Selected decode endpoint index
   uint8_t *pd_saved_body;            // Heap: original request body for decode phase
@@ -998,7 +998,7 @@ struct proxy_fd_ent {
    * discipline) by EITHER the backend connect-failure path (sockproxy_ep.c)
    * OR the generic teardown (pd_cleanup, sockproxy_http.c). Without this
    * pairing the unified CHWBL hard-cap and adaptive ε/λ run blind on
-   * single-role services (the 81-09 hot-spot, 99-RESEARCH Pitfall 1).
+   * single-role services (the hot-spot, 99-RESEARCH Pitfall 1).
    * Append-only growth on proxy_fd_ent (NOT xSync-serialized) — HA-safe per
    * the resp_parser_inited precedent above. Zero-init (pfe_alloc) == not held. */
   uint8_t  kv_sr_load_held;          // 1 = single-role KV load unit held 
@@ -1095,7 +1095,7 @@ l7_store_header(struct proxy_fd_ent *pfe, const char *name, const char *value)
 #define PROXY_SEL_WRR 6          // P3: Weighted Round-Robin (smooth distribution)
 #define PROXY_SEL_WRR_HASH 7     // P3.5: Weighted Consistent Hash + Bounded Loads
 
-// C2 (81-07): PROXY_SEL_GPU_AWARE scoring weights — the data-path live-load
+// PROXY_SEL_GPU_AWARE scoring weights — the data-path live-load
 // terms the capacity-weighted bounded-load scorer consumes in
 // pd_select_prefill (pd_capacity_blend_score). These were previously defined
 // ONLY under HAVE_DP_GPU_ROUTING (DEFAULT_{QUEUE,SWAP,KV_CACHE}_WEIGHT below)
@@ -1238,9 +1238,9 @@ struct proxy_arg {
   
   // explicit operator-supplied client-cert CRL path (PEM) loaded
   // into the verify X509_STORE with leaf-only X509_V_FLAG_CRL_CHECK. This is the explicit
-  // drop-in for 77-04's convention-derived sibling crl.pem (mtls_derive_crl_path): when set it
+  // drop-in for an earlier cycle's convention-derived sibling crl.pem (mtls_derive_crl_path): when set it
   // is preferred; empty ⇒ fall back to the CA-dir-sibling convention (today's behaviour).
-  char client_crl_path[256];        // empty ⇒ derive sibling crl.pem from client_ca_path (77-04)
+  char client_crl_path[256];        // empty ⇒ derive sibling crl.pem from client_ca_path 
 
   // Backend mTLS - Server cert verification + client cert
   uint8_t backend_verify_cert;      // 1=verify server cert, 0=no (SSL_VERIFY_NONE)
@@ -1406,11 +1406,11 @@ uint32_t pd_max_park_sec(void);
 /* runtime per-EP parked-FIFO depth (env LLB_PD_QUEUE_DEPTH_PER_EP;
  * 0/unset = bounded-admission OFF). The pd_cleanup dequeue hook gates on this. */
 uint32_t pd_queue_depth_per_ep(void);
-/* (AC-4): global total in-flight+queued footprint bound (env
+/* : global total in-flight+queued footprint bound (env
  * LLB_PD_MAX_TOTAL_INFLIGHT; 0/unset = ingress backpressure OFF, accept() byte-
  * identical). Mirrors pd_max_park_sec (getenv-once, __atomic-cached). */
 uint32_t pd_max_total_inflight(void);
-/* (AC-4): the pure accept-gate decision, factored out so it can be
+/* : the pure accept-gate decision, factored out so it can be
  * unit-tested in isolation. Returns 1 = ACCEPT (under bound or feature off),
  * 0 = REFUSE (at/over the bound — leave the SYN in the listen backlog). bound==0
  * (feature off) always ACCEPTs. */
@@ -1448,7 +1448,7 @@ int proxy_notify_delete_fd(int fd, int evict);
 
 // DEFAULT scoring weights (used when catalog not found - fallback only)
 // These match the "default" catalog for backward compatibility.
-// NOTE (C2 / 81-07): these are now ALSO defined unconditionally near the
+// NOTE (C2 / ): these are now ALSO defined unconditionally near the
 // PROXY_SEL_* block above so the GPU-aware prefill scorer compiles on the
 // default build; the #ifndef guards keep both definitions consistent.
 #ifndef DEFAULT_QUEUE_WEIGHT
