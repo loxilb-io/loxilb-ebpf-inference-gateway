@@ -1026,8 +1026,13 @@ dp_is_ppv2_ipv6(struct xfi *xf)
           xf->l34m.daddr[1] | xf->l34m.daddr[2] | xf->l34m.daddr[3]) != 0;
 }
 
+/* Writes the PROXY v2 header at *start* and returns, in *bcsum*, the one's
+ * complement partial sum of the bytes it wrote. The caller feeds that to
+ * bpf_l4_csum_replace() as a diff instead of folding it into the L4 checksum
+ * by hand - see the comment in dp_ins_ppv2().
+ */
 static int __always_inline
-dp_populate_ppv2(void *md, struct xfi *xf, void *start, __be32 *csum)
+dp_populate_ppv2(void *md, struct xfi *xf, void *start, __u32 *bcsum)
 {
   struct proxy_hdr_v2 *ppv2h;
   __u8 sig[12] = { 0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D,
@@ -1064,7 +1069,7 @@ dp_populate_ppv2(void *md, struct xfi *xf, void *start, __be32 *csum)
     pip6h->src_port = xf->l34m.source;
     pip6h->dst_port = xf->l34m.dest;
 
-    *csum = bpf_csum_diff((__be32 *)ppv2h, sizeof(*ppv2h) + sizeof(*pip6h), 0, 0, *csum);
+    *bcsum = bpf_csum_diff(0, 0, (__be32 *)ppv2h, sizeof(*ppv2h) + sizeof(*pip6h), 0);
   } else {
     /* IPv4 + TCP/UDP */
     struct proxy_ipv4_hdr *piph;
@@ -1084,7 +1089,7 @@ dp_populate_ppv2(void *md, struct xfi *xf, void *start, __be32 *csum)
     piph->src_port = xf->l34m.source;
     piph->dst_port = xf->l34m.dest;
 
-    *csum = bpf_csum_diff((__be32 *)ppv2h, sizeof(*ppv2h) + sizeof(*piph), 0, 0, *csum);
+    *bcsum = bpf_csum_diff(0, 0, (__be32 *)ppv2h, sizeof(*ppv2h) + sizeof(*piph), 0);
   }
 
   return 0;
@@ -1096,8 +1101,8 @@ dp_fixup_ppv2(void *md, struct xfi *xf)
   struct tcphdr *tcp;
   void *dend;
   __be32 oval = 0;
-  __u32 nval = 0;
-  __u32 csum = 0;
+  __be32 nval = 0;
+  int csum_off = xf->pm.l4_off + offsetof(struct tcphdr, check);
   __u16 ppv2_addr_len;
   int is_ipv6;
 
@@ -1125,18 +1130,110 @@ dp_fixup_ppv2(void *md, struct xfi *xf)
 
   if (xf->pm.oppv2) {
     oval = tcp->seq;
-    nval = bpf_ntohl(tcp->seq) + sizeof(struct proxy_hdr_v2) + ppv2_addr_len;
-    tcp->seq = bpf_htonl(nval);
-    nval = tcp->seq;
+    nval = bpf_htonl(bpf_ntohl(tcp->seq) +
+                     sizeof(struct proxy_hdr_v2) + ppv2_addr_len);
+    tcp->seq = nval;
   } else if (xf->pm.ippv2) {
     oval = tcp->ack_seq;
-    nval = bpf_ntohl(tcp->ack_seq) - (sizeof(struct proxy_hdr_v2) + ppv2_addr_len);
-    tcp->ack_seq = bpf_htonl(nval);
-    nval = tcp->ack_seq;
+    nval = bpf_htonl(bpf_ntohl(tcp->ack_seq) -
+                     (sizeof(struct proxy_hdr_v2) + ppv2_addr_len));
+    tcp->ack_seq = nval;
+  } else {
+    return 0;
   }
 
-  csum = bpf_csum_diff((__be32 *)&nval, 4, (__be32 *)&oval, 4, tcp->check);
-  tcp->check = csum_fold_helper_diff((__u32)csum);
+  /* seq/ack_seq live inside the L4 checksum's own coverage, not in the
+   * pseudo header, so hand the delta to bpf_l4_csum_replace() rather than
+   * patching tcp->check by hand. On a CHECKSUM_PARTIAL skb - which is what
+   * loxilb sees whenever the peer is a veth/tap/tun rather than a physical
+   * NIC (containerised loxilb, backend pods on the same node, VPN paths) -
+   * tcp->check holds only the pseudo-header sum and the final checksum is
+   * computed downstream over the already-modified L4 range. Folding the
+   * delta in here as well counts it twice, and every fixed-up packet leaves
+   * with a checksum off by exactly the ppv2 header length; a receiver that
+   * validates checksums then drops the whole flow. The helper knows the
+   * skb's checksum state, a direct store does not - and it is what the rest
+   * of the datapath (dp_set_tcp_*) already uses.
+   *
+   * NB: this invalidates tcp/dend for the verifier - do not touch the packet
+   * after this point without re-fetching them.
+   */
+  bpf_l4_csum_replace(md, csum_off, oval, nval, sizeof(nval));
+
+  return 0;
+}
+
+/* Insertion path for a segment that carries no TCP payload - which is the
+ * normal ppv2 trigger, since the header moved onto the handshake ACK.
+ *
+ * Growing the packet at the TAIL leaves the TCP header exactly where it is,
+ * so an offloaded (CHECKSUM_PARTIAL) skb keeps a valid csum_start and the
+ * stack still finalises the L4 checksum for us. The bpf_skb_adjust_room()
+ * path in dp_ins_ppv2() cannot: it opens the room *before* the TCP header
+ * and then slides the header down over it, which leaves csum_start pointing
+ * into the middle of the inserted bytes - and the helper resets the skb to
+ * CHECKSUM_NONE anyway, so whatever sits in tcp->check is shipped as if it
+ * were a finished checksum. When the packet reached loxilb from a veth/tap/
+ * tun peer rather than a physical NIC (containerised loxilb, backend pods on
+ * the same node, VPN paths) that field only ever held the pseudo-header sum,
+ * so the segment goes out with a bogus checksum and a validating receiver
+ * drops the connection.
+ */
+static int __always_inline
+dp_ins_ppv2_tail(void *md, struct xfi *xf, int len, __u16 doff)
+{
+  struct proxy_hdr_v2 *ppv2h;
+  struct iphdr *iph;
+  struct ipv6hdr *ip6h;
+  void *dend;
+  __u32 bcsum = 0;
+  int csum_off = xf->pm.l4_off + offsetof(struct tcphdr, check);
+  __be16 olp = bpf_htons(xf->pm.l3_plen);
+  __be16 nlp = bpf_htons(xf->pm.l3_plen + len);
+
+  if (bpf_skb_change_tail(md, DP_GET_LEN(md) + len, 0)) {
+    LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+    return -1;
+  }
+
+  dend = DP_TC_PTR(DP_PDATA_END(md));
+
+  if (xf->l2m.dl_type == bpf_htons(ETH_P_IP)) {
+    iph = DP_ADD_PTR(DP_PDATA(md), xf->pm.l3_off);
+    if (iph + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+    iph->tot_len = bpf_htons(xf->pm.l3_len + len);
+    dp_ipv4_new_csum((void *)iph);
+  } else {
+    ip6h = DP_ADD_PTR(DP_PDATA(md), xf->pm.l3_off);
+    if (ip6h + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+    ip6h->payload_len = bpf_htons(bpf_ntohs(ip6h->payload_len) + len);
+  }
+
+  /* The header goes right after the TCP header, which is also the tail of
+   * the original segment since there is no payload.
+   */
+  ppv2h = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off + doff);
+  if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
+    return -1;
+  }
+
+  /* The TCP length lives in the pseudo header and is invisible to any
+   * downstream checksum pass, so it always has to be applied. The appended
+   * bytes sit inside the L4 checksum's own coverage, so they must only be
+   * applied when the checksum is already complete - bpf_l4_csum_replace()
+   * makes exactly that distinction, a hand-folded store does not.
+   *
+   * NB: these calls invalidate every packet pointer held above.
+   */
+  bpf_l4_csum_replace(md, csum_off, olp, nlp,
+                      BPF_F_PSEUDO_HDR | sizeof(olp));
+  bpf_l4_csum_replace(md, csum_off, 0, bcsum, 0);
 
   return 0;
 }
@@ -1153,10 +1250,11 @@ dp_ins_ppv2(void *md, struct xfi *xf)
   struct udphdr *nudp;
   void *dend;
   __u16 doff;
-  __u32 olp;
-  __u32 nlp;
+  __be16 olp;
+  __be16 nlp;
   __u64 flags;
-  __u32 csum = 0;
+  __u32 bcsum = 0;
+  int csum_off;
   int is_ipv6 = dp_is_ppv2_ipv6(xf);
   int is_tcp = (xf->l34m.nw_proto == IPPROTO_TCP);
   int is_udp = (xf->l34m.nw_proto == IPPROTO_UDP);
@@ -1175,6 +1273,23 @@ dp_ins_ppv2(void *md, struct xfi *xf)
   if (xf->l2m.dl_type != bpf_htons(ETH_P_IP) &&
       xf->l2m.dl_type != bpf_htons(ETH_P_IPV6)) {
     return 0;
+  }
+
+  /* A payload-less segment can take the tail-growth path, which is safe for
+   * checksum-offloaded skbs. Anything else has to slide the L4 header down
+   * and therefore still goes through bpf_skb_adjust_room() below.
+   */
+  if (is_tcp) {
+    dend = DP_TC_PTR(DP_PDATA_END(md));
+    tcp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
+    if (tcp + 1 > dend) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+      return -1;
+    }
+    doff = tcp->doff << 2;
+    if (doff >= sizeof(*tcp) && xf->pm.l3_plen == doff) {
+      return dp_ins_ppv2_tail(md, xf, len, doff);
+    }
   }
 
   flags = BPF_F_ADJ_ROOM_FIXED_GSO;
@@ -1218,10 +1333,11 @@ dp_ins_ppv2(void *md, struct xfi *xf)
 
     doff = tcp->doff << 2;
 
-    /* Checksum changes due to TCP segment length change */
-    olp = (__u32)bpf_htons(xf->pm.l3_plen);
-    nlp = (__u32)bpf_htons(xf->pm.l3_plen + len);
-    csum = bpf_csum_diff((__be32 *)&nlp, 4, (__be32 *)&olp, 4, tcp->check);
+    /* TCP segment length is part of the pseudo header, the inserted bytes
+     * are not - the two are applied separately below.
+     */
+    olp = bpf_htons(xf->pm.l3_plen);
+    nlp = bpf_htons(xf->pm.l3_plen + len);
 
 
     ntcp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
@@ -1245,7 +1361,9 @@ dp_ins_ppv2(void *md, struct xfi *xf)
       }
       memcpy(ntop, top, 4);
       ppv2h = (void *)(ntop + 4);
-      dp_populate_ppv2(md, xf, ppv2h, &csum);
+      if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
+        return -1;
+      }
     } else if (doff == 28) {
       __u8 *top =  (void *)(tcp + 1);
       if (top + 8 > dend) { 
@@ -1259,7 +1377,9 @@ dp_ins_ppv2(void *md, struct xfi *xf)
       }
       memcpy(ntop, top, 8);
       ppv2h = (void *)(ntop + 8);
-      dp_populate_ppv2(md, xf, ppv2h, &csum);
+      if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
+        return -1;
+      }
     } else if (doff == 32) {
       __u8 *top =  (void *)(tcp + 1);
       if (top + 12 > dend) {
@@ -1273,7 +1393,9 @@ dp_ins_ppv2(void *md, struct xfi *xf)
       }
       memcpy(ntop, top, 12);
       ppv2h = (void *)(ntop + 12);
-      dp_populate_ppv2(md, xf, ppv2h, &csum);
+      if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
+        return -1;
+      }
     } else if (doff == 36) {
       __u8 *top =  (void *)(tcp + 1);
       if (top + 16 > dend) {
@@ -1287,7 +1409,9 @@ dp_ins_ppv2(void *md, struct xfi *xf)
       }
       memcpy(ntop, top, 16);
       ppv2h = (void *)(ntop + 16);
-      dp_populate_ppv2(md, xf, ppv2h, &csum);
+      if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
+        return -1;
+      }
     } else if (doff == 40) {
       __u8 *top =  (void *)(tcp + 1);
       if (top + 20 > dend) {
@@ -1301,7 +1425,9 @@ dp_ins_ppv2(void *md, struct xfi *xf)
       }
       memcpy(ntop, top, 20);
       ppv2h = (void *)(ntop + 20);
-      dp_populate_ppv2(md, xf, ppv2h, &csum);
+      if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
+        return -1;
+      }
     } else if (doff == 20) {
       /* No TCP options: nothing to shift, PPv2 header goes right after
        * the base 20-byte header. ntcp+1 already bounds-checked above
@@ -1316,21 +1442,31 @@ dp_ins_ppv2(void *md, struct xfi *xf)
        * option, landing on the already-handled doff==32 case).
        */
       ppv2h = (void *)(ntcp + 1);
-      dp_populate_ppv2(md, xf, ppv2h, &csum);
+      if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
+        return -1;
+      }
     } else {
       /* Max of 20 bytes of options */
       LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
       return -1;
     }
 
-    dend = DP_TC_PTR(DP_PDATA_END(md));
-    tcp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
-    if (tcp + 1 > dend) {
-      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
-      return -1;
-    }
-
-    tcp->check = csum_fold_helper_diff((__u32)csum);
+    /* Apply both checksum deltas through the kernel helper instead of
+     * storing a folded value into tcp->check: on a CHECKSUM_PARTIAL skb the
+     * field carries only the pseudo-header sum and the L4 range - including
+     * the 28 bytes just inserted - is summed downstream, so a hand-folded
+     * checksum is wrong there. The pseudo-header length change is invisible
+     * to that downstream pass and must always be applied (BPF_F_PSEUDO_HDR);
+     * the inserted payload bytes must only be applied when the checksum is
+     * already complete, which is exactly the distinction the helper makes.
+     * See dp_fixup_ppv2() for the failure this avoids.
+     *
+     * NB: these calls invalidate every packet pointer held above.
+     */
+    csum_off = xf->pm.l4_off + offsetof(struct tcphdr, check);
+    bpf_l4_csum_replace(md, csum_off, olp, nlp,
+                        BPF_F_PSEUDO_HDR | sizeof(olp));
+    bpf_l4_csum_replace(md, csum_off, 0, bcsum, 0);
   }
   /* Handle UDP protocol */
   else if (is_udp) {
@@ -1361,23 +1497,28 @@ dp_ins_ppv2(void *md, struct xfi *xf)
       return -1;
     }
 
-    /* Checksum changes for UDP */
-    olp = (__u32)bpf_htons(xf->pm.l3_plen);
-    nlp = (__u32)bpf_htons(olp + len);
-    csum = bpf_csum_diff((__be32 *)&nlp, 4, (__be32 *)&olp, 4, udp->check);
+    olp = bpf_htons(xf->pm.l3_plen);
+    nlp = bpf_htons(xf->pm.l3_plen + len);
 
-    dp_populate_ppv2(md, xf, ppv2h, &csum);
-
-    dend = DP_TC_PTR(DP_PDATA_END(md));
-    nudp = DP_ADD_PTR(DP_PDATA(md), xf->pm.l4_off);
-    if (nudp + 1 > dend) {
-      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
+    if (dp_populate_ppv2(md, xf, ppv2h, &bcsum)) {
       return -1;
     }
 
-    if (nudp->check != 0) {
-      nudp->check = csum_fold_helper_diff((__u32)csum);
-    }
+    /* Same split as the TCP path above, plus one extra term: for UDP the
+     * length appears twice - once in the pseudo header and once in udp->len,
+     * which sits inside the L4 checksum's own coverage - so both deltas have
+     * to be applied. BPF_F_MARK_MANGLED_0 preserves "no checksum" (0) and
+     * maps a result of 0 to CSUM_MANGLED_0, which is the UDP convention the
+     * old 'if (check != 0)' guard was approximating.
+     *
+     * NB: these calls invalidate every packet pointer held above.
+     */
+    csum_off = xf->pm.l4_off + offsetof(struct udphdr, check);
+    bpf_l4_csum_replace(md, csum_off, olp, nlp,
+                        BPF_F_PSEUDO_HDR | BPF_F_MARK_MANGLED_0 | sizeof(olp));
+    bpf_l4_csum_replace(md, csum_off, old_len, new_len,
+                        BPF_F_MARK_MANGLED_0 | sizeof(old_len));
+    bpf_l4_csum_replace(md, csum_off, 0, bcsum, BPF_F_MARK_MANGLED_0);
   }
 
   return 0;
