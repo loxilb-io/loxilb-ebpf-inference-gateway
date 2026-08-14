@@ -1302,7 +1302,22 @@ dp_ins_ppv2(void *md, struct xfi *xf)
       memcpy(ntop, top, 20);
       ppv2h = (void *)(ntop + 20);
       dp_populate_ppv2(md, xf, ppv2h, &csum);
-    } else if (doff != 20) {
+    } else if (doff == 20) {
+      /* No TCP options: nothing to shift, PPv2 header goes right after
+       * the base 20-byte header. ntcp+1 already bounds-checked above
+       * (the ntcp+1 > dend guard preceding the memmove of the base
+       * header). Without this case, doff==20 fell through every branch
+       * silently -- the room was already added and IP/TCP length and
+       * checksum fields already adjusted for it above, but ppv2h was
+       * never populated, leaving a 28-byte hole of uninitialized data in
+       * the stream instead of a valid PROXY v2 header. Reproduced with
+       * Windows clients, whose data segments commonly carry zero TCP
+       * options (Linux clients typically include a 12-byte timestamp
+       * option, landing on the already-handled doff==32 case).
+       */
+      ppv2h = (void *)(ntcp + 1);
+      dp_populate_ppv2(md, xf, ppv2h, &csum);
+    } else {
       /* Max of 20 bytes of options */
       LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLERR);
       return -1;
