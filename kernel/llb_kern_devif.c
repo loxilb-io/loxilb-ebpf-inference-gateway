@@ -290,8 +290,16 @@ dp_pipe_check_res(void *ctx, struct xfi *xf, void *fa)
         return DP_DROP;
     }
 
-    if (xf->pm.ppv2) { 
-      dp_ins_ppv2(ctx, xf);
+    if (xf->pm.ppv2) {
+      /* On failure dp_ins_ppv2() may already have grown the packet without
+       * writing a valid header (e.g. more than 20 bytes of TCP options). The
+       * pipeline verdict was computed before this point, so the drop it
+       * flags would be ignored - forwarding such a packet would put a
+       * corrupt byte stream on the wire. Drop it here instead.
+       */
+      if (dp_ins_ppv2(ctx, xf) != 0) {
+        return DP_DROP;
+      }
     } else if (xf->pm.oppv2 | xf->pm.ippv2) {
       dp_fixup_ppv2(ctx, xf);
     }
