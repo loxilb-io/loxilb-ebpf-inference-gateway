@@ -3559,9 +3559,16 @@ pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
   }
 
   /* Fail-fast on a prefill error status — no need to wait for message end
-   * (pd_router.rs shapes the abort off the prefill status the same way). */
-  if (!ent->pd_sg_drain_handled && !ent->pd_sg_drain_done &&
-      ent->parser.status_code >= 400) {
+   * (pd_router.rs shapes the abort off the prefill status the same way).
+   * Deliberately NOT gated on pd_sg_drain_done: when the whole error
+   * response arrives in ONE read, llhttp fires message-complete inside the
+   * llhttp_execute above, so drain_done is ALREADY set by the time this
+   * check runs — the original !drain_done gate then misclassified a
+   * complete 4xx/5xx as a successful drain (decode left to park until its
+   * own rendezvous timeout; the CICD prefill-500 leg caught this as a
+   * read-coalescing race). An error status couples the failure whether the
+   * response is mid-flight or complete. */
+  if (!ent->pd_sg_drain_handled && ent->parser.status_code >= 400) {
     ent->pd_sg_drain_handled = 1;
     if (pd_sg_decode_untouched(client_pfe)) {
       log_error("[PD_SG] prefill status %u — aborting decode leg "
