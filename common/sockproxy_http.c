@@ -227,6 +227,9 @@ static void pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
                                 uint8_t *msg, size_t len);
 static void pd_sg_close_drain(proxy_fd_ent_t *client_pfe, int count_close);
 static void pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason);
+static void pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
+                             uint8_t *hdrs, size_t hdrs_len,
+                             uint8_t *body, size_t body_len);
 static inline int pd_sg_decode_untouched(const proxy_fd_ent_t *client_pfe);
 static int pd_sg_dual_dispatch(proxy_fd_ent_t *client_pfe);
 /* pd_cleanup declared in sockproxy_internal.h */
@@ -3477,9 +3480,11 @@ pd_sg_close_drain(proxy_fd_ent_t *client_pfe, int count_close)
 }
 
 /* Prefill drain-leg failure with zero decode bytes relayed: abort the pair.
- * 502 to the client (status-faithful shaping is phase-4 scope with the pair
- * retry), decode leg closed via the client-fd cascade, lifecycle recorded as
- * a prefill error. Caller holds the CLIENT pfe lock. */
+ * 502 to the client, decode leg closed via the client-fd cascade, lifecycle
+ * recorded as a prefill error. Terminal — drain-leg TRANSPORT death gets one
+ * pd_sg_retry_pair attempt first (the proxy_pdestroy enqueue); an error
+ * STATUS from prefill aborts directly (a 4xx/5xx the origin computed is not
+ * a gateway-retryable fault). Caller holds the CLIENT pfe lock. */
 static void
 pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason)
 {
@@ -4597,6 +4602,382 @@ done:
   free(body);
 }
 
+/* SGLang P/D pair retry.
+ *
+ * The unit of retry is the PAIR: when the prefill drain leg dies before its
+ * response completed and ZERO decode bytes have been relayed, the rendezvous
+ * is unrecoverable in the OLD room (the decode engine sits in WaitingForInput
+ * against a bootstrap server that will never see prefill arrive). A retry
+ * therefore means: fresh pair selection, a FRESH room ID, re-injection of the
+ * bootstrap triple into the ORIGINAL saved body, and BOTH legs restarted.
+ * Budget rides pd_prefill_retries (1, same as the vLLM prefill failover) and
+ * is consumed at the proxy_pdestroy enqueue site.
+ *
+ * Deferred-execution contract is pd_retry_prefill's, verbatim: runs AFTER
+ * proxy_pdestroy drops PROXY_LOCK (leg registration re-takes it), safe
+ * against concurrent client teardown via the Option-A worker pinning (both
+ * old legs, both new legs, and the client serialize on the client fd's
+ * worker). hdrs/body are heap COPIES taken under PROXY_LOCK and owned
+ * (always freed) here — the originals stay on the client pfe.
+ *
+ * On any failure the abort contract runs via pd_sg_abort_pair (502, prefill
+ * error recorded, pair torn down through the client-fd cascade). */
+static void
+pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
+                 uint8_t *hdrs, size_t hdrs_len,
+                 uint8_t *body, size_t body_len)
+{
+  proxy_epval_t *tepval;
+  uint8_t *inj = NULL;
+  uint8_t *req = NULL;
+  size_t inj_len = 0;
+  size_t req_len = 0;
+  uint64_t new_room = 0;
+  uint64_t old_room = 0;
+  int old_d_idx = -1;
+  int p_idx = -1, d_idx = -1;
+  int p_cfd = -1, d_cfd = -1;
+
+  if (!client_pfe || !client_pfe->epv) goto fail;
+  tepval = (proxy_epval_t *)client_pfe->epv;
+  old_room = client_pfe->pd_sg_room;
+  old_d_idx = client_pfe->pd_decode_ep_idx;
+
+  if (!client_pfe->pd_sg_active ||
+      client_pfe->pd_phase != PD_PHASE_DECODE_SENDING ||
+      !pd_sg_decode_untouched(client_pfe)) goto fail;
+
+  /* 1. Close + detach the surviving OLD decode leg — its room is dead.
+   * BOTH directions are unlinked BEFORE shutdown so the leg's own teardown
+   * (same pinned worker, after we return) finds no client and can neither
+   * cascade-close it nor misread the fresh attempt as a zero-byte decode
+   * death. The engine aborts the orphaned in-room request on disconnect. */
+  for (int j = 0; j < MAX_PROXY_EP; j++) {
+    proxy_fd_ent_t *leg = client_pfe->rfd_ent[j];
+    if (leg && leg->is_pd_decode_backend) {
+      PROXY_ENT_LOCK(leg);
+      for (int k = 0; k < MAX_PROXY_EP; k++) {
+        if (leg->rfd_ent[k] == client_pfe) {
+          leg->rfd_ent[k] = NULL;
+          leg->rfd[k] = -1;
+          if (leg->n_rfd > 0) leg->n_rfd--;
+        }
+      }
+      PROXY_ENT_UNLOCK(leg);
+      client_pfe->rfd_ent[j] = NULL;
+      client_pfe->rfd[j] = -1;
+      if (client_pfe->n_rfd > 0) client_pfe->n_rfd--;
+      log_info("[PD_SG] pair retry: closing old decode leg fd=%d "
+               "(client_fd=%d old_room=%llu)", leg->fd, client_pfe->fd,
+               (unsigned long long)old_room);
+      if (leg->fd > 0) {
+        shutdown(leg->fd, SHUT_RDWR);
+      }
+    }
+  }
+
+  /* 2. Fresh PAIR selection. Prefill first, dead EP excluded, with the
+   * sync-connect condemn-and-continue loop of the vLLM failover; the decode
+   * hint is restored across pd_select_prefill (its Tier-0 session hit may
+   * overwrite it) and then deliberately CLEARED for a fresh min-load decode
+   * pick — new pair selection, not a patched-up old one. */
+  {
+    uint32_t excluded = 0;
+    int saved_decode = client_pfe->pd_decode_ep_idx;
+    if (dead_idx >= 0 && dead_idx < 32) excluded |= 1u << (unsigned)dead_idx;
+
+    for (int attempt = 0; attempt < tepval->n_prefill_eps; attempt++) {
+      int cand = -1;
+      int rc = pd_select_prefill(tepval, client_pfe, &cand, excluded);
+      client_pfe->pd_decode_ep_idx = saved_decode;
+      if (rc != 0 || cand < 0)
+        break;  /* no healthy candidates (park/shed count as none mid-request) */
+
+      uint8_t pp2buf[28];
+      int pp2len = 0;
+      {
+        proxy_map_ent_t *hent = (proxy_map_ent_t *)client_pfe->head;
+        if (hent && hent->val.ppv2) {
+          struct sockaddr_in cli, vip;
+          socklen_t cl = sizeof(cli), vl = sizeof(vip);
+          if (getpeername(client_pfe->fd, (struct sockaddr *)&cli, &cl) == 0 &&
+              getsockname(client_pfe->fd, (struct sockaddr *)&vip, &vl) == 0 &&
+              cli.sin_family == AF_INET && vip.sin_family == AF_INET) {
+            pp2len = proxy_build_ppv2_v4(pp2buf, sizeof(pp2buf),
+                                         cli.sin_addr.s_addr, cli.sin_port,
+                                         vip.sin_addr.s_addr, vip.sin_port);
+          }
+        }
+      }
+      p_cfd = proxy_setup_ep_connect(tepval->eps[cand].xip,
+                                     tepval->eps[cand].xport,
+                                     IPPROTO_TCP, NULL, NULL, client_pfe,
+                                     (pp2len ? pp2buf : NULL), pp2len);
+      if (p_cfd >= 0) { p_idx = cand; break; }
+      circuit_breaker_record_failure(tepval, cand);
+      if (cand >= 0 && cand < 32) excluded |= 1u << (unsigned)cand;
+    }
+    if (p_cfd < 0 || p_idx < 0) goto fail;
+
+    client_pfe->pd_decode_ep_idx = -1;  /* clear hint: force fresh min-load pick */
+    if (pd_select_decode(tepval, client_pfe, &d_idx) != 0 || d_idx < 0) {
+      client_pfe->pd_decode_ep_idx = saved_decode;  /* restore for cleanup/logs */
+      close(p_cfd);
+      p_cfd = -1;
+      goto fail;
+    }
+  }
+
+  /* 3. Decode connect (single attempt, pd_initiate_decode posture). */
+  {
+    uint8_t dpp2buf[28];
+    int dpp2len = 0;
+    proxy_map_ent_t *dent = (proxy_map_ent_t *)client_pfe->head;
+    if (dent && dent->val.ppv2) {
+      struct sockaddr_in cli, vip;
+      socklen_t cl = sizeof(cli), vl = sizeof(vip);
+      if (getpeername(client_pfe->fd, (struct sockaddr *)&cli, &cl) == 0 &&
+          getsockname(client_pfe->fd, (struct sockaddr *)&vip, &vl) == 0 &&
+          cli.sin_family == AF_INET && vip.sin_family == AF_INET) {
+        dpp2len = proxy_build_ppv2_v4(dpp2buf, sizeof(dpp2buf),
+                                      cli.sin_addr.s_addr, cli.sin_port,
+                                      vip.sin_addr.s_addr, vip.sin_port);
+      }
+    }
+    d_cfd = proxy_setup_ep_connect(tepval->eps[d_idx].xip,
+                                   tepval->eps[d_idx].xport,
+                                   IPPROTO_TCP, NULL, NULL, client_pfe,
+                                   (dpp2len ? dpp2buf : NULL), dpp2len);
+  }
+  if (d_cfd < 0) {
+    circuit_breaker_record_failure(tepval, d_idx);
+    close(p_cfd);
+    p_cfd = -1;
+    goto fail;
+  }
+
+  /* 4. Fresh room + re-injection into the ORIGINAL body under the ORIGINAL
+   * headers (same X-Request-Id), Content-Length re-fitted. The saved body is
+   * pristine pre-injection by construction (the admission-site contract). */
+  {
+    char sg_host[INET6_ADDRSTRLEN + 2];
+    struct in_addr sg_pin = { .s_addr = tepval->eps[p_idx].xip };
+    inet_ntop(AF_INET, &sg_pin, sg_host, sizeof(sg_host));
+
+    if (pd_sg_room_id(&new_room) != 0 ||
+        (inj = malloc(body_len + 512)) == NULL ||
+        pd_sg_inject_bootstrap(body, body_len, inj, &inj_len, body_len + 512,
+                               sg_host, tepval->pd_bootstrap_port,
+                               new_room) != 0) {
+      log_error("[PD_SG] pair retry: bootstrap re-injection failed "
+                "(client_fd=%d)", client_pfe->fd);
+      close(p_cfd);
+      close(d_cfd);
+      p_cfd = d_cfd = -1;
+      goto fail;
+    }
+    size_t req_cap = hdrs_len + inj_len + 256;
+    req = malloc(req_cap);
+    if (!req) {
+      close(p_cfd);
+      close(d_cfd);
+      p_cfd = d_cfd = -1;
+      goto fail;
+    }
+    memcpy(req, hdrs, hdrs_len);
+    memcpy(req + hdrs_len, inj, inj_len);
+    req_len = hdrs_len + inj_len;
+    pd_update_content_length(req, &req_len, req_cap, inj_len);
+  }
+
+  /* 5. Move the admission active_conns units dead->replacement (both roles)
+   * so pd_cleanup's decrement of the FINAL indexes stays balanced. */
+  if (dead_idx >= 0 && dead_idx < tepval->n_eps) {
+    uint32_t cur = atomic_load(&tepval->pd_ep_loads[dead_idx].active_conns);
+    if (cur > 0)
+      atomic_fetch_sub(&tepval->pd_ep_loads[dead_idx].active_conns, 1);
+  }
+  atomic_fetch_add(&tepval->pd_ep_loads[p_idx].active_conns, 1);
+  if (d_idx != old_d_idx) {
+    if (old_d_idx >= 0 && old_d_idx < tepval->n_eps) {
+      uint32_t cur = atomic_load(&tepval->pd_ep_loads[old_d_idx].active_conns);
+      if (cur > 0)
+        atomic_fetch_sub(&tepval->pd_ep_loads[old_d_idx].active_conns, 1);
+    }
+    atomic_fetch_add(&tepval->pd_ep_loads[d_idx].active_conns, 1);
+  }
+  client_pfe->pd_prefill_ep_idx = p_idx;
+  client_pfe->pd_decode_ep_idx = d_idx;
+
+  /* 6. Bring up BOTH replacement legs — fresh drain pfe (dedicated
+   * HTTP_RESPONSE framer, never client-facing) + fresh decode pfe (the
+   * pd_sg_dual_dispatch shapes), each pinned to the client fd's worker. */
+  {
+    proxy_map_ent_t *hent = (proxy_map_ent_t *)client_pfe->head;
+    proxy_fd_ent_t *drain_pfe = pfe_alloc();
+    proxy_fd_ent_t *decode_pfe = drain_pfe ? pfe_alloc() : NULL;
+    if (!drain_pfe || !decode_pfe || !hent) {
+      /* Alloc failure BEFORE any registration: close both fds and abort.
+       * (Both shells are allocated up front so a half-registered pair can
+       * never exist; an unregistered shell is an accepted OOM-path loss —
+       * the pool is grow-only.) */
+      close(p_cfd);
+      close(d_cfd);
+      p_cfd = d_cfd = -1;
+      goto fail;
+    }
+
+    drain_pfe->stype = PROXY_SOCK_ACTIVE;
+    drain_pfe->pd_decode_ep_idx = -1;
+    drain_pfe->fd = p_cfd;
+    drain_pfe->rfd[0] = client_pfe->fd;
+    drain_pfe->rfd_ent[0] = client_pfe;
+    drain_pfe->seltype = client_pfe->seltype;
+    drain_pfe->ep_num = -1;
+    drain_pfe->odir = 1;
+    drain_pfe->n_rfd = 1;
+    drain_pfe->head = client_pfe->head;
+    drain_pfe->sse_mode = client_pfe->sse_mode;
+    drain_pfe->max_stream_duration_sec = client_pfe->max_stream_duration_sec;
+    drain_pfe->backend_keepalive_sec = client_pfe->backend_keepalive_sec;
+    pd_sg_drain_parser_init(drain_pfe);
+    drain_pfe->pd_sg_drain = 1;
+
+    decode_pfe->stype = PROXY_SOCK_ACTIVE;
+    decode_pfe->pd_decode_ep_idx = -1;
+    decode_pfe->fd = d_cfd;
+    decode_pfe->rfd[0] = client_pfe->fd;
+    decode_pfe->rfd_ent[0] = client_pfe;
+    decode_pfe->seltype = client_pfe->seltype;
+    decode_pfe->ep_num = -1;
+    decode_pfe->odir = 1;
+    decode_pfe->is_pd_decode_backend = 1;
+    decode_pfe->n_rfd = 1;
+    decode_pfe->head = client_pfe->head;
+    decode_pfe->sse_mode = client_pfe->sse_mode;
+    decode_pfe->max_stream_duration_sec = client_pfe->max_stream_duration_sec;
+    decode_pfe->backend_keepalive_sec = client_pfe->backend_keepalive_sec;
+    if (pd_framing_v2_on()) {
+      pd_resp_parser_init(decode_pfe);
+    } else {
+      llhttp_init(&decode_pfe->parser, HTTP_BOTH, &decode_pfe->settings);
+      decode_pfe->settings.on_message_complete = handle_on_message_complete;
+      decode_pfe->settings.uarg = decode_pfe;
+    }
+
+    /* Link into the client's rfd slots (first free slot — the old legs left
+     * holes at 0/1) and register both legs. */
+    for (int j = 0; j < MAX_PROXY_EP; j++) {
+      if (!client_pfe->rfd_ent[j]) {
+        client_pfe->rfd[j] = p_cfd;
+        client_pfe->rfd_ent[j] = drain_pfe;
+        client_pfe->n_rfd++;
+        break;
+      }
+    }
+    for (int j = 0; j < MAX_PROXY_EP; j++) {
+      if (!client_pfe->rfd_ent[j]) {
+        client_pfe->rfd[j] = d_cfd;
+        client_pfe->rfd_ent[j] = decode_pfe;
+        client_pfe->n_rfd++;
+        break;
+      }
+    }
+
+    PROXY_LOCK();
+    drain_pfe->next = hent->val.fdlist;
+    hent->val.fdlist = drain_pfe;
+    hent->val.nfds++;
+    decode_pfe->next = hent->val.fdlist;
+    hent->val.fdlist = decode_pfe;
+    hent->val.nfds++;
+    PROXY_UNLOCK();
+    notify_add_ent_pinned(proxy_struct->ns, p_cfd,
+                          NOTI_TYPE_IN|NOTI_TYPE_HUP, drain_pfe,
+                          drain_pfe->gen, client_pfe->fd);
+    notify_add_ent_pinned(proxy_struct->ns, d_cfd,
+                          NOTI_TYPE_IN|NOTI_TYPE_HUP, decode_pfe,
+                          decode_pfe->gen, client_pfe->fd);
+  }
+
+  /* 7. Restart the pair state: same DECODE_SENDING lifecycle, fresh reaper
+   * window, fresh latency stamps, the NEW room recorded for logs/coupling. */
+  client_pfe->pd_sg_room = new_room;
+  client_pfe->pd_phase = PD_PHASE_DECODE_SENDING;
+  client_pfe->pd_phase_start_ts = time(NULL);
+  {
+    struct timespec _ts;
+    clock_gettime(CLOCK_MONOTONIC, &_ts);
+    uint64_t now_ns = (uint64_t)_ts.tv_sec * 1000000000ULL +
+                      (uint64_t)_ts.tv_nsec;
+    client_pfe->pd_prefill_start_ns = now_ns;
+    client_pfe->pd_decode_start_ns = now_ns;
+  }
+
+  /* 8. Same payload down both legs (fresh plaintext connects — TLS backend
+   * legs were excluded at the enqueue gate, vLLM parity). A send failure
+   * surfaces as that leg's HUP: the drain leg's death re-enters the
+   * exhausted-budget abort, the decode leg's death the zero-byte 502. */
+  {
+    size_t sent = 0;
+    while (sent < req_len) {
+      ssize_t n = write(p_cfd, req + sent, req_len - sent);
+      if (n <= 0) {
+        if (errno == EINTR || errno == EAGAIN) continue;
+        log_error("[PD_SG] pair retry: prefill send to EP%d failed: %s",
+                  p_idx, strerror(errno));
+        goto counted;
+      }
+      sent += (size_t)n;
+    }
+    sent = 0;
+    while (sent < req_len) {
+      ssize_t n = write(d_cfd, req + sent, req_len - sent);
+      if (n <= 0) {
+        if (errno == EINTR || errno == EAGAIN) continue;
+        log_error("[PD_SG] pair retry: decode send to EP%d failed: %s",
+                  d_idx, strerror(errno));
+        goto counted;
+      }
+      sent += (size_t)n;
+    }
+  }
+
+counted:
+  /* 9. Re-pin the session to the healthy pair (vLLM failover parity). */
+  {
+    const char *sk = NULL;
+    if (client_pfe->has_user_id && client_pfe->user_id[0] != '\0')
+      sk = client_pfe->user_id;
+    if (client_pfe->has_conv_id && client_pfe->conversation_id[0] != '\0' &&
+        strncmp(client_pfe->conversation_id, "auto-", 5) != 0)
+      sk = client_pfe->conversation_id;
+    if (sk) pd_session_store(tepval, sk, p_idx, d_idx);
+  }
+
+  atomic_fetch_add(&global_stats.pd_sg_room_retry, 1);
+  atomic_fetch_add(&global_stats.pd_connect_failover, 1);
+  log_info("[PD_SG] pair retry — client_fd=%d prefill EP%d died -> "
+           "pair(EP%d,EP%d) room %llu -> %llu req=%zuB",
+           client_pfe->fd, dead_idx, p_idx, d_idx,
+           (unsigned long long)old_room, (unsigned long long)new_room,
+           req_len);
+  goto done;
+
+fail:
+  if (client_pfe) {
+    log_error("[PD_SG] pair retry exhausted — aborting (client_fd=%d "
+              "dead EP%d)", client_pfe->fd, dead_idx);
+    pd_sg_abort_pair(client_pfe, "pair retry failed");
+  }
+
+done:
+  free(inj);
+  free(req);
+  free(hdrs);
+  free(body);
+}
+
 static void
 proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
 {
@@ -4641,11 +5022,14 @@ proxy_pdestroy(void *priv)
   int is_listener = 0;
 
   /* Prefill mid-request failover work is COLLECTED under PROXY_LOCK below and
-   * EXECUTED after the final PROXY_UNLOCK (pd_retry_prefill re-takes the
-   * non-recursive lock to register the replacement leg). */
+   * EXECUTED after the final PROXY_UNLOCK (pd_retry_prefill / pd_sg_retry_pair
+   * re-take the non-recursive lock to register the replacement leg(s)).
+   * sg selects the flavor: 0 = vLLM prefill-only re-dispatch, 1 = SGLang
+   * pair retry with a fresh room. */
   struct {
     proxy_fd_ent_t *cpfe;
     int dead_idx;
+    int sg;
     uint8_t *hdrs; size_t hdrs_len;
     uint8_t *body; size_t body_len;
   } pd_retry_pend[MAX_PROXY_EP];
@@ -4736,6 +5120,7 @@ proxy_pdestroy(void *priv)
               pd_retry_pend[n_pd_retry_pend].cpfe = client_pfe;
               pd_retry_pend[n_pd_retry_pend].dead_idx =
                   client_pfe->pd_prefill_ep_idx;
+              pd_retry_pend[n_pd_retry_pend].sg = 0;
               pd_retry_pend[n_pd_retry_pend].hdrs = rh;
               pd_retry_pend[n_pd_retry_pend].hdrs_len =
                   client_pfe->pd_saved_headers_len;
@@ -4830,6 +5215,69 @@ proxy_pdestroy(void *priv)
             !pfe->pd_sg_drain_done) {
           pfe->pd_sg_drain_handled = 1;
           if (pd_sg_decode_untouched(client_pfe)) {
+            /* SGLang pair retry: the ORIGINAL request survives on the client
+             * pfe (pd_saved_headers + the pristine pre-injection
+             * pd_saved_body) and no client-visible byte has flowed, so defer
+             * ONE retry-as-pair — fresh pair, fresh room, both legs
+             * restarted — instead of failing the client. Same deferral,
+             * buffer-copy, budget and TLS-exclusion contract as the vLLM
+             * enqueue above; budget is SHARED (pd_prefill_retries). */
+            int sg_deferred = 0;
+            if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
+                client_pfe->pd_prefill_retries == 0 &&
+                client_pfe->epv && !pfe->ssl &&
+                client_pfe->pd_saved_headers &&
+                client_pfe->pd_saved_headers_len > 0 &&
+                client_pfe->pd_saved_body &&
+                client_pfe->pd_saved_body_len > 0 &&
+                n_pd_retry_pend < MAX_PROXY_EP) {
+              uint8_t *rh = malloc(client_pfe->pd_saved_headers_len);
+              uint8_t *rb = rh ? malloc(client_pfe->pd_saved_body_len) : NULL;
+              if (rh && rb) {
+                memcpy(rh, client_pfe->pd_saved_headers,
+                       client_pfe->pd_saved_headers_len);
+                memcpy(rb, client_pfe->pd_saved_body,
+                       client_pfe->pd_saved_body_len);
+                client_pfe->pd_prefill_retries = 1;
+                /* Detach both directions so this leg's teardown below cannot
+                 * cascade-close the client (US-H202 idiom). */
+                for (int j = 0; j < MAX_PROXY_EP; j++) {
+                  if (client_pfe->rfd_ent[j] == pfe) {
+                    client_pfe->rfd_ent[j] = NULL;
+                    client_pfe->rfd[j] = -1;
+                    if (client_pfe->n_rfd > 0) client_pfe->n_rfd--;
+                    break;
+                  }
+                }
+                pd_retry_pend[n_pd_retry_pend].cpfe = client_pfe;
+                pd_retry_pend[n_pd_retry_pend].dead_idx =
+                    client_pfe->pd_prefill_ep_idx;
+                pd_retry_pend[n_pd_retry_pend].sg = 1;
+                pd_retry_pend[n_pd_retry_pend].hdrs = rh;
+                pd_retry_pend[n_pd_retry_pend].hdrs_len =
+                    client_pfe->pd_saved_headers_len;
+                pd_retry_pend[n_pd_retry_pend].body = rb;
+                pd_retry_pend[n_pd_retry_pend].body_len =
+                    client_pfe->pd_saved_body_len;
+                n_pd_retry_pend++;
+                pfe->rfd_ent[pd_i] = NULL;
+                pfe->n_rfd--;
+                sg_deferred = 1;
+                log_info("[PD_SG] drain leg died before prefill completed — "
+                         "pair retry deferred (client_fd=%d drain_fd=%d "
+                         "room=%llu)", client_pfe->fd, pfe->fd,
+                         (unsigned long long)client_pfe->pd_sg_room);
+              } else {
+                free(rh);
+                free(rb);
+              }
+            }
+            if (sg_deferred) {
+              /* Already fully detached — the decode-death taxonomy below
+               * must not misread the dying DRAIN leg as a zero-byte decode
+               * EOF against the retried client. */
+              continue;
+            }
             log_error("[PD_SG] drain leg died before prefill completed — "
                       "aborting pair (client_fd=%d drain_fd=%d)",
                       client_pfe->fd, pfe->fd);
@@ -4982,9 +5430,15 @@ proxy_pdestroy(void *priv)
    * PROXY_LOCK). Same-thread with the dying leg's teardown — the client pfe
    * cannot be concurrently torn down (Option-A worker pinning). */
   for (int ri = 0; ri < n_pd_retry_pend; ri++) {
-    pd_retry_prefill(pd_retry_pend[ri].cpfe, pd_retry_pend[ri].dead_idx,
-                     pd_retry_pend[ri].hdrs, pd_retry_pend[ri].hdrs_len,
-                     pd_retry_pend[ri].body, pd_retry_pend[ri].body_len);
+    if (pd_retry_pend[ri].sg) {
+      pd_sg_retry_pair(pd_retry_pend[ri].cpfe, pd_retry_pend[ri].dead_idx,
+                       pd_retry_pend[ri].hdrs, pd_retry_pend[ri].hdrs_len,
+                       pd_retry_pend[ri].body, pd_retry_pend[ri].body_len);
+    } else {
+      pd_retry_prefill(pd_retry_pend[ri].cpfe, pd_retry_pend[ri].dead_idx,
+                       pd_retry_pend[ri].hdrs, pd_retry_pend[ri].hdrs_len,
+                       pd_retry_pend[ri].body, pd_retry_pend[ri].body_len);
+    }
   }
 }
 
