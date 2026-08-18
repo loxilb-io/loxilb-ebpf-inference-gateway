@@ -86,6 +86,12 @@ extern int pd_extract_kv_params(const uint8_t *resp_buf, size_t resp_len,
 extern int pd_prepare_decode_body(const uint8_t *orig_body, size_t orig_body_len,
                                   const char *kv_params, size_t kv_params_len,
                                   uint8_t *out_buf, size_t *out_len, size_t out_capacity);
+/* SGLang P/D dual-dispatch helpers (sockproxy_pd.c) */
+extern int pd_sg_room_id(uint64_t *room_out);
+extern int pd_sg_inject_bootstrap(const uint8_t *orig_body, size_t orig_body_len,
+                                  uint8_t *out_buf, size_t *out_len, size_t out_capacity,
+                                  const char *bootstrap_host, uint16_t bootstrap_port,
+                                  uint64_t bootstrap_room);
 
 /* AI Gateway CGO bridge */
 extern void llb_ai_normal_session_hit(char *model_name);
@@ -216,6 +222,13 @@ pd_frame_mismatch_log(proxy_fd_ent_t *pfe, const uint8_t *buf, size_t cur_len,
 
 /* Internal forward declarations (file-scope only) */
 static int pd_initiate_decode(proxy_fd_ent_t *client_pfe);
+/* SGLang P/D dual-dispatch (defined beside pd_initiate_decode below) */
+static void pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
+                                uint8_t *msg, size_t len);
+static void pd_sg_close_drain(proxy_fd_ent_t *client_pfe, int count_close);
+static void pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason);
+static inline int pd_sg_decode_untouched(const proxy_fd_ent_t *client_pfe);
+static int pd_sg_dual_dispatch(proxy_fd_ent_t *client_pfe);
 /* pd_cleanup declared in sockproxy_internal.h */
 static int pd_update_content_length(uint8_t *buf, size_t *buf_len, size_t buf_capacity,
                                     size_t new_body_len);
@@ -1092,6 +1105,9 @@ skip_deferred_masking:
      * client-facing bytes) are framed as before. Flag OFF: whole block skipped,
      * byte-identical. */
     if (ent->odir == 1 && pd_framing_v2_on() && len > 0 &&
+        !ent->pd_sg_drain &&  /* SGLang drain leg: never client-facing — same
+                               * hazard class as the PREFILL_WAITING skip below;
+                               * it runs its OWN framer (pd_sg_drain_consume). */
         !(rfd_ent && rfd_ent->pd_phase == PD_PHASE_PREFILL_WAITING)) {
       /* D2 root fix (I5 V2 — close the dormant ENT(client)↔ENT(backend) ABBA).
        * We reach here holding the CLIENT lock (rfd_ent, taken at the relay scope
@@ -1246,6 +1262,15 @@ skip_deferred_masking:
       log_info("[PD_EPXMIT] odir=1 rfd_ent=%p pd_phase=%d len=%zu",
                rfd_ent, rfd_ent ? rfd_ent->pd_phase : -1, len);
     }
+
+    /* SGLang P/D drain leg: frame + discard the prefill response, fire the
+     * failure coupling on an error status. NEVER relayed to the client. */
+    if (ent->odir == 1 && ent->pd_sg_drain && rfd_ent != NULL) {
+      pd_sg_drain_consume(ent, rfd_ent, msg, len);
+      PROXY_ENT_UNLOCK(rfd_ent);
+      return 0;
+    }
+
     if (ent->odir == 1 && rfd_ent != NULL && rfd_ent->pd_phase == PD_PHASE_PREFILL_WAITING) {
       if (rfd_ent->pd_prefill_resp_buf && rfd_ent->pd_prefill_resp_cap > 0) {
         size_t remain = rfd_ent->pd_prefill_resp_cap - rfd_ent->pd_prefill_resp_len;
@@ -1372,6 +1397,12 @@ skip_deferred_masking:
         rfd_ent->n_rfd > 1 && ent->fd == rfd_ent->rfd[0]) {
       log_debug("[PD_LATE_PREFILL_DISCARD] client_fd=%d prefill_fd=%d len=%zu",
                 rfd_ent->fd, ent->fd, len);
+      /* Latent lock-leak fix: this early-return previously kept the client
+       * pfe write-lock taken at the relay scope above — any later lock
+       * attempt on this pfe (relay, teardown) would wedge. Never fired in
+       * conformant vLLM flows (prefill idle after its response); made
+       * load-bearing by the SGLang drain path landing beside it. */
+      PROXY_ENT_UNLOCK(rfd_ent);
       return 0;
     }
 
@@ -3366,6 +3397,394 @@ cleanup_failed_ssl_connection(proxy_fd_ent_t *pfe)
   }
 }
 
+/* ==========================================================================
+ * SGLang P/D dual dispatch
+ * --------------------------------------------------------------------------
+ * SGLang disaggregation is architecturally unlike the sequential vLLM machine
+ * below: the SAME bootstrap-injected request goes to the prefill AND decode
+ * EPs CONCURRENTLY, the engines rendezvous on (bootstrap_host, port, room) at
+ * prefill's bootstrap server, and the client response comes exclusively from
+ * the decode leg. Prefill's response is drained and discarded — a proxy that
+ * waits for it before contacting decode deadlocks (prefill returns only after
+ * decode joined the room; SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=300s).
+ *
+ * State model: the CLIENT pfe reuses the DECODE_SENDING/DECODE_STREAMING
+ * lifecycle from the moment of dispatch (every decode-side behavior — SSE
+ * latch, [DONE] scanner, caps, EOF taxonomy, reapers — applies unchanged);
+ * pd_sg_active marks the flavor. The prefill leg (client rfd slot 0, the
+ * admission-time connection) becomes a detached DRAIN leg: pd_sg_drain=1 on
+ * its backend pfe, its bytes are framed (status + message end) and discarded,
+ * never relayed.
+ *
+ * Failure coupling (mirrors sgl-model-gateway pd_router.rs):
+ *   - drain leg fails (5xx / transport death) with ZERO decode bytes relayed
+ *     -> abort the decode leg (its engine sits in WaitingForInput until the
+ *     300s timeout otherwise; on disconnect it aborts in ~4-8s), 502 client.
+ *   - decode leg fails -> close the drain leg too (don't orphan it).
+ *   - client disconnect -> the existing rfd cascade tears down both legs.
+ * ========================================================================== */
+
+/* llhttp message-complete callback for the drain leg: latch completion on the
+ * BACKEND pfe. All consequences (metrics, proactive close, detach) are run by
+ * the read-path caller, which owns the locks. */
+static int
+pd_sg_drain_on_msg_complete(llhttp_t *parser)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *drain_pfe = settings ? settings->uarg : NULL;
+  if (drain_pfe) {
+    drain_pfe->pd_sg_drain_done = 1;
+  }
+  return 0;
+}
+
+/* Dedicated HTTP_RESPONSE framer for the drain leg. NOT pd_resp_parser_init:
+ * the M1 resp callbacks drive client-stream completion, and the drain leg's
+ * response must never touch client-facing state (the exact hazard the
+ * PREFILL_WAITING framer-skip above documents). */
+static void
+pd_sg_drain_parser_init(proxy_fd_ent_t *drain_pfe)
+{
+  llhttp_settings_init(&drain_pfe->settings);
+  drain_pfe->settings.on_message_complete = pd_sg_drain_on_msg_complete;
+  drain_pfe->settings.uarg = drain_pfe;
+  llhttp_init(&drain_pfe->parser, HTTP_RESPONSE, &drain_pfe->settings);
+}
+
+/* Close the prefill drain leg of an SGLang dual dispatch, if one is still
+ * attached to this client. shutdown() only — the leg's own HUP/teardown path
+ * (same pinned worker) detaches and frees it. count_close ticks the
+ * decode-failure coupling counter; janitorial closes pass 0. */
+static void
+pd_sg_close_drain(proxy_fd_ent_t *client_pfe, int count_close)
+{
+  if (!client_pfe->pd_sg_active) return;
+  for (int j = 0; j < MAX_PROXY_EP; j++) {
+    proxy_fd_ent_t *leg = client_pfe->rfd_ent[j];
+    if (leg && leg->pd_sg_drain && !leg->pd_sg_drain_handled) {
+      leg->pd_sg_drain_handled = 1;
+      if (count_close) {
+        atomic_fetch_add(&global_stats.pd_sg_decode_close_drain, 1);
+      }
+      log_info("[PD_SG] closing prefill drain leg fd=%d (client_fd=%d%s)",
+               leg->fd, client_pfe->fd,
+               count_close ? ", decode-failure coupling" : "");
+      if (leg->fd > 0) {
+        shutdown(leg->fd, SHUT_RDWR);
+      }
+    }
+  }
+}
+
+/* Prefill drain-leg failure with zero decode bytes relayed: abort the pair.
+ * 502 to the client (status-faithful shaping is phase-4 scope with the pair
+ * retry), decode leg closed via the client-fd cascade, lifecycle recorded as
+ * a prefill error. Caller holds the CLIENT pfe lock. */
+static void
+pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason)
+{
+  static const char pd_sg_err[] =
+      "HTTP/1.1 502 Bad Gateway\r\n"
+      "Content-Type: application/json\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"pd_sg_prefill_failed\",\"detail\":\"prefill leg failed before decode produced output\"}";
+
+  atomic_fetch_add(&global_stats.pd_sg_prefill_abort_decode, 1);
+  atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+  log_error("[PD_SG] aborting pair (%s) — client_fd=%d room=%llu "
+            "prefill_ep=%d decode_ep=%d",
+            reason, client_pfe->fd,
+            (unsigned long long)client_pfe->pd_sg_room,
+            client_pfe->pd_prefill_ep_idx, client_pfe->pd_decode_ep_idx);
+  {
+    const char *pd_model = proxy_effective_model(client_pfe);
+    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 1 /*prefill error*/);
+  }
+  if (client_pfe->fd > 0) {
+    if (client_pfe->ssl) {
+      SSL_write(client_pfe->ssl, pd_sg_err, sizeof(pd_sg_err) - 1);
+    } else {
+      send(client_pfe->fd, pd_sg_err, sizeof(pd_sg_err) - 1,
+           MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+  }
+  client_pfe->pd_phase = PD_PHASE_ERROR;
+  pd_cleanup(client_pfe);
+  client_pfe->pd_phase = PD_PHASE_ERROR;  /* pd_cleanup resets to NONE */
+  /* Shut the client down: its teardown cascade releases BOTH backend legs on
+   * this same pinned worker (the decode engine aborts on disconnect). */
+  if (client_pfe->fd > 0) {
+    shutdown(client_pfe->fd, SHUT_RDWR);
+  }
+}
+
+/* Zero decode bytes relayed so far? (The decode-zero-byte-EOF predicate.) */
+static inline int
+pd_sg_decode_untouched(const proxy_fd_ent_t *client_pfe)
+{
+  return client_pfe->pd_last_decode_ts == 0 &&
+         client_pfe->pd_decode_content_length == 0 &&
+         client_pfe->pd_decode_bytes_received == 0;
+}
+
+/* Consume bytes arriving on the drain leg: frame them (status + message end),
+ * fire the failure coupling on a 4xx/5xx prefill status, discard everything.
+ * Caller (proxy_try_epxmit) holds the CLIENT pfe lock; ent's own parser state
+ * is mutated under a non-blocking self-lock (the M1 framer-feed discipline —
+ * on contention the feed is skipped and completion falls back to leg EOF). */
+static void
+pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
+                    uint8_t *msg, size_t len)
+{
+  int had_done = ent->pd_sg_drain_done;
+
+  if (!ent->pd_sg_drain_desync && len > 0) {
+    if (PROXY_ENT_TRYLOCK(ent) == 0) {
+      llhttp_errno_t perr = llhttp_execute(&ent->parser, (char *)msg, len);
+      if (perr != HPE_OK && perr != HPE_PAUSED) {
+        /* Unparseable prefill response — framing is gone; EOF becomes the
+         * only completion signal. Not a failure by itself. */
+        ent->pd_sg_drain_desync = 1;
+      }
+      PROXY_ENT_UNLOCK(ent);
+    } else {
+      ent->pd_sg_drain_desync = 1;
+    }
+  }
+
+  /* Fail-fast on a prefill error status — no need to wait for message end
+   * (pd_router.rs shapes the abort off the prefill status the same way). */
+  if (!ent->pd_sg_drain_handled && !ent->pd_sg_drain_done &&
+      ent->parser.status_code >= 400) {
+    ent->pd_sg_drain_handled = 1;
+    if (pd_sg_decode_untouched(client_pfe)) {
+      log_error("[PD_SG] prefill status %u — aborting decode leg "
+                "(client_fd=%d drain_fd=%d)",
+                ent->parser.status_code, client_pfe->fd, ent->fd);
+      pd_sg_abort_pair(client_pfe, "prefill error status");
+    } else {
+      /* Decode already produced client-visible output (fully radix-cached
+       * prompt) — let it finish; log + count only. */
+      atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+      log_warn("[PD_SG] prefill status %u AFTER decode bytes relayed — "
+               "letting decode finish (client_fd=%d)",
+               ent->parser.status_code, client_pfe->fd);
+      if (ent->fd > 0) shutdown(ent->fd, SHUT_RDWR);
+    }
+    return;
+  }
+
+  if (!had_done && ent->pd_sg_drain_done) {
+    /* Prefill response complete: stamp "prefill latency" = drain completion
+     * time (compute + KV transfer — the operationally interesting number).
+     * The shared decode-completion record sites compute
+     * prefill_ms = decode_start_ns - prefill_start_ns, so BACKDATE
+     * prefill_start_ns to make that subtraction yield the drain latency. */
+    struct timespec _ts;
+    clock_gettime(CLOCK_MONOTONIC, &_ts);
+    uint64_t now_ns = (uint64_t)_ts.tv_sec * 1000000000ULL +
+                      (uint64_t)_ts.tv_nsec;
+    uint64_t drain_ns = (client_pfe->pd_prefill_start_ns > 0 &&
+                         now_ns > client_pfe->pd_prefill_start_ns)
+                        ? now_ns - client_pfe->pd_prefill_start_ns : 0;
+    if (client_pfe->pd_decode_start_ns > drain_ns) {
+      client_pfe->pd_prefill_start_ns =
+          client_pfe->pd_decode_start_ns - drain_ns;
+    }
+    ent->pd_sg_drain_handled = 1;
+    log_info("[PD_SG] prefill drain complete — client_fd=%d drain_fd=%d "
+             "status=%u drain_ms=%llu room=%llu",
+             client_pfe->fd, ent->fd, ent->parser.status_code,
+             (unsigned long long)(drain_ns / 1000000ULL),
+             (unsigned long long)client_pfe->pd_sg_room);
+    /* Proactively close the leg (keep-alive servers hold it open forever
+     * otherwise); its teardown detaches benignly — the client sits in a
+     * DECODE_* phase, the stale-prefill-detach branch handles it. */
+    if (ent->fd > 0) {
+      shutdown(ent->fd, SHUT_RDWR);
+    }
+  }
+}
+
+/* Dual dispatch at request-complete: mark the admission-time prefill leg as
+ * the drain leg, bring up the decode leg, send the SAME bootstrap-injected
+ * request (already in client rcvbuf) down both, and enter the decode
+ * lifecycle. Returns 0 on success; on failure the 503 + record + cleanup are
+ * done here and -1 is returned (caller just resets its parse state). */
+static int
+pd_sg_dual_dispatch(proxy_fd_ent_t *client_pfe)
+{
+  proxy_epval_t *tepval;
+  proxy_fd_ent_t *drain_pfe;
+  int d_idx;
+  int ep_cfd = -1;
+
+  if (!client_pfe || !client_pfe->epv) return -1;
+  tepval = (proxy_epval_t *)client_pfe->epv;
+  d_idx = client_pfe->pd_decode_ep_idx;
+
+  if (d_idx < 0 || d_idx >= tepval->n_eps ||
+      client_pfe->n_rfd < 1 || client_pfe->rfd[0] <= 0 ||
+      !client_pfe->rfd_ent[0]) {
+    log_error("[PD_SG] dual dispatch preconditions failed — client_fd=%d "
+              "decode_ep=%d n_rfd=%d", client_pfe->fd, d_idx,
+              client_pfe->n_rfd);
+    goto fail;
+  }
+
+  /* 1. The admission-time prefill connection (slot 0) becomes the drain leg. */
+  drain_pfe = client_pfe->rfd_ent[0];
+  pd_sg_drain_parser_init(drain_pfe);
+  drain_pfe->pd_sg_drain = 1;
+
+  /* 2. Decode leg — connect + backend pfe, the pd_initiate_decode shape
+   * (selection happened at admission moments ago; inv/CB re-validation is the
+   * long-prefill-window concern of the vLLM path, not this one). */
+  {
+    uint8_t dpp2buf[28];
+    int dpp2len = 0;
+    proxy_map_ent_t *dent = (proxy_map_ent_t *)client_pfe->head;
+    if (dent && dent->val.ppv2) {
+      struct sockaddr_in cli, vip;
+      socklen_t cl = sizeof(cli), vl = sizeof(vip);
+      if (getpeername(client_pfe->fd, (struct sockaddr *)&cli, &cl) == 0 &&
+          getsockname(client_pfe->fd, (struct sockaddr *)&vip, &vl) == 0 &&
+          cli.sin_family == AF_INET && vip.sin_family == AF_INET) {
+        dpp2len = proxy_build_ppv2_v4(dpp2buf, sizeof(dpp2buf),
+                                      cli.sin_addr.s_addr, cli.sin_port,
+                                      vip.sin_addr.s_addr, vip.sin_port);
+      }
+    }
+    ep_cfd = proxy_setup_ep_connect(tepval->eps[d_idx].xip,
+                                    tepval->eps[d_idx].xport,
+                                    IPPROTO_TCP, NULL, NULL, client_pfe,
+                                    (dpp2len ? dpp2buf : NULL), dpp2len);
+  }
+  if (ep_cfd < 0) {
+    log_error("[PD_SG] decode EP%d connect failed (client_fd=%d)",
+              d_idx, client_pfe->fd);
+    atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+    goto fail;
+  }
+
+  {
+    proxy_fd_ent_t *decode_pfe = pfe_alloc();
+    if (!decode_pfe) {
+      close(ep_cfd);
+      goto fail;
+    }
+    decode_pfe->stype = PROXY_SOCK_ACTIVE;
+    decode_pfe->pd_decode_ep_idx = -1;
+    decode_pfe->fd = ep_cfd;
+    decode_pfe->rfd[0] = client_pfe->fd;
+    decode_pfe->rfd_ent[0] = client_pfe;
+    decode_pfe->seltype = client_pfe->seltype;
+    decode_pfe->ep_num = -1;
+    decode_pfe->odir = 1;
+    decode_pfe->is_pd_decode_backend = 1;
+    decode_pfe->n_rfd = 1;
+    decode_pfe->head = client_pfe->head;
+    decode_pfe->sse_mode = client_pfe->sse_mode;
+    decode_pfe->max_stream_duration_sec = client_pfe->max_stream_duration_sec;
+    decode_pfe->backend_keepalive_sec = client_pfe->backend_keepalive_sec;
+    if (pd_framing_v2_on()) {
+      pd_resp_parser_init(decode_pfe);
+    } else {
+      llhttp_init(&decode_pfe->parser, HTTP_BOTH, &decode_pfe->settings);
+      decode_pfe->settings.on_message_complete = handle_on_message_complete;
+      decode_pfe->settings.uarg = decode_pfe;
+    }
+
+    if (client_pfe->n_rfd < MAX_PROXY_EP) {
+      int slot = client_pfe->n_rfd;
+      client_pfe->rfd[slot] = ep_cfd;
+      client_pfe->rfd_ent[slot] = decode_pfe;
+      client_pfe->n_rfd++;
+    }
+
+    {
+      proxy_map_ent_t *ent = (proxy_map_ent_t *)client_pfe->head;
+      if (ent) {
+        PROXY_LOCK();
+        decode_pfe->next = ent->val.fdlist;
+        ent->val.fdlist = decode_pfe;
+        ent->val.nfds++;
+        PROXY_UNLOCK();
+        notify_add_ent_pinned(proxy_struct->ns, ep_cfd,
+                              NOTI_TYPE_IN|NOTI_TYPE_HUP, decode_pfe,
+                              decode_pfe->gen, client_pfe->fd);
+      }
+    }
+  }
+
+  /* 3. Send the identical payload down both legs. Prefill first via the
+   * regular transmit path (handles backend SSL/caching); decode via the
+   * plaintext write the vLLM decode leg established as precedent. A prefill
+   * send failure surfaces as the drain leg's HUP -> failure coupling. */
+  proxy_try_epxmit(client_pfe, client_pfe->rcvbuf, client_pfe->rcv_off, 0);
+  {
+    size_t sent = 0;
+    while (sent < client_pfe->rcv_off) {
+      ssize_t n = write(ep_cfd, client_pfe->rcvbuf + sent,
+                        client_pfe->rcv_off - sent);
+      if (n <= 0) {
+        if (errno == EINTR || errno == EAGAIN) continue;
+        log_error("[PD_SG] decode send failed: %s", strerror(errno));
+        atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+        goto fail;
+      }
+      sent += (size_t)n;
+    }
+  }
+
+  /* 4. Enter the decode lifecycle — every decode-side mechanism (SSE latch,
+   * [DONE], caps, EOF taxonomy, reapers) now applies unchanged. */
+  client_pfe->pd_phase = PD_PHASE_DECODE_SENDING;
+  client_pfe->pd_phase_start_ts = time(NULL);
+  {
+    struct timespec _ts;
+    clock_gettime(CLOCK_MONOTONIC, &_ts);
+    client_pfe->pd_decode_start_ns =
+        (uint64_t)_ts.tv_sec * 1000000000ULL + (uint64_t)_ts.tv_nsec;
+  }
+
+  log_info("[PD_SG] dual dispatch — client_fd=%d prefill_ep=%d(fd=%d) "
+           "decode_ep=%d(fd=%d) room=%llu req=%zuB",
+           client_pfe->fd, client_pfe->pd_prefill_ep_idx,
+           client_pfe->rfd[0], d_idx, ep_cfd,
+           (unsigned long long)client_pfe->pd_sg_room, client_pfe->rcv_off);
+  return 0;
+
+fail:
+  {
+    static const char pd_sg_dispatch_err[] =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang dual dispatch failed\"}";
+    const char *pd_model = proxy_effective_model(client_pfe);
+    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 2 /*decode error*/);
+    if (client_pfe->fd > 0) {
+      if (client_pfe->ssl) {
+        SSL_write(client_pfe->ssl, pd_sg_dispatch_err,
+                  sizeof(pd_sg_dispatch_err) - 1);
+      } else {
+        send(client_pfe->fd, pd_sg_dispatch_err,
+             sizeof(pd_sg_dispatch_err) - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+      }
+    }
+    client_pfe->pd_phase = PD_PHASE_ERROR;
+    pd_cleanup(client_pfe);
+    client_pfe->pd_phase = PD_PHASE_ERROR;
+    if (client_pfe->fd > 0) {
+      shutdown(client_pfe->fd, SHUT_RDWR);
+    }
+  }
+  return -1;
+}
+
 /* Initiate decode phase after prefill completes.
  * Creates a new backend connection to the decode EP, builds the decode request
  * (original body + kv_params), and sends it. The decode response will flow to
@@ -3706,6 +4125,16 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
              fd_ent->pd_prefill_ep_idx, fd_ent->pd_decode_ep_idx);
   }
 
+  /* SGLang dual dispatch: the request is over (completion, error, or
+   * keep-alive boundary) — a still-open prefill drain leg has no further
+   * purpose. shutdown() it so a keep-alive prefill server can't hold the
+   * leg (and its pfe) hostage; its own teardown detaches benignly.
+   * Janitorial close — the decode-failure coupling counter is ticked by the
+   * decode-death paths, not here. */
+  if (fd_ent->pd_sg_active) {
+    pd_sg_close_drain(fd_ent, 0);
+  }
+
   /* atomic single-owner free — see pd_free_claim banner. The historic
    * if(p){free;p=NULL;} double-freed when this ran concurrently for the same pfe on
    * the client-fd and backend-fd worker threads (conc=128 permanent wedge). */
@@ -3811,6 +4240,8 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
   fd_ent->pd_decode_content_length = 0;
   fd_ent->pd_decode_bytes_received = 0;
   fd_ent->pd_prefill_retries = 0;
+  fd_ent->pd_sg_active = 0;
+  fd_ent->pd_sg_room = 0;
 }
 
 /* Update Content-Length header in HTTP request buffer.
@@ -4365,7 +4796,8 @@ proxy_pdestroy(void *priv)
         /* US-H202: Decode backend closing after P/D already completed (pd_cleanup
          * set pd_phase=NONE via SSE [DONE] or non-streaming completion).
          * Just detach without closing the still-alive keep-alive client. */
-        if (pfe->is_pd_decode_backend && client_pfe->pd_phase == PD_PHASE_NONE) {
+        if ((pfe->is_pd_decode_backend || pfe->pd_sg_drain) &&
+            client_pfe->pd_phase == PD_PHASE_NONE) {
           for (int j = 0; j < client_pfe->n_rfd; j++) {
             if (client_pfe->rfd_ent[j] == pfe) {
               client_pfe->rfd_ent[j] = NULL;
@@ -4383,6 +4815,32 @@ proxy_pdestroy(void *priv)
 
         if (client_pfe->pd_phase < PD_PHASE_DECODE_SENDING ||
             client_pfe->pd_phase > PD_PHASE_DECODE_STREAMING) continue;
+
+        /* SGLang drain-leg death coupling (pd_router.rs:731 semantics):
+         * the prefill leg dying BEFORE its response completed, with ZERO
+         * decode bytes relayed, means the rendezvous cannot succeed — the
+         * decode engine would sit in WaitingForInput until its 300s
+         * disaggregation timeout. Abort the pair now (502; the client-fd
+         * shutdown cascade closes the decode leg, whose engine aborts on
+         * disconnect in ~4-8s). If decode already produced client-visible
+         * bytes (fully radix-cached prompt), let it finish — count only.
+         * Either way fall through to the detach loop below so this dying
+         * leg cannot cascade-close the client a second time. */
+        if (pfe->pd_sg_drain && !pfe->pd_sg_drain_handled &&
+            !pfe->pd_sg_drain_done) {
+          pfe->pd_sg_drain_handled = 1;
+          if (pd_sg_decode_untouched(client_pfe)) {
+            log_error("[PD_SG] drain leg died before prefill completed — "
+                      "aborting pair (client_fd=%d drain_fd=%d)",
+                      client_pfe->fd, pfe->fd);
+            pd_sg_abort_pair(client_pfe, "drain leg death");
+          } else {
+            atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+            log_warn("[PD_SG] drain leg died after decode bytes relayed — "
+                     "letting decode finish (client_fd=%d drain_fd=%d)",
+                     client_pfe->fd, pfe->fd);
+          }
+        }
 
         /* Check if this backend (pfe) is still in the client's rfd_ent[].
          * If found, it's a stale link (prefill backend) — detach it.
@@ -4442,6 +4900,8 @@ proxy_pdestroy(void *priv)
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
             llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
           }
+          /* SGLang: decode-leg death must not orphan the prefill drain leg */
+          pd_sg_close_drain(client_pfe, 1);
           client_pfe->pd_phase = PD_PHASE_ERROR;
           pd_cleanup(client_pfe);
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
@@ -4487,6 +4947,8 @@ proxy_pdestroy(void *priv)
                     "complete the client)",
                     client_pfe->fd, pfe->fd);
           atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+          /* SGLang: decode-leg death must not orphan the prefill drain leg */
+          pd_sg_close_drain(client_pfe, 1);
         }
         /* DECODE_STREAMING completion (non-cut) handled by SSE [DONE] scanner */
       }
@@ -7404,7 +7866,81 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
           }
         }
 
-        if (pd_body_start && pd_body_len > 0) {
+        if (pd_body_start && pd_body_len > 0 &&
+            pd_tepval->pd_engine == PD_ENGINE_SGLANG) {
+          /* SGLang dual-dispatch preparation: inject the bootstrap triple
+           * (prefill EP host, bootstrap port, fresh room) into the body —
+           * the SAME rewritten body goes to BOTH legs at the dispatch site
+           * below. The ORIGINAL body is saved for a pair-retry re-injection
+           * with a fresh room. Injection failure fails CLOSED (503): a
+           * bootstrap-less request against a prefill-mode SGLang server
+           * parks at the engine until its 300s disaggregation timeout. */
+          uint64_t sg_room = 0;
+          uint8_t *sg_buf = NULL;
+          size_t sg_len = 0;
+          char sg_host[INET6_ADDRSTRLEN + 2];
+          int sg_pidx = pfe->pd_prefill_ep_idx;
+
+          if (sg_pidx >= 0 && sg_pidx < pd_tepval->n_eps &&
+              pd_sg_room_id(&sg_room) == 0 &&
+              (sg_buf = malloc(pd_body_len + 512)) != NULL) {
+            struct in_addr sg_pin = { .s_addr = pd_tepval->eps[sg_pidx].xip };
+            inet_ntop(AF_INET, &sg_pin, sg_host, sizeof(sg_host));
+            if (pd_sg_inject_bootstrap(pd_body_start, pd_body_len,
+                                       sg_buf, &sg_len, pd_body_len + 512,
+                                       sg_host, pd_tepval->pd_bootstrap_port,
+                                       sg_room) == 0 &&
+                pd_hdr_len + sg_len < SP_SOCK_MSG_LEN) {
+              pfe->pd_saved_body = malloc(pd_body_len);
+              if (pfe->pd_saved_body) {
+                memcpy(pfe->pd_saved_body, pd_body_start, pd_body_len);
+                pfe->pd_saved_body_len = pd_body_len;
+              }
+              memcpy(pfe->rcvbuf + pd_hdr_len, sg_buf, sg_len);
+              pfe->rcv_off = pd_hdr_len + sg_len;
+              pfe->pd_prefill_body_len = sg_len;
+              pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
+                                       SP_SOCK_MSG_LEN, sg_len);
+              pfe->pd_sg_active = 1;
+              pfe->pd_sg_room = sg_room;
+              pfe->pd_phase_start_ts = time(NULL);
+              {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                pfe->pd_prefill_start_ns =
+                    (uint64_t)_ts.tv_sec * 1000000000ULL +
+                    (uint64_t)_ts.tv_nsec;
+              }
+              log_info("[PD_SG] entry — fd=%d prefill_ep=%d decode_ep=%d "
+                       "bootstrap=%s:%u room=%llu orig_body=%zu inj_body=%zu",
+                       pfe->fd, sg_pidx, pfe->pd_decode_ep_idx, sg_host,
+                       pd_tepval->pd_bootstrap_port,
+                       (unsigned long long)sg_room, pd_body_len, sg_len);
+            }
+          }
+          free(sg_buf);
+
+          if (!pfe->pd_sg_active) {
+            static const char pd_sg_prep_err[] =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang bootstrap injection failed\"}";
+            log_error("[PD_SG] bootstrap prep failed — fd=%d prefill_ep=%d "
+                      "(failing closed)", pfe->fd, sg_pidx);
+            if (pfe->ssl) {
+              SSL_write(pfe->ssl, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1);
+            } else {
+              send(pfe->fd, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1,
+                   MSG_DONTWAIT | MSG_NOSIGNAL);
+            }
+            pd_free_claim(&pfe->pd_saved_body);
+            pfe->pd_saved_body_len = 0;
+            shutdown(pfe->fd, SHUT_RDWR);
+            return SP_FWD_RESTART;
+          }
+        } else if (pd_body_start && pd_body_len > 0) {
           /* 1. Save original body for decode phase */
           pfe->pd_saved_body = malloc(pd_body_len);
           if (pfe->pd_saved_body) {
@@ -7586,8 +8122,10 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       }
     }
 
-    /* Save complete headers (with X-Request-Id) for decode phase */
-    if (pfe->pd_phase == PD_PHASE_PREFILL_SENDING && !pfe->pd_saved_headers) {
+    /* Save complete headers (with X-Request-Id) for decode phase (vLLM) or
+     * for the pair-retry re-injection (SGLang dual dispatch) */
+    if ((pfe->pd_phase == PD_PHASE_PREFILL_SENDING || pfe->pd_sg_active) &&
+        !pfe->pd_saved_headers) {
       uint8_t *hdr_end = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
       if (hdr_end) {
         size_t hdr_len = (size_t)(hdr_end + 4 - pfe->rcvbuf);
@@ -7622,7 +8160,9 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                pfe->has_vllm_request_id, pfe->http_content_length,
                pfe->is_streamable, pd_dis, pfe->odir, (int)pfe->pd_phase,
                pfe->n_rfd, pfe->ep_num,
-               pfe->pd_phase == PD_PHASE_PREFILL_SENDING ? "PD_PREFILL" : "PLAIN");
+               pfe->pd_phase == PD_PHASE_PREFILL_SENDING ? "PD_PREFILL" :
+               (pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE) ?
+                   "PD_SG_DUAL" : "PLAIN");
     }
 
     /* P/D-aware forwarding — force prefill EP, or normal multiplexor */
@@ -7635,6 +8175,14 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       proxy_try_epxmit(pfe, pfe->rcvbuf, pfe->rcv_off, 0);
       pfe->pd_phase = PD_PHASE_PREFILL_WAITING;
       log_info("Prefill request sent — fd=%d phase→PREFILL_WAITING", pfe->fd);
+    } else if (pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE) {
+      /* SGLang dual dispatch: same injected payload down BOTH legs — the
+       * admission-time prefill connection (slot 0, now the drain leg) and a
+       * fresh decode leg. Enters the decode lifecycle directly. On failure
+       * the 503 + record + cleanup already happened inside. */
+      if (pd_sg_dual_dispatch(pfe) < 0) {
+        pfe->pd_sg_active = 0;
+      }
     } else {
       /* R2 [FRAME_MISMATCH] instrument (log-only): generic multiplexor forward
        * site — declared (parser-owned) CL vs actual relayed body. */

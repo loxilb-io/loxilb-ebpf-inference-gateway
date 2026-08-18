@@ -601,6 +601,52 @@ check_draining_endpoints(void)
           }
         }
 
+        /* SGLang dual-dispatch rendezvous wedge — the SG client enters
+         * DECODE_SENDING at dispatch, so the prefill-phase scan above can
+         * never see it. If NO decode byte has arrived within the prefill
+         * timeout, the bootstrap rendezvous is stuck (prefill leg parked at
+         * the engine's disaggregation timeout, decode in WaitingForInput).
+         * Fail fast: 504, record, tear down BOTH legs — deliberately
+         * undercutting SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT (300s) so a
+         * client is never parked for 5 minutes. */
+        else if (pfe->pd_sg_active &&
+                 pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
+                 pfe->pd_phase_start_ts > 0 &&
+                 pfe->pd_last_decode_ts == 0 &&
+                 pfe->pd_decode_bytes_received == 0 &&
+                 pfe->pd_decode_content_length == 0) {
+          time_t sg_elapsed = now - pfe->pd_phase_start_ts;
+          uint32_t sg_timeout = pd_prefill_timeout_default();
+          if (pfe->epv) {
+            proxy_epval_t *sg_epv = (proxy_epval_t *)pfe->epv;
+            if (sg_epv->pd_prefill_timeout_sec > 0) {
+              sg_timeout = sg_epv->pd_prefill_timeout_sec;
+            }
+          }
+          if (sg_elapsed >= (time_t)sg_timeout) {
+            log_error("[PD_SG] rendezvous wedge — fd=%d room=%llu "
+                      "elapsed=%lds >= timeout=%us, tearing down pair",
+                      pfe->fd, (unsigned long long)pfe->pd_sg_room,
+                      (long)sg_elapsed, sg_timeout);
+            atomic_fetch_add(&global_stats.pd_sg_prefill_abort_decode, 1);
+            {
+              char *sg_model = "";
+              if (pfe->x_model_header[0] != '\0') {
+                sg_model = pfe->x_model_header;
+              } else if (pfe->prefix_key.model[0] != '\0') {
+                sg_model = pfe->prefix_key.model;
+              }
+              llb_ai_pd_record(sg_model, 0, 0, 0, 1 /*prefill error*/);
+            }
+            if (pfe->fd > 0) {
+              send(pfe->fd, pd_timeout_resp, sizeof(pd_timeout_resp) - 1,
+                   MSG_DONTWAIT | MSG_NOSIGNAL);
+            }
+            pfe->pd_phase = PD_PHASE_ERROR;
+            pd_teardown_conn(pfe);
+          }
+        }
+
         pfe = pfe_next;
       }
       pd_node = pd_node->next;

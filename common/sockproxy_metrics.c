@@ -208,6 +208,11 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_decode_zero_byte_eof    = atomic_load(&global_stats.pd_decode_zero_byte_eof);
     snapshot.pd_connect_failover        = atomic_load(&global_stats.pd_connect_failover);
     snapshot.lb_select_failure_shutdown = atomic_load(&global_stats.lb_select_failure_shutdown);
+
+    /* SGLang P/D dual-dispatch counters */
+    snapshot.pd_sg_prefill_abort_decode = atomic_load(&global_stats.pd_sg_prefill_abort_decode);
+    snapshot.pd_sg_decode_close_drain   = atomic_load(&global_stats.pd_sg_decode_close_drain);
+    snapshot.pd_sg_room_retry           = atomic_load(&global_stats.pd_sg_room_retry);
     /* P/D session and trie gauges — populated from PROXY_LOCK ephash walk above */
 
     /* KV Tier 1.5 routing diagnostics — storage only in plan 42-01; */

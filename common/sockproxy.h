@@ -162,6 +162,10 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
     _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
+    // SGLang P/D dual-dispatch observability (mirrors the failover family above)
+    _Atomic uint64_t pd_sg_prefill_abort_decode; // prefill drain-leg failure forced a decode-leg abort
+    _Atomic uint64_t pd_sg_decode_close_drain;   // decode-leg failure closed the prefill drain leg
+    _Atomic uint64_t pd_sg_room_retry;           // dual dispatch retried as a pair with a fresh room
     //: per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
@@ -1001,6 +1005,20 @@ struct proxy_fd_ent {
   uint64_t pd_decode_start_ns;       // Monotonic timestamp for decode latency
   size_t   pd_decode_content_length; // Content-Length from non-SSE decode response headers
   size_t   pd_decode_bytes_received; // Decode response body bytes received so far
+  /* SGLang P/D dual-dispatch state. The CLIENT pfe reuses the
+   * DECODE_SENDING/DECODE_STREAMING/COMPLETE pd_phase lifecycle for its decode
+   * leg (so every decode-side behavior — SSE latch, [DONE] scanner, stream
+   * caps, EOF taxonomy, reapers, xSync — applies unchanged); the prefill leg
+   * is a detached DRAIN leg whose state lives on the BACKEND pfe below.
+   * Append-only growth on proxy_fd_ent (NOT xSync-serialized) — HA-safe per
+   * the resp_parser_inited precedent. Zero-init (pfe_alloc) == off. */
+  uint8_t  pd_sg_active;             // CLIENT: SGLang dual dispatch live for this request
+  uint64_t pd_sg_room;               // CLIENT: bootstrap room injected into both legs (logs/retry)
+  uint8_t  pd_sg_drain;              // BACKEND: this leg is the SGLang prefill drain leg
+  uint8_t  pd_sg_drain_done;         // BACKEND: prefill response fully received (message complete)
+  uint8_t  pd_sg_drain_handled;      // BACKEND: failure coupling already fired for this leg
+  uint8_t  pd_sg_drain_desync;       // BACKEND: a parser feed was skipped (trylock miss) — framing
+                                     // untrusted, completion falls back to leg EOF
   uint8_t  pd_prefill_retries;       // Prefill mid-request failovers consumed (budget: 1).
                                      // Prefill is side-effect-idempotent and the complete
                                      // request survives in pd_saved_headers/pd_saved_body,
