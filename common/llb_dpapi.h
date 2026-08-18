@@ -1039,7 +1039,15 @@ struct dp_proxy_tacts {
   // byte of the former pad3c(4) — offsets and total size unchanged, so the
   // _Static_asserts below stay as-is (same idiom as kv_engine_type/pad3b).
   uint8_t  cb_enable;
-  uint8_t  pad3c[3];               // Alignment padding (keeps struct 8-byte aligned)
+  uint8_t  pad3c;                  // Alignment padding (keeps struct 8-byte aligned)
+  // SGLang P/D disaggregation bootstrap port on every prefill EP (0 ⇒ SGLang's
+  // default 8998, applied at proxy_add). Meaningful only when pd_disagg_mode=1
+  // and kv_engine_type=1 (sglang) — the Go control plane rejects every other
+  // pairing at config time. Takes the LAST TWO bytes of the former pad3c(3)
+  // (cb_enable sits at a 4-aligned+1 offset, so those two bytes are 2-aligned)
+  // — offsets and total size unchanged, the _Static_asserts below stay as-is
+  // (same idiom as cb_enable/kv_engine_type).
+  uint16_t pd_bootstrap_port;
   // Octavia per-listener member timeouts in MILLISECONDS (native unit).
   // Additive + default-off (0 ⇒ preserve today's behaviour). These mirror the proxy_arg
   // *_ms fields (sockproxy.h, added by Plan ) and are copied verbatim into proxy_arg by

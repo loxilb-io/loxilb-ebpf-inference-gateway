@@ -65,6 +65,17 @@ struct dp_proxy_ct_ent;
 #ifndef MAX_SALT_LEN
 #define MAX_SALT_LEN 64     // Cache isolation salt
 #define PD_KV_PARAMS_MAX_LEN 65536  // P/D kv_transfer_params buffer (64KB for real vLLM block_ids)
+
+/* P/D orchestration engine flavor (proxy_epval_t.pd_engine). Values equal
+ * the wire kv_engine_type encoding (0=vllm, 1=sglang) — the proxy_add stamp
+ * is a straight copy, these names exist so the orchestration branch reads an
+ * orchestration-named constant. */
+#define PD_ENGINE_VLLM   0
+#define PD_ENGINE_SGLANG 1
+
+/* SGLang --disaggregation-bootstrap-port default (server_args.py). Applied
+ * at proxy_add when the rule leaves pd_bootstrap_port at 0. */
+#define PD_SG_BOOTSTRAP_PORT_DFL 8998
 #endif
 
 // ============================================================================
@@ -490,9 +501,19 @@ typedef struct proxy_epval {
   uint32_t backend_keepalive_sec;   // Backend SO_KEEPALIVE+TCP_KEEPIDLE interval (0=disabled)
   uint32_t inactive_timeout_sec;    // Per-rule idle timeout in seconds (0=disabled); suppressed when sse_active=1
 
-  // P/D Disaggregation configuration 
+  // P/D Disaggregation configuration
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
+   * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG) so
+   * the orchestration branch never reads a KV-named field. vLLM keeps the
+   * sequential prefill→decode state machine; SGLang selects the concurrent
+   * dual-dispatch machine (bootstrap triple injection, prefill drain leg). */
+  uint8_t  pd_engine;
+  /* SGLang bootstrap port on every prefill EP; the decode engine rendezvouses
+   * with prefill on it. 0 is defaulted to PD_SG_BOOTSTRAP_PORT_DFL at
+   * proxy_add, so readers can trust it non-zero when pd_engine==SGLANG. */
+  uint16_t pd_bootstrap_port;
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
   int      n_prefill_eps;          // Count of prefill endpoints
   int      n_decode_eps;           // Count of decode endpoints
@@ -1198,9 +1219,13 @@ struct proxy_arg {
   // timeouts.request/backendRequest); a future Gateway controller MUST hard-error, never silent-drop.
   uint32_t timeout_tcp_inspect_ms;    // 0 ⇒ sane bounded default (header-accum deadline)
 
-  // P/D Disaggregation configuration 
+  // P/D Disaggregation configuration
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
+  // proxy_add). The nat2proxy hop of the additive chain
+  // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
+  uint16_t pd_bootstrap_port;
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
 
   // P/D Cache-Aware Routing configuration (US-PD801)

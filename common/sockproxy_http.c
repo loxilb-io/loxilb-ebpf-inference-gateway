@@ -2065,6 +2065,15 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
         }
 
+        /* P/D orchestration flavor + SGLang bootstrap port. pd_engine is
+         * stamped FROM kv_engine_type (values equal by construction) so the
+         * orchestration branch never reads a KV-named field; the port default
+         * lands here so every reader can trust it non-zero (pd_cache_threshold
+         * defaulting idiom). */
+        tepval->pd_engine = arg->kv_engine_type ? PD_ENGINE_SGLANG : PD_ENGINE_VLLM;
+        tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
+                                    arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
+
         // US-PD801: P/D Cache-Aware Routing configuration
         tepval->pd_kv_params_max = arg->pd_kv_params_max;
         tepval->pd_cache_aware_mode = arg->pd_cache_aware_mode;
@@ -2471,6 +2480,13 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
              tepval->n_prefill_eps, tepval->n_decode_eps);
 
   }
+
+  /* P/D orchestration flavor + SGLang bootstrap port — mirrors the
+   * update-existing-tepval branch above (pd_cache_threshold defaulting
+   * idiom for the port). */
+  tepval->pd_engine = arg->kv_engine_type ? PD_ENGINE_SGLANG : PD_ENGINE_VLLM;
+  tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
+                              arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
 
   // US-PD801: P/D Cache-Aware Routing configuration
   tepval->pd_kv_params_max = arg->pd_kv_params_max;
