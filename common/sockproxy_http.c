@@ -47,6 +47,7 @@
 #include "llb_dpapi.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy.h"
+#include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_internal.h"
 #include "sockproxy_metrics.h"
@@ -2100,11 +2101,14 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         }
 
         /* P/D orchestration flavor + SGLang bootstrap port. pd_engine is
-         * stamped FROM kv_engine_type (values equal by construction) so the
-         * orchestration branch never reads a KV-named field; the port default
-         * lands here so every reader can trust it non-zero (pd_cache_threshold
+         * mapped FROM kv_engine_type (N-way, ready for engines beyond
+         * vllm/sglang) so the orchestration branch never reads a KV-named
+         * field; the dialect ops pointer is resolved once here so the
+         * request path never re-derives the engine; the port default lands
+         * here so every reader can trust it non-zero (pd_cache_threshold
          * defaulting idiom). */
-        tepval->pd_engine = arg->kv_engine_type ? PD_ENGINE_SGLANG : PD_ENGINE_VLLM;
+        tepval->pd_engine = pd_engine_from_kv_engine_type(arg->kv_engine_type);
+        tepval->pd_ops = pd_dialect_resolve(tepval->pd_engine);
         tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
                                     arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
 
@@ -2518,7 +2522,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   /* P/D orchestration flavor + SGLang bootstrap port — mirrors the
    * update-existing-tepval branch above (pd_cache_threshold defaulting
    * idiom for the port). */
-  tepval->pd_engine = arg->kv_engine_type ? PD_ENGINE_SGLANG : PD_ENGINE_VLLM;
+  tepval->pd_engine = pd_engine_from_kv_engine_type(arg->kv_engine_type);
+  tepval->pd_ops = pd_dialect_resolve(tepval->pd_engine);
   tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
                               arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
 
@@ -8277,6 +8282,217 @@ static int pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                                 struct llb_sockmap_key *rkey,
                                 const char *phurl);
 
+/* --- Engine-dialect ops wrappers -----------------------------------------
+ * Both P/D machines still live in this file; these wrappers adapt them to
+ * the pd_dialect_ops table (sockproxy_pd.h) so the forward path calls
+ * through the epval's cached ops pointer instead of testing the engine.
+ * They migrate to sockproxy_pd_vllm.c / sockproxy_pd_sglang.c with their
+ * machines. Bodies are verbatim moves of the former inline branches. */
+
+/* vLLM sequential machine: save the original body for the decode phase and
+ * rewrite the request into the prefill probe (max_tokens=1, stream=false,
+ * +kv_transfer_params). Failures log and fall back to plain forwarding of
+ * the untouched request (returns 0 — never fails the client here). */
+static int
+pd_vllm_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
+                        size_t hdr_len, const uint8_t *body, size_t body_len)
+{
+  (void)epval;
+  /* 1. Save original body for decode phase */
+  pfe->pd_saved_body = malloc(body_len);
+  if (pfe->pd_saved_body) {
+    memcpy(pfe->pd_saved_body, body, body_len);
+    pfe->pd_saved_body_len = body_len;
+
+    /* 2. Rewrite body for prefill: max_tokens=1, stream=false,
+     *    +kv_transfer_params */
+    uint8_t *prefill_buf = malloc(body_len + 4096);
+    if (prefill_buf) {
+      size_t prefill_body_len = 0;
+      if (pd_prepare_prefill_body(body, body_len,
+                                  prefill_buf, &prefill_body_len,
+                                  body_len + 4096) == 0) {
+        /* Replace body in rcvbuf */
+        memcpy(pfe->rcvbuf + hdr_len, prefill_buf, prefill_body_len);
+        pfe->rcv_off = hdr_len + prefill_body_len;
+        pfe->pd_prefill_body_len = prefill_body_len;
+
+        /* 3. Allocate prefill response buffer (64KB cap) */
+        pfe->pd_prefill_resp_cap = 64 * 1024;
+        pfe->pd_prefill_resp_buf = malloc(pfe->pd_prefill_resp_cap);
+        if (pfe->pd_prefill_resp_buf) {
+          pfe->pd_prefill_resp_len = 0;
+
+          /* 4. Set phase and timestamps */
+          pfe->pd_phase = PD_PHASE_PREFILL_SENDING;
+          pfe->pd_phase_start_ts = time(NULL);
+          {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            pfe->pd_prefill_start_ns =
+                (uint64_t)_ts.tv_sec * 1000000000ULL +
+                (uint64_t)_ts.tv_nsec;
+          }
+
+          log_info("P/D entry — fd=%d prefill_ep=%d "
+                   "decode_ep=%d orig_body=%zu prefill_body=%zu",
+                   pfe->fd, pfe->pd_prefill_ep_idx,
+                   pfe->pd_decode_ep_idx,
+                   body_len, prefill_body_len);
+        } else {
+          log_error("malloc failed for prefill_resp_buf");
+          pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
+        }
+      } else {
+        log_error("pd_prepare_prefill_body failed");
+        pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
+      }
+      free(prefill_buf);
+    } else {
+      log_error("malloc failed for prefill_buf");
+      pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
+    }
+  } else {
+    log_error("malloc failed for pd_saved_body (%zu)", body_len);
+  }
+  return 0;
+}
+
+/* SGLang dual-dispatch preparation: inject the bootstrap triple (prefill EP
+ * host, bootstrap port, fresh room) into the body — the SAME rewritten body
+ * goes to BOTH legs at the dispatch site. The ORIGINAL body is saved for a
+ * pair-retry re-injection with a fresh room. Injection failure fails CLOSED
+ * (503, returns <0): a bootstrap-less request against a prefill-mode SGLang
+ * server parks at the engine until its 300s disaggregation timeout. */
+static int
+pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
+                      size_t hdr_len, const uint8_t *body, size_t body_len)
+{
+  uint64_t sg_room = 0;
+  uint8_t *sg_buf = NULL;
+  size_t sg_len = 0;
+  char sg_host[INET6_ADDRSTRLEN + 2];
+  int sg_pidx = pfe->pd_prefill_ep_idx;
+
+  if (sg_pidx >= 0 && sg_pidx < epval->n_eps &&
+      pd_sg_room_id(&sg_room) == 0 &&
+      (sg_buf = malloc(body_len + 512)) != NULL) {
+    struct in_addr sg_pin = { .s_addr = epval->eps[sg_pidx].xip };
+    inet_ntop(AF_INET, &sg_pin, sg_host, sizeof(sg_host));
+    if (pd_sg_inject_bootstrap(body, body_len,
+                               sg_buf, &sg_len, body_len + 512,
+                               sg_host, epval->pd_bootstrap_port,
+                               sg_room) == 0 &&
+        hdr_len + sg_len < SP_SOCK_MSG_LEN) {
+      pfe->pd_saved_body = malloc(body_len);
+      if (pfe->pd_saved_body) {
+        memcpy(pfe->pd_saved_body, body, body_len);
+        pfe->pd_saved_body_len = body_len;
+      }
+      memcpy(pfe->rcvbuf + hdr_len, sg_buf, sg_len);
+      pfe->rcv_off = hdr_len + sg_len;
+      pfe->pd_prefill_body_len = sg_len;
+      pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
+                               SP_SOCK_MSG_LEN, sg_len);
+      pfe->pd_sg_active = 1;
+      pfe->pd_sg_room = sg_room;
+      pfe->pd_phase_start_ts = time(NULL);
+      {
+        struct timespec _ts;
+        clock_gettime(CLOCK_MONOTONIC, &_ts);
+        pfe->pd_prefill_start_ns =
+            (uint64_t)_ts.tv_sec * 1000000000ULL +
+            (uint64_t)_ts.tv_nsec;
+      }
+      log_info("[PD_SG] entry — fd=%d prefill_ep=%d decode_ep=%d "
+               "bootstrap=%s:%u room=%llu orig_body=%zu inj_body=%zu",
+               pfe->fd, sg_pidx, pfe->pd_decode_ep_idx, sg_host,
+               epval->pd_bootstrap_port,
+               (unsigned long long)sg_room, body_len, sg_len);
+    }
+  }
+  free(sg_buf);
+
+  if (!pfe->pd_sg_active) {
+    static const char pd_sg_prep_err[] =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang bootstrap injection failed\"}";
+    log_error("[PD_SG] bootstrap prep failed — fd=%d prefill_ep=%d "
+              "(failing closed)", pfe->fd, sg_pidx);
+    if (pfe->ssl) {
+      SSL_write(pfe->ssl, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1);
+    } else {
+      send(pfe->fd, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1,
+           MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+    pd_free_claim(&pfe->pd_saved_body);
+    pfe->pd_saved_body_len = 0;
+    shutdown(pfe->fd, SHUT_RDWR);
+    return -1;
+  }
+  return 0;
+}
+
+/* vLLM forward: prefill leg only (EP 0, set in proxy_setup_ep__), then the
+ * sequential machine waits for the prefill response. */
+static int
+pd_vllm_dispatch(struct proxy_fd_ent *pfe)
+{
+  /* frame instrument (log-only): prefill forward site — declared
+   * (parser-owned) CL vs actual relayed body bytes. */
+  pd_frame_mismatch_log(pfe, pfe->rcvbuf, pfe->rcv_off,
+                        pfe->http_content_length, "prefill_xmit");
+  proxy_try_epxmit(pfe, pfe->rcvbuf, pfe->rcv_off, 0);
+  pfe->pd_phase = PD_PHASE_PREFILL_WAITING;
+  log_info("Prefill request sent — fd=%d phase→PREFILL_WAITING", pfe->fd);
+  return 0;
+}
+
+/* SGLang forward: same injected payload down BOTH legs — the admission-time
+ * prefill connection (slot 0, now the drain leg) and a fresh decode leg.
+ * Enters the decode lifecycle directly. On failure the 503 + record +
+ * cleanup already happened inside pd_sg_dual_dispatch. */
+static int
+pd_sg_dispatch(struct proxy_fd_ent *pfe)
+{
+  if (pd_sg_dual_dispatch(pfe) < 0) {
+    pfe->pd_sg_active = 0;
+    return -1;
+  }
+  return 0;
+}
+
+/* Dialect ops tables (extern decls in sockproxy_pd.h; resolved per rule in
+ * sockproxy_pd_core.c). Slots left NULL are lifecycle events not yet routed
+ * through the table — their sites still live inline in this file until each
+ * machine is extracted. */
+const pd_dialect_ops_t pd_dialect_vllm = {
+  .name = "vllm",
+  .needs_full_body = 1,
+  .max_inspect_body = 64 * 1024,
+  .prepare_request = pd_vllm_prepare_request,
+  .dispatch = pd_vllm_dispatch,
+  .on_prefill_response = NULL,
+  .on_leg_error = NULL,
+  .collect_retry = NULL,
+  .reap = NULL,
+};
+
+const pd_dialect_ops_t pd_dialect_sglang = {
+  .name = "sglang",
+  .needs_full_body = 1,
+  .max_inspect_body = 64 * 1024,
+  .prepare_request = pd_sg_prepare_request,
+  .dispatch = pd_sg_dispatch,
+  .on_prefill_response = NULL,
+  .on_leg_error = NULL,
+  .collect_retry = NULL,
+  .reap = NULL,
+};
+
 /* (R1): dispatch + forward, factored verbatim out of handle_client_data
  * (was the inline `Setup backend connection` + `NOW forward accumulated data` block).
  * Used by BOTH the fresh-dispatch site and the bounded-admission resume so the two
@@ -8327,138 +8543,16 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
           }
         }
 
+        /* Engine-dialect body preparation (ops table): the vllm machine
+         * saves the body and rewrites the prefill probe; the sglang machine
+         * injects the bootstrap triple. A negative return means the dialect
+         * terminated the request fail-closed (error response already sent)
+         * — restart the fd. */
         if (pd_body_start && pd_body_len > 0 &&
-            pd_tepval->pd_engine == PD_ENGINE_SGLANG) {
-          /* SGLang dual-dispatch preparation: inject the bootstrap triple
-           * (prefill EP host, bootstrap port, fresh room) into the body —
-           * the SAME rewritten body goes to BOTH legs at the dispatch site
-           * below. The ORIGINAL body is saved for a pair-retry re-injection
-           * with a fresh room. Injection failure fails CLOSED (503): a
-           * bootstrap-less request against a prefill-mode SGLang server
-           * parks at the engine until its 300s disaggregation timeout. */
-          uint64_t sg_room = 0;
-          uint8_t *sg_buf = NULL;
-          size_t sg_len = 0;
-          char sg_host[INET6_ADDRSTRLEN + 2];
-          int sg_pidx = pfe->pd_prefill_ep_idx;
-
-          if (sg_pidx >= 0 && sg_pidx < pd_tepval->n_eps &&
-              pd_sg_room_id(&sg_room) == 0 &&
-              (sg_buf = malloc(pd_body_len + 512)) != NULL) {
-            struct in_addr sg_pin = { .s_addr = pd_tepval->eps[sg_pidx].xip };
-            inet_ntop(AF_INET, &sg_pin, sg_host, sizeof(sg_host));
-            if (pd_sg_inject_bootstrap(pd_body_start, pd_body_len,
-                                       sg_buf, &sg_len, pd_body_len + 512,
-                                       sg_host, pd_tepval->pd_bootstrap_port,
-                                       sg_room) == 0 &&
-                pd_hdr_len + sg_len < SP_SOCK_MSG_LEN) {
-              pfe->pd_saved_body = malloc(pd_body_len);
-              if (pfe->pd_saved_body) {
-                memcpy(pfe->pd_saved_body, pd_body_start, pd_body_len);
-                pfe->pd_saved_body_len = pd_body_len;
-              }
-              memcpy(pfe->rcvbuf + pd_hdr_len, sg_buf, sg_len);
-              pfe->rcv_off = pd_hdr_len + sg_len;
-              pfe->pd_prefill_body_len = sg_len;
-              pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
-                                       SP_SOCK_MSG_LEN, sg_len);
-              pfe->pd_sg_active = 1;
-              pfe->pd_sg_room = sg_room;
-              pfe->pd_phase_start_ts = time(NULL);
-              {
-                struct timespec _ts;
-                clock_gettime(CLOCK_MONOTONIC, &_ts);
-                pfe->pd_prefill_start_ns =
-                    (uint64_t)_ts.tv_sec * 1000000000ULL +
-                    (uint64_t)_ts.tv_nsec;
-              }
-              log_info("[PD_SG] entry — fd=%d prefill_ep=%d decode_ep=%d "
-                       "bootstrap=%s:%u room=%llu orig_body=%zu inj_body=%zu",
-                       pfe->fd, sg_pidx, pfe->pd_decode_ep_idx, sg_host,
-                       pd_tepval->pd_bootstrap_port,
-                       (unsigned long long)sg_room, pd_body_len, sg_len);
-            }
-          }
-          free(sg_buf);
-
-          if (!pfe->pd_sg_active) {
-            static const char pd_sg_prep_err[] =
-                "HTTP/1.1 503 Service Unavailable\r\n"
-                "Content-Type: application/json\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang bootstrap injection failed\"}";
-            log_error("[PD_SG] bootstrap prep failed — fd=%d prefill_ep=%d "
-                      "(failing closed)", pfe->fd, sg_pidx);
-            if (pfe->ssl) {
-              SSL_write(pfe->ssl, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1);
-            } else {
-              send(pfe->fd, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1,
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
-            }
-            pd_free_claim(&pfe->pd_saved_body);
-            pfe->pd_saved_body_len = 0;
-            shutdown(pfe->fd, SHUT_RDWR);
-            return SP_FWD_RESTART;
-          }
-        } else if (pd_body_start && pd_body_len > 0) {
-          /* 1. Save original body for decode phase */
-          pfe->pd_saved_body = malloc(pd_body_len);
-          if (pfe->pd_saved_body) {
-            memcpy(pfe->pd_saved_body, pd_body_start, pd_body_len);
-            pfe->pd_saved_body_len = pd_body_len;
-
-            /* 2. Rewrite body for prefill: max_tokens=1, stream=false,
-             *    +kv_transfer_params */
-            uint8_t *prefill_buf = malloc(pd_body_len + 4096);
-            if (prefill_buf) {
-              size_t prefill_body_len = 0;
-              if (pd_prepare_prefill_body(pd_body_start, pd_body_len,
-                                          prefill_buf, &prefill_body_len,
-                                          pd_body_len + 4096) == 0) {
-                /* Replace body in rcvbuf */
-                memcpy(pfe->rcvbuf + pd_hdr_len, prefill_buf, prefill_body_len);
-                pfe->rcv_off = pd_hdr_len + prefill_body_len;
-                pfe->pd_prefill_body_len = prefill_body_len;
-
-                /* 3. Allocate prefill response buffer (64KB cap) */
-                pfe->pd_prefill_resp_cap = 64 * 1024;
-                pfe->pd_prefill_resp_buf = malloc(pfe->pd_prefill_resp_cap);
-                if (pfe->pd_prefill_resp_buf) {
-                  pfe->pd_prefill_resp_len = 0;
-
-                  /* 4. Set phase and timestamps */
-                  pfe->pd_phase = PD_PHASE_PREFILL_SENDING;
-                  pfe->pd_phase_start_ts = time(NULL);
-                  {
-                    struct timespec _ts;
-                    clock_gettime(CLOCK_MONOTONIC, &_ts);
-                    pfe->pd_prefill_start_ns =
-                        (uint64_t)_ts.tv_sec * 1000000000ULL +
-                        (uint64_t)_ts.tv_nsec;
-                  }
-
-                  log_info("P/D entry — fd=%d prefill_ep=%d "
-                           "decode_ep=%d orig_body=%zu prefill_body=%zu",
-                           pfe->fd, pfe->pd_prefill_ep_idx,
-                           pfe->pd_decode_ep_idx,
-                           pd_body_len, prefill_body_len);
-                } else {
-                  log_error("malloc failed for prefill_resp_buf");
-                  pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
-                }
-              } else {
-                log_error("pd_prepare_prefill_body failed");
-                pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
-              }
-              free(prefill_buf);
-            } else {
-              log_error("malloc failed for prefill_buf");
-              pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
-            }
-          } else {
-            log_error("malloc failed for pd_saved_body (%zu)", pd_body_len);
-          }
+            pd_tepval->pd_ops->prepare_request(pfe, pd_tepval, pd_hdr_len,
+                                               pd_body_start,
+                                               pd_body_len) < 0) {
+          return SP_FWD_RESTART;
         }
       }
     }
@@ -8626,24 +8720,13 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                    "PD_SG_DUAL" : "PLAIN");
     }
 
-    /* P/D-aware forwarding — force prefill EP, or normal multiplexor */
-    if (pfe->pd_phase == PD_PHASE_PREFILL_SENDING) {
-      /* R2 [FRAME_MISMATCH] instrument (log-only): prefill forward site —
-       * declared (parser-owned) CL vs actual relayed body bytes. */
-      pd_frame_mismatch_log(pfe, pfe->rcvbuf, pfe->rcv_off,
-                            pfe->http_content_length, "prefill_xmit");
-      /* Send to EP 0 which is the prefill EP (set in proxy_setup_ep__) */
-      proxy_try_epxmit(pfe, pfe->rcvbuf, pfe->rcv_off, 0);
-      pfe->pd_phase = PD_PHASE_PREFILL_WAITING;
-      log_info("Prefill request sent — fd=%d phase→PREFILL_WAITING", pfe->fd);
-    } else if (pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE) {
-      /* SGLang dual dispatch: same injected payload down BOTH legs — the
-       * admission-time prefill connection (slot 0, now the drain leg) and a
-       * fresh decode leg. Enters the decode lifecycle directly. On failure
-       * the 503 + record + cleanup already happened inside. */
-      if (pd_sg_dual_dispatch(pfe) < 0) {
-        pfe->pd_sg_active = 0;
-      }
+    /* P/D-aware forwarding — dialect dispatch, or normal multiplexor. The
+     * dialect states below are only reachable after the prepare step ran
+     * under a live epval, so the cached ops pointer is always present. */
+    if (pfe->epv &&
+        (pfe->pd_phase == PD_PHASE_PREFILL_SENDING ||
+         (pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE))) {
+      ((proxy_epval_t *)pfe->epv)->pd_ops->dispatch(pfe);
     } else {
       /* R2 [FRAME_MISMATCH] instrument (log-only): generic multiplexor forward
        * site — declared (parser-owned) CL vs actual relayed body. */

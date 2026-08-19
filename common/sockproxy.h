@@ -67,11 +67,17 @@ struct dp_proxy_ct_ent;
 #define PD_KV_PARAMS_MAX_LEN 65536  // P/D kv_transfer_params buffer (64KB for real vLLM block_ids)
 
 /* P/D orchestration engine flavor (proxy_epval_t.pd_engine). Values equal
- * the wire kv_engine_type encoding (0=vllm, 1=sglang) — the proxy_add stamp
- * is a straight copy, these names exist so the orchestration branch reads an
- * orchestration-named constant. */
+ * the wire kv_engine_type encoding (0=vllm, 1=sglang, 2=trtllm reserved) —
+ * the proxy_add stamp goes through pd_engine_from_kv_engine_type()
+ * (sockproxy_pd_core.c), these names exist so the orchestration branch reads
+ * an orchestration-named constant. Adding an engine = new constant here +
+ * mapper/resolver case + (when it diverges) its own dialect ops table. */
 #define PD_ENGINE_VLLM   0
 #define PD_ENGINE_SGLANG 1
+/* TensorRT-LLM disaggregation is sequential ctx-first — a parameterization
+ * of the vLLM machine. Reserved: resolves to the vllm dialect table until it
+ * earns its own. The control plane does not emit this value yet. */
+#define PD_ENGINE_TRTLLM 2
 
 /* SGLang --disaggregation-bootstrap-port default (server_args.py). Applied
  * at proxy_add when the rule leaves pd_bootstrap_port at 0. */
@@ -461,6 +467,10 @@ typedef struct proxy_ent {
  * single-TU unit build (the PD_CTRL_ST_* precedent). */
 #define KV_EXACT_MODE_SINGLE_ROLE 3
 
+/* P/D engine-dialect ops table — full definition in sockproxy_pd.h; the epval
+ * only carries the resolved pointer. */
+struct pd_dialect_ops;
+
 // Proxy endpoint value - manages endpoint pool for a service
 typedef struct proxy_epval {
   char host_url[256];
@@ -518,6 +528,10 @@ typedef struct proxy_epval {
    * with prefill on it. 0 is defaulted to PD_SG_BOOTSTRAP_PORT_DFL at
    * proxy_add, so readers can trust it non-zero when pd_engine==SGLANG. */
   uint16_t pd_bootstrap_port;
+  /* Dialect ops table (sockproxy_pd.h), resolved from pd_engine at the same
+   * proxy_add sites that stamp it — never NULL once the rule is live, so the
+   * request path calls through it without re-deriving the engine. */
+  const struct pd_dialect_ops *pd_ops;
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
   int      n_prefill_eps;          // Count of prefill endpoints
   int      n_decode_eps;           // Count of decode endpoints
