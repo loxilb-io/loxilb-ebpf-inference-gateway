@@ -10,10 +10,10 @@
  * pd_engine) and caches it on the epval; request-lifecycle events then call
  * through the table and never ask which engine they are speaking to.
  *
- * The table SHAPE is fixed here; exact slot signatures may adapt while the
- * machines are extracted into sockproxy_pd_vllm.c / sockproxy_pd_sglang.c.
- * Slots not yet routed through the table are NULL until the owning machine
- * is extracted.
+ * The machines live in sockproxy_pd_vllm.c / sockproxy_pd_sglang.c, which
+ * each define their pd_dialect_ops table; engine-neutral dispatch glue is
+ * in sockproxy_pd_core.c. A slot may be NULL when the dialect has no use
+ * for that lifecycle event.
  */
 
 #ifndef __SOCKPROXY_PD_H__

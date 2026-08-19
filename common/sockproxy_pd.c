@@ -1,7 +1,22 @@
-/* sockproxy_pd.c - P/D disaggregation body rewriting for vLLM prefill/decode
+/* sockproxy_pd.c - P/D disaggregation shared services (engine-neutral)
  *
- * Uses targeted memmem() + memmove() string replacement. Safe for OpenAI API
- * which has predictable flat JSON structure.
+ * This TU holds the pieces every engine dialect shares:
+ *   - JSON body rewriting for prefill/decode request preparation
+ *     (targeted memmem() + memmove() replacement — safe for the OpenAI API's
+ *     predictable flat JSON structure)
+ *   - kv_transfer_params extraction from prefill responses
+ *   - P/D session cache (resolve/lookup/store/evict) + cluster sync events
+ *   - admission control / load-guard counters
+ *
+ * Engine-specific orchestration contracts do NOT live here: the per-engine
+ * state machines and their pd_engine_ops tables are in sockproxy_pd_vllm.c
+ * (sequential prefill-then-decode) and sockproxy_pd_sglang.c (dual dispatch
+ * with bootstrap-room injection); engine-neutral dispatch plumbing is in
+ * sockproxy_pd_core.c. See those files for the orchestration contract notes.
+ *
+ * This file deliberately stays a standalone TU (rather than being folded
+ * into the dialect files) because the unit-test recipes compile it on its
+ * own under the TEST_PD_REWRITER / TEST_PD_CACHE_AWARE guards.
  */
 
 #define _GNU_SOURCE  /* for memmem() */
@@ -31,8 +46,7 @@ static inline void pd_kv_overflow_inc(void) {}
  * (sockproxy_kv_exact.c) rather than an exported symbol, because the
  * test_pd_* unit binaries compile this file without sockproxy_kv_exact.c.
  * Emits one [PD_KV_PARAMS] line per successful kv_transfer_params
- * extraction; the G2 sizing sweep (LC-3.1, uint16→uint32 widening
- * decision) parses this exact format — keep it stable. */
+ * extraction; sizing tooling parses this exact format — keep it stable. */
 static _Atomic int pd_kv_dbg_initialized = 0;
 static int pd_kv_dbg = 0;
 static int
@@ -733,9 +747,9 @@ pd_session_build_event(void *ev,
 #endif  /* TEST_PD_CACHE_AWARE */
 
 /* No macro — each emit site below calls llb_sockproxy_emit_sync_event()
- * directly so the SPEC §verification grep counts each occurrence. The
- * pd_session_build_event() helper composes the struct; the actual emit is
- * inlined verbatim at each call site for grep-visibility. */
+ * directly so a grep counts each occurrence. The pd_session_build_event()
+ * helper composes the struct; the actual emit is inlined verbatim at each
+ * call site for grep-visibility. */
 
 /*
  * pd_session_lookup() - Look up cached (prefill, decode) pair for a session key.

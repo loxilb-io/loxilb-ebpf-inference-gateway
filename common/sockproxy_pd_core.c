@@ -1,10 +1,11 @@
 /* sockproxy_pd_core.c - machine-agnostic P/D dialect core
  *
- * Target home (as extraction proceeds) for the dispatch-site glue, retry-pend
- * collection, reaper walk, pd counters, JSON splice + Content-Length fixup and
- * the [PD_DECISION]/frame-mismatch instruments shared by every dialect.
- * Skeleton for now: dialect resolution only — the machines still live in
- * sockproxy_http.c behind the ops table.
+ * Engine-neutral services shared by every dialect: dialect resolution
+ * (pd_engine → ops table), Content-Length fixup, and the
+ * [PD_DECISION]/frame-mismatch instruments. The per-engine machines live in
+ * sockproxy_pd_vllm.c (sequential) and sockproxy_pd_sglang.c (dual
+ * dispatch); the HTTP engine reaches them only through the pd_dialect_ops
+ * pointer cached on the epval (see sockproxy_pd.h).
  */
 
 #define _GNU_SOURCE
@@ -100,15 +101,15 @@ pd_update_content_length(uint8_t *buf, size_t *buf_len, size_t buf_capacity,
 }
 
 /* ---------------------------------------------------------------------------
- * [FRAME_MISMATCH] round-2 Bug-B instrument (REQ-R2 /, Task 2)
+ * [FRAME_MISMATCH] framing-consistency instrument
  *
  * LOG-ONLY. Emits one [FRAME_MISMATCH] line at each request-forward site to
- * discriminate the three Bug-B candidates (BUGB-RCA.md §"Round-2 instrument"):
+ * discriminate framing-corruption candidates:
  *   1. truncated/over-long forward  → decl_cl != body_bytes, deterministic
  *   2. CL-rewrite mismatch          → diverges only at the decode rewrite site
  *   3. buffer/locking race          → mismatch correlates with tid (worker)
  *
- * Fields (verified shape, RESEARCH §"Round-2 Bug-B instrument"):
+ * Fields:
  *   fd, method (parser-owned), decl_cl = pfe->http_content_length,
  *   hdr_len via memmem("\r\n\r\n") bounded by rcv_off, body_bytes =
  *   rcv_off - hdr_len, mismatch = (decl_cl > 0 && body_bytes != decl_cl),

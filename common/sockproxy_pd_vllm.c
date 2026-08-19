@@ -11,8 +11,7 @@
  *   → prefill send (leg slot 0) → response parse + kv_transfer_params
  *   extract → decode request rebuild + re-dispatch (leg slot 1)
  *   → mid-request prefill retry on a dead prefill leg.
- * Last re-validated: 2026-08 full long-context GPU suite green
- *   (56/56 incl. the G1/G1b/G2/G3 gates).
+ * Last re-validated: 2026-08 full long-context GPU suite green.
  *
  * TensorRT-LLM note: its disaggregation is sequential ctx-first — a
  * parameterization of THIS machine (see the dialect resolver). A dedicated
