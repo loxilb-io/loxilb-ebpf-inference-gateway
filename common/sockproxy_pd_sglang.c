@@ -125,9 +125,14 @@ pd_sg_close_drain(proxy_fd_ent_t *client_pfe, int count_close)
  * recorded as a prefill error. Terminal — drain-leg TRANSPORT death gets one
  * pd_sg_retry_pair attempt first (the proxy_pdestroy enqueue); an error
  * STATUS from prefill aborts directly (a 4xx/5xx the origin computed is not
- * a gateway-retryable fault). Caller holds the CLIENT pfe lock. */
+ * a gateway-retryable fault). origin_status carries that status (0 for
+ * transport death): a 4xx is an origin-computed CLIENT error, so it must not
+ * tick the EP-death failover counter — that family means "backend died", and
+ * a burst of oversize prompts would otherwise read as a dying prefill EP.
+ * Caller holds the CLIENT pfe lock. */
 void
-pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason)
+pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason,
+                 unsigned origin_status)
 {
   static const char pd_sg_err[] =
       "HTTP/1.1 502 Bad Gateway\r\n"
@@ -137,7 +142,9 @@ pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason)
       "{\"error\":\"pd_sg_prefill_failed\",\"detail\":\"prefill leg failed before decode produced output\"}";
 
   atomic_fetch_add(&global_stats.pd_sg_prefill_abort_decode, 1);
-  atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+  if (origin_status < 400 || origin_status >= 500) {
+    atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+  }
   log_error("[PD_SG] aborting pair (%s) — client_fd=%d room=%llu "
             "prefill_ep=%d decode_ep=%d",
             reason, client_pfe->fd,
@@ -165,6 +172,42 @@ pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason)
   }
 }
 
+/* Refuse a request that cannot be dual-dispatched on an SGLang disagg rule:
+ * a streamable body was never buffered, so bootstrap injection is
+ * impossible, and disaggregation-mode engines cannot serve a bootstrap-less
+ * relay — they either 400 it with a message blaming the CLIENT for the
+ * gateway's routing choice, or (engines without that validation) park it
+ * until their rendezvous timeout. Fail closed before any backend bytes
+ * move: honest gateway attribution, counted, fast. The client is mid-upload
+ * of a body we will not drain — Connection: close + shutdown, the teardown
+ * cascade releases any already-connected backend leg untouched. */
+void
+pd_sg_oversize_reject(proxy_fd_ent_t *client_pfe)
+{
+  static const char pd_sg_503[] =
+      "HTTP/1.1 503 Service Unavailable\r\n"
+      "Content-Type: application/json\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"pd_sg_oversize_unroutable\",\"detail\":\"request body exceeds the gateway inspection window for prefill/decode dual dispatch\"}";
+
+  atomic_fetch_add(&global_stats.pd_sg_oversize_reject, 1);
+  log_error("[PD_SG] streamable request on a disagg rule — fail-closed 503 "
+            "(client_fd=%d cl=%zu)",
+            client_pfe->fd, client_pfe->http_content_length);
+  if (client_pfe->fd > 0) {
+    if (client_pfe->ssl) {
+      SSL_write(client_pfe->ssl, pd_sg_503, sizeof(pd_sg_503) - 1);
+    } else {
+      send(client_pfe->fd, pd_sg_503, sizeof(pd_sg_503) - 1,
+           MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+  }
+  if (client_pfe->fd > 0) {
+    shutdown(client_pfe->fd, SHUT_RDWR);
+  }
+}
+
 /* Zero decode bytes relayed so far? (The decode-zero-byte-EOF predicate.) */
 int
 pd_sg_decode_untouched(const proxy_fd_ent_t *client_pfe)
@@ -172,6 +215,38 @@ pd_sg_decode_untouched(const proxy_fd_ent_t *client_pfe)
   return client_pfe->pd_last_decode_ts == 0 &&
          client_pfe->pd_decode_content_length == 0 &&
          client_pfe->pd_decode_bytes_received == 0;
+}
+
+/* Relay one chunk of the prefill's 4xx response to the client. The bodies
+ * are tiny (an engine validation error), but the response routinely spans
+ * two writes — HTTP servers flush headers and body separately — so this is
+ * called once per drain chunk while relay mode is on. */
+static void
+pd_sg_relay_bytes(proxy_fd_ent_t *client_pfe, uint8_t *msg, size_t len)
+{
+  if (client_pfe->fd <= 0 || len == 0) return;
+  if (client_pfe->ssl) {
+    SSL_write(client_pfe->ssl, msg, len);
+  } else {
+    send(client_pfe->fd, msg, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+  }
+}
+
+/* The relayed 4xx is complete (message end, or leg EOF for a close-framed
+ * response): tear the pair down exactly like the abort path, minus the
+ * synthetic 502 — the client already holds the origin's own response.
+ * Caller holds the CLIENT pfe lock. */
+void
+pd_sg_relay_finalize(proxy_fd_ent_t *client_pfe)
+{
+  client_pfe->pd_phase = PD_PHASE_ERROR;
+  pd_cleanup(client_pfe);
+  client_pfe->pd_phase = PD_PHASE_ERROR;  /* pd_cleanup resets to NONE */
+  /* Shut the client down: its teardown cascade releases BOTH backend legs on
+   * this same pinned worker (the decode engine aborts on disconnect). */
+  if (client_pfe->fd > 0) {
+    shutdown(client_pfe->fd, SHUT_RDWR);
+  }
 }
 
 /* Consume bytes arriving on the drain leg: frame them (status + message end),
@@ -184,8 +259,10 @@ pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
                     uint8_t *msg, size_t len)
 {
   int had_done = ent->pd_sg_drain_done;
+  int first_feed = !ent->pd_sg_drain_fed;
 
   if (!ent->pd_sg_drain_desync && len > 0) {
+    ent->pd_sg_drain_fed = 1;
     if (PROXY_ENT_TRYLOCK(ent) == 0) {
       llhttp_errno_t perr = llhttp_execute(&ent->parser, (char *)msg, len);
       if (perr != HPE_OK && perr != HPE_PAUSED) {
@@ -209,17 +286,65 @@ pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
    * own rendezvous timeout; the CICD prefill-500 leg caught this as a
    * read-coalescing race). An error status couples the failure whether the
    * response is mid-flight or complete. */
+  /* Relay mode: an origin-computed 4xx is being handed to the client
+   * verbatim — keep relaying every drain chunk until the message completes
+   * (a close-framed response finalizes at leg EOF instead, in the death
+   * handler). */
+  if (ent->pd_sg_drain_relay) {
+    pd_sg_relay_bytes(client_pfe, msg, len);
+    if (ent->pd_sg_drain_done) {
+      pd_sg_relay_finalize(client_pfe);
+    }
+    return;
+  }
+
   if (!ent->pd_sg_drain_handled && ent->parser.status_code >= 400) {
     ent->pd_sg_drain_handled = 1;
     if (pd_sg_decode_untouched(client_pfe)) {
+      /* A prefill 4xx is an origin-computed, deterministic CLIENT error
+       * (malformed body, prompt over the context window) that every prefill
+       * EP would repeat. Masking it as a gateway 502 mislabels a client
+       * fault as a server fault — upstream retry logic replays a request
+       * that can never succeed — and buries the origin's diagnostic body
+       * (token counts, validation detail). The decode leg relays ITS 4xx
+       * verbatim, so without this the client-visible contract for the same
+       * mistake depended on which leg's error won the race. Enter relay
+       * mode instead — only when the status arrived on the FIRST fed chunk
+       * (earlier chunks were discarded, so a later detection has no
+       * verbatim prefix to hand over) and framing is trusted. Fragmented
+       * status lines, desynced legs and all 5xx keep the abort contract. */
+      if (ent->parser.status_code < 500 && first_feed &&
+          !ent->pd_sg_drain_desync) {
+        ent->pd_sg_drain_relay = 1;
+        atomic_fetch_add(&global_stats.pd_sg_prefill_reject_relay, 1);
+        log_warn("[PD_SG] prefill status %u — relaying origin reject "
+                 "verbatim, aborting decode leg (client_fd=%d drain_fd=%d "
+                 "room=%llu)",
+                 ent->parser.status_code, client_pfe->fd, ent->fd,
+                 (unsigned long long)client_pfe->pd_sg_room);
+        {
+          const char *pd_model = proxy_effective_model(client_pfe);
+          llb_ai_pd_record((char *)pd_model, 0, 0, 0, 1 /*prefill error*/);
+        }
+        pd_sg_relay_bytes(client_pfe, msg, len);
+        if (ent->pd_sg_drain_done) {
+          pd_sg_relay_finalize(client_pfe);
+        }
+        return;
+      }
       log_error("[PD_SG] prefill status %u — aborting decode leg "
                 "(client_fd=%d drain_fd=%d)",
                 ent->parser.status_code, client_pfe->fd, ent->fd);
-      pd_sg_abort_pair(client_pfe, "prefill error status");
+      pd_sg_abort_pair(client_pfe, "prefill error status",
+                       ent->parser.status_code);
     } else {
       /* Decode already produced client-visible output (fully radix-cached
-       * prompt) — let it finish; log + count only. */
-      atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+       * prompt) — let it finish; log + count only. A 4xx here is an
+       * origin-computed client error, not a backend death — keep the
+       * EP-death failover counter for 5xx/transport. */
+      if (ent->parser.status_code >= 500) {
+        atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+      }
       log_warn("[PD_SG] prefill status %u AFTER decode bytes relayed — "
                "letting decode finish (client_fd=%d)",
                ent->parser.status_code, client_pfe->fd);
@@ -804,7 +929,7 @@ fail:
   if (client_pfe) {
     log_error("[PD_SG] pair retry exhausted — aborting (client_fd=%d "
               "dead EP%d)", client_pfe->fd, dead_idx);
-    pd_sg_abort_pair(client_pfe, "pair retry failed");
+    pd_sg_abort_pair(client_pfe, "pair retry failed", 0 /*transport*/);
   }
 
 done:
@@ -831,6 +956,18 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
   size_t sg_len = 0;
   char sg_host[INET6_ADDRSTRLEN + 2];
   int sg_pidx = pfe->pd_prefill_ep_idx;
+
+  /* A streamed request was never fully buffered, so the body handed in here
+   * is a truncated fragment — bootstrap injection is impossible by
+   * construction. Refuse honestly as OVERSIZE: the generic prep-failure
+   * below misattributes it to pool health ("pd_pool_unavailable"), and the
+   * paths that skip preparation entirely relay it PLAIN, drawing an engine
+   * 400 that blames the client — or a park on engines that skip the
+   * bootstrap validation. */
+  if (pfe->is_streamable || body_len < pfe->http_content_length) {
+    pd_sg_oversize_reject(pfe);
+    return -1;
+  }
 
   if (sg_pidx >= 0 && sg_pidx < epval->n_eps &&
       pd_sg_room_id(&sg_room) == 0 &&

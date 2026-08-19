@@ -1209,7 +1209,9 @@ skip_deferred_masking:
     }
 
     /* SGLang P/D drain leg: frame + discard the prefill response, fire the
-     * failure coupling on an error status. NEVER relayed to the client. */
+     * failure coupling on an error status. Never relayed to the client —
+     * with ONE exception: an origin-computed 4xx (pre-decode) enters relay
+     * mode and IS handed over verbatim, replacing the old 502 mask. */
     if (ent->odir == 1 && ent->pd_sg_drain && rfd_ent != NULL) {
       pd_sg_drain_consume(ent, rfd_ent, msg, len);
       PROXY_ENT_UNLOCK(rfd_ent);
@@ -3712,6 +3714,15 @@ proxy_pdestroy(void *priv)
          * bytes (fully radix-cached prompt), let it finish — count only.
          * Either way fall through to the detach loop below so this dying
          * leg cannot cascade-close the client a second time. */
+        /* A drain leg in 4xx relay mode dying before message-complete is a
+         * CLOSE-FRAMED origin response: EOF is its terminator, not a
+         * failure. The client already holds the relayed bytes — finalize
+         * (abort-shaped teardown, no synthetic 502 on top of them). */
+        if (pfe->pd_sg_drain && pfe->pd_sg_drain_relay &&
+            !pfe->pd_sg_drain_done) {
+          pfe->pd_sg_drain_done = 1;
+          pd_sg_relay_finalize(client_pfe);
+        } else
         if (pfe->pd_sg_drain && !pfe->pd_sg_drain_handled &&
             !pfe->pd_sg_drain_done) {
           pfe->pd_sg_drain_handled = 1;
@@ -3782,7 +3793,7 @@ proxy_pdestroy(void *priv)
             log_error("[PD_SG] drain leg died before prefill completed — "
                       "aborting pair (client_fd=%d drain_fd=%d)",
                       client_pfe->fd, pfe->fd);
-            pd_sg_abort_pair(client_pfe, "drain leg death");
+            pd_sg_abort_pair(client_pfe, "drain leg death", 0 /*transport*/);
           } else {
             atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
             log_warn("[PD_SG] drain leg died after decode bytes relayed — "
@@ -7001,7 +7012,18 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     /* P/D-aware forwarding — dialect dispatch, or normal multiplexor. The
      * dialect states below are only reachable after the prepare step ran
      * under a live epval, so the cached ops pointer is always present. */
-    if (pfe->epv &&
+    /* A streamable request skipped body buffering, so bootstrap injection is
+     * impossible. On an SGLang-dialect disagg rule a bootstrap-less PLAIN
+     * relay is never servable (disaggregation-mode engines reject or park
+     * it), so refuse it fail-closed before any backend bytes move. vLLM
+     * dialect rules keep their fail-open PLAIN degradation — a standalone
+     * relay is served there. */
+    if (pfe->epv && pfe->is_streamable &&
+        !pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE &&
+        ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled &&
+        ((proxy_epval_t *)pfe->epv)->pd_engine == PD_ENGINE_SGLANG) {
+      pd_sg_oversize_reject(pfe);
+    } else if (pfe->epv &&
         (pfe->pd_phase == PD_PHASE_PREFILL_SENDING ||
          (pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE))) {
       ((proxy_epval_t *)pfe->epv)->pd_ops->dispatch(pfe);

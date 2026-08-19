@@ -173,6 +173,8 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_sg_prefill_abort_decode; // prefill drain-leg failure forced a decode-leg abort
     _Atomic uint64_t pd_sg_decode_close_drain;   // decode-leg failure closed the prefill drain leg
     _Atomic uint64_t pd_sg_room_retry;           // dual dispatch retried as a pair with a fresh room
+    _Atomic uint64_t pd_sg_prefill_reject_relay; // prefill 4xx relayed to the client verbatim (origin-computed client error, not an EP fault)
+    _Atomic uint64_t pd_sg_oversize_reject;      // streamable body on an SGLang disagg rule refused fail-closed (503, no backend bytes)
     //: per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
@@ -1034,6 +1036,12 @@ struct proxy_fd_ent {
   uint8_t  pd_sg_drain_handled;      // BACKEND: failure coupling already fired for this leg
   uint8_t  pd_sg_drain_desync;       // BACKEND: a parser feed was skipped (trylock miss) — framing
                                      // untrusted, completion falls back to leg EOF
+  uint8_t  pd_sg_drain_fed;          // BACKEND: drain framer consumed at least one chunk (a 4xx
+                                     // enters relay mode only when detected on the FIRST chunk —
+                                     // earlier chunks were discarded and cannot be re-relayed)
+  uint8_t  pd_sg_drain_relay;        // BACKEND: origin 4xx being handed to the client verbatim;
+                                     // every further drain chunk is relayed until message end
+                                     // (or leg EOF for a close-framed response)
   uint8_t  pd_prefill_retries;       // Prefill mid-request failovers consumed (budget: 1).
                                      // Prefill is side-effect-idempotent and the complete
                                      // request survives in pd_saved_headers/pd_saved_body,

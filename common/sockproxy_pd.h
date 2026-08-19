@@ -155,7 +155,10 @@ void pd_sg_close_drain(struct proxy_fd_ent *client_pfe, int count_close);
 
 /* Abort the pair: 502 to the client, both legs torn down, prefill error
  * recorded. */
-void pd_sg_abort_pair(struct proxy_fd_ent *client_pfe, const char *reason);
+void pd_sg_abort_pair(struct proxy_fd_ent *client_pfe, const char *reason,
+                      unsigned origin_status);
+void pd_sg_relay_finalize(struct proxy_fd_ent *client_pfe);
+void pd_sg_oversize_reject(struct proxy_fd_ent *client_pfe);
 
 /* Zero decode bytes relayed so far? (The decode-zero-byte-EOF predicate.) */
 int pd_sg_decode_untouched(const struct proxy_fd_ent *client_pfe);
