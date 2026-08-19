@@ -140,6 +140,32 @@ void pd_retry_prefill(struct proxy_fd_ent *client_pfe, int dead_idx,
                       uint8_t *hdrs, size_t hdrs_len,
                       uint8_t *body, size_t body_len);
 
+/* --- SGLang dual-dispatch machine (sockproxy_pd_sglang.c) ----------------
+ * Entry points the HTTP engine's relay/teardown glue calls into: drain-leg
+ * byte consumption, failure coupling, and the deferred pair retry. */
+
+/* Consume + discard drain-leg bytes; fire failure coupling on 4xx/5xx. */
+void pd_sg_drain_consume(struct proxy_fd_ent *ent,
+                         struct proxy_fd_ent *client_pfe,
+                         uint8_t *msg, size_t len);
+
+/* Close a still-attached prefill drain leg (count_close ticks the
+ * decode-failure coupling counter; janitorial closes pass 0). */
+void pd_sg_close_drain(struct proxy_fd_ent *client_pfe, int count_close);
+
+/* Abort the pair: 502 to the client, both legs torn down, prefill error
+ * recorded. */
+void pd_sg_abort_pair(struct proxy_fd_ent *client_pfe, const char *reason);
+
+/* Zero decode bytes relayed so far? (The decode-zero-byte-EOF predicate.) */
+int pd_sg_decode_untouched(const struct proxy_fd_ent *client_pfe);
+
+/* Pair retry with a fresh room (deferred from proxy_pdestroy; owns and frees
+ * hdrs/body). */
+void pd_sg_retry_pair(struct proxy_fd_ent *client_pfe, int dead_idx,
+                      uint8_t *hdrs, size_t hdrs_len,
+                      uint8_t *body, size_t body_len);
+
 /* --- HTTP-engine services consumed by the dialect machines ----------------
  * Defined in sockproxy_http.c; the machines call back into the engine for
  * relay, response framing and the legacy message-complete orchestration. */
