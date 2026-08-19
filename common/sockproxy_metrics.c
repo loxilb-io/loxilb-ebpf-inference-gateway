@@ -225,6 +225,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_kv_t15_miss_hashes       = atomic_load(&global_stats.pd_kv_t15_miss_hashes);
     snapshot.pd_kv_t15_miss_no_worker    = atomic_load(&global_stats.pd_kv_t15_miss_no_worker);
     snapshot.pd_kv_t15_miss_excluded     = atomic_load(&global_stats.pd_kv_t15_miss_excluded);
+    snapshot.pd_kv_t15_miss_shallow      = atomic_load(&global_stats.pd_kv_t15_miss_shallow);
     snapshot.pd_kv_t15_fallthrough_total = atomic_load(&global_stats.pd_kv_t15_fallthrough_total);
 
     /* (OBS-01): CB proactive heal (global_stats) + per-EP

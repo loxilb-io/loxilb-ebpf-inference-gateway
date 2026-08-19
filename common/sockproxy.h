@@ -159,6 +159,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_miss_hashes;       // block-hash computation produced no hashes
     _Atomic uint64_t pd_kv_t15_miss_no_worker;    // llb_ai_kv_best_worker returned no candidate
     _Atomic uint64_t pd_kv_t15_miss_excluded;     // candidate EP excluded (health / load)
+    _Atomic uint64_t pd_kv_t15_miss_shallow;      // best match under the minimum token depth
     _Atomic uint64_t pd_kv_t15_fallthrough_total; // Tier 1.5 skipped entirely -> Tier 2 path
     // Failover observability: endpoint-death and failover EVENTS (as detected
     // per connection), distinct from the request-outcome counters in

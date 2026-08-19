@@ -165,6 +165,7 @@ typedef struct proxy_global_stats {
   _Atomic uint64_t pd_kv_t15_miss_hashes;
   _Atomic uint64_t pd_kv_t15_miss_no_worker;
   _Atomic uint64_t pd_kv_t15_miss_excluded;
+  _Atomic uint64_t pd_kv_t15_miss_shallow;
   _Atomic uint64_t pd_kv_t15_fallthrough_total;
   /* C3 per-stage µs histograms (mirror of sockproxy.h proxy_global_stats):
    * [stage][outcome] where outcome 0=miss, 1=hit. */
@@ -769,6 +770,68 @@ test_guard_g_excluded_mask(void)
   ASSERT_EQ(rc, -1, "GUARD_G excluded_mask returns -1");
   ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_excluded), 1,
             "pd_kv_t15_miss_excluded incremented (excluded_mask)");
+}
+
+/* GUARD H (shallow): with one-token blocks (SGLang page_size=1 →
+ * kvBlockSize=1) a 1-block match is a single shared leading token — NOT a
+ * cache hit. The default 16-token floor must reject it; a match at/above
+ * the floor and a FULL match of a short prompt must both still hit. */
+static void
+test_guard_h_shallow_match(void)
+{
+  printf("Test: GUARD_H shallow match rejected at kv_block_size=1\n");
+  proxy_epval_t tepval;
+  proxy_fd_ent_t pfe;
+  int ep = -1;
+
+  /* 1-token-deep match on a long prompt → shallow miss */
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);
+  kv_reset_pfe(&pfe);
+  tepval.kv_block_size = 1;
+  stub_token_count = 100;        /* 100 one-token blocks in the query */
+  stub_best_ep = 1;
+  stub_best_score = 1;           /* one shared leading token */
+  int rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(rc, -1, "GUARD_H 1/100-block match returns -1");
+  ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_shallow), 1,
+            "pd_kv_t15_miss_shallow incremented");
+
+  /* 16-token-deep match on the same prompt → real hit */
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);
+  kv_reset_pfe(&pfe);
+  tepval.kv_block_size = 1;
+  stub_token_count = 100;
+  stub_best_ep = 1;
+  stub_best_score = 16;          /* meets the default 16-token floor */
+  rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(rc, 0, "GUARD_H 16/100-block match hits");
+  ASSERT_EQ(ep, 1, "GUARD_H hit routes to the scored EP");
+
+  /* FULL match of a short prompt (5 blocks < the 16-token floor) → hit:
+   * the floor is capped at the query's own block count. */
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);
+  kv_reset_pfe(&pfe);
+  tepval.kv_block_size = 1;
+  stub_token_count = 5;
+  stub_best_ep = 2;
+  stub_best_score = 5;           /* every block of the short prompt */
+  rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(rc, 0, "GUARD_H full short-prompt match hits");
+
+  /* kvBlockSize=16 (vLLM default): 1 block == 16 tokens — behavior
+   * unchanged by the guard. */
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);
+  kv_reset_pfe(&pfe);
+  tepval.kv_block_size = 16;
+  stub_token_count = 100;
+  stub_best_ep = 1;
+  stub_best_score = 1;
+  rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(rc, 0, "GUARD_H kvBlockSize=16 single-block match still hits");
 }
 
 /* GUARD G (ep_inv): the picked EP is healthy in inventory but marked inv=1
@@ -2084,6 +2147,7 @@ main(int argc, char **argv)
   test_guard_f_no_hashes();
   test_guard_g_no_worker();
   test_guard_g_excluded_mask();
+  test_guard_h_shallow_match();
   test_guard_g_ep_inv();
   test_guard_g_cb_open();
   test_proxy_add_entry_kv_exact_fields_new_path();
