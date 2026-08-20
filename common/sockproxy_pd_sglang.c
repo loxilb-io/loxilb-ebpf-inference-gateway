@@ -145,6 +145,18 @@ pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason,
   if (origin_status < 400 || origin_status >= 500) {
     atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
   }
+  /* An origin-computed 5xx from the prefill feeds its breaker's origin
+   * streak — the demotion that stops warm affinity from re-pinning an
+   * endpoint that accepts TCP but keeps erroring. Transport deaths
+   * (origin_status 0) stay with the connect-level breaker feed; decode-leg
+   * 5xx are deliberately NOT attributed here (a decode KV-transfer error
+   * routinely blames its prefill peer — demoting the decode would demote
+   * the wrong endpoint). */
+  if (origin_status >= 500 && client_pfe->epv &&
+      client_pfe->pd_prefill_ep_idx >= 0) {
+    circuit_breaker_record_origin_error((proxy_epval_t *)client_pfe->epv,
+                                        client_pfe->pd_prefill_ep_idx);
+  }
   log_error("[PD_SG] aborting pair (%s) — client_fd=%d room=%llu "
             "prefill_ep=%d decode_ep=%d",
             reason, client_pfe->fd,
@@ -344,6 +356,11 @@ pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
        * EP-death failover counter for 5xx/transport. */
       if (ent->parser.status_code >= 500) {
         atomic_fetch_add(&global_stats.pd_prefill_ep_died, 1);
+        if (client_pfe->epv && client_pfe->pd_prefill_ep_idx >= 0) {
+          circuit_breaker_record_origin_error(
+              (proxy_epval_t *)client_pfe->epv,
+              client_pfe->pd_prefill_ep_idx);
+        }
       }
       log_warn("[PD_SG] prefill status %u AFTER decode bytes relayed — "
                "letting decode finish (client_fd=%d)",
@@ -371,6 +388,13 @@ pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
           client_pfe->pd_decode_start_ns - drain_ns;
     }
     ent->pd_sg_drain_handled = 1;
+    /* A clean prefill response resets the origin-error streak (4xx are
+     * client faults — neither error nor success for the demotion count). */
+    if (ent->parser.status_code > 0 && ent->parser.status_code < 400 &&
+        client_pfe->epv && client_pfe->pd_prefill_ep_idx >= 0) {
+      circuit_breaker_record_origin_success(
+          (proxy_epval_t *)client_pfe->epv, client_pfe->pd_prefill_ep_idx);
+    }
     log_info("[PD_SG] prefill drain complete — client_fd=%d drain_fd=%d "
              "status=%u drain_ms=%llu room=%llu",
              client_pfe->fd, ent->fd, ent->parser.status_code,

@@ -421,6 +421,15 @@ typedef struct circuit_breaker {
   uint32_t open_timeout_sec;       // Default: 30 seconds before HALF_OPEN
   uint32_t half_open_max_requests; // Default: 3 test requests in HALF_OPEN
   uint32_t half_open_requests;     // Current request count in HALF_OPEN
+
+  /* Origin-error demotion. failure_count only sees CONNECT-level faults and
+   * is reset by every connect success, so an EP that accepts TCP but keeps
+   * answering HTTP 5xx never trips the breaker — warm KV affinity then
+   * re-pins it indefinitely. This streak is touched ONLY by origin response
+   * statuses (5xx increments, <400 resets), so connect successes cannot
+   * defeat it; at the threshold the breaker opens through the same trip
+   * actions (trie removal, parked drain, selection/affinity skip). */
+  uint32_t origin_err_streak;      // Consecutive origin 5xx responses
 } circuit_breaker_t;
 
 // ============================================================================
@@ -1415,6 +1424,8 @@ int find_next_healthy_endpoint(proxy_epval_t *tepval, int start_idx);
 int select_healthy_endpoint(proxy_epval_t *tepval, int algorithm_selection);
 void circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index);
 void circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index);
+void circuit_breaker_record_origin_error(proxy_epval_t *tepval, int ep_index);
+void circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index);
 int chwbl_ring_lookup(chwbl_ring_t *ring, uint64_t hash);
 uint64_t compute_prefix_hash(llm_prefix_key_t *key);
 int extract_llm_prefix(const char *json_str, size_t json_len, llm_prefix_key_t *key);

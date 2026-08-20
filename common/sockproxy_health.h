@@ -44,6 +44,8 @@ int circuit_breaker_should_skip(proxy_epval_t *tepval, int ep_index);
 
 /* Record a connection failure for the circuit breaker */
 void circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index);
+void circuit_breaker_record_origin_error(proxy_epval_t *tepval, int ep_index);
+void circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index);
 
 /* Record a connection success for the circuit breaker */
 void circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index);

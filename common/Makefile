@@ -322,8 +322,17 @@ test_resp_framing: test_resp_framing.c llhttp.c httpapi.c http.c
 test_cb_heal: test_cb_heal.c circuit_breaker_heal.h
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< -I.
 
+# Same idiom for the origin-error demotion predicate: a minimal CB struct plus
+# only circuit_breaker_origin.h. Proves consecutive origin 5xx trip the breaker
+# at the streak threshold even though every request's connect success resets
+# failure_count in between (the reset that lets warm affinity pin an
+# up-but-erroring EP), origin successes reset the streak, HALF_OPEN probes
+# re-trip immediately, and threshold 0 disables. -fsanitize=address for hygiene.
+test_cb_origin: test_cb_origin.c circuit_breaker_origin.h
+	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< -I.
+
 .PHONY: test_pd
-test_pd: test_pd_rewriter test_h2_inject test_cookie test_pd_leak test_pd_complete test_resp_framing test_cb_heal test_pd_admission test_pd_ctrl
+test_pd: test_pd_rewriter test_h2_inject test_cookie test_pd_leak test_pd_complete test_resp_framing test_cb_heal test_cb_origin test_pd_admission test_pd_ctrl
 	./test_pd_rewriter
 	./test_h2_inject
 	./test_cookie
@@ -331,6 +340,7 @@ test_pd: test_pd_rewriter test_h2_inject test_cookie test_pd_leak test_pd_comple
 	./test_pd_complete
 	./test_resp_framing
 	./test_cb_heal
+	./test_cb_origin
 	./test_pd_admission
 	./test_pd_ctrl
 

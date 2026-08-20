@@ -51,6 +51,7 @@
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
 #include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
+#include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
 #include "sockproxy_health.h"
 #include "sockproxy_ai_gw.h"
 #include "notify.h"
@@ -1125,6 +1126,75 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
     // Success in OPEN state shouldn't happen, but log it
     break;
   }
+}
+
+/* Origin-error demotion threshold: consecutive origin 5xx responses from a
+ * P/D backend before its breaker opens. Env LLB_PD_ORIGIN_ERR_THRESHOLD
+ * overrides; 0 disables. */
+#define PD_ORIGIN_ERR_THRESHOLD_DEFAULT 3
+static int
+pd_origin_err_threshold(void)
+{
+  static int thr = -1;
+  if (thr < 0) {
+    const char *env = getenv("LLB_PD_ORIGIN_ERR_THRESHOLD");
+    thr = env ? atoi(env) : PD_ORIGIN_ERR_THRESHOLD_DEFAULT;
+    if (thr < 0) thr = 0;
+  }
+  return thr;
+}
+
+/* Record an origin-computed 5xx from a P/D backend leg. Connect-level
+ * successes reset the breaker's failure_count on every request, so an
+ * endpoint that accepts TCP but keeps answering 5xx never trips it — and
+ * warm KV affinity then re-pins the erroring endpoint indefinitely. The
+ * origin streak (see circuit_breaker_origin.h) is immune to that reset; at
+ * the threshold the breaker opens with the same trip actions as a connect
+ * failure: trie removal, parked-client drain, and every selection path
+ * (including the KV-exact affinity guard) skips the endpoint until the
+ * open-timeout heal cycle proves it recovered. */
+void
+circuit_breaker_record_origin_error(proxy_epval_t *tepval, int ep_index)
+{
+  circuit_breaker_t *cb;
+  int thr = pd_origin_err_threshold();
+
+  if (!tepval || !tepval->cb_enabled || thr <= 0 ||
+      ep_index < 0 || ep_index >= MAX_PROXY_EP) {
+    return;
+  }
+  cb = &tepval->circuit_breakers[ep_index];
+  if (!circuit_breaker_origin_note_error(cb, thr)) {
+    return;
+  }
+  cb->state = CB_STATE_OPEN;
+  cb->open_ts = time(NULL);
+  cb->last_failure_ts = cb->open_ts;
+  cb->failure_count = cb->failure_threshold;
+  atomic_fetch_add(&global_stats.pd_cb_flips, 1);
+  log_warn("[CB_ORIGIN] ep[%d] -> OPEN after %d consecutive origin 5xx — "
+           "demoted from selection and KV affinity", ep_index, thr);
+  /* remove tripped EP from trie */
+  if (tepval->pd_trie) {
+    pthread_rwlock_wrlock(&tepval->pd_trie_lock);
+    pd_trie_remove_ep(tepval->pd_trie, ep_index);
+    pthread_rwlock_unlock(&tepval->pd_trie_lock);
+  }
+  /* release clients parked on the tripped EP for re-selection */
+  pd_parked_drain_ep(tepval, ep_index, "cb-origin-open");
+}
+
+/* Record an origin success (status < 400) from a P/D backend leg: the
+ * origin-error streak resets. Breaker state transitions stay with the
+ * existing connect-success path. */
+void
+circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index)
+{
+  if (!tepval || !tepval->cb_enabled ||
+      ep_index < 0 || ep_index >= MAX_PROXY_EP) {
+    return;
+  }
+  circuit_breaker_origin_note_success(&tepval->circuit_breakers[ep_index]);
 }
 
 // ============================================================================
