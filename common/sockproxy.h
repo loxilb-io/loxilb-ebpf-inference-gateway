@@ -67,7 +67,7 @@ struct dp_proxy_ct_ent;
 #define PD_KV_PARAMS_MAX_LEN 65536  // P/D kv_transfer_params buffer (64KB for real vLLM block_ids)
 
 /* P/D orchestration engine flavor (proxy_epval_t.pd_engine). Values equal
- * the wire kv_engine_type encoding (0=vllm, 1=sglang, 2=trtllm reserved) —
+ * the wire kv_engine_type encoding (0=vllm, 1=sglang, 2=trtllm) —
  * the proxy_add stamp goes through pd_engine_from_kv_engine_type()
  * (sockproxy_pd_core.c), these names exist so the orchestration branch reads
  * an orchestration-named constant. Adding an engine = new constant here +
@@ -75,8 +75,8 @@ struct dp_proxy_ct_ent;
 #define PD_ENGINE_VLLM   0
 #define PD_ENGINE_SGLANG 1
 /* TensorRT-LLM disaggregation is sequential ctx-first — a parameterization
- * of the vLLM machine. Reserved: resolves to the vllm dialect table until it
- * earns its own. The control plane does not emit this value yet. */
+ * of the vLLM machine with its own body dialect (sockproxy_pd_trtllm.c:
+ * disaggregated_params splice/extract/re-splice + context early exit). */
 #define PD_ENGINE_TRTLLM 2
 
 /* SGLang --disaggregation-bootstrap-port default (server_args.py). Applied
@@ -175,6 +175,8 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_sg_room_retry;           // dual dispatch retried as a pair with a fresh room
     _Atomic uint64_t pd_sg_prefill_reject_relay; // prefill 4xx relayed to the client verbatim (origin-computed client error, not an EP fault)
     _Atomic uint64_t pd_sg_oversize_reject;      // streamable body on an SGLang disagg rule refused fail-closed (503, no backend bytes)
+    // TRT-LLM sequential-dialect observability
+    _Atomic uint64_t pd_trt_ctx_early_exit;      // context response finished the request — decode leg skipped, buffered response relayed
     //: per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
@@ -531,10 +533,12 @@ typedef struct proxy_epval {
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
-   * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG) so
-   * the orchestration branch never reads a KV-named field. vLLM keeps the
-   * sequential prefill→decode state machine; SGLang selects the concurrent
-   * dual-dispatch machine (bootstrap triple injection, prefill drain leg). */
+   * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG,
+   * 2=trtllm ⇒ PD_ENGINE_TRTLLM) so the orchestration branch never reads a
+   * KV-named field. vLLM keeps the sequential prefill→decode state machine
+   * (TRT-LLM rides it with its own body dialect); SGLang selects the
+   * concurrent dual-dispatch machine (bootstrap triple injection, prefill
+   * drain leg). */
   uint8_t  pd_engine;
   /* SGLang bootstrap port on every prefill EP; the decode engine rendezvouses
    * with prefill on it. 0 is defaulted to PD_SG_BOOTSTRAP_PORT_DFL at
@@ -612,7 +616,7 @@ typedef struct proxy_epval {
   time_t   kv_warmup_start;      // Timestamp when ZMQ subscriber connected (runtime; never set in production — see A1 note)
   // (SGL-03): per-rule KV engine + SGLang DP rank count.
   // Copied field-for-field at proxy_add_entry alongside the five kv_* fields above.
-  uint8_t  kv_engine_type;       // 0=vllm (default), 1=sglang
+  uint8_t  kv_engine_type;       // 0=vllm (default), 1=sglang, 2=trtllm
   uint8_t  kv_dp_rank_count;     // SGLang DP ranks (1..8; 0 defaulted to 1 at the CGO fill)
   /* (SGL-04, RESEARCH Pitfall 2): the calling rule's identity for the
    * Tier-1.5 Go selector. Threaded through llb_ai_kv_best_worker so the Go side
@@ -1293,7 +1297,7 @@ struct proxy_arg {
   uint32_t kv_block_size;        // Token block size (default 16)
   uint32_t kv_warmup_sec;        // Warmup seconds
   // (SGL-03): per-rule KV engine + SGLang DP rank count.
-  uint8_t  kv_engine_type;       // 0=vllm (default), 1=sglang
+  uint8_t  kv_engine_type;       // 0=vllm (default), 1=sglang, 2=trtllm
   uint8_t  kv_dp_rank_count;     // SGLang DP ranks (1..8; 0 defaulted to 1 at the CGO fill)
 
   // CHWBL prefix hash level: 0=use default(1), 1=L1 only, 2=L1+L2, 3=L1+L2+L3

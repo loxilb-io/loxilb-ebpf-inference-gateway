@@ -108,6 +108,10 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_sg_room_retry;
     uint64_t pd_sg_prefill_reject_relay;
     uint64_t pd_sg_oversize_reject;
+
+    /* TRT-LLM sequential-dialect counters. TAIL-APPEND ONLY — same
+     * three-way lockstep contract as the SGLang block above. */
+    uint64_t pd_trt_ctx_early_exit;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================
