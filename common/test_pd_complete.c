@@ -201,6 +201,43 @@ test_graceful_guards(void)
   printf("  [PASS] guards (phase/sse/terminated/no-byte/disabled) all suppress\n");
 }
 
+/* ---- Case 9: pd_http_resp_status — the origin-feed status glance ----
+ * The vLLM sequential machine swallows the prefill response (a 5xx degrades
+ * to decode-recompute), so the breaker's origin-error feed reads the status
+ * straight off the accumulated response buffer with this parser. Malformed /
+ * truncated / non-HTTP buffers must yield 0 ("status unknown" — fed as
+ * NEITHER error nor success), never a fabricated code. */
+static void
+test_http_resp_status(void)
+{
+  static const char ok200[]  = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+  static const char err500[] = "HTTP/1.1 500 Internal Server Error\r\n\r\n";
+  static const char err503[] = "HTTP/1.0 503 Service Unavailable\r\n\r\n";
+  static const char cli400[] = "HTTP/1.1 400 Bad Request\r\n\r\n";
+
+  assert(pd_http_resp_status((const uint8_t *)ok200, sizeof(ok200) - 1) == 200);
+  assert(pd_http_resp_status((const uint8_t *)err500, sizeof(err500) - 1) == 500);
+  assert(pd_http_resp_status((const uint8_t *)err503, sizeof(err503) - 1) == 503);
+  assert(pd_http_resp_status((const uint8_t *)cli400, sizeof(cli400) - 1) == 400);
+
+  /* status line truncated mid-code: too short to trust */
+  assert(pd_http_resp_status((const uint8_t *)"HTTP/1.1 50", 11) == 0 &&
+         "truncated status line must be status-unknown");
+  /* not an HTTP response at all (e.g. a raw JSON error body) */
+  assert(pd_http_resp_status((const uint8_t *)"{\"error\":1}", 11) == 0 &&
+         "non-HTTP buffer must be status-unknown");
+  /* non-digit where the code belongs */
+  assert(pd_http_resp_status((const uint8_t *)"HTTP/1.1 OK 200\r\n", 17) == 0 &&
+         "non-numeric code must be status-unknown");
+  /* out-of-range 3-digit code */
+  assert(pd_http_resp_status((const uint8_t *)"HTTP/1.1 999 Nope\r\n", 19) == 0 &&
+         "out-of-range code must be status-unknown");
+  /* NULL / empty */
+  assert(pd_http_resp_status(NULL, 64) == 0);
+  assert(pd_http_resp_status((const uint8_t *)"", 0) == 0);
+  printf("  [PASS] pd_http_resp_status: codes parsed, malformed -> unknown\n");
+}
+
 int
 main(void)
 {
@@ -213,6 +250,7 @@ main(void)
   test_graceful_idle_reaped();
   test_graceful_slow_stream_not_reaped();
   test_graceful_guards();
+  test_http_resp_status();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;
 }

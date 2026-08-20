@@ -216,6 +216,36 @@ kv_hash_debug_on(void)
   return on;
 }
 
+/* LLB_KV_MIN_MATCH_TOKENS — minimum matched-prefix depth, in TOKENS, for a
+ * Tier-1.5 result to count as a cache hit. The inventory scorer counts
+ * matched BLOCKS, and a block is kvBlockSize tokens: at the vLLM default
+ * (16) one matched block is a meaningful shared prefix, but engines that
+ * publish one-token pages (SGLang page_size=1) would let a single shared
+ * leading token — e.g. a "//" comment opener every code prompt starts
+ * with — count as a hit and herd unrelated prompts onto whichever EP owns
+ * the largest inventory. Default 16 tokens == exactly one vLLM-sized
+ * block, so kvBlockSize>=16 rules keep their existing behavior
+ * bit-for-bit. "0" disables the guard. */
+static _Atomic int llb_kv_min_match_initialized = 0;
+static uint32_t llb_kv_min_match_tokens = 16;
+
+static uint32_t
+kv_min_match_tokens(void)
+{
+  int init = atomic_load_explicit(&llb_kv_min_match_initialized,
+                                  memory_order_acquire);
+  if (init) return llb_kv_min_match_tokens;
+  const char *v = getenv("LLB_KV_MIN_MATCH_TOKENS");
+  if (v && v[0] != '\0') {
+    char *end = NULL;
+    unsigned long n = strtoul(v, &end, 10);
+    if (end && *end == '\0' && n <= 4096) llb_kv_min_match_tokens = (uint32_t)n;
+  }
+  atomic_store_explicit(&llb_kv_min_match_initialized, 1,
+                        memory_order_release);
+  return llb_kv_min_match_tokens;
+}
+
 /* Test hook: force the debug gate without setenv/unsetenv races in unit
  * tests. The kv_hash_debug_test_set symbol is declared in sockproxy_kv_exact.h. */
 void
@@ -941,6 +971,28 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
     atomic_fetch_add(&global_stats.pd_kv_t15_miss_no_worker, 1);
     KV_T15_FLUSH(KV_STAGE_OUTCOME_MISS);
     return -1;
+  }
+
+  /* GUARD H: minimum match depth. score is in BLOCKS; convert the token
+   * floor to blocks with this rule's kvBlockSize. Prompts shorter than the
+   * floor can still fully hit (min is capped at the query's own block
+   * count — matching EVERY block of a short prompt is a genuine hit). */
+  {
+    uint32_t min_tok = kv_min_match_tokens();
+    if (min_tok > 0) {
+      uint32_t bs = tepval->kv_block_size ? tepval->kv_block_size : 16;
+      uint32_t min_blocks = (min_tok + bs - 1) / bs;
+      if (min_blocks > (uint32_t)n_hashes) min_blocks = (uint32_t)n_hashes;
+      if (min_blocks < 1) min_blocks = 1;
+      if ((uint32_t)score < min_blocks) {
+        log_info("[KV_T15] fd=%d GUARD_H shallow best_ep=%d score=%d "
+                 "min_blocks=%u (block_size=%u min_tokens=%u)",
+                 pfe->fd, best_ep, score, min_blocks, bs, min_tok);
+        atomic_fetch_add(&global_stats.pd_kv_t15_miss_shallow, 1);
+        KV_T15_FLUSH(KV_STAGE_OUTCOME_MISS);
+        return -1;
+      }
+    }
   }
 
   /* Check excluded mask, health, circuit breaker */

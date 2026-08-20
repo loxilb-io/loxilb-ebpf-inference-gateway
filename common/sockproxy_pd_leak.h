@@ -119,6 +119,35 @@ pd_detect_http_msg_end(const uint8_t *buf, size_t len)
   return 0;
 }
 
+/*
+ * pd_http_resp_status - parse the status code out of an accumulated HTTP
+ * response buffer's status line ("HTTP/1.x NNN ...").
+ *
+ * Same charter as the other helpers here: pure, bounded strictly by `len`,
+ * no dependency on the proxy machinery, so the unit TU exercises the literal
+ * production parser. Returns the 3-digit status (100..599) or 0 when the
+ * buffer does not start with a well-formed HTTP/1.x status line — callers
+ * treat 0 as "status unknown", never as a success or an error.
+ */
+static inline int
+pd_http_resp_status(const uint8_t *buf, size_t len)
+{
+  /* "HTTP/1.x NNN" — 12 bytes minimum. */
+  if (buf == NULL || len < 12 || memcmp(buf, "HTTP/1.", 7) != 0) {
+    return 0;
+  }
+  if (buf[8] != ' ' ||
+      buf[9]  < '0' || buf[9]  > '9' ||
+      buf[10] < '0' || buf[10] > '9' ||
+      buf[11] < '0' || buf[11] > '9') {
+    return 0;
+  }
+  {
+    int st = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + (buf[11] - '0');
+    return (st >= 100 && st <= 599) ? st : 0;
+  }
+}
+
 /* PD_MSG_END_TAIL_KEEP - bytes of trailing context carried between successive
  * reads so a message-end terminator that straddles two TCP segments is still
  * detected. Must be >= the longest terminator pd_detect_http_msg_end matches:

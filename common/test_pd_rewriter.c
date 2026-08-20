@@ -869,6 +869,187 @@ static int test_kv_extract_content_verification(void) {
 
 /* ===== Main ===== */
 
+/* ===== Suite F: SGLang bootstrap triple injection ===== */
+
+static int test_sg_inject_flat(void) {
+  const char *input = "{\"model\":\"llama\",\"prompt\":\"hi\",\"stream\":true}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 42), 0,
+            "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "\"bootstrap_host\":\"10.0.0.11\"", "host injected");
+  ASSERT_STR_CONTAINS(out, out_len, "\"bootstrap_port\":8998", "port injected");
+  ASSERT_STR_CONTAINS(out, out_len, "\"bootstrap_room\":42", "room injected");
+  /* Triple lands INSIDE the object: last byte is still the closing brace,
+   * and the pre-existing fields are untouched. */
+  ASSERT_EQ(out[out_len - 1], '}', "still ends with }");
+  ASSERT_STR_CONTAINS(out, out_len, "\"stream\":true", "original fields untouched");
+  return 1;
+}
+
+static int test_sg_inject_nested_tail(void) {
+  /* Body ENDING in a nested object — the splice must target the OUTER
+   * closing brace, not the nested one. */
+  const char *input = "{\"model\":\"llama\",\"opts\":{\"temperature\":0.5}}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 7), 0,
+            "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "{\"temperature\":0.5},\"bootstrap_host\"",
+                      "spliced after the nested object, before the outer brace");
+  ASSERT_EQ(out[out_len - 1], '}', "still ends with }");
+  return 1;
+}
+
+static int test_sg_inject_escaped_brace_in_string(void) {
+  /* A '}' inside a string value must not confuse the splice point. */
+  const char *input = "{\"prompt\":\"code: if (x) { y(); }\"}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 7), 0,
+            "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "y(); }\",\"bootstrap_host\"",
+                      "spliced after the string value");
+  ASSERT_EQ(out[out_len - 1], '}', "still ends with }");
+  return 1;
+}
+
+static int test_sg_inject_trailing_whitespace(void) {
+  const char *input = "{\"model\":\"llama\"}\n";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 7), 0,
+            "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "\"bootstrap_room\":7}\n",
+                      "spliced before the brace, trailing newline preserved");
+  return 1;
+}
+
+static int test_sg_inject_ipv6_wrap(void) {
+  const char *input = "{\"model\":\"llama\"}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "fd00::11", 8998, 7), 0,
+            "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "\"bootstrap_host\":\"[fd00::11]\"",
+                      "IPv6 host bracket-wrapped");
+  return 1;
+}
+
+static int test_sg_inject_ipv6_already_bracketed(void) {
+  const char *input = "{\"model\":\"llama\"}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "[fd00::11]", 8998, 7), 0,
+            "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "\"bootstrap_host\":\"[fd00::11]\"",
+                      "already-bracketed host left alone");
+  ASSERT_STR_NOT_CONTAINS(out, out_len, "[[", "no double wrap");
+  return 1;
+}
+
+static int test_sg_inject_empty_object(void) {
+  const char *input = "{}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 7), 0,
+            "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "{\"bootstrap_host\"",
+                      "no leading comma after the opening brace");
+  ASSERT_EQ(out[out_len - 1], '}', "still ends with }");
+  return 1;
+}
+
+static int test_sg_inject_room_max(void) {
+  /* Room upper bound 2^63-1 must round-trip through the decimal format. */
+  const char *input = "{\"model\":\"llama\"}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998,
+            (uint64_t)INT64_MAX), 0, "inject succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "\"bootstrap_room\":9223372036854775807",
+                      "room formatted as full positive i64");
+  return 1;
+}
+
+static int test_sg_inject_overflow(void) {
+  const char *input = "{\"model\":\"llama\"}";
+  uint8_t out[32]; /* too small for body + triple */
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 7), -1,
+            "overflow rejected");
+  return 1;
+}
+
+static int test_sg_inject_no_brace(void) {
+  const char *input = "not json at all";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)input, strlen(input),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 7), -1,
+            "brace-less body rejected");
+  return 1;
+}
+
+static int test_sg_inject_original_untouched(void) {
+  /* The retry path re-injects a FRESH room into the SAVED original body —
+   * the source buffer must come through pristine. */
+  const char *input = "{\"model\":\"llama\",\"prompt\":\"hi\"}";
+  char orig[128];
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  strcpy(orig, input);
+  ASSERT_EQ(pd_sg_inject_bootstrap((const uint8_t *)orig, strlen(orig),
+            out, &out_len, sizeof(out), "10.0.0.11", 8998, 7), 0,
+            "inject succeeds");
+  ASSERT_EQ(strcmp(orig, input), 0, "original body untouched");
+  return 1;
+}
+
+static int test_sg_room_id_range(void) {
+  /* Every draw must succeed and land in [0, 2^63-1] (top bit clear). */
+  int i;
+  uint64_t room = 0;
+
+  for (i = 0; i < 1000; i++) {
+    ASSERT_EQ(pd_sg_room_id(&room), 0, "room draw succeeds");
+    ASSERT_EQ((room >> 63), 0, "room top bit clear (i64-positive range)");
+  }
+  ASSERT_EQ(pd_sg_room_id(NULL), -1, "NULL out rejected");
+  return 1;
+}
+
+static int test_sg_room_id_distinct(void) {
+  /* Two draws colliding is a 2^-63 event — a repeat means the RNG is not
+   * actually random (the exact failure rooms must never have). */
+  uint64_t a = 0, b = 0;
+
+  ASSERT_EQ(pd_sg_room_id(&a), 0, "first draw succeeds");
+  ASSERT_EQ(pd_sg_room_id(&b), 0, "second draw succeeds");
+  ASSERT_EQ(a != b, 1, "consecutive rooms distinct");
+  return 1;
+}
+
 int main(void) {
   printf("=== Suite A: P/D JSON Rewriting ===\n");
   RUN_TEST(test_normal_rewrite);
@@ -911,6 +1092,21 @@ int main(void) {
   RUN_TEST(test_kv_extract_boundary_65535);
   RUN_TEST(test_kv_extract_boundary_65536);
   RUN_TEST(test_kv_extract_content_verification);
+
+  printf("\n=== Suite F: SGLang Bootstrap Injection ===\n");
+  RUN_TEST(test_sg_inject_flat);
+  RUN_TEST(test_sg_inject_nested_tail);
+  RUN_TEST(test_sg_inject_escaped_brace_in_string);
+  RUN_TEST(test_sg_inject_trailing_whitespace);
+  RUN_TEST(test_sg_inject_ipv6_wrap);
+  RUN_TEST(test_sg_inject_ipv6_already_bracketed);
+  RUN_TEST(test_sg_inject_empty_object);
+  RUN_TEST(test_sg_inject_room_max);
+  RUN_TEST(test_sg_inject_overflow);
+  RUN_TEST(test_sg_inject_no_brace);
+  RUN_TEST(test_sg_inject_original_untouched);
+  RUN_TEST(test_sg_room_id_range);
+  RUN_TEST(test_sg_room_id_distinct);
 
   printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
 

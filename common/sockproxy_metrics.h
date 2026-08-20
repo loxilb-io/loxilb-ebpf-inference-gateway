@@ -79,6 +79,7 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_kv_t15_miss_hashes;
     uint64_t pd_kv_t15_miss_no_worker;
     uint64_t pd_kv_t15_miss_excluded;
+    uint64_t pd_kv_t15_miss_shallow;
     uint64_t pd_kv_t15_fallthrough_total;
 
     /* (OBS-01): CB proactive heal  + per-EP admission layer
@@ -97,6 +98,16 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_decode_zero_byte_eof;
     uint64_t pd_connect_failover;
     uint64_t lb_select_failure_shutdown;
+
+    /* SGLang P/D dual-dispatch counters. TAIL-APPEND ONLY — twin-declared in
+     * the cgo preamble of api/prometheus/sockproxy_metrics.go AND in
+     * api/prometheus/proxy_metrics_stub.c; keep ALL THREE in lockstep,
+     * same commit. */
+    uint64_t pd_sg_prefill_abort_decode;
+    uint64_t pd_sg_decode_close_drain;
+    uint64_t pd_sg_room_retry;
+    uint64_t pd_sg_prefill_reject_relay;
+    uint64_t pd_sg_oversize_reject;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

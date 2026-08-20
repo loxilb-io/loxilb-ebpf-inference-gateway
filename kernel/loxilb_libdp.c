@@ -2466,9 +2466,12 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->backend_client_cert_id[sizeof(pval->backend_client_cert_id) - 1] = '\0';
 #endif /* HAVE_MTLS */
 
-  // P/D disaggregation configuration 
+  // P/D disaggregation configuration
   pval->pd_disagg_mode = dat->pd_disagg_mode;
   pval->ai_gw_mode = dat->ai_gw_mode;
+  // SGLang bootstrap port (0 ⇒ defaulted at proxy_add) — the nat2proxy hop
+  // of the additive chain (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
+  pval->pd_bootstrap_port = dat->pd_bootstrap_port;
 
   // P/D Buffer: runtime-configurable kv_transfer_params limit
   pval->pd_kv_params_max = dat->pd_kv_params_max;

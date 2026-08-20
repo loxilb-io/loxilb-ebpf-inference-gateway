@@ -1,7 +1,22 @@
-/* sockproxy_pd.c - P/D disaggregation body rewriting for vLLM prefill/decode
+/* sockproxy_pd.c - P/D disaggregation shared services (engine-neutral)
  *
- * Uses targeted memmem() + memmove() string replacement. Safe for OpenAI API
- * which has predictable flat JSON structure.
+ * This TU holds the pieces every engine dialect shares:
+ *   - JSON body rewriting for prefill/decode request preparation
+ *     (targeted memmem() + memmove() replacement — safe for the OpenAI API's
+ *     predictable flat JSON structure)
+ *   - kv_transfer_params extraction from prefill responses
+ *   - P/D session cache (resolve/lookup/store/evict) + cluster sync events
+ *   - admission control / load-guard counters
+ *
+ * Engine-specific orchestration contracts do NOT live here: the per-engine
+ * state machines and their pd_engine_ops tables are in sockproxy_pd_vllm.c
+ * (sequential prefill-then-decode) and sockproxy_pd_sglang.c (dual dispatch
+ * with bootstrap-room injection); engine-neutral dispatch plumbing is in
+ * sockproxy_pd_core.c. See those files for the orchestration contract notes.
+ *
+ * This file deliberately stays a standalone TU (rather than being folded
+ * into the dialect files) because the unit-test recipes compile it on its
+ * own under the TEST_PD_REWRITER / TEST_PD_CACHE_AWARE guards.
  */
 
 #define _GNU_SOURCE  /* for memmem() */
@@ -31,8 +46,7 @@ static inline void pd_kv_overflow_inc(void) {}
  * (sockproxy_kv_exact.c) rather than an exported symbol, because the
  * test_pd_* unit binaries compile this file without sockproxy_kv_exact.c.
  * Emits one [PD_KV_PARAMS] line per successful kv_transfer_params
- * extraction; the G2 sizing sweep (LC-3.1, uint16→uint32 widening
- * decision) parses this exact format — keep it stable. */
+ * extraction; sizing tooling parses this exact format — keep it stable. */
 static _Atomic int pd_kv_dbg_initialized = 0;
 static int pd_kv_dbg = 0;
 static int
@@ -344,6 +358,131 @@ pd_prepare_prefill_body(const uint8_t *orig_body, size_t orig_body_len,
   return 0;
 }
 
+/* ===== SGLang P/D dual-dispatch support =====
+ *
+ * SGLang disaggregation rendezvouses prefill and decode through a bootstrap
+ * server on the prefill host: the router's whole job is to make both engine
+ * legs see the SAME (bootstrap_host, bootstrap_port, bootstrap_room) triple
+ * in the request body (sgl-model-gateway pd_router.rs
+ * inject_bootstrap_into_value / mini_lb.py). Nothing is extracted from any
+ * response — contrast the vLLM kv_transfer_params relay above. */
+
+#if defined(__linux__)
+#include <sys/random.h>
+#endif
+
+/* Draw a fresh bootstrap room ID: uniform in [0, 2^63-1], matching the
+ * reference routers (rand::random::<u64>() & i64::MAX / randint(0, 2**63-1)).
+ * getrandom(2), never rand() — rooms must not collide across gateway
+ * threads or restarts (a collision cross-wires two requests' KV transfers
+ * at the engine rendezvous).
+ * Returns 0 on success with *room_out set, -1 on RNG failure (caller fails
+ * the dispatch; never proceed with a predictable room). */
+int
+pd_sg_room_id(uint64_t *room_out)
+{
+  uint64_t room = 0;
+
+  if (!room_out) return -1;
+#if defined(__linux__)
+  {
+    ssize_t r;
+    do {
+      r = getrandom(&room, sizeof(room), 0);
+    } while (r < 0 && errno == EINTR);
+    if (r != (ssize_t)sizeof(room)) {
+      /* getrandom cannot legitimately fail for 8 bytes post-boot; if it
+       * ever does, /dev/urandom is the only acceptable fallback. */
+      FILE *f = fopen("/dev/urandom", "rb");
+      size_t got = f ? fread(&room, 1, sizeof(room), f) : 0;
+      if (f) fclose(f);
+      if (got != sizeof(room)) return -1;
+    }
+  }
+#else
+  /* Non-Linux builds exist only for the host-side unit harness. */
+  arc4random_buf(&room, sizeof(room));
+#endif
+  *room_out = room & (uint64_t)INT64_MAX;
+  return 0;
+}
+
+/* Inject the SGLang bootstrap triple into a JSON request body:
+ *   ,"bootstrap_host":"<host>","bootstrap_port":<port>,"bootstrap_room":<room>
+ * spliced before the FINAL closing '}' (the kv_transfer_params appender
+ * idiom). IPv6 hosts (any ':' present) are bracket-wrapped per mini_lb's
+ * maybe_wrap_ipv6_address; an already-bracketed host is left alone.
+ *
+ * orig -> out copy (pd_prepare_prefill_body idiom): the caller's saved
+ * ORIGINAL body stays pristine so a pair-retry can re-inject with a fresh
+ * room. The same rewritten body goes to BOTH legs — no per-leg differences.
+ *
+ * Returns 0 on success (*out_len set), -1 on error (bad args, no closing
+ * brace, or the triple would overflow out_capacity).
+ */
+int
+pd_sg_inject_bootstrap(const uint8_t *orig_body, size_t orig_body_len,
+                       uint8_t *out_buf, size_t *out_len, size_t out_capacity,
+                       const char *bootstrap_host, uint16_t bootstrap_port,
+                       uint64_t bootstrap_room)
+{
+  char triple[512];
+  const char *frag;
+  int tlen, flen;
+  int i, j, insert_pos = -1;
+
+  if (!orig_body || !out_buf || !out_len || !bootstrap_host ||
+      orig_body_len == 0) {
+    return -1;
+  }
+
+  if (strchr(bootstrap_host, ':') && bootstrap_host[0] != '[') {
+    tlen = snprintf(triple, sizeof(triple),
+                    ",\"bootstrap_host\":\"[%s]\",\"bootstrap_port\":%u,"
+                    "\"bootstrap_room\":%llu",
+                    bootstrap_host, bootstrap_port,
+                    (unsigned long long)bootstrap_room);
+  } else {
+    tlen = snprintf(triple, sizeof(triple),
+                    ",\"bootstrap_host\":\"%s\",\"bootstrap_port\":%u,"
+                    "\"bootstrap_room\":%llu",
+                    bootstrap_host, bootstrap_port,
+                    (unsigned long long)bootstrap_room);
+  }
+  if (tlen < 0 || (size_t)tlen >= sizeof(triple)) return -1;
+
+  if (orig_body_len + (size_t)tlen >= out_capacity) return -1;
+
+  memcpy(out_buf, orig_body, orig_body_len);
+
+  /* Find the FINAL '}' in the body. */
+  for (i = (int)orig_body_len - 1; i >= 0; i--) {
+    if (out_buf[i] == '}') { insert_pos = i; break; }
+  }
+  if (insert_pos < 0) return -1;
+
+  /* Empty object ("{}" / "{ }"): drop the leading comma or the splice
+   * would produce {,"bootstrap_host":...}. */
+  frag = triple;
+  flen = tlen;
+  j = insert_pos - 1;
+  while (j >= 0 && (out_buf[j] == ' ' || out_buf[j] == '\t' ||
+                    out_buf[j] == '\n' || out_buf[j] == '\r')) {
+    j--;
+  }
+  if (j >= 0 && out_buf[j] == '{') {
+    frag++;
+    flen--;
+  }
+
+  memmove(out_buf + insert_pos + flen, out_buf + insert_pos,
+          orig_body_len - (size_t)insert_pos);
+  memcpy(out_buf + insert_pos, frag, (size_t)flen);
+
+  *out_len = orig_body_len + (size_t)flen;
+  return 0;
+}
+
 /* Extract kv_transfer_params from prefill response.
  * Searches the prefill response body for "kv_transfer_params" JSON object
  * and copies the full nested object value to kv_out buffer.
@@ -608,9 +747,9 @@ pd_session_build_event(void *ev,
 #endif  /* TEST_PD_CACHE_AWARE */
 
 /* No macro — each emit site below calls llb_sockproxy_emit_sync_event()
- * directly so the SPEC §verification grep counts each occurrence. The
- * pd_session_build_event() helper composes the struct; the actual emit is
- * inlined verbatim at each call site for grep-visibility. */
+ * directly so a grep counts each occurrence. The pd_session_build_event()
+ * helper composes the struct; the actual emit is inlined verbatim at each
+ * call site for grep-visibility. */
 
 /*
  * pd_session_lookup() - Look up cached (prefill, decode) pair for a session key.

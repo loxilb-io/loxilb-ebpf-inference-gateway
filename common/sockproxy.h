@@ -65,6 +65,23 @@ struct dp_proxy_ct_ent;
 #ifndef MAX_SALT_LEN
 #define MAX_SALT_LEN 64     // Cache isolation salt
 #define PD_KV_PARAMS_MAX_LEN 65536  // P/D kv_transfer_params buffer (64KB for real vLLM block_ids)
+
+/* P/D orchestration engine flavor (proxy_epval_t.pd_engine). Values equal
+ * the wire kv_engine_type encoding (0=vllm, 1=sglang, 2=trtllm reserved) —
+ * the proxy_add stamp goes through pd_engine_from_kv_engine_type()
+ * (sockproxy_pd_core.c), these names exist so the orchestration branch reads
+ * an orchestration-named constant. Adding an engine = new constant here +
+ * mapper/resolver case + (when it diverges) its own dialect ops table. */
+#define PD_ENGINE_VLLM   0
+#define PD_ENGINE_SGLANG 1
+/* TensorRT-LLM disaggregation is sequential ctx-first — a parameterization
+ * of the vLLM machine. Reserved: resolves to the vllm dialect table until it
+ * earns its own. The control plane does not emit this value yet. */
+#define PD_ENGINE_TRTLLM 2
+
+/* SGLang --disaggregation-bootstrap-port default (server_args.py). Applied
+ * at proxy_add when the rule leaves pd_bootstrap_port at 0. */
+#define PD_SG_BOOTSTRAP_PORT_DFL 8998
 #endif
 
 // ============================================================================
@@ -142,6 +159,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_miss_hashes;       // block-hash computation produced no hashes
     _Atomic uint64_t pd_kv_t15_miss_no_worker;    // llb_ai_kv_best_worker returned no candidate
     _Atomic uint64_t pd_kv_t15_miss_excluded;     // candidate EP excluded (health / load)
+    _Atomic uint64_t pd_kv_t15_miss_shallow;      // best match under the minimum token depth
     _Atomic uint64_t pd_kv_t15_fallthrough_total; // Tier 1.5 skipped entirely -> Tier 2 path
     // Failover observability: endpoint-death and failover EVENTS (as detected
     // per connection), distinct from the request-outcome counters in
@@ -151,6 +169,12 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
     _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
+    // SGLang P/D dual-dispatch observability (mirrors the failover family above)
+    _Atomic uint64_t pd_sg_prefill_abort_decode; // prefill drain-leg failure forced a decode-leg abort
+    _Atomic uint64_t pd_sg_decode_close_drain;   // decode-leg failure closed the prefill drain leg
+    _Atomic uint64_t pd_sg_room_retry;           // dual dispatch retried as a pair with a fresh room
+    _Atomic uint64_t pd_sg_prefill_reject_relay; // prefill 4xx relayed to the client verbatim (origin-computed client error, not an EP fault)
+    _Atomic uint64_t pd_sg_oversize_reject;      // streamable body on an SGLang disagg rule refused fail-closed (503, no backend bytes)
     //: per-stage hot-path µs histograms. One 12-bucket histogram
     // per (stage, outcome) — stage in {TOKENIZE,HASH,CGO,SCAN} (sockproxy_kv_exact.h),
     // outcome in {miss=0, hit=1}. Bucket bounds reuse latency_bucket_bounds_us so the
@@ -397,6 +421,15 @@ typedef struct circuit_breaker {
   uint32_t open_timeout_sec;       // Default: 30 seconds before HALF_OPEN
   uint32_t half_open_max_requests; // Default: 3 test requests in HALF_OPEN
   uint32_t half_open_requests;     // Current request count in HALF_OPEN
+
+  /* Origin-error demotion. failure_count only sees CONNECT-level faults and
+   * is reset by every connect success, so an EP that accepts TCP but keeps
+   * answering HTTP 5xx never trips the breaker — warm KV affinity then
+   * re-pins it indefinitely. This streak is touched ONLY by origin response
+   * statuses (5xx increments, <400 resets), so connect successes cannot
+   * defeat it; at the threshold the breaker opens through the same trip
+   * actions (trie removal, parked drain, selection/affinity skip). */
+  uint32_t origin_err_streak;      // Consecutive origin 5xx responses
 } circuit_breaker_t;
 
 // ============================================================================
@@ -446,6 +479,10 @@ typedef struct proxy_ent {
  * single-TU unit build (the PD_CTRL_ST_* precedent). */
 #define KV_EXACT_MODE_SINGLE_ROLE 3
 
+/* P/D engine-dialect ops table — full definition in sockproxy_pd.h; the epval
+ * only carries the resolved pointer. */
+struct pd_dialect_ops;
+
 // Proxy endpoint value - manages endpoint pool for a service
 typedef struct proxy_epval {
   char host_url[256];
@@ -490,9 +527,23 @@ typedef struct proxy_epval {
   uint32_t backend_keepalive_sec;   // Backend SO_KEEPALIVE+TCP_KEEPIDLE interval (0=disabled)
   uint32_t inactive_timeout_sec;    // Per-rule idle timeout in seconds (0=disabled); suppressed when sse_active=1
 
-  // P/D Disaggregation configuration 
+  // P/D Disaggregation configuration
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
+   * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG) so
+   * the orchestration branch never reads a KV-named field. vLLM keeps the
+   * sequential prefill→decode state machine; SGLang selects the concurrent
+   * dual-dispatch machine (bootstrap triple injection, prefill drain leg). */
+  uint8_t  pd_engine;
+  /* SGLang bootstrap port on every prefill EP; the decode engine rendezvouses
+   * with prefill on it. 0 is defaulted to PD_SG_BOOTSTRAP_PORT_DFL at
+   * proxy_add, so readers can trust it non-zero when pd_engine==SGLANG. */
+  uint16_t pd_bootstrap_port;
+  /* Dialect ops table (sockproxy_pd.h), resolved from pd_engine at the same
+   * proxy_add sites that stamp it — never NULL once the rule is live, so the
+   * request path calls through it without re-deriving the engine. */
+  const struct pd_dialect_ops *pd_ops;
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
   int      n_prefill_eps;          // Count of prefill endpoints
   int      n_decode_eps;           // Count of decode endpoints
@@ -980,6 +1031,26 @@ struct proxy_fd_ent {
   uint64_t pd_decode_start_ns;       // Monotonic timestamp for decode latency
   size_t   pd_decode_content_length; // Content-Length from non-SSE decode response headers
   size_t   pd_decode_bytes_received; // Decode response body bytes received so far
+  /* SGLang P/D dual-dispatch state. The CLIENT pfe reuses the
+   * DECODE_SENDING/DECODE_STREAMING/COMPLETE pd_phase lifecycle for its decode
+   * leg (so every decode-side behavior — SSE latch, [DONE] scanner, stream
+   * caps, EOF taxonomy, reapers, xSync — applies unchanged); the prefill leg
+   * is a detached DRAIN leg whose state lives on the BACKEND pfe below.
+   * Append-only growth on proxy_fd_ent (NOT xSync-serialized) — HA-safe per
+   * the resp_parser_inited precedent. Zero-init (pfe_alloc) == off. */
+  uint8_t  pd_sg_active;             // CLIENT: SGLang dual dispatch live for this request
+  uint64_t pd_sg_room;               // CLIENT: bootstrap room injected into both legs (logs/retry)
+  uint8_t  pd_sg_drain;              // BACKEND: this leg is the SGLang prefill drain leg
+  uint8_t  pd_sg_drain_done;         // BACKEND: prefill response fully received (message complete)
+  uint8_t  pd_sg_drain_handled;      // BACKEND: failure coupling already fired for this leg
+  uint8_t  pd_sg_drain_desync;       // BACKEND: a parser feed was skipped (trylock miss) — framing
+                                     // untrusted, completion falls back to leg EOF
+  uint8_t  pd_sg_drain_fed;          // BACKEND: drain framer consumed at least one chunk (a 4xx
+                                     // enters relay mode only when detected on the FIRST chunk —
+                                     // earlier chunks were discarded and cannot be re-relayed)
+  uint8_t  pd_sg_drain_relay;        // BACKEND: origin 4xx being handed to the client verbatim;
+                                     // every further drain chunk is relayed until message end
+                                     // (or leg EOF for a close-framed response)
   uint8_t  pd_prefill_retries;       // Prefill mid-request failovers consumed (budget: 1).
                                      // Prefill is side-effect-idempotent and the complete
                                      // request survives in pd_saved_headers/pd_saved_body,
@@ -1198,9 +1269,13 @@ struct proxy_arg {
   // timeouts.request/backendRequest); a future Gateway controller MUST hard-error, never silent-drop.
   uint32_t timeout_tcp_inspect_ms;    // 0 ⇒ sane bounded default (header-accum deadline)
 
-  // P/D Disaggregation configuration 
+  // P/D Disaggregation configuration
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
+  // proxy_add). The nat2proxy hop of the additive chain
+  // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
+  uint16_t pd_bootstrap_port;
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
 
   // P/D Cache-Aware Routing configuration (US-PD801)
@@ -1349,6 +1424,8 @@ int find_next_healthy_endpoint(proxy_epval_t *tepval, int start_idx);
 int select_healthy_endpoint(proxy_epval_t *tepval, int algorithm_selection);
 void circuit_breaker_record_failure(proxy_epval_t *tepval, int ep_index);
 void circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index);
+void circuit_breaker_record_origin_error(proxy_epval_t *tepval, int ep_index);
+void circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index);
 int chwbl_ring_lookup(chwbl_ring_t *ring, uint64_t hash);
 uint64_t compute_prefix_hash(llm_prefix_key_t *key);
 int extract_llm_prefix(const char *json_str, size_t json_len, llm_prefix_key_t *key);
