@@ -42,6 +42,7 @@
 #include "sockproxy.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_pd_leak.h"
 
 /* Rewrite the prefill address inside a P/D request-id receipt
  * (___prefill_addr_<ep>___decode_addr_<ep>_<uuid>) within an HTTP header
@@ -146,6 +147,30 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   uint8_t *l_prefill = __atomic_exchange_n(&client_pfe->pd_prefill_resp_buf,
                                            NULL, __ATOMIC_ACQ_REL);
   if (!l_prefill) l_prefill_len = 0; else client_pfe->pd_prefill_resp_len = 0;
+
+  /* Origin-error feed (parity with the SGLang drain leg): the sequential
+   * machine swallows the prefill response — a prefill 5xx degrades to
+   * decode-recompute and the request still succeeds, so nothing downstream
+   * ever demotes an EP that accepts TCP but keeps erroring; warm affinity
+   * then re-pins it indefinitely. Feed the origin streak here, the one
+   * point every prefill completion path funnels through: 5xx increments,
+   * <400 resets, 4xx stays neutral (client faults), status-unknown (0 —
+   * transport deaths stay with the connect-level breaker feed) is neutral
+   * too. Decode-leg statuses are deliberately not attributed. */
+  {
+    int pr_status = pd_http_resp_status(l_prefill, l_prefill_len);
+    int pr_ep = client_pfe->pd_prefill_ep_idx;
+    if (pr_ep >= 0) {
+      if (pr_status >= 500) {
+        log_warn("prefill EP%d answered origin %d — feeding breaker "
+                 "origin streak (client_fd=%d)",
+                 pr_ep, pr_status, client_pfe->fd);
+        circuit_breaker_record_origin_error(tepval, pr_ep);
+      } else if (pr_status > 0 && pr_status < 400) {
+        circuit_breaker_record_origin_success(tepval, pr_ep);
+      }
+    }
+  }
 
   size_t l_body_len = client_pfe->pd_saved_body_len;
   uint8_t *l_body = __atomic_exchange_n(&client_pfe->pd_saved_body,
