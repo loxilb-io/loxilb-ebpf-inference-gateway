@@ -377,6 +377,9 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
    * completion check (phase == PD_PHASE_DECODE_SENDING) to miss and
    * llb_ai_pd_record to never be called. Set unconditionally here. */
   client_pfe->pd_phase = PD_PHASE_DECODE_SENDING;
+  /* restart the phase clock: it still holds the prefill dispatch time, and
+   * the health scan's decode first-byte wedge measures from here */
+  client_pfe->pd_phase_start_ts = time(NULL);
   {
     struct timespec _ts;
     clock_gettime(CLOCK_MONOTONIC, &_ts);

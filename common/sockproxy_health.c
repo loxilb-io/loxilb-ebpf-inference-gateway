@@ -542,6 +542,12 @@ check_draining_endpoints(void)
         "Connection: close\r\n"
         "\r\n"
         "{\"error\":\"pd_prefill_timeout\"}";
+    static const char pd_decode_timeout_resp[] =
+        "HTTP/1.1 504 Gateway Timeout\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"error\":\"pd_decode_timeout\"}";
 
     proxy_map_ent_t *pd_node = proxy_struct->head;
     while (pd_node) {
@@ -602,46 +608,61 @@ check_draining_endpoints(void)
           }
         }
 
-        /* SGLang dual-dispatch rendezvous wedge — the SG client enters
-         * DECODE_SENDING at dispatch, so the prefill-phase scan above can
-         * never see it. If NO decode byte has arrived within the prefill
-         * timeout, the bootstrap rendezvous is stuck (prefill leg parked at
-         * the engine's disaggregation timeout, decode in WaitingForInput).
-         * Fail fast: 504, record, tear down BOTH legs — deliberately
-         * undercutting SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT (300s) so a
-         * client is never parked for 5 minutes. */
-        else if (pfe->pd_sg_active &&
-                 pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
+        /* Decode first-byte wedge — every P/D machine enters DECODE_SENDING
+         * at decode dispatch, so the prefill-phase scan above can never see
+         * it. A decode EP that accepts the connection but never answers (a
+         * frozen container, a wedged engine) would otherwise park the client
+         * until IT gives up: nothing else times this phase out once the
+         * decode request bytes are written. For SGLang the same condition is
+         * the dual-dispatch rendezvous wedge (prefill leg parked at the
+         * engine's disaggregation timeout, decode in WaitingForInput) —
+         * deliberately undercutting SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+         * (300s). Fail fast either way: 504, record, tear down BOTH legs. */
+        else if (pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
                  pfe->pd_phase_start_ts > 0 &&
                  pfe->pd_last_decode_ts == 0 &&
                  pfe->pd_decode_bytes_received == 0 &&
                  pfe->pd_decode_content_length == 0) {
-          time_t sg_elapsed = now - pfe->pd_phase_start_ts;
-          uint32_t sg_timeout = pd_prefill_timeout_default();
+          time_t dec_elapsed = now - pfe->pd_phase_start_ts;
+          uint32_t dec_timeout = pd_prefill_timeout_default();
           if (pfe->epv) {
-            proxy_epval_t *sg_epv = (proxy_epval_t *)pfe->epv;
-            if (sg_epv->pd_prefill_timeout_sec > 0) {
-              sg_timeout = sg_epv->pd_prefill_timeout_sec;
+            proxy_epval_t *dec_epv = (proxy_epval_t *)pfe->epv;
+            if (dec_epv->pd_prefill_timeout_sec > 0) {
+              dec_timeout = dec_epv->pd_prefill_timeout_sec;
             }
           }
-          if (sg_elapsed >= (time_t)sg_timeout) {
-            log_error("[PD_SG] rendezvous wedge — fd=%d room=%llu "
-                      "elapsed=%lds >= timeout=%us, tearing down pair",
-                      pfe->fd, (unsigned long long)pfe->pd_sg_room,
-                      (long)sg_elapsed, sg_timeout);
-            atomic_fetch_add(&global_stats.pd_sg_prefill_abort_decode, 1);
+          if (dec_elapsed >= (time_t)dec_timeout) {
+            if (pfe->pd_sg_active) {
+              log_error("[PD_SG] rendezvous wedge — fd=%d room=%llu "
+                        "elapsed=%lds >= timeout=%us, tearing down pair",
+                        pfe->fd, (unsigned long long)pfe->pd_sg_room,
+                        (long)dec_elapsed, dec_timeout);
+              atomic_fetch_add(&global_stats.pd_sg_prefill_abort_decode, 1);
+            } else {
+              log_error("P/D decode first-byte timeout — fd=%d "
+                        "elapsed=%lds >= timeout=%us, tearing down pair",
+                        pfe->fd, (long)dec_elapsed, dec_timeout);
+            }
             {
-              char *sg_model = "";
+              char *dec_model = "";
               if (pfe->x_model_header[0] != '\0') {
-                sg_model = pfe->x_model_header;
+                dec_model = pfe->x_model_header;
               } else if (pfe->prefix_key.model[0] != '\0') {
-                sg_model = pfe->prefix_key.model;
+                dec_model = pfe->prefix_key.model;
               }
-              llb_ai_pd_record(sg_model, 0, 0, 0, 1 /*prefill error*/);
+              llb_ai_pd_record(dec_model, 0, 0, 0, 1 /*prefill error*/);
             }
             if (pfe->fd > 0) {
-              send(pfe->fd, pd_timeout_resp, sizeof(pd_timeout_resp) - 1,
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              /* SG keeps its historical body; the sequential machines name
+               * the leg that actually timed out. */
+              if (pfe->pd_sg_active) {
+                send(pfe->fd, pd_timeout_resp, sizeof(pd_timeout_resp) - 1,
+                     MSG_DONTWAIT | MSG_NOSIGNAL);
+              } else {
+                send(pfe->fd, pd_decode_timeout_resp,
+                     sizeof(pd_decode_timeout_resp) - 1,
+                     MSG_DONTWAIT | MSG_NOSIGNAL);
+              }
             }
             pfe->pd_phase = PD_PHASE_ERROR;
             pd_teardown_conn(pfe);
