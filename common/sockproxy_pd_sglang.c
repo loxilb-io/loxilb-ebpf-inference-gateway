@@ -1071,8 +1071,6 @@ pd_sg_dispatch(struct proxy_fd_ent *pfe)
 
 const pd_dialect_ops_t pd_dialect_sglang = {
   .name = "sglang",
-  .needs_full_body = 1,
-  .max_inspect_body = 64 * 1024,
   .prepare_request = pd_sg_prepare_request,
   .dispatch = pd_sg_dispatch,
   .on_prefill_response = NULL,

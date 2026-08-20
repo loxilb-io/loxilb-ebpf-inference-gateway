@@ -29,8 +29,6 @@ struct proxy_epval;    /* sockproxy.h */
 
 typedef struct pd_dialect_ops {
   const char *name;              /* "vllm" | "sglang" */
-  int         needs_full_body;   /* body rewrite requires the buffered body */
-  size_t      max_inspect_body;  /* body-inspection cap for this dialect */
 
   /* Body rewrite before dispatch, called with the located request body
    * (hdr_len/body point into pfe->rcvbuf). vllm: save original +
