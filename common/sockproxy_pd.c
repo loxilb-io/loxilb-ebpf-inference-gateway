@@ -616,6 +616,319 @@ pd_prepare_decode_body(const uint8_t *orig_body, size_t orig_body_len,
   return 0;
 }
 
+/* ===== TensorRT-LLM sequential-dialect body surgery =====
+ *
+ * TRT-LLM disaggregation is sequential context-first — the vLLM machine
+ * SHAPE — but speaks a different body dialect: splice a disaggregated_params
+ * object (request_type=context_only) into the context ("prefill") request,
+ * extract choices[0].disaggregated_params from the buffered context
+ * response, and re-splice it into the generation ("decode") request with
+ * request_type=generation_only. Contract points that differ from the vLLM
+ * rewrite above:
+ *   - NO max_tokens rewrite: the context worker forces its own one-step
+ *     token cap, and the returned finish_reason drives the early-exit
+ *     decision (pd_trt_ctx_early_exit_check) — rewriting max_tokens would
+ *     corrupt that signal.
+ *   - The serving endpoints enforce extra="forbid": any unknown field draws
+ *     a 400, so disaggregated_params is the ONLY addition either leg may
+ *     carry.
+ */
+
+/* Prepare the TRT-LLM context-leg body: stream -> false, drop
+ * stream_options, splice
+ *   ,"disaggregated_params":{"request_type":"context_only",
+ *                            "disagg_request_id":<id>}
+ * before the final closing brace. Deterministic-id variant for the unit
+ * vectors; production callers use pd_trt_prepare_prefill_body below.
+ * Returns 0 on success (*out_len set), -1 on error. */
+int
+pd_trt_prepare_prefill_body_id(const uint8_t *orig_body, size_t orig_body_len,
+                               uint8_t *out_buf, size_t *out_len,
+                               size_t out_capacity, uint64_t disagg_id)
+{
+  const uint8_t *vs, *ve;
+  char frag[128];
+  const char *f;
+  int flen, i, j, insert_pos = -1;
+  int new_len;
+
+  if (!orig_body || !out_buf || !out_len || orig_body_len == 0) return -1;
+  if (orig_body_len >= out_capacity) return -1;
+
+  memcpy(out_buf, orig_body, orig_body_len);
+  new_len = (int)orig_body_len;
+
+  /* The context leg is never streamed — its response is buffered and
+   * parsed for disaggregated_params. */
+  if (pd_find_json_value(out_buf, new_len, "stream", 6, &vs, &ve) == 0) {
+    int r = pd_replace_json_value(out_buf, new_len, out_capacity, vs, ve,
+                                  "false", 5);
+    if (r < 0) return -1;
+    new_len = r;
+  }
+  {
+    int r = pd_remove_json_field(out_buf, new_len, "stream_options", 14);
+    if (r > 0) new_len = r;
+  }
+
+  flen = snprintf(frag, sizeof(frag),
+                  ",\"disaggregated_params\":{\"request_type\":\"context_only\","
+                  "\"disagg_request_id\":%llu}",
+                  (unsigned long long)disagg_id);
+  if (flen < 0 || (size_t)flen >= sizeof(frag)) return -1;
+  if ((size_t)new_len + (size_t)flen >= out_capacity) return -1;
+
+  for (i = new_len - 1; i >= 0; i--) {
+    if (out_buf[i] == '}') { insert_pos = i; break; }
+  }
+  if (insert_pos < 0) return -1;
+
+  /* Empty object: drop the leading comma (pd_sg_inject_bootstrap idiom). */
+  f = frag;
+  j = insert_pos - 1;
+  while (j >= 0 && (out_buf[j] == ' ' || out_buf[j] == '\t' ||
+                    out_buf[j] == '\n' || out_buf[j] == '\r')) {
+    j--;
+  }
+  if (j >= 0 && out_buf[j] == '{') {
+    f++;
+    flen--;
+  }
+
+  memmove(out_buf + insert_pos + flen, out_buf + insert_pos,
+          new_len - insert_pos);
+  memcpy(out_buf + insert_pos, f, (size_t)flen);
+  new_len += flen;
+
+  *out_len = (size_t)new_len;
+  return 0;
+}
+
+/* Production entry: draw a fresh disagg_request_id per context dispatch —
+ * a mid-request retry therefore re-rewrites with a NEW id, matching the
+ * reference proxy's per-dispatch allocation. Same RNG contract as the
+ * SGLang bootstrap room (uniform int63, getrandom, never rand()). */
+int
+pd_trt_prepare_prefill_body(const uint8_t *orig_body, size_t orig_body_len,
+                            uint8_t *out_buf, size_t *out_len,
+                            size_t out_capacity)
+{
+  uint64_t disagg_id = 0;
+
+  if (pd_sg_room_id(&disagg_id) != 0) return -1;
+  return pd_trt_prepare_prefill_body_id(orig_body, orig_body_len, out_buf,
+                                        out_len, out_capacity, disagg_id);
+}
+
+/* Extract the choices[0].disaggregated_params object span from the
+ * buffered context response. The search is bounded to the choices array so
+ * a same-named key elsewhere in the envelope can never be picked up (n=1
+ * always holds on a disaggregated request).
+ * Return contract mirrors pd_extract_kv_params: 0 with the span copied,
+ * -ENOENT when absent/null (decode degrades to a plain converged serve on
+ * the generation worker), -EMSGSIZE on overflow, -EINVAL on bad args. */
+int
+pd_trt_extract_disagg_params(const uint8_t *resp_buf, size_t resp_len,
+                             char *dp_out, size_t *dp_out_len,
+                             size_t dp_capacity)
+{
+  const uint8_t *cs, *ce, *vs, *ve;
+  size_t val_len;
+
+  if (!dp_out || !dp_out_len || dp_capacity == 0) {
+    return -EINVAL;
+  }
+
+  *dp_out_len = 0;
+  dp_out[0] = '\0';
+
+  if (!resp_buf || resp_len == 0) {
+    return -ENOENT;
+  }
+
+  if (pd_find_json_value(resp_buf, resp_len, "choices", 7, &cs, &ce) != 0) {
+    return -ENOENT;
+  }
+  if (pd_find_json_value(cs, (size_t)(ce - cs), "disaggregated_params", 20,
+                         &vs, &ve) != 0) {
+    return -ENOENT;
+  }
+  /* The engine emits null here on a non-disaggregated serve — only an
+   * object span is relayable. */
+  if (ve <= vs || *vs != '{') {
+    return -ENOENT;
+  }
+
+  val_len = (size_t)(ve - vs);
+  if (val_len >= dp_capacity) {
+    pd_kv_overflow_inc();
+    log_warn("disaggregated_params too large (%zu >= %zu capacity)",
+             val_len, dp_capacity);
+    return -EMSGSIZE;
+  }
+
+  memcpy(dp_out, vs, val_len);
+  dp_out[val_len] = '\0';
+  *dp_out_len = val_len;
+
+  PD_KV_PARAMS_DBG(val_len, dp_capacity);
+
+  return 0;
+}
+
+/* Build the TRT-LLM generation-leg body: the ORIGINAL client body (prompt/
+ * messages, stream and max_tokens untouched) + the extracted
+ * disaggregated_params span with its request_type value replaced by
+ * "generation_only". The surgery is computed on the const span and applied
+ * during a piecewise copy, so the buffer tail is moved exactly once.
+ * Empty/absent params degrade to the original body unchanged (plain
+ * converged serve on the generation worker — the vLLM-dialect posture). */
+int
+pd_trt_prepare_decode_body(const uint8_t *orig_body, size_t orig_body_len,
+                           const char *dp, size_t dp_len,
+                           uint8_t *out_buf, size_t *out_len,
+                           size_t out_capacity)
+{
+  static const char dp_prefix[] = ",\"disaggregated_params\":";
+  static const char gen_val[] = "\"generation_only\"";
+  static const char gen_field[] = "\"request_type\":\"generation_only\"";
+  const size_t prefix_len = sizeof(dp_prefix) - 1;
+  const uint8_t *vs = NULL, *ve = NULL;
+  size_t inject_len;
+  int insert_pos = -1;
+  int i, have_rt, dp_empty = 1;
+  uint8_t *w;
+
+  if (!orig_body || !out_buf || !out_len || orig_body_len == 0) {
+    return -1;
+  }
+  if (orig_body_len >= out_capacity) {
+    return -1;
+  }
+
+  memcpy(out_buf, orig_body, orig_body_len);
+
+  if (!dp || dp_len == 0) {
+    *out_len = orig_body_len;
+    return 0;
+  }
+
+  for (i = (int)orig_body_len - 1; i >= 0; i--) {
+    if (out_buf[i] == '}') { insert_pos = i; break; }
+  }
+  if (insert_pos < 0) {
+    /* No closing brace — malformed JSON, return original body. */
+    *out_len = orig_body_len;
+    return 0;
+  }
+
+  have_rt = (pd_find_json_value((const uint8_t *)dp, dp_len,
+                                "request_type", 12, &vs, &ve) == 0);
+  if (have_rt) {
+    inject_len = prefix_len + dp_len - (size_t)(ve - vs)
+                 + (sizeof(gen_val) - 1);
+  } else {
+    /* Defensive: the span carried no request_type — inject the field right
+     * after the opening brace ('{' guaranteed by the extraction guard). */
+    size_t k;
+    for (k = 1; k + 1 < dp_len; k++) {
+      if (dp[k] != ' ' && dp[k] != '\t' && dp[k] != '\n' && dp[k] != '\r') {
+        dp_empty = 0;
+        break;
+      }
+    }
+    if (dp_empty) {
+      inject_len = prefix_len + 1 + (sizeof(gen_field) - 1) + 1; /* {field} */
+    } else {
+      inject_len = prefix_len + dp_len + (sizeof(gen_field) - 1) + 1; /* +comma */
+    }
+  }
+
+  if (orig_body_len + inject_len >= out_capacity) {
+    log_error("trt decode body overflow (%zu + %zu >= %zu) "
+              "— using original body", orig_body_len, inject_len,
+              out_capacity);
+    *out_len = orig_body_len;
+    return 0;
+  }
+
+  memmove(out_buf + insert_pos + inject_len, out_buf + insert_pos,
+          orig_body_len - (size_t)insert_pos);
+
+  w = out_buf + insert_pos;
+  memcpy(w, dp_prefix, prefix_len);
+  w += prefix_len;
+  if (have_rt) {
+    size_t pre = (size_t)(vs - (const uint8_t *)dp);
+    size_t post_off = (size_t)(ve - (const uint8_t *)dp);
+    memcpy(w, dp, pre);
+    w += pre;
+    memcpy(w, gen_val, sizeof(gen_val) - 1);
+    w += sizeof(gen_val) - 1;
+    memcpy(w, dp + post_off, dp_len - post_off);
+  } else if (dp_empty) {
+    *w++ = '{';
+    memcpy(w, gen_field, sizeof(gen_field) - 1);
+    w += sizeof(gen_field) - 1;
+    *w = '}';
+  } else {
+    *w++ = '{';
+    memcpy(w, gen_field, sizeof(gen_field) - 1);
+    w += sizeof(gen_field) - 1;
+    *w++ = ',';
+    memcpy(w, dp + 1, dp_len - 1);
+  }
+
+  *out_len = orig_body_len + inject_len;
+  return 0;
+}
+
+/* Early-exit decision on the buffered context response: a finish_reason
+ * that is neither "length" nor "not_finished" means the request already
+ * finished in the context step — the buffered response IS the answer and
+ * the generation leg is skipped (the caller relays it). Only a definite
+ * string verdict may skip the leg: null / absent / malformed all return 0
+ * and proceed to decode, whose worst case (recompute) is still a correct
+ * response, where a wrong early exit would truncate it. */
+int
+pd_trt_ctx_early_exit_check(const uint8_t *resp_buf, size_t resp_len)
+{
+  const uint8_t *cs, *ce, *vs, *ve;
+  size_t n;
+
+  if (!resp_buf || resp_len == 0) return 0;
+  if (pd_find_json_value(resp_buf, resp_len, "choices", 7, &cs, &ce) != 0) {
+    return 0;
+  }
+  if (pd_find_json_value(cs, (size_t)(ce - cs), "finish_reason", 13,
+                         &vs, &ve) != 0) {
+    return 0;
+  }
+  n = (size_t)(ve - vs);
+  if (n < 2 || *vs != '"' || *(ve - 1) != '"') return 0;
+  vs++;
+  n -= 2;
+  if ((n == 6 && memcmp(vs, "length", 6) == 0) ||
+      (n == 12 && memcmp(vs, "not_finished", 12) == 0)) {
+    return 0;
+  }
+  return 1;
+}
+
+/* Did the ORIGINAL client body request streaming? Decides the early-exit
+ * relay framing (verbatim JSON vs one-chunk SSE re-frame). */
+int
+pd_trt_stream_requested(const uint8_t *body, size_t body_len)
+{
+  const uint8_t *vs, *ve;
+
+  if (!body || body_len == 0) return 0;
+  if (pd_find_json_value(body, body_len, "stream", 6, &vs, &ve) != 0) {
+    return 0;
+  }
+  return ((size_t)(ve - vs) == 4 && memcmp(vs, "true", 4) == 0);
+}
+
 /* ============================================================================
  * P/D Session Stickiness (Tier 0 cache-aware routing)
  *

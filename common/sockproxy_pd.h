@@ -1,19 +1,25 @@
 /* sockproxy_pd.h - P/D disaggregation engine-dialect ops table
  *
  * Each LLM framework speaks a different P/D orchestration dialect:
- *   vLLM   — SEQUENTIAL machine: kv_transfer_params append → prefill send →
- *            response parse/extract → decode re-dispatch → prefill retry.
- *   SGLang — DUAL-DISPATCH machine: bootstrap triple injection (room RNG),
- *            simultaneous prefill(drain)/decode legs, pair-retry,
- *            rendezvous-wedge reaper.
+ *   vLLM    — SEQUENTIAL machine: kv_transfer_params append → prefill send →
+ *             response parse/extract → decode re-dispatch → prefill retry.
+ *   SGLang  — DUAL-DISPATCH machine: bootstrap triple injection (room RNG),
+ *             simultaneous prefill(drain)/decode legs, pair-retry,
+ *             rendezvous-wedge reaper.
+ *   TRT-LLM — the SEQUENTIAL machine with a different body dialect:
+ *             disaggregated_params splice (context_only) → buffered context
+ *             response → params re-splice (generation_only) or early exit
+ *             when the context step already finished the request.
  * The HTTP engine selects an ops pointer once per rule (proxy_add, from
  * pd_engine) and caches it on the epval; request-lifecycle events then call
  * through the table and never ask which engine they are speaking to.
  *
- * The machines live in sockproxy_pd_vllm.c / sockproxy_pd_sglang.c, which
- * each define their pd_dialect_ops table; engine-neutral dispatch glue is
- * in sockproxy_pd_core.c. A slot may be NULL when the dialect has no use
- * for that lifecycle event.
+ * The machines live in sockproxy_pd_vllm.c / sockproxy_pd_sglang.c /
+ * sockproxy_pd_trtllm.c, which each define their pd_dialect_ops table;
+ * engine-neutral dispatch glue is in sockproxy_pd_core.c. A slot may be
+ * NULL when the dialect has no use for that lifecycle event. TRT-LLM rides
+ * the vLLM sequential machine (sockproxy_pd_vllm.c), which selects the
+ * dialect's body-surgery functions by epval->pd_engine.
  */
 
 #ifndef __SOCKPROXY_PD_H__
@@ -28,7 +34,7 @@ struct proxy_fd_ent;   /* sockproxy.h */
 struct proxy_epval;    /* sockproxy.h */
 
 typedef struct pd_dialect_ops {
-  const char *name;              /* "vllm" | "sglang" */
+  const char *name;              /* "vllm" | "sglang" | "trtllm" */
 
   /* Body rewrite before dispatch, called with the located request body
    * (hdr_len/body point into pfe->rcvbuf). vllm: save original +
@@ -62,6 +68,7 @@ typedef struct pd_dialect_ops {
  * extraction moves them into their sockproxy_pd_<engine>.c homes). */
 extern const pd_dialect_ops_t pd_dialect_vllm;
 extern const pd_dialect_ops_t pd_dialect_sglang;
+extern const pd_dialect_ops_t pd_dialect_trtllm;
 
 /* Wire kv_engine_type → PD_ENGINE_* (sockproxy.h). Unknown values degrade
  * to PD_ENGINE_VLLM. */
@@ -86,6 +93,26 @@ int pd_sg_inject_bootstrap(const uint8_t *orig_body, size_t orig_body_len,
                            uint8_t *out_buf, size_t *out_len,
                            size_t out_capacity, const char *bootstrap_host,
                            uint16_t bootstrap_port, uint64_t bootstrap_room);
+
+/* TRT-LLM sequential-dialect body surgery (sockproxy_pd.c). The _id
+ * variant takes a deterministic disagg_request_id for the unit vectors;
+ * production draws a fresh int63 per context dispatch. */
+int pd_trt_prepare_prefill_body(const uint8_t *orig_body,
+                                size_t orig_body_len, uint8_t *out_buf,
+                                size_t *out_len, size_t out_capacity);
+int pd_trt_prepare_prefill_body_id(const uint8_t *orig_body,
+                                   size_t orig_body_len, uint8_t *out_buf,
+                                   size_t *out_len, size_t out_capacity,
+                                   uint64_t disagg_id);
+int pd_trt_extract_disagg_params(const uint8_t *resp_buf, size_t resp_len,
+                                 char *dp_out, size_t *dp_out_len,
+                                 size_t dp_capacity);
+int pd_trt_prepare_decode_body(const uint8_t *orig_body,
+                               size_t orig_body_len, const char *dp,
+                               size_t dp_len, uint8_t *out_buf,
+                               size_t *out_len, size_t out_capacity);
+int pd_trt_ctx_early_exit_check(const uint8_t *resp_buf, size_t resp_len);
+int pd_trt_stream_requested(const uint8_t *body, size_t body_len);
 
 /* --- Machine-agnostic helpers (sockproxy_pd_core.c) ---------------------- */
 
@@ -127,7 +154,28 @@ pd_free_claim(uint8_t **pp)
   }
 }
 
-/* --- vLLM sequential machine (sockproxy_pd_vllm.c) ----------------------- */
+/* --- vLLM sequential machine (sockproxy_pd_vllm.c) -----------------------
+ * Shared by the TRT-LLM dialect, which parameterizes the body-surgery
+ * sites (rewriter selection by epval->pd_engine inside the machine). */
+
+/* Prefill-body rewriter signature shared by the sequential machine's
+ * dialects (pd_prepare_prefill_body / pd_trt_prepare_prefill_body). */
+typedef int (*pd_body_rewrite_t)(const uint8_t *orig_body,
+                                 size_t orig_body_len, uint8_t *out_buf,
+                                 size_t *out_len, size_t out_capacity);
+
+/* Sequential-machine request preparation: save the original body, rewrite
+ * it via the dialect's prefill rewriter, arm the response buffer and the
+ * phase/timestamps. Never fails the client (falls back to plain
+ * forwarding of the untouched request). */
+int pd_seq_prepare_request(struct proxy_fd_ent *pfe,
+                           struct proxy_epval *epval, size_t hdr_len,
+                           const uint8_t *body, size_t body_len,
+                           pd_body_rewrite_t rewrite);
+
+/* Sequential-machine forward: prefill leg only, phase → PREFILL_WAITING.
+ * Shared verbatim by the vLLM and TRT-LLM dialect tables. */
+int pd_vllm_dispatch(struct proxy_fd_ent *pfe);
 
 /* Initiate the decode phase after prefill completes. */
 int pd_initiate_decode(struct proxy_fd_ent *client_pfe);
@@ -137,6 +185,16 @@ int pd_initiate_decode(struct proxy_fd_ent *client_pfe);
 void pd_retry_prefill(struct proxy_fd_ent *client_pfe, int dead_idx,
                       uint8_t *hdrs, size_t hdrs_len,
                       uint8_t *body, size_t body_len);
+
+/* --- TRT-LLM dialect glue (sockproxy_pd_trtllm.c) ------------------------ */
+
+/* Early exit: the buffered context response already finished the request —
+ * relay it to the client (verbatim, or one-chunk SSE re-frame when the
+ * client asked for streaming), record metrics and complete the P/D flow
+ * without a decode leg. Counted in global_stats.pd_trt_ctx_early_exit. */
+void pd_trt_early_exit_relay(struct proxy_fd_ent *client_pfe,
+                             const uint8_t *resp, size_t resp_len,
+                             int stream_requested);
 
 /* --- SGLang dual-dispatch machine (sockproxy_pd_sglang.c) ----------------
  * Entry points the HTTP engine's relay/teardown glue calls into: drain-leg

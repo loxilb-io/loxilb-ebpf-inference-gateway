@@ -49,9 +49,9 @@ pd_dialect_resolve(uint8_t pd_engine)
   case PD_ENGINE_SGLANG:
     return &pd_dialect_sglang;
   case PD_ENGINE_TRTLLM:
-    /* Sequential ctx-first disaggregation — rides the vLLM machine until a
-     * dedicated sockproxy_pd_trtllm.c table earns its place. */
-    return &pd_dialect_vllm;
+    /* Sequential ctx-first disaggregation: own context-splice rewrite,
+     * everything else riding the vLLM machine (sockproxy_pd_trtllm.c). */
+    return &pd_dialect_trtllm;
   case PD_ENGINE_VLLM:
   default:
     return &pd_dialect_vllm;

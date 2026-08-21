@@ -1050,6 +1050,248 @@ static int test_sg_room_id_distinct(void) {
   return 1;
 }
 
+/* ===== Suite G: TRT-LLM dialect body surgery ===== */
+
+static int test_trt_prefill_basic(void) {
+  const char *input =
+      "{\"model\":\"m\",\"prompt\":\"hi\",\"max_tokens\":200,"
+      "\"stream\":true,\"stream_options\":{\"include_usage\":true}}";
+  uint8_t out[2048];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_trt_prepare_prefill_body_id((const uint8_t *)input,
+            strlen(input), out, &out_len, sizeof(out), 42), 0,
+            "trt prefill rewrite succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "\"stream\":false", "stream forced false");
+  ASSERT_STR_NOT_CONTAINS(out, out_len, "stream_options",
+                          "stream_options dropped");
+  ASSERT_STR_CONTAINS(out, out_len,
+      "\"disaggregated_params\":{\"request_type\":\"context_only\","
+      "\"disagg_request_id\":42}", "context splice present");
+  /* THE dialect divergence: the context worker forces its own token cap. */
+  ASSERT_STR_CONTAINS(out, out_len, "\"max_tokens\":200",
+                      "max_tokens NOT rewritten");
+  ASSERT_STR_NOT_CONTAINS(out, out_len, "kv_transfer_params",
+                          "no vLLM fields (extra=forbid would 400)");
+  return 1;
+}
+
+static int test_trt_prefill_exact_bytes(void) {
+  const char *input = "{\"prompt\":\"a\",\"stream\":true}";
+  const char *expect =
+      "{\"prompt\":\"a\",\"stream\":false,\"disaggregated_params\":"
+      "{\"request_type\":\"context_only\",\"disagg_request_id\":7}}";
+  uint8_t out[1024];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_trt_prepare_prefill_body_id((const uint8_t *)input,
+            strlen(input), out, &out_len, sizeof(out), 7), 0,
+            "rewrite succeeds");
+  ASSERT_EQ((int)out_len, (int)strlen(expect), "exact length");
+  ASSERT_EQ(memcmp(out, expect, out_len), 0, "exact bytes");
+  return 1;
+}
+
+static int test_trt_prefill_empty_object(void) {
+  const char *input = "{}";
+  uint8_t out[512];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_trt_prepare_prefill_body_id((const uint8_t *)input,
+            strlen(input), out, &out_len, sizeof(out), 1), 0,
+            "empty-object rewrite succeeds");
+  ASSERT_STR_CONTAINS(out, out_len, "{\"disaggregated_params\"",
+                      "leading comma dropped on empty object");
+  return 1;
+}
+
+static int test_trt_prefill_fresh_ids(void) {
+  /* The production entry draws a fresh int63 per call — a retry must not
+   * reuse the previous disagg_request_id. */
+  const char *input = "{\"prompt\":\"a\"}";
+  uint8_t out_a[512], out_b[512];
+  size_t len_a = 0, len_b = 0;
+
+  ASSERT_EQ(pd_trt_prepare_prefill_body((const uint8_t *)input,
+            strlen(input), out_a, &len_a, sizeof(out_a)), 0, "draw A");
+  ASSERT_EQ(pd_trt_prepare_prefill_body((const uint8_t *)input,
+            strlen(input), out_b, &len_b, sizeof(out_b)), 0, "draw B");
+  ASSERT_EQ((len_a != len_b) || memcmp(out_a, out_b, len_a) != 0, 1,
+            "consecutive ids distinct");
+  return 1;
+}
+
+/* C2-capture-shaped context response fixture. */
+static const char trt_ctx_resp[] =
+    "{\"id\":\"cmpl-1\",\"object\":\"text_completion\",\"model\":\"m\","
+    "\"choices\":[{\"index\":0,\"text\":\"x\",\"finish_reason\":\"length\","
+    "\"disaggregated_params\":{\"request_type\":\"context_only\","
+    "\"first_gen_tokens\":[123],\"ctx_request_id\":7,"
+    "\"encoded_opaque_state\":\"QUJDREVG\",\"draft_tokens\":null}}],"
+    "\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1}}";
+
+static int test_trt_extract_typical(void) {
+  char dp[4096];
+  size_t dp_len = 0;
+
+  ASSERT_EQ(pd_trt_extract_disagg_params((const uint8_t *)trt_ctx_resp,
+            sizeof(trt_ctx_resp) - 1, dp, &dp_len, sizeof(dp)), 0,
+            "extract succeeds");
+  ASSERT_EQ(dp[0], '{', "span is an object");
+  ASSERT_EQ(dp[dp_len - 1], '}', "span closes");
+  ASSERT_STR_CONTAINS(dp, dp_len, "\"encoded_opaque_state\":\"QUJDREVG\"",
+                      "opaque state carried");
+  ASSERT_STR_CONTAINS(dp, dp_len, "\"request_type\":\"context_only\"",
+                      "request_type carried verbatim");
+  return 1;
+}
+
+static int test_trt_extract_null_params(void) {
+  const char *resp =
+      "{\"choices\":[{\"index\":0,\"finish_reason\":\"stop\","
+      "\"disaggregated_params\":null}]}";
+  char dp[256];
+  size_t dp_len = 1;
+
+  ASSERT_EQ(pd_trt_extract_disagg_params((const uint8_t *)resp, strlen(resp),
+            dp, &dp_len, sizeof(dp)), -ENOENT, "null params -> ENOENT");
+  ASSERT_EQ((int)dp_len, 0, "out length zeroed");
+  return 1;
+}
+
+static int test_trt_extract_outside_choices(void) {
+  /* The descent bounds the search to the choices array — a same-named key
+   * elsewhere in the envelope must never be picked up. */
+  const char *resp =
+      "{\"disaggregated_params\":{\"bogus\":1},"
+      "\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}]}";
+  char dp[256];
+  size_t dp_len = 0;
+
+  ASSERT_EQ(pd_trt_extract_disagg_params((const uint8_t *)resp, strlen(resp),
+            dp, &dp_len, sizeof(dp)), -ENOENT,
+            "envelope-level key not matched");
+  return 1;
+}
+
+static int test_trt_extract_overflow(void) {
+  char dp[16];
+  size_t dp_len = 0;
+
+  ASSERT_EQ(pd_trt_extract_disagg_params((const uint8_t *)trt_ctx_resp,
+            sizeof(trt_ctx_resp) - 1, dp, &dp_len, sizeof(dp)), -EMSGSIZE,
+            "tiny capacity -> EMSGSIZE");
+  ASSERT_EQ((int)dp_len, 0, "degrades to empty");
+  return 1;
+}
+
+static int test_trt_decode_body(void) {
+  const char *orig =
+      "{\"model\":\"m\",\"prompt\":\"hi\",\"stream\":true,\"max_tokens\":200}";
+  const char *dp =
+      "{\"request_type\":\"context_only\",\"encoded_opaque_state\":\"QUJD\"}";
+  uint8_t out[4096];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_trt_prepare_decode_body((const uint8_t *)orig, strlen(orig),
+            dp, strlen(dp), out, &out_len, sizeof(out)), 0,
+            "decode body build succeeds");
+  ASSERT_STR_CONTAINS(out, out_len,
+      ",\"disaggregated_params\":{\"request_type\":\"generation_only\","
+      "\"encoded_opaque_state\":\"QUJD\"}", "params spliced, type flipped");
+  ASSERT_STR_NOT_CONTAINS(out, out_len, "context_only",
+                          "no context_only residue");
+  ASSERT_STR_CONTAINS(out, out_len, "\"stream\":true",
+                      "client stream preserved");
+  ASSERT_STR_CONTAINS(out, out_len, "\"max_tokens\":200",
+                      "max_tokens preserved");
+  ASSERT_EQ(out[out_len - 1], '}', "body closes");
+  return 1;
+}
+
+static int test_trt_decode_body_no_request_type(void) {
+  const char *orig = "{\"prompt\":\"hi\"}";
+  const char *dp = "{\"encoded_opaque_state\":\"QUJD\"}";
+  uint8_t out[1024];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_trt_prepare_decode_body((const uint8_t *)orig, strlen(orig),
+            dp, strlen(dp), out, &out_len, sizeof(out)), 0,
+            "build succeeds");
+  ASSERT_STR_CONTAINS(out, out_len,
+      "{\"request_type\":\"generation_only\",\"encoded_opaque_state\":\"QUJD\"}",
+      "request_type injected");
+  return 1;
+}
+
+static int test_trt_decode_body_empty_params(void) {
+  const char *orig = "{\"prompt\":\"hi\",\"stream\":true}";
+  uint8_t out[1024];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_trt_prepare_decode_body((const uint8_t *)orig, strlen(orig),
+            NULL, 0, out, &out_len, sizeof(out)), 0, "build succeeds");
+  ASSERT_EQ((int)out_len, (int)strlen(orig), "original length");
+  ASSERT_EQ(memcmp(out, orig, out_len), 0,
+            "original body unchanged (converged-serve degradation)");
+  return 1;
+}
+
+static int test_trt_decode_body_empty_obj_params(void) {
+  const char *orig = "{\"prompt\":\"hi\"}";
+  const char *dp = "{}";
+  uint8_t out[1024];
+  size_t out_len = 0;
+
+  ASSERT_EQ(pd_trt_prepare_decode_body((const uint8_t *)orig, strlen(orig),
+            dp, strlen(dp), out, &out_len, sizeof(out)), 0, "build succeeds");
+  ASSERT_STR_CONTAINS(out, out_len,
+      ",\"disaggregated_params\":{\"request_type\":\"generation_only\"}",
+      "empty span gets the field, no trailing comma");
+  return 1;
+}
+
+static int test_trt_early_exit_verdicts(void) {
+  const char *stop =
+      "{\"choices\":[{\"finish_reason\":\"stop\",\"text\":\"x\"}]}";
+  const char *length =
+      "{\"choices\":[{\"finish_reason\":\"length\",\"text\":\"x\"}]}";
+  const char *notfin =
+      "{\"choices\":[{\"finish_reason\":\"not_finished\",\"text\":\"x\"}]}";
+  const char *nul =
+      "{\"choices\":[{\"finish_reason\":null,\"text\":\"x\"}]}";
+  const char *absent = "{\"choices\":[{\"text\":\"x\"}]}";
+
+  ASSERT_EQ(pd_trt_ctx_early_exit_check((const uint8_t *)stop, strlen(stop)),
+            1, "stop -> early exit");
+  ASSERT_EQ(pd_trt_ctx_early_exit_check((const uint8_t *)length,
+            strlen(length)), 0, "length -> decode");
+  ASSERT_EQ(pd_trt_ctx_early_exit_check((const uint8_t *)notfin,
+            strlen(notfin)), 0, "not_finished -> decode");
+  /* Fail-safe direction: only a definite string verdict skips the decode
+   * leg — a wrong skip truncates the response, a wrong decode recomputes. */
+  ASSERT_EQ(pd_trt_ctx_early_exit_check((const uint8_t *)nul, strlen(nul)),
+            0, "null -> decode");
+  ASSERT_EQ(pd_trt_ctx_early_exit_check((const uint8_t *)absent,
+            strlen(absent)), 0, "absent -> decode");
+  return 1;
+}
+
+static int test_trt_stream_requested(void) {
+  const char *s_true = "{\"prompt\":\"a\",\"stream\":true}";
+  const char *s_false = "{\"prompt\":\"a\",\"stream\":false}";
+  const char *s_absent = "{\"prompt\":\"a\"}";
+
+  ASSERT_EQ(pd_trt_stream_requested((const uint8_t *)s_true, strlen(s_true)),
+            1, "stream:true detected");
+  ASSERT_EQ(pd_trt_stream_requested((const uint8_t *)s_false,
+            strlen(s_false)), 0, "stream:false");
+  ASSERT_EQ(pd_trt_stream_requested((const uint8_t *)s_absent,
+            strlen(s_absent)), 0, "stream absent");
+  ASSERT_EQ(pd_trt_stream_requested(NULL, 0), 0, "null body");
+  return 1;
+}
+
 int main(void) {
   printf("=== Suite A: P/D JSON Rewriting ===\n");
   RUN_TEST(test_normal_rewrite);
@@ -1107,6 +1349,22 @@ int main(void) {
   RUN_TEST(test_sg_inject_original_untouched);
   RUN_TEST(test_sg_room_id_range);
   RUN_TEST(test_sg_room_id_distinct);
+
+  printf("\n=== Suite G: TRT-LLM Dialect Body Surgery ===\n");
+  RUN_TEST(test_trt_prefill_basic);
+  RUN_TEST(test_trt_prefill_exact_bytes);
+  RUN_TEST(test_trt_prefill_empty_object);
+  RUN_TEST(test_trt_prefill_fresh_ids);
+  RUN_TEST(test_trt_extract_typical);
+  RUN_TEST(test_trt_extract_null_params);
+  RUN_TEST(test_trt_extract_outside_choices);
+  RUN_TEST(test_trt_extract_overflow);
+  RUN_TEST(test_trt_decode_body);
+  RUN_TEST(test_trt_decode_body_no_request_type);
+  RUN_TEST(test_trt_decode_body_empty_params);
+  RUN_TEST(test_trt_decode_body_empty_obj_params);
+  RUN_TEST(test_trt_early_exit_verdicts);
+  RUN_TEST(test_trt_stream_requested);
 
   printf("\n=== Results: %d/%d tests passed ===\n", tests_passed, tests_run);
 

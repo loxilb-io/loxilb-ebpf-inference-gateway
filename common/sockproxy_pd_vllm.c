@@ -14,8 +14,11 @@
  * Last re-validated: 2026-08 full long-context GPU suite green.
  *
  * TensorRT-LLM note: its disaggregation is sequential ctx-first — a
- * parameterization of THIS machine (see the dialect resolver). A dedicated
- * sockproxy_pd_trtllm.c only appears once its contract diverges.
+ * parameterization of THIS machine. The pd_dialect_trtllm table
+ * (sockproxy_pd_trtllm.c) provides its own prefill rewrite and rides
+ * everything else here; the machine selects the dialect's body-surgery
+ * functions (extract / decode-body / early-exit) by epval->pd_engine at
+ * the three sites below.
  */
 
 #define _GNU_SOURCE
@@ -157,8 +160,8 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
    * <400 resets, 4xx stays neutral (client faults), status-unknown (0 —
    * transport deaths stay with the connect-level breaker feed) is neutral
    * too. Decode-leg statuses are deliberately not attributed. */
+  int pr_status = pd_http_resp_status(l_prefill, l_prefill_len);
   {
-    int pr_status = pd_http_resp_status(l_prefill, l_prefill_len);
     int pr_ep = client_pfe->pd_prefill_ep_idx;
     if (pr_ep >= 0) {
       if (pr_status >= 500) {
@@ -182,7 +185,24 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
                                            NULL, __ATOMIC_ACQ_REL);
   if (!l_headers) l_headers_len = 0; else client_pfe->pd_saved_headers_len = 0;
 
-  /* 1. Extract kv_params from prefill response */
+  int is_trt = (tepval->pd_engine == PD_ENGINE_TRTLLM);
+
+  /* TRT-LLM early exit: a 200 context response whose finish_reason is
+   * neither "length" nor "not_finished" already finished the request in
+   * the context step — relay it and skip the decode leg entirely. Gated on
+   * status 200 so error responses keep the vLLM-shaped degradation (decode
+   * recompute + the origin-streak feed above). */
+  if (is_trt && pr_status == 200 &&
+      pd_trt_ctx_early_exit_check(l_prefill, l_prefill_len)) {
+    pd_trt_early_exit_relay(client_pfe, l_prefill, l_prefill_len,
+                            pd_trt_stream_requested(l_body, l_body_len));
+    ret = 0;
+    goto out;
+  }
+
+  /* 1. Extract the transfer params from the prefill response (dialect
+   *    surgery: kv_transfer_params for vLLM, choices[0].disaggregated_params
+   *    for TRT-LLM — both land in pd_kv_params) */
   /* Determine effective KV params capacity: runtime config or compile-time max */
   size_t kv_capacity = sizeof(client_pfe->pd_kv_params);
   proxy_epval_t *kv_epv = (proxy_epval_t *)client_pfe->epv;
@@ -190,24 +210,35 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
       kv_epv->pd_kv_params_max < kv_capacity) {
       kv_capacity = kv_epv->pd_kv_params_max;
   }
-  int kv_ret = pd_extract_kv_params(l_prefill,
+  int kv_ret = is_trt ?
+      pd_trt_extract_disagg_params(l_prefill,
+                       l_prefill_len,
+                       client_pfe->pd_kv_params,
+                       &client_pfe->pd_kv_params_len,
+                       kv_capacity) :
+      pd_extract_kv_params(l_prefill,
                        l_prefill_len,
                        client_pfe->pd_kv_params,
                        &client_pfe->pd_kv_params_len,
                        kv_capacity);
   if (kv_ret == -EMSGSIZE) {
-    log_error("kv_transfer_params overflow (%zu bytes) — decode will recompute prefill",
+    log_error("%s overflow (%zu bytes) — decode will recompute prefill",
+              is_trt ? "disaggregated_params" : "kv_transfer_params",
               l_prefill_len);
     /* Graceful degradation: pd_kv_params_len already set to 0 */
   } else if (kv_ret == -ENOENT) {
-    log_debug("kv_transfer_params not found in prefill response — decode will recompute");
+    log_debug("%s not found in prefill response — decode will recompute",
+              is_trt ? "disaggregated_params" : "kv_transfer_params");
     /* Normal for non-NIXL vLLM — proceed without KV params */
   } else if (kv_ret == -EINVAL) {
-    log_error("pd_extract_kv_params: invalid arguments (should not happen)");
+    log_error("pd transfer-params extract: invalid arguments (should not happen)");
   }
 
-  /* 2. Build decode request body with kv_transfer_params injection */
-  size_t decode_body_cap = l_body_len + 8192;
+  /* 2. Build decode request body with the transfer-params injection. The
+   *    capacity covers the extracted span explicitly — TRT-LLM's
+   *    encoded_opaque_state measures KiB-scale, and a too-small buffer
+   *    would silently degrade the decode leg to a full prefill recompute. */
+  size_t decode_body_cap = l_body_len + client_pfe->pd_kv_params_len + 8192;
   decode_body = malloc(decode_body_cap);
   if (!decode_body) {
     log_error("malloc failed for decode_body");
@@ -215,13 +246,22 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   }
 
   size_t decode_body_len = 0;
-  if (pd_prepare_decode_body(l_body,
+  int db_ret = is_trt ?
+      pd_trt_prepare_decode_body(l_body,
                              l_body_len,
                              client_pfe->pd_kv_params,
                              client_pfe->pd_kv_params_len,
                              decode_body, &decode_body_len,
-                             decode_body_cap) != 0) {
-    log_error("pd_prepare_decode_body failed");
+                             decode_body_cap) :
+      pd_prepare_decode_body(l_body,
+                             l_body_len,
+                             client_pfe->pd_kv_params,
+                             client_pfe->pd_kv_params_len,
+                             decode_body, &decode_body_len,
+                             decode_body_cap);
+  if (db_ret != 0) {
+    log_error("pd decode-body build failed (engine=%s)",
+              is_trt ? "trtllm" : "vllm");
     goto out;
   }
 
@@ -337,6 +377,9 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
    * completion check (phase == PD_PHASE_DECODE_SENDING) to miss and
    * llb_ai_pd_record to never be called. Set unconditionally here. */
   client_pfe->pd_phase = PD_PHASE_DECODE_SENDING;
+  /* restart the phase clock: it still holds the prefill dispatch time, and
+   * the health scan's decode first-byte wedge measures from here */
+  client_pfe->pd_phase_start_ts = time(NULL);
   {
     struct timespec _ts;
     clock_gettime(CLOCK_MONOTONIC, &_ts);
@@ -478,15 +521,21 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
 
     if (ep_cfd < 0 || new_idx < 0) goto fail;
 
-    /* Rebuild the prefill request exactly as at admission: deterministic
-     * max_tokens=1/stream=false rewrite of the ORIGINAL body under the
-     * ORIGINAL headers (same X-Request-Id), with Content-Length re-fitted. */
+    /* Rebuild the prefill request exactly as at admission via the dialect
+     * rewriter: the vLLM max_tokens=1/stream=false probe, or the TRT-LLM
+     * context splice (which draws a FRESH disagg_request_id — the
+     * reference proxy allocates one per context dispatch too). Same
+     * ORIGINAL body under the ORIGINAL headers (same X-Request-Id), with
+     * Content-Length re-fitted. */
     size_t prefill_cap = body_len + 4096;
     size_t prefill_len = 0;
+    pd_body_rewrite_t rewrite =
+        (tepval->pd_engine == PD_ENGINE_TRTLLM) ?
+            pd_trt_prepare_prefill_body : pd_prepare_prefill_body;
     prefill_buf = malloc(prefill_cap);
     if (!prefill_buf ||
-        pd_prepare_prefill_body(body, body_len, prefill_buf, &prefill_len,
-                                prefill_cap) != 0) {
+        rewrite(body, body_len, prefill_buf, &prefill_len,
+                prefill_cap) != 0) {
       log_error("prefill failover: body rewrite failed (client_fd=%d)",
                 client_pfe->fd);
       close(ep_cfd);
@@ -680,13 +729,16 @@ done:
 
 /* --- Dialect ops --------------------------------------------------------- */
 
-/* vLLM sequential machine: save the original body for the decode phase and
- * rewrite the request into the prefill probe (max_tokens=1, stream=false,
- * +kv_transfer_params). Failures log and fall back to plain forwarding of
- * the untouched request (returns 0 — never fails the client here). */
-static int
-pd_vllm_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
-                        size_t hdr_len, const uint8_t *body, size_t body_len)
+/* Sequential-machine request preparation, parameterized by the dialect's
+ * prefill-body rewriter (vLLM probe rewrite vs TRT-LLM context splice).
+ * Everything else — original-body save, response-buffer allocation,
+ * phase/timestamp arming — is dialect-invariant. Failures log and fall
+ * back to plain forwarding of the untouched request (returns 0 — never
+ * fails the client here). */
+int
+pd_seq_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
+                       size_t hdr_len, const uint8_t *body, size_t body_len,
+                       pd_body_rewrite_t rewrite)
 {
   (void)epval;
   /* 1. Save original body for decode phase */
@@ -695,14 +747,13 @@ pd_vllm_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
     memcpy(pfe->pd_saved_body, body, body_len);
     pfe->pd_saved_body_len = body_len;
 
-    /* 2. Rewrite body for prefill: max_tokens=1, stream=false,
-     *    +kv_transfer_params */
+    /* 2. Rewrite body for the prefill leg (dialect rewriter) */
     uint8_t *prefill_buf = malloc(body_len + 4096);
     if (prefill_buf) {
       size_t prefill_body_len = 0;
-      if (pd_prepare_prefill_body(body, body_len,
-                                  prefill_buf, &prefill_body_len,
-                                  body_len + 4096) == 0) {
+      if (rewrite(body, body_len,
+                  prefill_buf, &prefill_body_len,
+                  body_len + 4096) == 0) {
         /* Replace body in rcvbuf */
         memcpy(pfe->rcvbuf + hdr_len, prefill_buf, prefill_body_len);
         pfe->rcv_off = hdr_len + prefill_body_len;
@@ -749,9 +800,20 @@ pd_vllm_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
   return 0;
 }
 
-/* vLLM forward: prefill leg only (EP 0, set in proxy_setup_ep__), then the
- * sequential machine waits for the prefill response. */
+/* vLLM sequential machine: the classic prefill probe rewrite
+ * (max_tokens=1, stream=false, +kv_transfer_params). */
 static int
+pd_vllm_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
+                        size_t hdr_len, const uint8_t *body, size_t body_len)
+{
+  return pd_seq_prepare_request(pfe, epval, hdr_len, body, body_len,
+                                pd_prepare_prefill_body);
+}
+
+/* Sequential-machine forward: prefill leg only (EP 0, set in
+ * proxy_setup_ep__), then the machine waits for the prefill response.
+ * Shared verbatim by the vLLM and TRT-LLM dialect tables. */
+int
 pd_vllm_dispatch(struct proxy_fd_ent *pfe)
 {
   /* frame instrument (log-only): prefill forward site — declared
