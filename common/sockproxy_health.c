@@ -1126,8 +1126,15 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
     break;
     
   case CB_STATE_HALF_OPEN:
+    /* Origin-tripped breaker: the EP accepts TCP fine — that is exactly why
+     * it tripped, so a connect success proves nothing. The HALF_OPEN probe's
+     * ORIGIN status decides: <400 closes it (record_origin_success), a 5xx
+     * re-trips immediately (record_origin_error). */
+    if (circuit_breaker_origin_gates_connect_close(cb)) {
+      break;
+    }
     cb->success_count++;
-    
+
     if (cb->success_count >= cb->success_threshold) {
       // Enough successes - close circuit
       cb->state = CB_STATE_CLOSED;
@@ -1205,17 +1212,30 @@ circuit_breaker_record_origin_error(proxy_epval_t *tepval, int ep_index)
   pd_parked_drain_ep(tepval, ep_index, "cb-origin-open");
 }
 
-/* Record an origin success (status < 400) from a P/D backend leg: the
- * origin-error streak resets. Breaker state transitions stay with the
- * existing connect-success path. */
+/* Record an origin success (status < 400) from a backend leg: the
+ * origin-error streak resets, and a HALF_OPEN probe on an ORIGIN-tripped
+ * breaker closes it — the origin status is the recovery proof a connect
+ * success cannot provide (the connect-success close is withheld for
+ * origin-tripped breakers, see circuit_breaker_record_success). */
 void
 circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index)
 {
+  circuit_breaker_t *cb;
+
   if (!tepval || !tepval->cb_enabled ||
       ep_index < 0 || ep_index >= MAX_PROXY_EP) {
     return;
   }
-  circuit_breaker_origin_note_success(&tepval->circuit_breakers[ep_index]);
+  cb = &tepval->circuit_breakers[ep_index];
+  if (circuit_breaker_origin_note_success(cb)) {
+    cb->state = CB_STATE_CLOSED;
+    cb->failure_count = 0;
+    cb->success_count = 0;
+    cb->origin_tripped = 0;
+    atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* HALF_OPEN→CLOSED */
+    log_info("[CB_ORIGIN] ep[%d] HALF_OPEN->CLOSED on origin success — "
+             "fully back in rotation", ep_index);
+  }
 }
 
 // ============================================================================

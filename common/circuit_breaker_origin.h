@@ -7,7 +7,7 @@
  *
  * The includer must already provide:
  *   - the `circuit_breaker_t` type with fields:
- *       state, origin_err_streak
+ *       state, origin_err_streak, origin_tripped
  *   - the enum values CB_STATE_CLOSED, CB_STATE_OPEN, CB_STATE_HALF_OPEN
  *
  * Why a separate streak: the breaker's failure_count is fed by CONNECT-level
@@ -42,26 +42,44 @@ circuit_breaker_origin_note_error(circuit_breaker_t *cb, int threshold)
     cb->origin_err_streak++;
     if (cb->origin_err_streak >= (uint32_t)threshold) {
       cb->origin_err_streak = 0;
+      cb->origin_tripped = 1;
       return 1;
     }
     return 0;
   case CB_STATE_HALF_OPEN:
     cb->origin_err_streak = 0;
+    cb->origin_tripped = 1;
     return 1;
   default:
     return 0;
   }
 }
 
-/* Note an origin success (status < 400): the streak resets. Breaker state is
- * left alone — HALF_OPEN -> CLOSED recovery stays with the existing success
- * path. */
-static inline void
+/* An origin-tripped breaker must NOT close on a connect success: the EP
+ * accepts TCP fine — that is exactly why it tripped. Returns 1 when the
+ * connect-success close must be withheld (the HALF_OPEN probe's ORIGIN
+ * status decides instead, see note_success below). */
+static inline int
+circuit_breaker_origin_gates_connect_close(const circuit_breaker_t *cb)
+{
+  return cb && cb->origin_tripped;
+}
+
+/* Note an origin success (status < 400): the streak resets. Returns 1 when
+ * the caller should CLOSE the breaker now — a HALF_OPEN probe on an
+ * origin-tripped breaker drew a real origin success, which is the recovery
+ * proof a connect success cannot provide. The caller owns the close actions
+ * (state change, counter resets, clearing origin_tripped, observability),
+ * mirroring the note_error trip contract. Connect-tripped breakers return 0:
+ * their HALF_OPEN -> CLOSED recovery stays with the connect-success path. */
+static inline int
 circuit_breaker_origin_note_success(circuit_breaker_t *cb)
 {
-  if (cb) {
-    cb->origin_err_streak = 0;
+  if (!cb) {
+    return 0;
   }
+  cb->origin_err_streak = 0;
+  return (cb->state == CB_STATE_HALF_OPEN && cb->origin_tripped) ? 1 : 0;
 }
 
 #endif /* CIRCUIT_BREAKER_ORIGIN_H */
