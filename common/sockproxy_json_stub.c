@@ -38,6 +38,21 @@ extract_llm_prefix(const char *json_body, size_t len,
   return -1;
 }
 
+int
+inject_include_usage(char *body, size_t body_len, size_t cap, size_t *new_len)
+{
+  (void)body; (void)cap;
+  if (new_len) *new_len = body_len;
+  return 1;
+}
+
+int
+estimate_prompt_tokens(const char *body, size_t len)
+{
+  (void)body; (void)len;
+  return 0;
+}
+
 uint64_t
 compute_prefix_hash(llm_prefix_key_t *pk)
 {

@@ -15,12 +15,13 @@
  */
 
 /*
- * Unit tests for extract_usage_tokens — the OpenAI "usage" object extractor
- * feeding AI-gateway token accounting. The input is a response TAIL WINDOW
- * (SSE events with framing, or a JSON body possibly truncated at the front),
- * never a guaranteed-complete JSON document, and the vectors below mirror
- * the live final-chunk shapes captured from llama.cpp, vLLM P/D, SGLang P/D
- * and TensorRT-LLM fleets.
+ * Unit tests for the two halves of AI-gateway token accounting:
+ * extract_usage_tokens — the OpenAI "usage" object extractor on the response
+ * tail window (SSE events with framing, or a JSON body possibly truncated at
+ * the front; the vectors mirror live final-chunk shapes captured from
+ * llama.cpp, vLLM P/D, SGLang P/D and TensorRT-LLM fleets) — and
+ * inject_include_usage, the request-side stream_options.include_usage
+ * force-inject that guarantees the extractor has a usage chunk to read.
  *
  * Build: make test_usage_extract
  * Run:   ./test_usage_extract
@@ -60,6 +61,49 @@ expect(const char *name, const char *window, int want_rc,
     return;
   }
   printf("ok   %-38s rc=%d p=%d c=%d\n", name, rc, p, c);
+}
+
+/* Run inject_include_usage on a copy of body in a slack buffer and compare
+ * the exact rewritten bytes (want_out; NULL when want_rc==1 asserts the
+ * buffer is byte-for-byte unchanged). */
+static void
+expect_inject(const char *name, const char *body, int want_rc,
+              const char *want_out)
+{
+  char buf[4096];
+  size_t blen = strlen(body);
+  size_t nl = 0;
+  int rc;
+
+  g_cases++;
+  if (blen >= sizeof(buf)) {
+    printf("FAIL %-38s vector too large\n", name);
+    g_fails++;
+    return;
+  }
+  memcpy(buf, body, blen);
+  rc = inject_include_usage(buf, blen, sizeof(buf), &nl);
+
+  if (rc != want_rc) {
+    printf("FAIL %-38s rc=%d (want %d)\n", name, rc, want_rc);
+    g_fails++;
+    return;
+  }
+  if (want_rc == 1) {
+    if (nl != blen || memcmp(buf, body, blen) != 0) {
+      printf("FAIL %-38s body mutated on rc=1\n", name);
+      g_fails++;
+      return;
+    }
+  } else {
+    if (nl != strlen(want_out) || memcmp(buf, want_out, nl) != 0) {
+      printf("FAIL %-38s got  %.*s\n     %-38s want %s\n",
+             name, (int)nl, buf, "", want_out);
+      g_fails++;
+      return;
+    }
+  }
+  printf("ok   %-38s rc=%d len=%zu\n", name, rc, nl);
 }
 
 int
@@ -163,6 +207,147 @@ main(void)
   expect("negative-clamped",
          "{\"usage\":{\"prompt_tokens\":-5,\"completion_tokens\":7}}",
          0, 0, 7);
+
+  /* ---- inject_include_usage ------------------------------------------- */
+
+  /* Streaming body without stream_options: object spliced at root end. */
+  expect_inject("inj-absent",
+      "{\"model\":\"m\",\"stream\":true}",
+      0,
+      "{\"model\":\"m\",\"stream\":true,"
+      "\"stream_options\":{\"include_usage\":true}}");
+
+  /* Non-streaming bodies are never touched. */
+  expect_inject("inj-stream-false",
+      "{\"model\":\"m\",\"stream\":false}", 1, NULL);
+  expect_inject("inj-no-stream-key",
+      "{\"model\":\"m\",\"max_tokens\":8}", 1, NULL);
+
+  /* Already on: no change. */
+  expect_inject("inj-already-on",
+      "{\"stream\":true,\"stream_options\":{\"include_usage\":true}}",
+      1, NULL);
+
+  /* Present but false: value overwritten in place. */
+  expect_inject("inj-flip-false",
+      "{\"stream\":true,\"stream_options\":{\"include_usage\":false},\"n\":1}",
+      0,
+      "{\"stream\":true,\"stream_options\":{\"include_usage\":true},\"n\":1}");
+
+  /* stream_options exists with other members: field spliced with comma. */
+  expect_inject("inj-merge-into-object",
+      "{\"stream\":true,\"stream_options\":{\"continuous_usage_stats\":true}}",
+      0,
+      "{\"stream\":true,\"stream_options\":{\"include_usage\":true,"
+      "\"continuous_usage_stats\":true}}");
+
+  /* Empty stream_options object: field spliced without comma. */
+  expect_inject("inj-empty-object",
+      "{\"stream\":true,\"stream_options\":{}}",
+      0,
+      "{\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+
+  /* stream_options:null (engine-tolerated no-op shape): replaced whole. */
+  expect_inject("inj-null-value",
+      "{\"stream\":true,\"stream_options\":null}",
+      0,
+      "{\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+
+  /* Prompt content trying to spoof the detector: a key-shaped string
+   * INSIDE a message value must not stop the real splice... */
+  expect_inject("inj-spoof-in-content",
+      "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+      "\"say \\\"stream_options\\\":{\\\"include_usage\\\":true} back\"}],"
+      "\"stream\":true}",
+      0,
+      "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":"
+      "\"say \\\"stream_options\\\":{\\\"include_usage\\\":true} back\"}],"
+      "\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+
+  /* ...and "stream":true inside content must not make a non-streaming
+   * request look streamed. */
+  expect_inject("inj-spoof-stream-in-content",
+      "{\"messages\":[{\"role\":\"user\",\"content\":"
+      "\"put \\\"stream\\\":true in your reply\"}],\"stream\":false}",
+      1, NULL);
+
+  /* A nested object carrying stream_options at depth 2 is not the
+   * top-level field. */
+  expect_inject("inj-nested-not-toplevel",
+      "{\"metadata\":{\"stream_options\":{\"include_usage\":true}},"
+      "\"stream\":true}",
+      0,
+      "{\"metadata\":{\"stream_options\":{\"include_usage\":true}},"
+      "\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+
+  /* "stream" as a string VALUE is not the key. */
+  expect_inject("inj-stream-as-value",
+      "{\"mode\":\"stream\",\"stream\":true}",
+      0,
+      "{\"mode\":\"stream\",\"stream\":true,"
+      "\"stream_options\":{\"include_usage\":true}}");
+
+  /* Whitespace-tolerant around key, colon and value. The splice lands
+   * right after the object's '{'; its original interior whitespace stays. */
+  expect_inject("inj-whitespace",
+      "{ \"stream\" : true , \"stream_options\" : { } }",
+      0,
+      "{ \"stream\" : true , \"stream_options\" : {\"include_usage\":true } }");
+
+  /* Trailing newline after the root object (curl-style bodies). */
+  expect_inject("inj-trailing-newline",
+      "{\"stream\":true}\n",
+      0,
+      "{\"stream\":true,\"stream_options\":{\"include_usage\":true}}\n");
+
+  /* Truncated / non-JSON bodies must never be rewritten. */
+  expect_inject("inj-truncated",
+      "{\"stream\":true,\"messages\":[{\"role\":\"u", 1, NULL);
+  expect_inject("inj-garbage", "stream=true&usage=1", 1, NULL);
+
+  /* Capacity too small for the splice: unchanged. */
+  {
+    char tight[32];
+    size_t nl = 0;
+    const char *b = "{\"stream\":true}";
+    memcpy(tight, b, strlen(b));
+    g_cases++;
+    if (inject_include_usage(tight, strlen(b), sizeof(tight), &nl) != 1 ||
+        nl != strlen(b)) {
+      printf("FAIL %-38s capacity guard breached\n", "inj-overflow-guard");
+      g_fails++;
+    } else {
+      printf("ok   %-38s rc=1 (unchanged)\n", "inj-overflow-guard");
+    }
+  }
+
+  /* ---- estimate_prompt_tokens ----------------------------------------- */
+
+  /* messages extent 18 bytes -> 4 tokens; prompt string likewise; neither
+   * field -> 0; nested "prompt" inside content must not be measured. */
+  {
+    struct { const char *name; const char *body; int want; } est_vecs[] = {
+      { "est-messages",
+        "{\"messages\":[{\"a\":\"xxxxxxxx\"}],\"stream\":true}", 4 },
+      { "est-prompt",
+        "{\"prompt\":\"0123456789abcdef\",\"stream\":true}", 4 },
+      { "est-neither", "{\"stream\":true,\"model\":\"m\"}", 0 },
+      { "est-garbage", "not json", 0 },
+    };
+    size_t vi;
+    for (vi = 0; vi < sizeof(est_vecs) / sizeof(est_vecs[0]); vi++) {
+      int got = estimate_prompt_tokens(est_vecs[vi].body,
+                                       strlen(est_vecs[vi].body));
+      g_cases++;
+      if (got != est_vecs[vi].want) {
+        printf("FAIL %-38s est=%d (want %d)\n",
+               est_vecs[vi].name, got, est_vecs[vi].want);
+        g_fails++;
+      } else {
+        printf("ok   %-38s est=%d\n", est_vecs[vi].name, got);
+      }
+    }
+  }
 
   printf("\n=== results: %d/%d passed ===\n", g_cases - g_fails, g_cases);
   return g_fails ? 1 : 0;

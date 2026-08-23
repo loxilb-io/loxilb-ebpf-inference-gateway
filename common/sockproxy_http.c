@@ -1465,7 +1465,7 @@ skip_deferred_masking:
           rfd_ent->usage_complet_toks = uc;
           llb_ai_token_quota_consume((char *)rfd_ent->tenant_id,
                                      (char *)proxy_effective_model(rfd_ent),
-                                     up, uc, NULL);
+                                     up, uc, 0, NULL);
           rfd_ent->usage_consumed = 1;
           log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (non-stream)",
                    rfd_ent->fd, up, uc);
@@ -1529,6 +1529,28 @@ skip_deferred_masking:
        * crosses the cap. */
       rfd_ent->pd_last_decode_ts = time(NULL);
 
+      /* Estimate net: count relayed SSE data-object chunks ("data:" whose
+       * value opens with '{' — [DONE] never matches). At the OpenAI
+       * streaming convention of one content delta per chunk this
+       * approximates completion tokens; used only when the final usage
+       * object never materializes. A "data:" split across two TCP
+       * segments undercounts by one — acceptable for a backstop. */
+      {
+        const uint8_t *ev_p = (const uint8_t *)msg;
+        size_t ev_left = len;
+        const uint8_t *ev_hit;
+        while ((ev_hit = memmem(ev_p, ev_left, "data:", 5)) != NULL) {
+          const uint8_t *ev_v = ev_hit + 5;
+          const uint8_t *ev_end = (const uint8_t *)msg + len;
+          while (ev_v < ev_end && (*ev_v == ' ' || *ev_v == '\t'))
+            ev_v++;
+          if (ev_v < ev_end && *ev_v == '{')
+            rfd_ent->usage_sse_events++;
+          ev_left -= (size_t)(ev_hit + 5 - ev_p);
+          ev_p = ev_hit + 5;
+        }
+      }
+
       uint8_t window[PROXY_SSE_TAIL_KEEP * 2];
       uint8_t old_len = rfd_ent->sse_tail_len;
       uint8_t new_len = (len < PROXY_SSE_TAIL_KEEP) ? (uint8_t)len
@@ -1587,6 +1609,7 @@ skip_deferred_masking:
          * request at the rate-limit gate. */
         int sse_tok_p = rfd_ent->usage_prompt_toks;
         int sse_tok_c = rfd_ent->usage_complet_toks;
+        int sse_estimated = 0;
         if (!rfd_ent->usage_consumed) {
           const pd_dialect_ops_t *sse_uops = proxy_usage_ops(rfd_ent);
           if (sse_uops->extract_usage &&
@@ -1598,15 +1621,23 @@ skip_deferred_masking:
             log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (stream)",
                      rfd_ent->fd, sse_tok_p, sse_tok_c);
           } else {
-            sse_tok_p = 0;
-            sse_tok_c = 0;
-            log_info("[AI_TOKENS] client_fd=%d no usage in final chunk "
-                     "(include_usage not requested?)", rfd_ent->fd);
+            /* No usage object despite the request-side include_usage
+             * inject (chunked/oversize body skipped it, or the engine
+             * dropped the final chunk) — fall back to the estimate net so
+             * the stream is not free. */
+            sse_tok_p = (int)rfd_ent->usage_est_prompt;
+            sse_tok_c = (int)rfd_ent->usage_sse_events;
+            sse_estimated = (sse_tok_p + sse_tok_c) > 0;
+            rfd_ent->usage_prompt_toks = sse_tok_p;
+            rfd_ent->usage_complet_toks = sse_tok_c;
+            log_info("[AI_TOKENS] client_fd=%d no usage in final chunk — "
+                     "estimated prompt=%d completion=%d",
+                     rfd_ent->fd, sse_tok_p, sse_tok_c);
           }
           rfd_ent->usage_consumed = 1;
         }
         llb_ai_token_quota_consume((char *)sse_tenant, (char *)sse_model,
-                                   sse_tok_p, sse_tok_c, NULL);
+                                   sse_tok_p, sse_tok_c, sse_estimated, NULL);
         /* Step 4: End SSE stream gauge */
         llb_ai_stream_end("", (char *)sse_model);
         /* Step 5: Record request metrics. Status comes from the backend
@@ -5611,6 +5642,8 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->usage_consumed = 0;
     pfe->usage_prompt_toks = 0;
     pfe->usage_complet_toks = 0;
+    pfe->usage_est_prompt = 0;
+    pfe->usage_sse_events = 0;
   }
   return 0;
 }
@@ -6970,6 +7003,55 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 
   // NOW forward accumulated data to backend
   if (pfe->rfd[0] > 0) {  // Backend connected successfully
+
+    /* AI-gateway token accounting: force stream_options.include_usage=true
+     * into streaming request bodies BEFORE any dialect rewrite, so the
+     * backend's final SSE chunk carries the usage object the response path
+     * charges from. A client that omits the flag would otherwise stream
+     * tokens invisible to the per-tenant quota. Placement covers every
+     * plane from one site: the plain relay forwards the patched body, the
+     * sequential P/D machines save it for the decode leg (their prefill
+     * rewrites strip stream_options again), and the sglang dual dispatch
+     * inherits it on both legs — exactly what a reference router forwards
+     * when the client itself sets the flag. Chunked or partially
+     * accumulated bodies are left untouched (not contiguous/complete
+     * here); non-streaming requests carry usage without the flag. */
+    if (pfe->epv && pfe->odir == 0 && pfe->rcv_off > 4 && !pfe->is_streamable &&
+        ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
+      size_t ug_scan = pfe->rcv_off < 2048 ? pfe->rcv_off : 2048;
+      if (memmem(pfe->rcvbuf, ug_scan, "Transfer-Encoding: chunked", 26) == NULL &&
+          memmem(pfe->rcvbuf, ug_scan, "transfer-encoding: chunked", 26) == NULL) {
+        char *ug_body = NULL;
+        size_t ug_body_len = 0, ug_hdr_len = 0;
+        for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
+          if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
+              pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
+            ug_hdr_len = i + 4;
+            ug_body = (char *)pfe->rcvbuf + ug_hdr_len;
+            ug_body_len = pfe->rcv_off - ug_hdr_len;
+            break;
+          }
+        }
+        if (ug_body && ug_body_len > 0 && pfe->http_content_length > 0 &&
+            ug_body_len >= (size_t)pfe->http_content_length) {
+          size_t ug_new_len = ug_body_len;
+          if (inject_include_usage(ug_body, ug_body_len,
+                                   SP_SOCK_MSG_LEN - ug_hdr_len,
+                                   &ug_new_len) == 0) {
+            pfe->rcv_off = ug_hdr_len + ug_new_len;
+            pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
+                                     SP_SOCK_MSG_LEN, ug_new_len);
+            log_info("[AI_USAGE_INJECT] fd=%d body %zu -> %zu bytes",
+                     pfe->fd, ug_body_len, ug_new_len);
+          }
+          /* Size the prompt-estimate net while the body is at hand — only
+           * ever charged (flagged estimated) when the response's usage
+           * object fails to materialize. */
+          pfe->usage_est_prompt =
+              (uint32_t)estimate_prompt_tokens(ug_body, ug_new_len);
+        }
+      }
+    }
 
     /* P/D disaggregation body rewriting.
      * Moved here from handle_on_message_complete because pfe->epv

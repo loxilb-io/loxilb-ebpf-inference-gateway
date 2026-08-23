@@ -36,6 +36,21 @@ int extract_model_field(const char *body, size_t len, char *out, size_t cap);
 int extract_usage_tokens(const char *buf, size_t len, int *prompt_tokens,
                          int *completion_tokens);
 
+/* Force stream_options.include_usage=true into a streaming OpenAI-compatible
+ * request body (in place; cap is the buffer capacity behind body) so the
+ * final SSE chunk carries the usage object token accounting charges from.
+ * Returns 0 when the body was modified (*new_len updated), 1 when no change
+ * was needed or possible (*new_len == body_len).
+ */
+int inject_include_usage(char *body, size_t body_len, size_t cap,
+                         size_t *new_len);
+
+/* Estimate the prompt-token count of a request body from the byte extent of
+ * its top-level "messages" or "prompt" value (~4 bytes/token). Estimate net
+ * for responses whose usage object never materializes. Returns 0 on miss.
+ */
+int estimate_prompt_tokens(const char *body, size_t len);
+
 /* Extract LLM prefix key (model, prompt/messages, optional L2/L3 fields)
  * from the JSON request body.
  *

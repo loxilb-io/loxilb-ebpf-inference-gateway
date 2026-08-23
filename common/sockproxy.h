@@ -1010,6 +1010,14 @@ struct proxy_fd_ent {
   uint8_t  usage_consumed;            // 1 = token quota charged for the current response
   int      usage_prompt_toks;         // extracted usage.prompt_tokens (0 = none seen)
   int      usage_complet_toks;        // extracted usage.completion_tokens
+  /* Estimate net for responses whose usage object never materializes
+   * (chunked/oversize request bodies skip the include_usage inject; an
+   * engine may drop the final chunk). usage_est_prompt is sized from the
+   * request's messages/prompt bytes at dispatch; usage_sse_events counts
+   * relayed "data: {" SSE chunks (~1 completion token per content chunk).
+   * Charged with the estimated flag ONLY when extraction misses. */
+  uint32_t usage_est_prompt;          // prompt-token estimate from the request body
+  uint32_t usage_sse_events;          // relayed SSE data-object chunk count
   time_t   pd_last_decode_ts;         // wall-clock of the LAST decode backend byte relayed to the
                                       // client. Refreshed per byte during decode streaming so the safety-net
                                       // reaper (sockproxy_health.c) can gate graceful [DONE] synthesis on

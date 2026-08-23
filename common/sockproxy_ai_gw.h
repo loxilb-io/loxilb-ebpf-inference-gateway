@@ -168,6 +168,9 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  *   model_name     effective model name (NUL-terminated; pass "" if unknown)
  *   prompt_tokens  token count from the request body; 0 when absent
  *   complet_tokens token count from the response body; 0 when absent
+ *   estimated      1 when the counts come from the estimate net (request-size
+ *                  prompt estimate + SSE chunk count) rather than an extracted
+ *                  usage object; feeds the estimated-tokens split metric
  *   result         output structure; decision may be set to 3 when quota exceeded
  *
  * Returns:
@@ -176,7 +179,7 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  */
 extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                                       int prompt_tokens, int complet_tokens,
-                                      ai_gw_decision_t *result);
+                                      int estimated, ai_gw_decision_t *result);
 
 /*
  * llb_ai_pd_record – record a P/D disaggregation lifecycle event.
