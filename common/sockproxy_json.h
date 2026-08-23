@@ -23,6 +23,11 @@
  */
 int extract_user_id(const char *body, size_t len, char *out, size_t cap);
 
+/* Extract the top-level "model" field from an OpenAI-compatible JSON body.
+ * Returns 0 on success (found model in out), -1 on miss.
+ */
+int extract_model_field(const char *body, size_t len, char *out, size_t cap);
+
 /* Extract LLM prefix key (model, prompt/messages, optional L2/L3 fields)
  * from the JSON request body.
  *

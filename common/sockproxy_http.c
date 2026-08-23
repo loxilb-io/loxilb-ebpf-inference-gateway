@@ -5522,8 +5522,32 @@ handle_on_message_complete(llhttp_t* parser)
     proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
     if (hent->val.ephash && hent->val.ephash->ai_gw_mode) {
       ai_gw_decision_t ai_dec = {0};
-      char *model = pfe->x_model_header[0] ? pfe->x_model_header
-                  : (pfe->prefix_key.model[0] ? pfe->prefix_key.model : "");
+      char body_model[MAX_MODEL_LEN] = {0};
+
+      /* allowed_models must bind to the model the backend will actually
+       * serve, which is the one in the JSON body — an X-Model header that
+       * differs from the body is at best a stale hint and at worst a spoof.
+       * The message is complete here, so the body is present in rcvbuf;
+       * parse it and fall back to the header only when the body carries no
+       * model field. */
+      if (pfe->http_content_length > 0 && pfe->rcv_off > 4) {
+        const char *body_start = NULL;
+        size_t body_len = 0;
+        for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
+          if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
+              pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
+            body_start = (const char *)(pfe->rcvbuf + i + 4);
+            body_len = pfe->rcv_off - (i + 4);
+            break;
+          }
+        }
+        if (body_start && body_len > 0) {
+          extract_model_field(body_start, body_len, body_model, sizeof(body_model));
+        }
+      }
+      char *model = body_model[0] ? body_model
+                  : (pfe->prefix_key.model[0] ? pfe->prefix_key.model
+                  : (pfe->x_model_header[0] ? pfe->x_model_header : ""));
 
       /* Step 1: validate X-Api-Key → 401 (missing/invalid) or 403 (model denied) */
       int ai_rc = llb_ai_validate_key(pfe->x_api_key_raw, model, &ai_dec);

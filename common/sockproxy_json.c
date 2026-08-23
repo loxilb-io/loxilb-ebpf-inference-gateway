@@ -431,6 +431,40 @@ extract_user_id(const char *body, size_t len, char *out, size_t cap)
   return -1;
 }
 
+// AI Gateway allowed_models: extract the top-level "model" field from an
+// OpenAI-compatible JSON body. Same top-level-only iteration as
+// extract_user_id so nested "model" strings (e.g. inside messages content)
+// are never matched. The token pool must fit the WHOLE body — jsmn fails
+// outright rather than partially when it runs out — so it is sized like
+// extract_llm_prefix's, not extract_user_id's 64.
+int
+extract_model_field(const char *body, size_t len, char *out, size_t cap)
+{
+  jsmn_parser p;
+  jsmntok_t tokens[2048];
+  int r, i, pair;
+
+  if (!body || len == 0 || !out || cap == 0) return -1;
+
+  jsmn_init(&p);
+  r = jsmn_parse(&p, body, len, tokens, 2048);
+  if (r < 2 || tokens[0].type != JSMN_OBJECT) return -1;
+
+  i = 1;
+  for (pair = 0; pair < tokens[0].size && i + 1 < r; pair++) {
+    if (tokens[i].type == JSMN_STRING &&
+        jsoneq(body, &tokens[i], "model") == 0 &&
+        tokens[i + 1].type == JSMN_STRING) {
+      json_extract_string(body, &tokens[i + 1], out, cap);
+      return (out[0] != '\0') ? 0 : -1;
+    }
+    /* Skip the key token (always 1) then skip the entire value subtree. */
+    i++;
+    i += jsmn_subtree_count(tokens, i, r);
+  }
+  return -1;
+}
+
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
 /* User-prefix affinity fallback: chat bodies with NO system message used to
  * return -1 here, so every such request was sprayed (per-request hash) and
