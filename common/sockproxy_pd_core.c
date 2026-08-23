@@ -23,6 +23,7 @@
 #include "llhttp.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"
+#include "sockproxy_json.h"
 
 /* Wire kv_engine_type → PD_ENGINE_*. Values are equal by construction for
  * the engines the control plane emits today; unknown/future values degrade
@@ -57,6 +58,29 @@ pd_dialect_resolve(uint8_t pd_engine)
     return &pd_dialect_vllm;
   }
 }
+
+/* Shared OpenAI-convention usage extractor. Every supported engine reports
+ * token usage the same way (verified live across llama.cpp, vLLM P/D,
+ * SGLang P/D and TensorRT-LLM: usage rides the final pre-[DONE] SSE chunk
+ * under stream_options.include_usage, or the body object non-streaming, and
+ * the client-visible/decode stream always carries prompt_tokens), so all
+ * dialect profiles bind this one parser. */
+int
+pd_usage_extract_openai(struct proxy_fd_ent *pfe, const uint8_t *buf,
+                        size_t len, int *prompt_tokens, int *completion_tokens)
+{
+  (void)pfe;
+  return extract_usage_tokens((const char *)buf, len, prompt_tokens,
+                              completion_tokens);
+}
+
+/* Plain-LB profile: AI-gateway rules with no engine dialect (no
+ * kv_engine_type) still account tokens; every P/D orchestration op stays
+ * NULL. */
+const pd_dialect_ops_t pd_dialect_plain = {
+  .name = "plain",
+  .extract_usage = pd_usage_extract_openai,
+};
 
 /* Update Content-Length header in HTTP request buffer.
  * Searches for "Content-Length:" header and replaces the value with new_body_len.

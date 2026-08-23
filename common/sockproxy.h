@@ -995,6 +995,21 @@ struct proxy_fd_ent {
                                       // streams to 0 and NTP steps could skew/negate the delta)
   uint8_t  sse_tail[20];              // Sliding tail buffer for TCP-fragmentation-safe [DONE] scanner
   uint8_t  sse_tail_len;              // Number of valid bytes in sse_tail
+
+  /* Token-accounting response scan state. usage_tail is a sliding window
+   * over the LAST bytes of the backend response relayed to this client fd —
+   * sized to hold the final SSE usage chunk (or the tail of a non-streamed
+   * JSON body) across TCP segment splits. The quota is charged exactly once
+   * per response (usage_consumed); all four fields reset with the other
+   * per-request captures at the next message begin. proxy_fd_ent is not
+   * xSync-serialized, so this growth is HA-safe (pd_last_decode_ts
+   * precedent below). */
+#define PROXY_USAGE_TAIL_KEEP 1024
+  uint8_t  usage_tail[PROXY_USAGE_TAIL_KEEP];
+  uint16_t usage_tail_len;            // Number of valid bytes in usage_tail
+  uint8_t  usage_consumed;            // 1 = token quota charged for the current response
+  int      usage_prompt_toks;         // extracted usage.prompt_tokens (0 = none seen)
+  int      usage_complet_toks;        // extracted usage.completion_tokens
   time_t   pd_last_decode_ts;         // wall-clock of the LAST decode backend byte relayed to the
                                       // client. Refreshed per byte during decode streaming so the safety-net
                                       // reaper (sockproxy_health.c) can gate graceful [DONE] synthesis on

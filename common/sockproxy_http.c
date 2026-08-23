@@ -840,6 +840,41 @@ rewrite_location_header(uint8_t *buf, size_t buflen, size_t bufsize, int is_ssl)
   return new_len;
 }
 
+/* Slide the token-accounting tail window: keep the last
+ * PROXY_USAGE_TAIL_KEEP bytes of the response stream. Unlike the [DONE]
+ * scanner's replace-tail, partial segments ACCUMULATE so a usage object
+ * split across small SSE segments survives intact in the window. */
+static void
+proxy_usage_tail_update(proxy_fd_ent_t *pfe, const uint8_t *msg, size_t len)
+{
+  if (len >= PROXY_USAGE_TAIL_KEEP) {
+    memcpy(pfe->usage_tail, msg + len - PROXY_USAGE_TAIL_KEEP,
+           PROXY_USAGE_TAIL_KEEP);
+    pfe->usage_tail_len = PROXY_USAGE_TAIL_KEEP;
+    return;
+  }
+  if ((size_t)pfe->usage_tail_len + len > PROXY_USAGE_TAIL_KEEP) {
+    size_t shift = (size_t)pfe->usage_tail_len + len - PROXY_USAGE_TAIL_KEEP;
+    memmove(pfe->usage_tail, pfe->usage_tail + shift,
+            pfe->usage_tail_len - shift);
+    pfe->usage_tail_len = (uint16_t)(pfe->usage_tail_len - shift);
+  }
+  memcpy(pfe->usage_tail + pfe->usage_tail_len, msg, len);
+  pfe->usage_tail_len = (uint16_t)(pfe->usage_tail_len + len);
+}
+
+/* Dialect ops for token accounting on the response path. P/D rules carry
+ * their engine dialect on the epval; plain AI-gateway rules (no
+ * kv_engine_type) fall back to the plain-LB profile. */
+static const pd_dialect_ops_t *
+proxy_usage_ops(proxy_fd_ent_t *pfe)
+{
+  proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+  if (epv && epv->pd_ops)
+    return epv->pd_ops;
+  return &pd_dialect_plain;
+}
+
 int
 proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 {
@@ -1408,6 +1443,36 @@ skip_deferred_masking:
       }
     }
 
+    /* Token accounting: maintain the response tail window and, for
+     * non-streamed JSON bodies, charge the tenant quota as soon as the
+     * usage object completes in the window (headers and body usually share
+     * one segment, but a split body keeps retrying here per segment). SSE
+     * responses charge at the [DONE] terminator below, where the final
+     * chunk — the usage carrier under stream_options.include_usage — is
+     * already in this same window. result stays NULL on the consume call:
+     * a completed response is never interrupted; an exceeded quota denies
+     * the NEXT request at the rate-limit gate. */
+    if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
+        rfd_ent->ai_gw_mode && !rfd_ent->usage_consumed && len > 0) {
+      proxy_usage_tail_update(rfd_ent, (const uint8_t *)msg, len);
+      if (!rfd_ent->sse_active && rfd_ent->metric_response_status != 0) {
+        const pd_dialect_ops_t *uops = proxy_usage_ops(rfd_ent);
+        int up = 0, uc = 0;
+        if (uops->extract_usage &&
+            uops->extract_usage(rfd_ent, rfd_ent->usage_tail,
+                                rfd_ent->usage_tail_len, &up, &uc) == 0) {
+          rfd_ent->usage_prompt_toks = up;
+          rfd_ent->usage_complet_toks = uc;
+          llb_ai_token_quota_consume((char *)rfd_ent->tenant_id,
+                                     (char *)proxy_effective_model(rfd_ent),
+                                     up, uc, NULL);
+          rfd_ent->usage_consumed = 1;
+          log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (non-stream)",
+                   rfd_ent->fd, up, uc);
+        }
+      }
+    }
+
     /* Record non-SSE AI-Gateway responses into loxilb_ai_requests_total.
      * The SSE path records at its [DONE] terminator; a plain-JSON response —
      * the common error shape (OpenAI-compatible backends return errors as JSON
@@ -1417,7 +1482,10 @@ skip_deferred_masking:
      * the SSE sniff above did NOT activate a stream, record the request exactly
      * once. metric_ai_recorded guards against the [DONE] path (which also sets
      * it) and against re-firing on later packets of the same response; status +
-     * TTFB latency were captured by the L7-metrics block above. */
+     * TTFB latency were captured by the L7-metrics block above. Token counts
+     * come from the accounting block above when the body carried usage in
+     * this same segment (0 when it arrives later — the quota still charges,
+     * only this metric misses the counts). */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
         rfd_ent->ai_gw_mode && !rfd_ent->metric_ai_recorded &&
         !rfd_ent->sse_active && rfd_ent->metric_response_status != 0 &&
@@ -1430,7 +1498,8 @@ skip_deferred_masking:
       const char *ai_ns_model = proxy_effective_model(rfd_ent);
       llb_ai_record_request((char *)rfd_ent->tenant_id, (char *)ai_ns_model,
                             (int)rfd_ent->metric_response_status, ai_ns_lat_ms,
-                            0, 0, 0, 0, "");
+                            rfd_ent->usage_prompt_toks,
+                            rfd_ent->usage_complet_toks, 0, 0, "");
       rfd_ent->metric_ai_recorded = 1;
       log_info("[AI_NONSSE_RECORDED] client_fd=%d backend_fd=%d model=%s status=%u",
                rfd_ent->fd, ent->fd, ai_ns_model,
@@ -1507,13 +1576,37 @@ skip_deferred_masking:
         const char *sse_model = proxy_effective_model(rfd_ent);
         const char *sse_tenant = rfd_ent->tenant_id;
 
-        /* Step 3: Record token consumption.
-         * Pass 0,0 for token counts — per-request token extraction from
-         * the final SSE chunk is not yet wired (best-effort B-2 mode).
+        /* Step 3: Record token consumption. The final pre-[DONE] chunk —
+         * the usage carrier when the client requested
+         * stream_options.include_usage — sits in the usage tail window
+         * maintained on the relay path above; extract through the engine
+         * dialect and charge the tenant quota. Counts stay 0 when the
+         * client omitted the flag (no usage chunk to read).
          * Pass NULL for result — the current response is complete and
-         * must NOT be interrupted. */
+         * must NOT be interrupted; an exceeded quota denies the NEXT
+         * request at the rate-limit gate. */
+        int sse_tok_p = rfd_ent->usage_prompt_toks;
+        int sse_tok_c = rfd_ent->usage_complet_toks;
+        if (!rfd_ent->usage_consumed) {
+          const pd_dialect_ops_t *sse_uops = proxy_usage_ops(rfd_ent);
+          if (sse_uops->extract_usage &&
+              sse_uops->extract_usage(rfd_ent, rfd_ent->usage_tail,
+                                      rfd_ent->usage_tail_len,
+                                      &sse_tok_p, &sse_tok_c) == 0) {
+            rfd_ent->usage_prompt_toks = sse_tok_p;
+            rfd_ent->usage_complet_toks = sse_tok_c;
+            log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (stream)",
+                     rfd_ent->fd, sse_tok_p, sse_tok_c);
+          } else {
+            sse_tok_p = 0;
+            sse_tok_c = 0;
+            log_info("[AI_TOKENS] client_fd=%d no usage in final chunk "
+                     "(include_usage not requested?)", rfd_ent->fd);
+          }
+          rfd_ent->usage_consumed = 1;
+        }
         llb_ai_token_quota_consume((char *)sse_tenant, (char *)sse_model,
-                                   0, 0, NULL);
+                                   sse_tok_p, sse_tok_c, NULL);
         /* Step 4: End SSE stream gauge */
         llb_ai_stream_end("", (char *)sse_model);
         /* Step 5: Record request metrics. Status comes from the backend
@@ -1524,7 +1617,7 @@ skip_deferred_masking:
                              ? (int)rfd_ent->metric_response_status
                              : 200;
         llb_ai_record_request((char *)sse_tenant, (char *)sse_model, sse_status,
-                              latency_ms, 0, 0, 0, 0, "");
+                              latency_ms, sse_tok_p, sse_tok_c, 0, 0, "");
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         log_info("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
@@ -5511,6 +5604,13 @@ handle_on_message_begin(llhttp_t* parser)
   if (pfe->odir == 0) {
     pfe->x_api_key_raw[0] = '\0';
     pfe->x_model_header[0] = '\0';
+    /* Token-accounting state is per-response: without this reset, request
+     * N+1 on a reused connection would inherit request N's consumed flag
+     * (never charging again) or its stale counts. */
+    pfe->usage_tail_len = 0;
+    pfe->usage_consumed = 0;
+    pfe->usage_prompt_toks = 0;
+    pfe->usage_complet_toks = 0;
   }
   return 0;
 }

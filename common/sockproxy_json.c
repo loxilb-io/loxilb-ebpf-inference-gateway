@@ -465,6 +465,114 @@ extract_model_field(const char *body, size_t len, char *out, size_t cap)
   return -1;
 }
 
+// AI Gateway token accounting: pull prompt_tokens / completion_tokens out of
+// the OpenAI "usage" object in a response byte window. The window is NOT a
+// complete JSON document — it is the tail of a response stream (SSE events
+// with their framing, or a JSON body possibly truncated at the front) — so
+// this scans backwards for the LAST `"usage"` key whose value is a complete
+// object and jsmn-parses ONLY that object. Model-generated text can never
+// spoof the key: inside a JSON string value every quote is escaped, so the
+// raw byte sequence "usage" with unescaped quotes cannot occur within
+// content deltas. Engines that put "usage":null on every content chunk
+// (SGLang) fail the value-must-be-an-object check and are skipped.
+// Counts inside nested detail objects (prompt_tokens_details.cached_tokens)
+// are never matched: only the usage object's DIRECT pairs are read.
+// Returns 0 when at least one count was extracted, -1 otherwise.
+int
+extract_usage_tokens(const char *buf, size_t len, int *prompt_tokens,
+                     int *completion_tokens)
+{
+  static const char key[] = "\"usage\"";
+  const size_t klen = sizeof(key) - 1;
+  size_t pos;
+  int failed_candidates = 0;
+
+  if (!prompt_tokens || !completion_tokens)
+    return -1;
+  *prompt_tokens = 0;
+  *completion_tokens = 0;
+  if (!buf || len < klen + 4)
+    return -1;
+
+  pos = len - klen;
+  for (;;) {
+    if (memcmp(buf + pos, key, klen) == 0 &&
+        (pos == 0 || buf[pos - 1] != '\\')) {
+      const char *p = buf + pos + klen;
+      const char *end = buf + len;
+      while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+        p++;
+      if (p < end && *p == ':') {
+        p++;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+          p++;
+      } else {
+        p = end;  /* not a key:value shape — disqualify this candidate */
+      }
+      if (p < end && *p == '{') {
+        /* Balanced-brace scan (string- and escape-aware) to find the end of
+         * the usage object; an object still missing its closing brace in
+         * this window fails here and a later segment retries. */
+        const char *q = p;
+        int depth = 0, instr = 0, esc = 0, complete = 0;
+        for (; q < end; q++) {
+          char ch = *q;
+          if (esc) { esc = 0; continue; }
+          if (ch == '\\') { esc = 1; continue; }
+          if (instr) { if (ch == '"') instr = 0; continue; }
+          if (ch == '"') { instr = 1; continue; }
+          if (ch == '{') depth++;
+          else if (ch == '}') {
+            depth--;
+            if (depth == 0) { q++; complete = 1; break; }
+          }
+        }
+        if (complete) {
+          jsmn_parser jp;
+          jsmntok_t toks[64];
+          int r, ti, pair, got = 0;
+          jsmn_init(&jp);
+          r = jsmn_parse(&jp, p, (size_t)(q - p), toks, 64);
+          if (r >= 3 && toks[0].type == JSMN_OBJECT) {
+            ti = 1;
+            for (pair = 0; pair < toks[0].size && ti + 1 < r; pair++) {
+              if (toks[ti].type == JSMN_STRING &&
+                  toks[ti + 1].type == JSMN_PRIMITIVE) {
+                long v;
+                if (jsoneq(p, &toks[ti], "prompt_tokens") == 0) {
+                  v = strtol(p + toks[ti + 1].start, NULL, 10);
+                  if (v < 0) v = 0;
+                  if (v > 100000000L) v = 100000000L;
+                  *prompt_tokens = (int)v;
+                  got = 1;
+                } else if (jsoneq(p, &toks[ti], "completion_tokens") == 0) {
+                  v = strtol(p + toks[ti + 1].start, NULL, 10);
+                  if (v < 0) v = 0;
+                  if (v > 100000000L) v = 100000000L;
+                  *completion_tokens = (int)v;
+                  got = 1;
+                }
+              }
+              ti++;
+              ti += jsmn_subtree_count(toks, ti, r);
+            }
+          }
+          if (got)
+            return 0;
+        }
+      }
+      /* Matched "usage" but no extractable object — walk further back, but
+       * give up after a few dead candidates (null-usage chunks etc.). */
+      if (++failed_candidates > 4)
+        return -1;
+    }
+    if (pos == 0)
+      break;
+    pos--;
+  }
+  return -1;
+}
+
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
 /* User-prefix affinity fallback: chat bodies with NO system message used to
  * return -1 here, so every such request was sprayed (per-request hash) and

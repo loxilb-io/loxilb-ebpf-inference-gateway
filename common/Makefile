@@ -382,6 +382,15 @@ test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.
 test_kv: test_kv_exact
 	./test_kv_exact
 
+# AI-gateway token accounting: usage-object extraction unit tests
+# (compiles sockproxy_json.c into the test TU; log.c is stubbed inside)
+test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h xxhash.c
+	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< xxhash.c -I. -lpthread
+
+.PHONY: test_usage
+test_usage: test_usage_extract
+	./test_usage_extract
+
 # Phase 47 P47-R2: root-pipe cfg V2 validator + miss-dispatch unit test
 # Standalone -- mirrors the header struct inline, does NOT link against DOCA.
 test_doca_root_v2: test_doca_root_v2.c

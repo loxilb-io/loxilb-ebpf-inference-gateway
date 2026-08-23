@@ -62,6 +62,17 @@ typedef struct pd_dialect_ops {
 
   /* Timeout semantics (30s prefill timeout vs rendezvous wedge 504). */
   int (*reap)(struct proxy_fd_ent *pfe, time_t now);
+
+  /* Token accounting: scan RESPONSE bytes (the relay path's sliding tail
+   * window) for the engine's usage report and return prompt/completion
+   * token counts. Every supported engine follows the OpenAI convention —
+   * usage rides the final pre-[DONE] SSE chunk under
+   * stream_options.include_usage, or the body object non-streaming — so all
+   * dialects currently bind the shared parser; the op stays per-dialect so
+   * a divergent engine can override without touching the relay path.
+   * Returns 0 when at least one count was extracted. */
+  int (*extract_usage)(struct proxy_fd_ent *pfe, const uint8_t *buf,
+                       size_t len, int *prompt_tokens, int *completion_tokens);
 } pd_dialect_ops_t;
 
 /* Dialect instances. Defined next to their machines (sockproxy_http.c until
@@ -69,6 +80,17 @@ typedef struct pd_dialect_ops {
 extern const pd_dialect_ops_t pd_dialect_vllm;
 extern const pd_dialect_ops_t pd_dialect_sglang;
 extern const pd_dialect_ops_t pd_dialect_trtllm;
+
+/* Plain-LB profile for AI-gateway rules that never resolve an engine
+ * dialect (no kv_engine_type — e.g. a converged llama.cpp fleet). Only
+ * extract_usage is populated; the P/D orchestration ops stay NULL. */
+extern const pd_dialect_ops_t pd_dialect_plain;
+
+/* Shared OpenAI-convention usage extractor bound by all dialect profiles
+ * (sockproxy_pd_core.c). */
+int pd_usage_extract_openai(struct proxy_fd_ent *pfe, const uint8_t *buf,
+                            size_t len, int *prompt_tokens,
+                            int *completion_tokens);
 
 /* Wire kv_engine_type → PD_ENGINE_* (sockproxy.h). Unknown values degrade
  * to PD_ENGINE_VLLM. */

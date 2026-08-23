@@ -28,6 +28,14 @@ int extract_user_id(const char *body, size_t len, char *out, size_t cap);
  */
 int extract_model_field(const char *body, size_t len, char *out, size_t cap);
 
+/* Extract prompt_tokens / completion_tokens from the last complete OpenAI
+ * "usage" object in a response byte window (SSE tail or JSON body tail;
+ * the window need not be a complete JSON document).
+ * Returns 0 when at least one count was extracted, -1 on miss.
+ */
+int extract_usage_tokens(const char *buf, size_t len, int *prompt_tokens,
+                         int *completion_tokens);
+
 /* Extract LLM prefix key (model, prompt/messages, optional L2/L3 fields)
  * from the JSON request body.
  *
