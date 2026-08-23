@@ -5495,6 +5495,27 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
 }
 
 int
+handle_on_message_begin(llhttp_t* parser)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe;
+
+  pfe = settings->uarg;
+  assert(pfe);
+
+  /* A new request head on the client leg: clear the per-request header
+   * captures so a keep-alive request cannot inherit the previous request's
+   * credentials or model hint — handle_header_val only overwrites these when
+   * the header is present, so without this reset a keyless request N+1 on a
+   * reused connection would be validated with request N's key. */
+  if (pfe->odir == 0) {
+    pfe->x_api_key_raw[0] = '\0';
+    pfe->x_model_header[0] = '\0';
+  }
+  return 0;
+}
+
+int
 handle_on_message_complete(llhttp_t* parser)
 {
   llhttp_settings_t *settings = parser->settings;
@@ -6754,6 +6775,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 
   // Initialize HTTP parser
   llhttp_settings_init(&npfe1->settings);
+  npfe1->settings.on_message_begin = handle_on_message_begin;
   npfe1->settings.on_message_complete = handle_on_message_complete;
   npfe1->settings.on_header_field = handle_header_name;
   npfe1->settings.on_header_value = handle_header_val;
@@ -7517,12 +7539,32 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * After release rfd[0]==-1 so this SAME read falls into the parse branch and reframes
        * cleanly. No race with the Phase-89-pinned decode path: req N+1 only arrives after
        * req N's response fully drained, so pd_phase already went COMPLETE->NONE. */
+      /* AI-gateway arm of the same boundary release: on an ai_gw_mode
+       * connection EVERY keep-alive request must re-enter the parse phase, or
+       * the auth/RPS/model gate (and the future TPM charge) runs only on
+       * request #1 of the connection and a client that holds one connection
+       * open bypasses enforcement entirely. Same boundary guards as the P/D
+       * arm (rcv_off==0 request boundary; streamed-forward mid-body excluded
+       * above), plus sse_active==0 so an in-flight streamed response is never
+       * torn down by an early (pipelined) next request. Cost: the backend leg
+       * is re-established per request — which also re-runs endpoint selection,
+       * so a long-lived client connection no longer pins every request to the
+       * EP chosen for request #1. Like the P/D arm, this assumes the client
+       * does not pipeline request N+1 before N's response drains. */
+      int ai_gw_boundary = 0;
+      if (pfe->head) {
+        proxy_map_ent_t *ka_hent = (proxy_map_ent_t *)pfe->head;
+        if (ka_hent->val.ephash && ka_hent->val.ephash->ai_gw_mode &&
+            pfe->sse_active == 0)
+          ai_gw_boundary = 1;
+      }
       if (pfe->rcv_off == 0 && pfe->n_rfd > 0 &&
           pfe->pd_phase == PD_PHASE_NONE &&
-          pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) {
-        log_info("[KA_FIX] fd=%d releasing stale P/D backend leg before next keep-alive "
-                 "request (n_rfd=%d rfd0=%d) — reframe fix",
-                 pfe->fd, pfe->n_rfd, pfe->rfd[0]);
+          ((pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) ||
+           ai_gw_boundary)) {
+        log_info("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
+                 "request (n_rfd=%d rfd0=%d ai_gw=%d) — reframe/gate re-arm",
+                 pfe->fd, pfe->n_rfd, pfe->rfd[0], ai_gw_boundary);
         proxy_release_rfd_ctx(pfe);
       }
 
