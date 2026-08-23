@@ -431,6 +431,30 @@ extract_user_id(const char *body, size_t len, char *out, size_t cap)
   return -1;
 }
 
+#ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
+/* User-prefix affinity fallback: chat bodies with NO system message used to
+ * return -1 here, so every such request was sprayed (per-request hash) and
+ * repeats always landed cold. When no system role exists, hash a BOUNDED
+ * prefix of the FIRST user message instead. The bound matters: later turns
+ * of a conversation diverge, but they share their opening, so hashing only
+ * the first N bytes keeps turn N co-located with turn 1.
+ * Env LLB_LLM_USER_PREFIX_FALLBACK_LEN overrides; 0 disables (restores the
+ * spray behavior). System-keyed traffic is byte-for-byte unaffected. */
+#define LLM_USER_PREFIX_FALLBACK_DEFAULT 256
+static int
+llm_user_prefix_fallback_len(void)
+{
+  static int len = -1;
+  if (len < 0) {
+    const char *env = getenv("LLB_LLM_USER_PREFIX_FALLBACK_LEN");
+    len = env ? atoi(env) : LLM_USER_PREFIX_FALLBACK_DEFAULT;
+    if (len < 0) len = 0;
+    if (len >= MAX_PREFIX_LEN) len = MAX_PREFIX_LEN - 1;
+  }
+  return len;
+}
+#endif
+
 // Main extraction function for LLM prefix (PHASE 1 ENHANCED)
 int extract_llm_prefix(const char *json_body, size_t len,
                        llm_prefix_key_t *prefix_key)
@@ -438,7 +462,11 @@ int extract_llm_prefix(const char *json_body, size_t len,
   jsmn_parser parser;
   jsmntok_t tokens[2048];  // Increased from 512 to handle large system prompts
   int r, i;
-  
+#ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
+  char first_user[MAX_PREFIX_LEN] = {0};
+  int has_first_user = 0;
+#endif
+
   memset(prefix_key, 0, sizeof(*prefix_key));
   prefix_key->level = 1;  // Default: L1 routing
   prefix_key->flags = 0;  // No optional fields initially
@@ -700,6 +728,14 @@ int extract_llm_prefix(const char *json_body, size_t len,
           
           return 0;  // Success - found system message for cache alignment
         }
+        // No system role seen so far — remember the FIRST user message as the
+        // bounded fallback hash source (used only if the full scan finds no
+        // system message; see the fallback below the scan loop).
+        if (!has_first_user && has_role && has_content &&
+            strcmp(role, "user") == 0 && content[0] != '\0') {
+          strncpy(first_user, content, sizeof(first_user) - 1);
+          has_first_user = 1;
+        }
 #else
         // Check if this is a user message (per-query routing)
         if (has_role && has_content && strcmp(role, "user") == 0) {
@@ -726,6 +762,17 @@ int extract_llm_prefix(const char *json_body, size_t len,
   }
   
   if (!prefix_key->valid) {
+#ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
+    int fb_len = llm_user_prefix_fallback_len();
+    if (fb_len > 0 && has_first_user) {
+      strncpy(prefix_key->prefix, first_user, fb_len);
+      prefix_key->prefix[fb_len] = '\0';
+      prefix_key->valid = 1;
+      log_debug("[PREFIX_USER_FALLBACK] no system message; hashing first %d "
+                "bytes of first user message", fb_len);
+      return 0;
+    }
+#endif
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("No user message found in JSON");
 #endif
