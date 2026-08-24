@@ -57,7 +57,20 @@ dp_do_if_lkup(void *ctx, struct xfi *xf)
     xf->pm.mirr  = l2a->set_ifi.mirr;
     xf->pm.pten  = l2a->set_ifi.pten;
     xf->pm.pprop = l2a->set_ifi.pprop;
-    xf->qm.ipolid = l2a->set_ifi.polid;
+    /* Direction is a RUNTIME property, never a compile-time one: the ingress
+     * and egress images share the pinned tail-call table (pgm_tbl), so
+     * whichever image attaches last supplies the tail-called programs for
+     * BOTH hooks — divergent twin code here would make ingress packets run
+     * egress semantics. A packet that entered the pipeline from an egress
+     * hook is host-originated (no ingress ifindex — transit is stamped at
+     * ingress and passes the egress hook untouched) or was redirected here;
+     * everything else is ingress.
+     */
+    if (DP_LLB_IS_EGR(ctx) || DP_LLB_INIFIDX_NONE(ctx)) {
+      xf->qm.opolid = l2a->set_ifi.e_polid;
+    } else {
+      xf->qm.ipolid = l2a->set_ifi.polid;
+    }
   } else {
     LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_UNK);
   }
@@ -360,8 +373,10 @@ dp_ing(void *ctx,  struct xfi *xf)
     dp_do_mark_mirr(ctx, xf);
   }
 
-  if (xf->qm.ipolid != 0) {
-    do_dp_policer(ctx, xf, 0);
+  if (xf->qm.opolid != 0) {
+    do_dp_policer(ctx, xf, xf->qm.opolid);
+  } else if (xf->qm.ipolid != 0) {
+    do_dp_policer(ctx, xf, xf->qm.ipolid);
   }
 
   return 0;
@@ -461,6 +476,18 @@ dp_ingress_slow_main(struct __sk_buff *ctx,  struct xfi *xf)
 
   dp_ingress_l2(ctx, xf, fa);
 
+  /* Rule-attached policer, established-flow leg. The CT lookup inside
+   * dp_ingress_l2 applied the NAT act and armed rpolid; such packets leave
+   * this program with RES_HIT set and jump straight to the verdict in the CT
+   * program — the policer call there is never reached for them. First packets
+   * are ct-miss here (rpolid still 0, no charge) and get policed at the
+   * CT-program site after dp_do_nat arms rpolid — so between the two sites
+   * every packet is policed exactly once.
+   */
+  if (xf->qm.rpolid != 0 && !(xf->pm.pipe_act & LLB_PIPE_DROP)) {
+    do_dp_policer(ctx, xf, xf->qm.rpolid);
+  }
+
 #ifdef HAVE_DP_FC
   /* fast-cache is used only when certain conditions are met */
   if (LLB_PIPE_FC_CAP(xf)) {
@@ -551,6 +578,17 @@ dp_ingress_ct_main(struct __sk_buff *ctx,  struct xfi *xf)
    * complexity for now 
    */
   dp_l3_fwd(ctx, xf, fa, 0);
+
+  /* Rule-attached policer, first-packet leg. Only ct-miss entries reach this
+   * point — established flows arrive with RES_HIT and jump to the verdict
+   * above; their policer call is the slow-main-program site. rpolid was armed
+   * by dp_do_nat above, and this runs before the masq tail-call below so SNAT
+   * first packets are policed too. Between the two sites every packet is
+   * policed exactly once.
+   */
+  if (xf->qm.rpolid != 0 && !(xf->pm.pipe_act & LLB_PIPE_DROP)) {
+    do_dp_policer(ctx, xf, xf->qm.rpolid);
+  }
 
   /* Perform masquerading if necessary */
   if ((xf->pm.phit & LLB_DP_CTM_HIT) == 0) {
