@@ -1465,7 +1465,13 @@ skip_deferred_masking:
           rfd_ent->usage_complet_toks = uc;
           llb_ai_token_quota_consume((char *)rfd_ent->tenant_id,
                                      (char *)proxy_effective_model(rfd_ent),
-                                     up, uc, 0, NULL);
+                                     up, uc, 0,
+                                     (int)rfd_ent->usage_reserved_toks,
+                                     rfd_ent->usage_res_epoch, NULL);
+          /* Settled: the admission claim is spent. Zero it so no later
+           * consume on this connection can release it a second time. */
+          rfd_ent->usage_reserved_toks = 0;
+          rfd_ent->usage_res_epoch = 0;
           rfd_ent->usage_consumed = 1;
           log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (non-stream)",
                    rfd_ent->fd, up, uc);
@@ -1637,7 +1643,13 @@ skip_deferred_masking:
           rfd_ent->usage_consumed = 1;
         }
         llb_ai_token_quota_consume((char *)sse_tenant, (char *)sse_model,
-                                   sse_tok_p, sse_tok_c, sse_estimated, NULL);
+                                   sse_tok_p, sse_tok_c, sse_estimated,
+                                   (int)rfd_ent->usage_reserved_toks,
+                                   rfd_ent->usage_res_epoch, NULL);
+        /* Settled: zero the claim so a spurious second [DONE] or a later
+         * non-stream consume on this connection cannot double-release. */
+        rfd_ent->usage_reserved_toks = 0;
+        rfd_ent->usage_res_epoch = 0;
         /* Step 4: End SSE stream gauge */
         llb_ai_stream_end("", (char *)sse_model);
         /* Step 5: Record request metrics. Status comes from the backend
@@ -5644,6 +5656,8 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->usage_complet_toks = 0;
     pfe->usage_est_prompt = 0;
     pfe->usage_sse_events = 0;
+    pfe->usage_reserved_toks = 0;
+    pfe->usage_res_epoch = 0;
   }
   return 0;
 }
@@ -5677,26 +5691,27 @@ handle_on_message_complete(llhttp_t* parser)
     if (hent->val.ephash && hent->val.ephash->ai_gw_mode) {
       ai_gw_decision_t ai_dec = {0};
       char body_model[MAX_MODEL_LEN] = {0};
+      const char *gate_body = NULL;
+      size_t gate_body_len = 0;
 
       /* allowed_models must bind to the model the backend will actually
        * serve, which is the one in the JSON body — an X-Model header that
        * differs from the body is at best a stale hint and at worst a spoof.
        * The message is complete here, so the body is present in rcvbuf;
        * parse it and fall back to the header only when the body carries no
-       * model field. */
+       * model field. The located body also feeds the pre-admission token
+       * reservation below. */
       if (pfe->http_content_length > 0 && pfe->rcv_off > 4) {
-        const char *body_start = NULL;
-        size_t body_len = 0;
         for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
           if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
               pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
-            body_start = (const char *)(pfe->rcvbuf + i + 4);
-            body_len = pfe->rcv_off - (i + 4);
+            gate_body = (const char *)(pfe->rcvbuf + i + 4);
+            gate_body_len = pfe->rcv_off - (i + 4);
             break;
           }
         }
-        if (body_start && body_len > 0) {
-          extract_model_field(body_start, body_len, body_model, sizeof(body_model));
+        if (gate_body && gate_body_len > 0) {
+          extract_model_field(gate_body, gate_body_len, body_model, sizeof(body_model));
         }
       }
       char *model = body_model[0] ? body_model
@@ -5755,6 +5770,47 @@ handle_on_message_complete(llhttp_t* parser)
                  pfe->fd, ai_dec.key_id, ai_dec.tenant_id,
                  rl_dec.error_code, rl_dec.retry_after);
         return;
+      }
+
+      /* Step 3: pre-admission token reservation → 429 BEFORE dispatch.
+       * Claim the request's worst case (prompt estimated from the body's
+       * messages/prompt extent + its declared max_tokens ceiling) against
+       * the tenant quota now, while denial costs one cheap response — not
+       * a backend prefill whose tokens the latch only bills afterwards.
+       * The claim and its window tag ride the pfe to the consume call,
+       * which credits the ceiling back and charges the real usage. */
+      if (gate_body && gate_body_len > 0) {
+        int resv_prompt = estimate_prompt_tokens(gate_body, gate_body_len);
+        int resv_max = extract_max_tokens(gate_body, gate_body_len);
+        if (resv_prompt > 0 || resv_max > 0) {
+          ai_gw_decision_t rs_dec = {0};
+          int64_t rs_epoch = 0;
+          if (llb_ai_token_quota_reserve(ai_dec.tenant_id, model,
+                                         resv_prompt, resv_max,
+                                         &rs_epoch, &rs_dec) != 0) {
+            char resp_429r[320];
+            int rn = snprintf(resp_429r, sizeof(resp_429r),
+              "HTTP/1.1 429 Too Many Requests\r\n"
+              "Content-Type: application/json\r\n"
+              "Retry-After: %d\r\n"
+              "Connection: close\r\n"
+              "\r\n"
+              "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+              rs_dec.retry_after, rs_dec.error_code, rs_dec.retry_after);
+            if (rn > 0 && rn < (int)sizeof(resp_429r))
+              send(pfe->fd, resp_429r, (size_t)rn, 0);
+            shutdown(pfe->fd, SHUT_RDWR);
+            log_info("[AIGateway] fd=%d pre-admission denied: tenant=%s "
+                     "want=%d+%d error=%s retry=%d",
+                     pfe->fd, ai_dec.tenant_id, resv_prompt, resv_max,
+                     rs_dec.error_code, rs_dec.retry_after);
+            return;
+          }
+          if (rs_epoch != 0) {
+            pfe->usage_reserved_toks = (uint32_t)(resv_prompt + resv_max);
+            pfe->usage_res_epoch = rs_epoch;
+          }
+        }
       }
     }
   }

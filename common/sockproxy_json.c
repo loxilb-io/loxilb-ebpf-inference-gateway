@@ -843,6 +843,36 @@ estimate_prompt_tokens(const char *body, size_t len)
   return (int)est;
 }
 
+// AI Gateway pre-admission: read the request's declared completion ceiling.
+// max_completion_tokens (the current OpenAI chat name) wins over the legacy
+// max_tokens when both are present. Only a plain non-negative top-level
+// number counts — a negative value (llama.cpp uses -1 for "unlimited"), a
+// string, or a nested/spoofed occurrence reads as undeclared. Returns the
+// ceiling, or 0 when the request declares none: an undeclared ceiling
+// cannot be guessed, so the caller reserves the prompt estimate alone.
+int
+extract_max_tokens(const char *body, size_t len)
+{
+  const char *vs = NULL, *ve = NULL;
+  long val = 0;
+
+  if (json_top_find(body, len, "max_completion_tokens", 21, &vs, &ve, NULL) != 0 &&
+      json_top_find(body, len, "max_tokens", 10, &vs, &ve, NULL) != 0)
+    return 0;
+  if (!vs || !ve || vs >= ve || *vs == '"' || *vs == '{' || *vs == '[')
+    return 0;
+  if (*vs == '-')
+    return 0;
+  for (; vs < ve; vs++) {
+    if (*vs < '0' || *vs > '9')
+      return 0;               /* floats/exponents/junk: not a declared count */
+    val = val * 10 + (*vs - '0');
+    if (val > 100000000L)
+      return 100000000;
+  }
+  return (int)val;
+}
+
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
 /* User-prefix affinity fallback: chat bodies with NO system message used to
  * return -1 here, so every such request was sprayed (per-request hash) and

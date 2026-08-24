@@ -51,6 +51,13 @@ int inject_include_usage(char *body, size_t body_len, size_t cap,
  */
 int estimate_prompt_tokens(const char *body, size_t len);
 
+/* Read the request's declared completion ceiling: top-level
+ * max_completion_tokens (preferred) or max_tokens as a plain non-negative
+ * number. Feeds the pre-admission token reservation. Returns 0 when the
+ * request declares no usable ceiling.
+ */
+int extract_max_tokens(const char *body, size_t len);
+
 /* Extract LLM prefix key (model, prompt/messages, optional L2/L3 fields)
  * from the JSON request body.
  *

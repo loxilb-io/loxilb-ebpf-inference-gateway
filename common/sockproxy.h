@@ -1018,6 +1018,12 @@ struct proxy_fd_ent {
    * Charged with the estimated flag ONLY when extraction misses. */
   uint32_t usage_est_prompt;          // prompt-token estimate from the request body
   uint32_t usage_sse_events;          // relayed SSE data-object chunk count
+  /* Pre-admission reservation made at the gate (prompt estimate +
+   * declared max_tokens) and its quota-window tag; both echoed to the
+   * consume call at settlement, zeroed there and at message begin. An
+   * aborted request's claim self-heals at window rollover. */
+  uint32_t usage_reserved_toks;       // tokens reserved at admission (0 = none)
+  int64_t  usage_res_epoch;           // reservation window tag from the reserve call
   time_t   pd_last_decode_ts;         // wall-clock of the LAST decode backend byte relayed to the
                                       // client. Refreshed per byte during decode streaming so the safety-net
                                       // reaper (sockproxy_health.c) can gate graceful [DONE] synthesis on

@@ -97,14 +97,32 @@ llb_ai_stream_end(char *tenant_id, char *model_name)
 int
 llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                            int prompt_tokens, int complet_tokens,
-                           int estimated, ai_gw_decision_t *result)
+                           int estimated, int reserved_toks,
+                           int64_t res_epoch, ai_gw_decision_t *result)
 {
     (void)tenant_id;
     (void)model_name;
     (void)prompt_tokens;
     (void)complet_tokens;
     (void)estimated;
+    (void)reserved_toks;
+    (void)res_epoch;
     (void)result;
+    return 0;  /* allow — no quota enforcement in C-only debug builds */
+}
+
+int
+llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
+                           int prompt_est, int max_tokens,
+                           int64_t *res_epoch, ai_gw_decision_t *result)
+{
+    (void)tenant_id;
+    (void)model_name;
+    (void)prompt_est;
+    (void)max_tokens;
+    (void)result;
+    if (res_epoch)
+        *res_epoch = 0;
     return 0;  /* allow — no quota enforcement in C-only debug builds */
 }
 

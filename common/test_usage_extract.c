@@ -349,6 +349,47 @@ main(void)
     }
   }
 
+  /* ---- extract_max_tokens --------------------------------------------- */
+
+  /* The pre-admission reservation reads the declared completion ceiling:
+   * plain top-level numbers only; max_completion_tokens beats max_tokens;
+   * negatives (llama.cpp -1 = unlimited), strings, floats and nested or
+   * string-embedded spoofs all read as undeclared (0). */
+  {
+    struct { const char *name; const char *body; int want; } mt_vecs[] = {
+      { "mt-plain",
+        "{\"model\":\"m\",\"max_tokens\":256,\"stream\":true}", 256 },
+      { "mt-completion-name",
+        "{\"max_completion_tokens\":128,\"stream\":true}", 128 },
+      { "mt-completion-wins",
+        "{\"max_tokens\":999,\"max_completion_tokens\":64}", 64 },
+      { "mt-absent", "{\"model\":\"m\",\"stream\":true}", 0 },
+      { "mt-negative-unlimited", "{\"max_tokens\":-1}", 0 },
+      { "mt-string-value", "{\"max_tokens\":\"256\"}", 0 },
+      { "mt-float-value", "{\"max_tokens\":25.6}", 0 },
+      { "mt-nested-spoof",
+        "{\"opts\":{\"max_tokens\":512},\"stream\":true}", 0 },
+      { "mt-string-embedded-spoof",
+        "{\"messages\":[{\"content\":\"say max_tokens:9\"}]}", 0 },
+      { "mt-last-key-no-comma", "{\"stream\":true,\"max_tokens\":42}", 42 },
+      { "mt-whitespace", "{\"max_tokens\" :\t 7 }", 7 },
+      { "mt-garbage", "not json", 0 },
+    };
+    size_t vi;
+    for (vi = 0; vi < sizeof(mt_vecs) / sizeof(mt_vecs[0]); vi++) {
+      int got = extract_max_tokens(mt_vecs[vi].body,
+                                   strlen(mt_vecs[vi].body));
+      g_cases++;
+      if (got != mt_vecs[vi].want) {
+        printf("FAIL %-38s max=%d (want %d)\n",
+               mt_vecs[vi].name, got, mt_vecs[vi].want);
+        g_fails++;
+      } else {
+        printf("ok   %-38s max=%d\n", mt_vecs[vi].name, got);
+      }
+    }
+  }
+
   printf("\n=== results: %d/%d passed ===\n", g_cases - g_fails, g_cases);
   return g_fails ? 1 : 0;
 }

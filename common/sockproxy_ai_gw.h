@@ -171,6 +171,16 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  *   estimated      1 when the counts come from the estimate net (request-size
  *                  prompt estimate + SSE chunk count) rather than an extracted
  *                  usage object; feeds the estimated-tokens split metric
+ *   reserved_toks  the admission-time reservation made for this request by
+ *                  llb_ai_token_quota_reserve (prompt estimate + max_tokens);
+ *                  released here and replaced by the real charge. Pass 0 when
+ *                  no reservation was made. Must be passed even when both
+ *                  token counts are 0 — an uncounted response still has to
+ *                  give its claim back.
+ *   res_epoch      the reservation's window tag returned by
+ *                  llb_ai_token_quota_reserve; the release is skipped when
+ *                  the window has already rolled over (the rollover wiped the
+ *                  claim). Pass 0 when no reservation was made.
  *   result         output structure; decision may be set to 3 when quota exceeded
  *
  * Returns:
@@ -179,7 +189,51 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  */
 extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                                       int prompt_tokens, int complet_tokens,
-                                      int estimated, ai_gw_decision_t *result);
+                                      int estimated, int reserved_toks,
+                                      int64_t res_epoch,
+                                      ai_gw_decision_t *result);
+
+/*
+ * llb_ai_token_quota_reserve – pre-admission token reservation.
+ *
+ * Called at the AI gate (message-complete, after the key and RPS checks
+ * pass) with the request's worst-case token spend: the prompt estimated
+ * from the body's messages/prompt byte extent plus the declared
+ * max_tokens/max_completion_tokens ceiling. When the tenant's remaining
+ * per-minute quota cannot cover it, the request is denied 429 BEFORE it is
+ * dispatched to a backend — no GPU prefill is burned on a request whose
+ * quota is already spoken for.
+ *
+ * On admission the caller must stash the reserved amount and *res_epoch on
+ * the connection and echo both to llb_ai_token_quota_consume at response
+ * completion, which credits the pessimistic claim back and charges the real
+ * usage. A reservation orphaned by an aborted request self-heals at the
+ * next window rollover (bounded at one 60-second window).
+ *
+ * A denial does NOT latch the tenant's exceeded flag: it is sized to this
+ * request, and a smaller request may still be admitted in the same window.
+ *
+ * Parameters:
+ *   tenant_id   tenant identifier from the validated API key (NUL-terminated)
+ *   model_name  effective model name (NUL-terminated; pass "" if unknown)
+ *   prompt_est  prompt-token estimate from the request body; 0 when unknown
+ *   max_tokens  declared completion ceiling from the request body; 0 when
+ *               the client did not declare one (only the prompt estimate is
+ *               then reserved — an undeclared ceiling cannot be guessed)
+ *   res_epoch   output: the reservation's window tag to echo at settlement;
+ *               0 when nothing was reserved (no quota configured)
+ *   result      output structure; on denial decision=3, retry_after set and
+ *               error_code = "token_quota_would_exceed" (distinct from the
+ *               post-hoc "token_quota_exceeded" latch denial)
+ *
+ * Returns:
+ *    0  admitted (or no quota configured); *res_epoch tags the reservation
+ *   -1  denied; respond 429 and do NOT dispatch
+ */
+extern int llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
+                                      int prompt_est, int max_tokens,
+                                      int64_t *res_epoch,
+                                      ai_gw_decision_t *result);
 
 /*
  * llb_ai_pd_record – record a P/D disaggregation lifecycle event.
