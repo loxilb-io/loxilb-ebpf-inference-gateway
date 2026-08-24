@@ -44,10 +44,12 @@ llb_ai_validate_key(char *raw_key, char *model_name, ai_gw_decision_t *result)
 }
 
 int
-llb_ai_ratelimit_check(char *key_id, char *tenant_id, ai_gw_decision_t *result)
+llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
+                       ai_gw_decision_t *result)
 {
     (void)key_id;
     (void)tenant_id;
+    (void)model;
     (void)result;
     return 0;  /* allow */
 }

@@ -63,6 +63,8 @@ extern int llb_ai_validate_key(char *raw_key, char *model_name, ai_gw_decision_t
  * Parameters:
  *   key_id    the validated API key's key_id string
  *   tenant_id the validated API key's tenant_id string
+ *   model     the request's body-bound model name (may be empty); selects the
+ *             tenant|model token bucket for the token-quota stage
  *   result    output structure; on denial, decision is set to 3 (429),
  *             retry_after is set in seconds, and error_code is populated
  *
@@ -70,7 +72,8 @@ extern int llb_ai_validate_key(char *raw_key, char *model_name, ai_gw_decision_t
  *    0  request is within rate limits; proceed
  *   -1  request is rate-limited; inspect result->decision and result->retry_after
  */
-extern int llb_ai_ratelimit_check(char *key_id, char *tenant_id, ai_gw_decision_t *result);
+extern int llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
+                                  ai_gw_decision_t *result);
 
 /*
  * llb_ai_ratelimit_update – synchronously refresh in-memory rate-limit buckets.

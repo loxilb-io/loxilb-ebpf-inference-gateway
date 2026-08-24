@@ -5750,9 +5750,11 @@ handle_on_message_complete(llhttp_t* parser)
       strncpy(pfe->tenant_id, ai_dec.tenant_id, sizeof(pfe->tenant_id) - 1);
       pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
 
-      /* Step 2: per-key then per-tenant RPS check → 429 */
+      /* Step 2: per-key then per-tenant RPS check → 429. The body-bound
+       * model rides along so the token-quota stage can consult the
+       * tenant|model bucket next to the tenant aggregate. */
       ai_gw_decision_t rl_dec = {0};
-      int rl_rc = llb_ai_ratelimit_check(ai_dec.key_id, ai_dec.tenant_id, &rl_dec);
+      int rl_rc = llb_ai_ratelimit_check(ai_dec.key_id, ai_dec.tenant_id, model, &rl_dec);
       if (rl_rc != 0) {
         char resp_429[320];
         int n = snprintf(resp_429, sizeof(resp_429),
