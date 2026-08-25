@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <arpa/inet.h>
 #include "uthash.h"             /* MUST precede sockproxy.h */
 #include "log.h"
 #include "sockproxy_internal.h" /* includes sockproxy.h    */
@@ -192,6 +193,35 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("LPM fallback: hostname-only match '%s'\n", search_key);
 #endif
+    }
+  }
+
+  /* Fallback: listener-identity key. Rules created WITHOUT a host get their
+   * host_url substituted with the listener's own "ip:port" before the ephash
+   * key is built (llb_conv_nat2proxy, loxilb_libdp.c). No Host-header-derived
+   * lookup above can ever produce that key — the port is stripped from the
+   * header before matching — so without this fallback an empty-host rule is
+   * unreachable whenever the client's Host string differs from the rule's
+   * stored form (e.g. clients arriving via a NAT'd/floating external IP).
+   * Keying on the listener identity makes empty-host rules Host-agnostic,
+   * which is their intended wildcard semantic. */
+  if (!best_match) {
+    char self_key[256];   /* "ip:port||model" — model_name alone can be 128 */
+    char ab1[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, (struct in_addr *)&ent->key.xip, ab1, sizeof(ab1))) {
+      char self_host[64];
+      snprintf(self_host, sizeof(self_host), "%s:%u", ab1, ntohs(ent->key.xport));
+      if (model_name && model_name[0] != '\0') {
+        /* model-specific pool under the listener identity first */
+        build_ephash_key(self_key, sizeof(self_key), self_host, "", model_name);
+        HASH_FIND_STR(ent->val.ephash, self_key, tepval);
+        if (tepval) return tepval;
+      }
+      build_ephash_key(self_key, sizeof(self_key), self_host, "", "");
+      HASH_FIND_STR(ent->val.ephash, self_key, tepval);
+      if (tepval) {
+        return tepval;
+      }
     }
   }
 
