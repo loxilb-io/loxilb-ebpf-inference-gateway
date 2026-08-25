@@ -717,10 +717,12 @@ typedef struct proxy_map_ent {
   // map value). qos_cfg.cir_Bps == 0 means the shaper is off and the relay
   // path is byte-for-byte today's behaviour. Meters PLAINTEXT payload bytes;
   // the Tier-0 eBPF policer meters L3 wire bytes — different units, never
-  // comparable. qos_up shapes client->backend reads; the response direction
-  // has its own bucket when enabled via qos_cfg.dir.
+  // comparable. qos_up shapes client->backend reads (qos_cfg.dir bit 0);
+  // qos_down shapes backend->client reads (bit 1). The buckets are
+  // independent: each direction gets its own CIR, they never share tokens.
   struct proxy_qos_cfg    qos_cfg;
   struct proxy_qos_bucket qos_up;
+  struct proxy_qos_bucket qos_down;
 } proxy_map_ent_t;
 
 // ============================================================================

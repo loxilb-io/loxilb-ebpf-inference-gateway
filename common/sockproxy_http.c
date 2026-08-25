@@ -2094,7 +2094,7 @@ skip_deferred_masking:
 /* Tier-1 shaper (defined with its control plane further down) */
 static void qos_apply_stored_cfg(proxy_map_ent_t *ent);
 static void qos_service_teardown(proxy_ent_t *key);
-static int qos_park_reader(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, int fd);
+static int qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd);
 static int qos_resume_reader(int fd, proxy_fd_ent_t *pfe);
 
 int
@@ -3176,12 +3176,18 @@ qos_apply_cfg(proxy_map_ent_t *ent, const struct proxy_qos_cfg *cfg)
   if (!was_on && now_on) {
     pthread_mutex_init(&ent->qos_up.park_lock, NULL);
     ent->qos_up.n_parked = 0;
+    pthread_mutex_init(&ent->qos_down.park_lock, NULL);
+    ent->qos_down.n_parked = 0;
   }
 
   ent->qos_cfg = *cfg;
 
   if (now_on) {
+    /* both buckets are (re)armed; the burst-loop gate consults qos_cfg.dir,
+     * so a direction the config leaves un-shaped simply never drains its
+     * bucket — no per-direction init dance needed */
     qos_bucket_init(&ent->qos_up, cfg, qos_now_ns());
+    qos_bucket_init(&ent->qos_down, cfg, qos_now_ns());
     log_info("qos: shaper on %s:%u cir=%luB/s cbs=%uB dir=0x%x mode=%d",
              inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
              (unsigned long)cfg->cir_Bps, qos_effective_cbs(cfg),
@@ -3191,6 +3197,7 @@ qos_apply_cfg(proxy_map_ent_t *ent, const struct proxy_qos_cfg *cfg)
     /* rate change or disable: parked readers re-evaluate against the new
      * config on their owner workers */
     qos_wake_all_parked(&ent->qos_up);
+    qos_wake_all_parked(&ent->qos_down);
     if (!now_on) {
       log_info("qos: shaper off %s:%u",
                inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport));
@@ -3223,6 +3230,7 @@ qos_service_teardown(proxy_ent_t *key)
     if (cmp_proxy_ent(&ent->key, key)) {
       if (ent->qos_cfg.cir_Bps) {
         qos_wake_all_parked(&ent->qos_up);
+        qos_wake_all_parked(&ent->qos_down);
       }
       break;
     }
@@ -3282,14 +3290,13 @@ proxy_update_qos_config(struct proxy_ent *key, uint64_t cir_bps,
   return 0;
 }
 
-/* Park the reading side of fd on the entry's bucket. Returns 0 on success;
- * -1 when the ring is full, in which case the caller lets the read proceed
- * unshaped for this burst (availability over precision — a full ring means
- * hundreds of throttled conns already queued). */
+/* Park the reading side of fd on its direction's bucket. Returns 0 on
+ * success; -1 when the ring is full, in which case the caller lets the read
+ * proceed unshaped for this burst (availability over precision — a full ring
+ * means hundreds of throttled conns already queued). */
 static int
-qos_park_reader(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, int fd)
+qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd)
 {
-  struct proxy_qos_bucket *b = &ent->qos_up;
   int owner = notify_owner_thr(proxy_struct->ns, fd);
 
   pthread_mutex_lock(&b->park_lock);
@@ -3361,11 +3368,16 @@ proxy_qos_tick(int thread)
     if (ent->qos_cfg.cir_Bps == 0) {
       continue;
     }
-    struct proxy_qos_bucket *b = &ent->qos_up;
-    qos_bucket_refill(b, ent->qos_cfg.cir_Bps,
-                      qos_effective_cbs(&ent->qos_cfg), now);
-    if (atomic_load_explicit(&b->tokens, memory_order_relaxed) > 0) {
-      qos_wake_all_parked(b);
+    /* each enabled direction refills its own bucket at the full CIR — the
+     * directions are independent meters, not halves of a shared one */
+    struct proxy_qos_bucket *dirs[2] = { &ent->qos_up, &ent->qos_down };
+    for (int d = 0; d < 2; d++) {
+      struct proxy_qos_bucket *b = dirs[d];
+      qos_bucket_refill(b, ent->qos_cfg.cir_Bps,
+                        qos_effective_cbs(&ent->qos_cfg), now);
+      if (atomic_load_explicit(&b->tokens, memory_order_relaxed) > 0) {
+        qos_wake_all_parked(b);
+      }
     }
   }
   PROXY_UNLOCK();
@@ -7949,16 +7961,22 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
   // 🔍 DEBUG: Log start of burst loop
   log_trace("burst-start fd=%d odir=%d", fd, pfe->odir);
 
-  /* Tier-1 byte shaper: resolve the service's bucket once per burst.
-   * Client->backend reads only; an H2 connection is never shaped (a
+  /* Tier-1 byte shaper: resolve this direction's bucket once per burst.
+   * odir 0 reads client->backend payload against qos_up; odir 1 reads
+   * backend->client payload against qos_down — independent buckets, each
+   * gated by its own qos_cfg.dir bit. An H2 connection is never shaped (a
    * connection-level pause head-of-line-blocks every stream on it). The
    * token check sits INSIDE the burst loop and clamps the read length —
    * one readiness event can otherwise drain up to 1024 x 1MB unshaped. */
-  proxy_map_ent_t *qos_ent = NULL;
-  if (pfe->odir == 0 && pfe->head && !pfe->h2_session) {
+  struct proxy_qos_bucket *qos_b = NULL;
+  if (pfe->head && !pfe->h2_session) {
     proxy_map_ent_t *qhent = (proxy_map_ent_t *)pfe->head;
-    if (qhent->qos_cfg.cir_Bps && (qhent->qos_cfg.dir & QOS_DIR_UPLOAD)) {
-      qos_ent = qhent;
+    if (qhent->qos_cfg.cir_Bps) {
+      if (pfe->odir == 0 && (qhent->qos_cfg.dir & QOS_DIR_UPLOAD)) {
+        qos_b = &qhent->qos_up;
+      } else if (pfe->odir == 1 && (qhent->qos_cfg.dir & QOS_DIR_DOWNLOAD)) {
+        qos_b = &qhent->qos_down;
+      }
     }
   }
 
@@ -7967,10 +7985,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     size_t rd_want = SP_SOCK_MSG_LEN - pfe->rcv_off;
     uint64_t qos_grant = 0;
 
-    if (qos_ent && rd_want > 0) {
-      qos_grant = qos_bucket_take(&qos_ent->qos_up, rd_want);
+    if (qos_b && rd_want > 0) {
+      qos_grant = qos_bucket_take(qos_b, rd_want);
       if (qos_grant == 0) {
-        if (qos_park_reader(qos_ent, pfe, fd) == 0) {
+        if (qos_park_reader(qos_b, pfe, fd) == 0) {
           /* parked: the pending payload stays in the socket buffer; the
            * refill wake re-arms EPOLLIN and this loop re-runs */
           goto burst_break;
@@ -7984,22 +8002,22 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, rd_want);
     int saved_errno = errno;  // Save errno immediately after recv()
 
-    if (qos_ent) {
+    if (qos_b) {
       if (rc > 0) {
         if ((uint64_t)rc < qos_grant) {
           /* short read: return the unread part of the grant */
-          qos_bucket_credit(&qos_ent->qos_up, qos_grant - (uint64_t)rc);
+          qos_bucket_credit(qos_b, qos_grant - (uint64_t)rc);
         }
-        atomic_fetch_add_explicit(&qos_ent->qos_up.bytes_pass, (uint64_t)rc,
+        atomic_fetch_add_explicit(&qos_b->bytes_pass, (uint64_t)rc,
                                   memory_order_relaxed);
         if (pfe->qos_was_parked) {
           pfe->qos_was_parked = 0;
-          atomic_fetch_add_explicit(&qos_ent->qos_up.bytes_delayed, (uint64_t)rc,
+          atomic_fetch_add_explicit(&qos_b->bytes_delayed, (uint64_t)rc,
                                     memory_order_relaxed);
         }
       } else if (qos_grant) {
         /* nothing read (EAGAIN/EOF/error): the whole grant goes back */
-        qos_bucket_credit(&qos_ent->qos_up, qos_grant);
+        qos_bucket_credit(qos_b, qos_grant);
       }
     }
     
