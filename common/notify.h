@@ -30,6 +30,11 @@ typedef struct notify_cbs {
    * Phase-89/90 UAF invariant). NULL when the admission layer is not wired. The fd
    * is the parked client fd queued by the slot-freeing thread. */
   void (*resume)(int fd);
+  /* Periodic maintenance hook: invoked from EVERY worker's poll loop on each
+   * iteration (event-bearing or timeout — under sustained load poll never
+   * times out, and time-based work must not starve). The callee rate-limits
+   * itself; the common case must be near-free. NULL when unused. */
+  void (*tick)(int thread);
 } notify_cbs_t ;
 
 int notify_check_slot(void *ctx, int fd);

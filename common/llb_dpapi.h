@@ -313,7 +313,18 @@ struct dp_nat_act {
   __u8 cdis;
   __u8 nmh;
   __u8 ppv2;
+  /* Rule-attached policer id carried per-flow (from dp_proxy_tacts.polid at CT-create;
+   * 0 = none). Occupies former tail padding — struct size is unchanged at 52 bytes,
+   * pinned below. Established packets re-arm xf->qm.rpolid from here (dp_pipe_set_nat)
+   * so the rule policer fires on every packet, not just the nat_map-lookup ones.
+   */
+  __u16 polid;
 };
+
+/* dp_nat_act rides inside dp_ct_tact (ct_map value) — a silent size change here would
+ * skew every CT entry. polid consumed tail padding; the size must not have moved.
+ */
+_Static_assert(sizeof(struct dp_nat_act) == 52, "dp_nat_act ABI size changed");
 
 #define MIN_DP_POLICER_RATE  (8*1000*1000)  /* 1 MBps = 8 Mbps */
 
@@ -586,7 +597,12 @@ struct dp_intf_tact_set_ifi {
 #define DP_PTEN_TRAP  1
 #define DP_PTEN_DIS   0
   __u8  pten;
-  __u8  r[4];
+  /* Egress-direction policer id (polx_map key; 0 = none). Consumed only by the
+   * egress TC image; the ingress image never reads it. Takes the first two bytes
+   * of the former r[4] padding — offsets and total size unchanged.
+   */
+  __u16 e_polid;
+  __u8  r[2];
 };
 
 struct dp_intf_tact {
@@ -1058,7 +1074,14 @@ struct dp_proxy_tacts {
   uint32_t timeout_member_connect_ms; // backend connect-poll deadline (0 ⇒ 500ms default)
   uint32_t timeout_member_data_ms;    // member-side relay idle deadline (0 ⇒ existing idle)
   uint32_t timeout_tcp_inspect_ms;    // header-accumulation deadline (0 ⇒ bounded default)
-  uint32_t pad3d;                     // Alignment padding (keeps struct 8-byte aligned)
+  // Rule-attached Tier-0 policer id (polx_map key; 0 = no rule policer). Takes the
+  // FIRST TWO bytes of the former pad3d(4) — offsets and total size unchanged, so the
+  // _Static_asserts below stay as-is (same idiom as cb_enable/kv_engine_type). The NAT
+  // datapath (dp_do_nat) copies this into xf->qm.rpolid on rule hit; CT-create persists
+  // it per-flow in dp_nat_act.polid so established packets keep policing after the
+  // nat_map lookup stops running for the flow.
+  uint16_t polid;
+  uint16_t pad3d;                     // Remaining padding (keeps struct 8-byte aligned)
   // TLS-hardening scalars ( version/cipher pinning, HSTS, backend
   // certIds). Additive + default-off (0/empty ⇒ today's behaviour, -COMPAT). Copied verbatim
   // into the proxy_arg fields added by llb_conv_nat2proxy. Consumed only on the L7_Proxy

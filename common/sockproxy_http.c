@@ -840,6 +840,41 @@ rewrite_location_header(uint8_t *buf, size_t buflen, size_t bufsize, int is_ssl)
   return new_len;
 }
 
+/* Slide the token-accounting tail window: keep the last
+ * PROXY_USAGE_TAIL_KEEP bytes of the response stream. Unlike the [DONE]
+ * scanner's replace-tail, partial segments ACCUMULATE so a usage object
+ * split across small SSE segments survives intact in the window. */
+static void
+proxy_usage_tail_update(proxy_fd_ent_t *pfe, const uint8_t *msg, size_t len)
+{
+  if (len >= PROXY_USAGE_TAIL_KEEP) {
+    memcpy(pfe->usage_tail, msg + len - PROXY_USAGE_TAIL_KEEP,
+           PROXY_USAGE_TAIL_KEEP);
+    pfe->usage_tail_len = PROXY_USAGE_TAIL_KEEP;
+    return;
+  }
+  if ((size_t)pfe->usage_tail_len + len > PROXY_USAGE_TAIL_KEEP) {
+    size_t shift = (size_t)pfe->usage_tail_len + len - PROXY_USAGE_TAIL_KEEP;
+    memmove(pfe->usage_tail, pfe->usage_tail + shift,
+            pfe->usage_tail_len - shift);
+    pfe->usage_tail_len = (uint16_t)(pfe->usage_tail_len - shift);
+  }
+  memcpy(pfe->usage_tail + pfe->usage_tail_len, msg, len);
+  pfe->usage_tail_len = (uint16_t)(pfe->usage_tail_len + len);
+}
+
+/* Dialect ops for token accounting on the response path. P/D rules carry
+ * their engine dialect on the epval; plain AI-gateway rules (no
+ * kv_engine_type) fall back to the plain-LB profile. */
+static const pd_dialect_ops_t *
+proxy_usage_ops(proxy_fd_ent_t *pfe)
+{
+  proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+  if (epv && epv->pd_ops)
+    return epv->pd_ops;
+  return &pd_dialect_plain;
+}
+
 int
 proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 {
@@ -1408,6 +1443,42 @@ skip_deferred_masking:
       }
     }
 
+    /* Token accounting: maintain the response tail window and, for
+     * non-streamed JSON bodies, charge the tenant quota as soon as the
+     * usage object completes in the window (headers and body usually share
+     * one segment, but a split body keeps retrying here per segment). SSE
+     * responses charge at the [DONE] terminator below, where the final
+     * chunk — the usage carrier under stream_options.include_usage — is
+     * already in this same window. result stays NULL on the consume call:
+     * a completed response is never interrupted; an exceeded quota denies
+     * the NEXT request at the rate-limit gate. */
+    if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
+        rfd_ent->ai_gw_mode && !rfd_ent->usage_consumed && len > 0) {
+      proxy_usage_tail_update(rfd_ent, (const uint8_t *)msg, len);
+      if (!rfd_ent->sse_active && rfd_ent->metric_response_status != 0) {
+        const pd_dialect_ops_t *uops = proxy_usage_ops(rfd_ent);
+        int up = 0, uc = 0;
+        if (uops->extract_usage &&
+            uops->extract_usage(rfd_ent, rfd_ent->usage_tail,
+                                rfd_ent->usage_tail_len, &up, &uc) == 0) {
+          rfd_ent->usage_prompt_toks = up;
+          rfd_ent->usage_complet_toks = uc;
+          llb_ai_token_quota_consume((char *)rfd_ent->tenant_id,
+                                     (char *)proxy_effective_model(rfd_ent),
+                                     up, uc, 0,
+                                     (int)rfd_ent->usage_reserved_toks,
+                                     rfd_ent->usage_res_epoch, NULL);
+          /* Settled: the admission claim is spent. Zero it so no later
+           * consume on this connection can release it a second time. */
+          rfd_ent->usage_reserved_toks = 0;
+          rfd_ent->usage_res_epoch = 0;
+          rfd_ent->usage_consumed = 1;
+          log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (non-stream)",
+                   rfd_ent->fd, up, uc);
+        }
+      }
+    }
+
     /* Record non-SSE AI-Gateway responses into loxilb_ai_requests_total.
      * The SSE path records at its [DONE] terminator; a plain-JSON response —
      * the common error shape (OpenAI-compatible backends return errors as JSON
@@ -1417,7 +1488,10 @@ skip_deferred_masking:
      * the SSE sniff above did NOT activate a stream, record the request exactly
      * once. metric_ai_recorded guards against the [DONE] path (which also sets
      * it) and against re-firing on later packets of the same response; status +
-     * TTFB latency were captured by the L7-metrics block above. */
+     * TTFB latency were captured by the L7-metrics block above. Token counts
+     * come from the accounting block above when the body carried usage in
+     * this same segment (0 when it arrives later — the quota still charges,
+     * only this metric misses the counts). */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
         rfd_ent->ai_gw_mode && !rfd_ent->metric_ai_recorded &&
         !rfd_ent->sse_active && rfd_ent->metric_response_status != 0 &&
@@ -1430,7 +1504,8 @@ skip_deferred_masking:
       const char *ai_ns_model = proxy_effective_model(rfd_ent);
       llb_ai_record_request((char *)rfd_ent->tenant_id, (char *)ai_ns_model,
                             (int)rfd_ent->metric_response_status, ai_ns_lat_ms,
-                            0, 0, 0, 0, "");
+                            rfd_ent->usage_prompt_toks,
+                            rfd_ent->usage_complet_toks, 0, 0, "");
       rfd_ent->metric_ai_recorded = 1;
       log_info("[AI_NONSSE_RECORDED] client_fd=%d backend_fd=%d model=%s status=%u",
                rfd_ent->fd, ent->fd, ai_ns_model,
@@ -1459,6 +1534,28 @@ skip_deferred_masking:
        * stream whose backend has gone genuinely silent (vLLM dropped its [DONE])
        * crosses the cap. */
       rfd_ent->pd_last_decode_ts = time(NULL);
+
+      /* Estimate net: count relayed SSE data-object chunks ("data:" whose
+       * value opens with '{' — [DONE] never matches). At the OpenAI
+       * streaming convention of one content delta per chunk this
+       * approximates completion tokens; used only when the final usage
+       * object never materializes. A "data:" split across two TCP
+       * segments undercounts by one — acceptable for a backstop. */
+      {
+        const uint8_t *ev_p = (const uint8_t *)msg;
+        size_t ev_left = len;
+        const uint8_t *ev_hit;
+        while ((ev_hit = memmem(ev_p, ev_left, "data:", 5)) != NULL) {
+          const uint8_t *ev_v = ev_hit + 5;
+          const uint8_t *ev_end = (const uint8_t *)msg + len;
+          while (ev_v < ev_end && (*ev_v == ' ' || *ev_v == '\t'))
+            ev_v++;
+          if (ev_v < ev_end && *ev_v == '{')
+            rfd_ent->usage_sse_events++;
+          ev_left -= (size_t)(ev_hit + 5 - ev_p);
+          ev_p = ev_hit + 5;
+        }
+      }
 
       uint8_t window[PROXY_SSE_TAIL_KEEP * 2];
       uint8_t old_len = rfd_ent->sse_tail_len;
@@ -1507,13 +1604,52 @@ skip_deferred_masking:
         const char *sse_model = proxy_effective_model(rfd_ent);
         const char *sse_tenant = rfd_ent->tenant_id;
 
-        /* Step 3: Record token consumption.
-         * Pass 0,0 for token counts — per-request token extraction from
-         * the final SSE chunk is not yet wired (best-effort B-2 mode).
+        /* Step 3: Record token consumption. The final pre-[DONE] chunk —
+         * the usage carrier when the client requested
+         * stream_options.include_usage — sits in the usage tail window
+         * maintained on the relay path above; extract through the engine
+         * dialect and charge the tenant quota. Counts stay 0 when the
+         * client omitted the flag (no usage chunk to read).
          * Pass NULL for result — the current response is complete and
-         * must NOT be interrupted. */
+         * must NOT be interrupted; an exceeded quota denies the NEXT
+         * request at the rate-limit gate. */
+        int sse_tok_p = rfd_ent->usage_prompt_toks;
+        int sse_tok_c = rfd_ent->usage_complet_toks;
+        int sse_estimated = 0;
+        if (!rfd_ent->usage_consumed) {
+          const pd_dialect_ops_t *sse_uops = proxy_usage_ops(rfd_ent);
+          if (sse_uops->extract_usage &&
+              sse_uops->extract_usage(rfd_ent, rfd_ent->usage_tail,
+                                      rfd_ent->usage_tail_len,
+                                      &sse_tok_p, &sse_tok_c) == 0) {
+            rfd_ent->usage_prompt_toks = sse_tok_p;
+            rfd_ent->usage_complet_toks = sse_tok_c;
+            log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (stream)",
+                     rfd_ent->fd, sse_tok_p, sse_tok_c);
+          } else {
+            /* No usage object despite the request-side include_usage
+             * inject (chunked/oversize body skipped it, or the engine
+             * dropped the final chunk) — fall back to the estimate net so
+             * the stream is not free. */
+            sse_tok_p = (int)rfd_ent->usage_est_prompt;
+            sse_tok_c = (int)rfd_ent->usage_sse_events;
+            sse_estimated = (sse_tok_p + sse_tok_c) > 0;
+            rfd_ent->usage_prompt_toks = sse_tok_p;
+            rfd_ent->usage_complet_toks = sse_tok_c;
+            log_info("[AI_TOKENS] client_fd=%d no usage in final chunk — "
+                     "estimated prompt=%d completion=%d",
+                     rfd_ent->fd, sse_tok_p, sse_tok_c);
+          }
+          rfd_ent->usage_consumed = 1;
+        }
         llb_ai_token_quota_consume((char *)sse_tenant, (char *)sse_model,
-                                   0, 0, NULL);
+                                   sse_tok_p, sse_tok_c, sse_estimated,
+                                   (int)rfd_ent->usage_reserved_toks,
+                                   rfd_ent->usage_res_epoch, NULL);
+        /* Settled: zero the claim so a spurious second [DONE] or a later
+         * non-stream consume on this connection cannot double-release. */
+        rfd_ent->usage_reserved_toks = 0;
+        rfd_ent->usage_res_epoch = 0;
         /* Step 4: End SSE stream gauge */
         llb_ai_stream_end("", (char *)sse_model);
         /* Step 5: Record request metrics. Status comes from the backend
@@ -1524,7 +1660,7 @@ skip_deferred_masking:
                              ? (int)rfd_ent->metric_response_status
                              : 200;
         llb_ai_record_request((char *)sse_tenant, (char *)sse_model, sse_status,
-                              latency_ms, 0, 0, 0, 0, "");
+                              latency_ms, sse_tok_p, sse_tok_c, 0, 0, "");
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         log_info("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
@@ -1955,6 +2091,12 @@ skip_deferred_masking:
 /* Session hash, conversation mapping, endpoint selection (proxy_setup_ep__),
  * proxy_conversation_cleanup_thread, proxy_run moved to sockproxy_ep.c */
 
+/* Tier-1 shaper (defined with its control plane further down) */
+static void qos_apply_stored_cfg(proxy_map_ent_t *ent);
+static void qos_service_teardown(proxy_ent_t *key);
+static int qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd);
+static int qos_resume_reader(int fd, proxy_fd_ent_t *pfe);
+
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 {
@@ -1970,6 +2112,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   while (ent) {
     if (cmp_proxy_ent(&ent->key, new_ent)) {
+      /* a shaper config stored before this add (or surviving a rule
+       * re-create) attaches here; no-op when none is stored */
+      qos_apply_stored_cfg(ent);
+
       // P6: Build composite key (host|path|model) or shorter form for backward compat
       char ephash_key[512];
       build_ephash_key(ephash_key, sizeof(ephash_key),
@@ -2656,6 +2802,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
                   tepval->ephash_key, strlen(tepval->ephash_key),
                   tepval);
 
+  /* new service: attach any shaper config stored ahead of rule creation */
+  qos_apply_stored_cfg(node);
+
   node->next = proxy_struct->head;
   proxy_struct->head = node;
 
@@ -2677,6 +2826,14 @@ proxy_delete_entry(proxy_ent_t *ent, proxy_arg_t *arg)
   void *ssl_epctx = NULL;
 
   PROXY_LOCK();
+
+  /* Release the shaper state for this service before teardown: drop the
+   * stored config (a later rule on the same VIP:port must not inherit it —
+   * a surviving policer association is re-driven by the policer ticker) and
+   * wake any parked readers so their connections tear down promptly instead
+   * of hanging HUP-armed until a client timeout. */
+  qos_service_teardown(ent);
+
   ret = proxy_delete_entry__(ent, arg, &fd, &ssl_ctx, &ssl_epctx);
   PROXY_UNLOCK();
 
@@ -2927,6 +3084,303 @@ proxy_update_ep_health_by_ip(proxy_ent_t *key, uint32_t ep_ip, uint8_t inactive)
   log_error("Proxy entry not found for %s:%u",
             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
   return -ENOENT;
+}
+
+/* ==========================================================================
+ * Tier-1 (L7) byte shaper — control plane + refill/wake engine.
+ *
+ * The bucket itself and the burst-loop enforcement live on the relay hot
+ * path (handle_client_data); everything here is control/slow path. Config is
+ * stored in a small key-indexed table so a policer attached BEFORE its LB
+ * rule exists converges when proxy_add_entry later creates the entry, and so
+ * a rule re-create keeps its shaper without a control-plane round trip.
+ *
+ * Locking: the store and all cfg mutation are under PROXY_LOCK (write); the
+ * tick walks entries under PROXY_RDLOCK. Bucket state is atomics-only.
+ * ========================================================================== */
+
+#define QOS_CFG_STORE_MAX   512
+#define QOS_TICK_QUANTUM_NS 5000000ULL   /* refill/wake sweep every 5ms */
+
+struct qos_cfg_slot {
+  proxy_ent_t key;
+  struct proxy_qos_cfg cfg;
+  int valid;
+};
+
+static struct qos_cfg_slot qos_cfg_store[QOS_CFG_STORE_MAX]; /* PROXY_LOCK */
+static _Atomic uint64_t qos_last_tick_ns;
+
+static uint64_t
+qos_now_ns(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* PROXY_LOCK held. Returns the slot for key; allocates a free one when
+ * alloc != 0. NULL when absent (or the store is full). */
+static struct qos_cfg_slot *
+qos_store_find(proxy_ent_t *key, int alloc)
+{
+  struct qos_cfg_slot *free_slot = NULL;
+  for (int i = 0; i < QOS_CFG_STORE_MAX; i++) {
+    if (qos_cfg_store[i].valid) {
+      if (cmp_proxy_ent(&qos_cfg_store[i].key, key)) {
+        return &qos_cfg_store[i];
+      }
+    } else if (!free_slot) {
+      free_slot = &qos_cfg_store[i];
+    }
+  }
+  if (alloc && free_slot) {
+    memset(free_slot, 0, sizeof(*free_slot));
+    memcpy(&free_slot->key, key, sizeof(*key));
+    return free_slot;
+  }
+  return NULL;
+}
+
+/* PROXY_LOCK held. Wake every parked fd on the bucket — used when shaping is
+ * disabled (a parked fd would otherwise stay HUP-armed forever) and on rate
+ * changes. Wakes route to each fd's owner worker; resume is gen-validated so
+ * stale entries are harmless. */
+static void
+qos_wake_all_parked(struct proxy_qos_bucket *b)
+{
+  struct qos_parked_fd wake[QOS_MAX_PARKED];
+  int n;
+
+  pthread_mutex_lock(&b->park_lock);
+  n = b->n_parked;
+  if (n > 0) {
+    memcpy(wake, b->parked, (size_t)n * sizeof(wake[0]));
+    b->n_parked = 0;
+  }
+  pthread_mutex_unlock(&b->park_lock);
+
+  for (int i = 0; i < n; i++) {
+    notify_wake_worker(proxy_struct->ns, wake[i].owner_thr, wake[i].fd);
+  }
+}
+
+/* PROXY_LOCK held. Applies cfg to a live entry. Enabling (or a rate change)
+ * re-inits the bucket to a full burst; disabling releases parked readers. */
+static void
+qos_apply_cfg(proxy_map_ent_t *ent, const struct proxy_qos_cfg *cfg)
+{
+  int was_on = ent->qos_cfg.cir_Bps != 0;
+  int now_on = cfg->cir_Bps != 0;
+
+  if (!was_on && now_on) {
+    pthread_mutex_init(&ent->qos_up.park_lock, NULL);
+    ent->qos_up.n_parked = 0;
+    pthread_mutex_init(&ent->qos_down.park_lock, NULL);
+    ent->qos_down.n_parked = 0;
+  }
+
+  ent->qos_cfg = *cfg;
+
+  if (now_on) {
+    /* both buckets are (re)armed; the burst-loop gate consults qos_cfg.dir,
+     * so a direction the config leaves un-shaped simply never drains its
+     * bucket — no per-direction init dance needed */
+    qos_bucket_init(&ent->qos_up, cfg, qos_now_ns());
+    qos_bucket_init(&ent->qos_down, cfg, qos_now_ns());
+    log_info("qos: shaper on %s:%u cir=%luB/s cbs=%uB dir=0x%x mode=%d",
+             inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+             (unsigned long)cfg->cir_Bps, qos_effective_cbs(cfg),
+             cfg->dir, cfg->mode);
+  }
+  if (was_on) {
+    /* rate change or disable: parked readers re-evaluate against the new
+     * config on their owner workers */
+    qos_wake_all_parked(&ent->qos_up);
+    qos_wake_all_parked(&ent->qos_down);
+    if (!now_on) {
+      log_info("qos: shaper off %s:%u",
+               inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport));
+    }
+  }
+}
+
+/* Called from proxy_add_entry (PROXY_LOCK held) for both the create and the
+ * in-place refresh path: a stored config survives rule re-creation. */
+static void
+qos_apply_stored_cfg(proxy_map_ent_t *ent)
+{
+  struct qos_cfg_slot *slot = qos_store_find(&ent->key, 0);
+  if (slot && slot->cfg.cir_Bps && !ent->qos_cfg.cir_Bps) {
+    qos_apply_cfg(ent, &slot->cfg);
+  }
+}
+
+/* Called from proxy_delete_entry (PROXY_LOCK held): drop the stored config
+ * for the service and release its parked readers so teardown never leaves a
+ * connection HUP-armed with no wake source. */
+static void
+qos_service_teardown(proxy_ent_t *key)
+{
+  struct qos_cfg_slot *slot = qos_store_find(key, 0);
+  if (slot) {
+    slot->valid = 0;
+  }
+  for (proxy_map_ent_t *ent = proxy_struct->head; ent; ent = ent->next) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      if (ent->qos_cfg.cir_Bps) {
+        qos_wake_all_parked(&ent->qos_up);
+        qos_wake_all_parked(&ent->qos_down);
+      }
+      break;
+    }
+  }
+}
+
+int
+proxy_update_qos_config(struct proxy_ent *key, uint64_t cir_bps,
+                        uint64_t pir_bps, uint32_t cbs_bytes,
+                        uint8_t dir, uint8_t mode)
+{
+  proxy_map_ent_t *ent;
+  struct proxy_qos_cfg cfg = { 0 };
+
+  if (!key) {
+    return -EINVAL;
+  }
+
+  /* rates arrive in bits/sec (policer API unit); the shaper meters bytes */
+  cfg.cir_Bps = cir_bps / 8;
+  cfg.pir_Bps = pir_bps / 8;   /* reserved: single-rate shaping for now */
+  cfg.cbs_bytes = cbs_bytes;
+  cfg.dir = dir ? dir : QOS_DIR_UPLOAD;
+  cfg.mode = mode ? mode : QOS_MODE_SHAPE;
+
+  if (cfg.mode != QOS_MODE_SHAPE && cfg.cir_Bps) {
+    log_error("qos: mode %d unsupported (shape only)", cfg.mode);
+    return -EOPNOTSUPP;
+  }
+
+  PROXY_LOCK();
+
+  if (cfg.cir_Bps == 0) {
+    struct qos_cfg_slot *slot = qos_store_find(key, 0);
+    if (slot) {
+      slot->valid = 0;
+    }
+  } else {
+    struct qos_cfg_slot *slot = qos_store_find(key, 1);
+    if (!slot) {
+      PROXY_UNLOCK();
+      log_error("qos: config store full (%d services)", QOS_CFG_STORE_MAX);
+      return -ENOSPC;
+    }
+    slot->cfg = cfg;
+    slot->valid = 1;
+  }
+
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      qos_apply_cfg(ent, &cfg);
+      break;
+    }
+  }
+
+  PROXY_UNLOCK();
+  return 0;
+}
+
+/* Park the reading side of fd on its direction's bucket. Returns 0 on
+ * success; -1 when the ring is full, in which case the caller lets the read
+ * proceed unshaped for this burst (availability over precision — a full ring
+ * means hundreds of throttled conns already queued). */
+static int
+qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd)
+{
+  int owner = notify_owner_thr(proxy_struct->ns, fd);
+
+  pthread_mutex_lock(&b->park_lock);
+  if (b->n_parked >= QOS_MAX_PARKED) {
+    pthread_mutex_unlock(&b->park_lock);
+    return -1;
+  }
+  b->parked[b->n_parked].fd = fd;
+  b->parked[b->n_parked].gen =
+      atomic_load_explicit(&pfe->gen, memory_order_acquire);
+  b->parked[b->n_parked].owner_thr = owner;
+  b->n_parked++;
+  pthread_mutex_unlock(&b->park_lock);
+
+  /* flags BEFORE the poll-mask change so a racing event observes the park */
+  pfe->qos_parked = 1;
+  pfe->qos_was_parked = 1;
+  pfe->read_paused = 1;
+  atomic_fetch_add_explicit(&b->parks, 1, memory_order_relaxed);
+  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+  return 0;
+}
+
+/* Resume half of the park/resume pair — invoked on the fd's OWNER worker via
+ * the notify wake path (see pd_resume_parked, which dispatches here first).
+ * Re-arms EPOLLIN; the pending payload is still unread in the socket buffer,
+ * so level-triggered poll re-drives handle_client_data naturally. Returns 1
+ * when the fd was a QoS park (caller stops), 0 otherwise. */
+static int
+qos_resume_reader(int fd, proxy_fd_ent_t *pfe)
+{
+  if (!pfe->qos_parked) {
+    return 0;
+  }
+  pfe->qos_parked = 0;
+  pfe->read_paused = 0;
+  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  return 1;
+}
+
+/* Notifier tick: refill every active bucket and wake parked readers when
+ * tokens returned. Runs opportunistically from EVERY worker's poll loop (not
+ * only the timeout branch — under sustained event load poll never times out,
+ * and parked fds must not starve); the CAS on qos_last_tick_ns elects one
+ * refiller per quantum, so the common case is a single atomic load. */
+void
+proxy_qos_tick(int thread)
+{
+  (void)thread;
+  proxy_map_ent_t *ent;
+
+  if (!proxy_struct) {
+    return;
+  }
+
+  uint64_t now = qos_now_ns();
+  uint64_t last = atomic_load_explicit(&qos_last_tick_ns, memory_order_relaxed);
+  if (now - last < QOS_TICK_QUANTUM_NS) {
+    return;
+  }
+  if (!atomic_compare_exchange_strong_explicit(&qos_last_tick_ns, &last, now,
+                                               memory_order_acq_rel,
+                                               memory_order_relaxed)) {
+    return;
+  }
+
+  PROXY_RDLOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (ent->qos_cfg.cir_Bps == 0) {
+      continue;
+    }
+    /* each enabled direction refills its own bucket at the full CIR — the
+     * directions are independent meters, not halves of a shared one */
+    struct proxy_qos_bucket *dirs[2] = { &ent->qos_up, &ent->qos_down };
+    for (int d = 0; d < 2; d++) {
+      struct proxy_qos_bucket *b = dirs[d];
+      qos_bucket_refill(b, ent->qos_cfg.cir_Bps,
+                        qos_effective_cbs(&ent->qos_cfg), now);
+      if (atomic_load_explicit(&b->tokens, memory_order_relaxed) > 0) {
+        qos_wake_all_parked(b);
+      }
+    }
+  }
+  PROXY_UNLOCK();
 }
 
 // P2: Configure draining policy for a proxy service
@@ -5420,6 +5874,9 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->cache_total_size = 0;
     npfe2->cache_backpressure = 0;
     npfe2->read_paused = 0;
+    npfe2->qos_parked = 0;    /* pfe shells are pool-recycled, never re-zeroed */
+    npfe2->qos_was_parked = 0;
+    npfe2->qos_park_seen_ts = 0;
 
     PROXY_LOCK();
     npfe2->next = ent->val.fdlist;
@@ -5495,6 +5952,38 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
 }
 
 int
+handle_on_message_begin(llhttp_t* parser)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe;
+
+  pfe = settings->uarg;
+  assert(pfe);
+
+  /* A new request head on the client leg: clear the per-request header
+   * captures so a keep-alive request cannot inherit the previous request's
+   * credentials or model hint — handle_header_val only overwrites these when
+   * the header is present, so without this reset a keyless request N+1 on a
+   * reused connection would be validated with request N's key. */
+  if (pfe->odir == 0) {
+    pfe->x_api_key_raw[0] = '\0';
+    pfe->x_model_header[0] = '\0';
+    /* Token-accounting state is per-response: without this reset, request
+     * N+1 on a reused connection would inherit request N's consumed flag
+     * (never charging again) or its stale counts. */
+    pfe->usage_tail_len = 0;
+    pfe->usage_consumed = 0;
+    pfe->usage_prompt_toks = 0;
+    pfe->usage_complet_toks = 0;
+    pfe->usage_est_prompt = 0;
+    pfe->usage_sse_events = 0;
+    pfe->usage_reserved_toks = 0;
+    pfe->usage_res_epoch = 0;
+  }
+  return 0;
+}
+
+int
 handle_on_message_complete(llhttp_t* parser)
 {
   llhttp_settings_t *settings = parser->settings;
@@ -5522,8 +6011,33 @@ handle_on_message_complete(llhttp_t* parser)
     proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
     if (hent->val.ephash && hent->val.ephash->ai_gw_mode) {
       ai_gw_decision_t ai_dec = {0};
-      char *model = pfe->x_model_header[0] ? pfe->x_model_header
-                  : (pfe->prefix_key.model[0] ? pfe->prefix_key.model : "");
+      char body_model[MAX_MODEL_LEN] = {0};
+      const char *gate_body = NULL;
+      size_t gate_body_len = 0;
+
+      /* allowed_models must bind to the model the backend will actually
+       * serve, which is the one in the JSON body — an X-Model header that
+       * differs from the body is at best a stale hint and at worst a spoof.
+       * The message is complete here, so the body is present in rcvbuf;
+       * parse it and fall back to the header only when the body carries no
+       * model field. The located body also feeds the pre-admission token
+       * reservation below. */
+      if (pfe->http_content_length > 0 && pfe->rcv_off > 4) {
+        for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
+          if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
+              pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
+            gate_body = (const char *)(pfe->rcvbuf + i + 4);
+            gate_body_len = pfe->rcv_off - (i + 4);
+            break;
+          }
+        }
+        if (gate_body && gate_body_len > 0) {
+          extract_model_field(gate_body, gate_body_len, body_model, sizeof(body_model));
+        }
+      }
+      char *model = body_model[0] ? body_model
+                  : (pfe->prefix_key.model[0] ? pfe->prefix_key.model
+                  : (pfe->x_model_header[0] ? pfe->x_model_header : ""));
 
       /* Step 1: validate X-Api-Key → 401 (missing/invalid) or 403 (model denied) */
       int ai_rc = llb_ai_validate_key(pfe->x_api_key_raw, model, &ai_dec);
@@ -5557,9 +6071,11 @@ handle_on_message_complete(llhttp_t* parser)
       strncpy(pfe->tenant_id, ai_dec.tenant_id, sizeof(pfe->tenant_id) - 1);
       pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
 
-      /* Step 2: per-key then per-tenant RPS check → 429 */
+      /* Step 2: per-key then per-tenant RPS check → 429. The body-bound
+       * model rides along so the token-quota stage can consult the
+       * tenant|model bucket next to the tenant aggregate. */
       ai_gw_decision_t rl_dec = {0};
-      int rl_rc = llb_ai_ratelimit_check(ai_dec.key_id, ai_dec.tenant_id, &rl_dec);
+      int rl_rc = llb_ai_ratelimit_check(ai_dec.key_id, ai_dec.tenant_id, model, &rl_dec);
       if (rl_rc != 0) {
         char resp_429[320];
         int n = snprintf(resp_429, sizeof(resp_429),
@@ -5577,6 +6093,47 @@ handle_on_message_complete(llhttp_t* parser)
                  pfe->fd, ai_dec.key_id, ai_dec.tenant_id,
                  rl_dec.error_code, rl_dec.retry_after);
         return;
+      }
+
+      /* Step 3: pre-admission token reservation → 429 BEFORE dispatch.
+       * Claim the request's worst case (prompt estimated from the body's
+       * messages/prompt extent + its declared max_tokens ceiling) against
+       * the tenant quota now, while denial costs one cheap response — not
+       * a backend prefill whose tokens the latch only bills afterwards.
+       * The claim and its window tag ride the pfe to the consume call,
+       * which credits the ceiling back and charges the real usage. */
+      if (gate_body && gate_body_len > 0) {
+        int resv_prompt = estimate_prompt_tokens(gate_body, gate_body_len);
+        int resv_max = extract_max_tokens(gate_body, gate_body_len);
+        if (resv_prompt > 0 || resv_max > 0) {
+          ai_gw_decision_t rs_dec = {0};
+          int64_t rs_epoch = 0;
+          if (llb_ai_token_quota_reserve(ai_dec.tenant_id, model,
+                                         resv_prompt, resv_max,
+                                         &rs_epoch, &rs_dec) != 0) {
+            char resp_429r[320];
+            int rn = snprintf(resp_429r, sizeof(resp_429r),
+              "HTTP/1.1 429 Too Many Requests\r\n"
+              "Content-Type: application/json\r\n"
+              "Retry-After: %d\r\n"
+              "Connection: close\r\n"
+              "\r\n"
+              "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+              rs_dec.retry_after, rs_dec.error_code, rs_dec.retry_after);
+            if (rn > 0 && rn < (int)sizeof(resp_429r))
+              send(pfe->fd, resp_429r, (size_t)rn, 0);
+            shutdown(pfe->fd, SHUT_RDWR);
+            log_info("[AIGateway] fd=%d pre-admission denied: tenant=%s "
+                     "want=%d+%d error=%s retry=%d",
+                     pfe->fd, ai_dec.tenant_id, resv_prompt, resv_max,
+                     rs_dec.error_code, rs_dec.retry_after);
+            return;
+          }
+          if (rs_epoch != 0) {
+            pfe->usage_reserved_toks = (uint32_t)(resv_prompt + resv_max);
+            pfe->usage_res_epoch = rs_epoch;
+          }
+        }
       }
     }
   }
@@ -6727,9 +7284,13 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->cache_total_size = 0;
   npfe1->cache_backpressure = 0;
   npfe1->read_paused = 0;
+  npfe1->qos_parked = 0;      /* pfe shells are pool-recycled, never re-zeroed */
+  npfe1->qos_was_parked = 0;
+  npfe1->qos_park_seen_ts = 0;
 
   // Initialize HTTP parser
   llhttp_settings_init(&npfe1->settings);
+  npfe1->settings.on_message_begin = handle_on_message_begin;
   npfe1->settings.on_message_complete = handle_on_message_complete;
   npfe1->settings.on_header_field = handle_header_name;
   npfe1->settings.on_header_value = handle_header_val;
@@ -6824,6 +7385,55 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 
   // NOW forward accumulated data to backend
   if (pfe->rfd[0] > 0) {  // Backend connected successfully
+
+    /* AI-gateway token accounting: force stream_options.include_usage=true
+     * into streaming request bodies BEFORE any dialect rewrite, so the
+     * backend's final SSE chunk carries the usage object the response path
+     * charges from. A client that omits the flag would otherwise stream
+     * tokens invisible to the per-tenant quota. Placement covers every
+     * plane from one site: the plain relay forwards the patched body, the
+     * sequential P/D machines save it for the decode leg (their prefill
+     * rewrites strip stream_options again), and the sglang dual dispatch
+     * inherits it on both legs — exactly what a reference router forwards
+     * when the client itself sets the flag. Chunked or partially
+     * accumulated bodies are left untouched (not contiguous/complete
+     * here); non-streaming requests carry usage without the flag. */
+    if (pfe->epv && pfe->odir == 0 && pfe->rcv_off > 4 && !pfe->is_streamable &&
+        ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
+      size_t ug_scan = pfe->rcv_off < 2048 ? pfe->rcv_off : 2048;
+      if (memmem(pfe->rcvbuf, ug_scan, "Transfer-Encoding: chunked", 26) == NULL &&
+          memmem(pfe->rcvbuf, ug_scan, "transfer-encoding: chunked", 26) == NULL) {
+        char *ug_body = NULL;
+        size_t ug_body_len = 0, ug_hdr_len = 0;
+        for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
+          if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
+              pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
+            ug_hdr_len = i + 4;
+            ug_body = (char *)pfe->rcvbuf + ug_hdr_len;
+            ug_body_len = pfe->rcv_off - ug_hdr_len;
+            break;
+          }
+        }
+        if (ug_body && ug_body_len > 0 && pfe->http_content_length > 0 &&
+            ug_body_len >= (size_t)pfe->http_content_length) {
+          size_t ug_new_len = ug_body_len;
+          if (inject_include_usage(ug_body, ug_body_len,
+                                   SP_SOCK_MSG_LEN - ug_hdr_len,
+                                   &ug_new_len) == 0) {
+            pfe->rcv_off = ug_hdr_len + ug_new_len;
+            pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
+                                     SP_SOCK_MSG_LEN, ug_new_len);
+            log_info("[AI_USAGE_INJECT] fd=%d body %zu -> %zu bytes",
+                     pfe->fd, ug_body_len, ug_new_len);
+          }
+          /* Size the prompt-estimate net while the body is at hand — only
+           * ever charged (flagged estimated) when the response's usage
+           * object fails to materialize. */
+          pfe->usage_est_prompt =
+              (uint32_t)estimate_prompt_tokens(ug_body, ug_new_len);
+        }
+      }
+    }
 
     /* P/D disaggregation body rewriting.
      * Moved here from handle_on_message_complete because pfe->epv
@@ -7217,6 +7827,16 @@ pd_resume_parked(int fd)
     log_warn("[PD_ADMISSION] resume fd=%d: gen mismatch (slot recycled) — drop", fd);
     return;
   }
+
+  /* Tier-1 shaper wake rides the same owner-worker resume path. A QoS park
+   * never consumed the pending payload, so re-arming EPOLLIN is the whole
+   * resume — level-triggered poll re-drives handle_client_data with a
+   * refilled bucket. Handled before the P/D-park gate below (a QoS-parked
+   * fd is not in PD_PHASE_PARKED). */
+  if (qos_resume_reader(fd, pfe)) {
+    return;
+  }
+
   if (pfe->pd_phase != PD_PHASE_PARKED) {
     /* Already resumed/reaped/torn down by another edge — idempotent no-op. */
     return;
@@ -7288,7 +7908,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
   for (j = 0; j < pfe->n_rfd; j++) {
     if (pfe->rfd_ent[j]) {
       // SAFETY: Clear backpressure if cache is actually empty (prevents stuck state)
-      if (pfe->rfd_ent[j]->cache_backpressure && pfe->rfd_ent[j]->cache_total_size == 0) {
+      // A QoS park is NOT backpressure: clearing read_paused here would
+      // disengage the shaper — only the shaper's refill wake may do that.
+      if (pfe->rfd_ent[j]->cache_backpressure && pfe->rfd_ent[j]->cache_total_size == 0 &&
+          !pfe->rfd_ent[j]->qos_parked) {
         pfe->rfd_ent[j]->cache_backpressure = 0;
         pfe->rfd_ent[j]->read_paused = 0;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -7325,8 +7948,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     }
     return 0; // Success (handled by pausing)
   } else {
-    // Re-enable reads if they were paused
-    if (pfe->read_paused) {
+    // Re-enable reads if they were paused — unless the pause belongs to the
+    // Tier-1 shaper: a QoS park is released only by the refill wake.
+    if (pfe->read_paused && !pfe->qos_parked) {
       pfe->read_paused = 0;
       notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, pfe, pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -7338,11 +7962,66 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
   // 🔍 DEBUG: Log start of burst loop
   log_trace("burst-start fd=%d odir=%d", fd, pfe->odir);
-  
+
+  /* Tier-1 byte shaper: resolve this direction's bucket once per burst.
+   * odir 0 reads client->backend payload against qos_up; odir 1 reads
+   * backend->client payload against qos_down — independent buckets, each
+   * gated by its own qos_cfg.dir bit. An H2 connection is never shaped (a
+   * connection-level pause head-of-line-blocks every stream on it). The
+   * token check sits INSIDE the burst loop and clamps the read length —
+   * one readiness event can otherwise drain up to 1024 x 1MB unshaped. */
+  struct proxy_qos_bucket *qos_b = NULL;
+  if (pfe->head && !pfe->h2_session) {
+    proxy_map_ent_t *qhent = (proxy_map_ent_t *)pfe->head;
+    if (qhent->qos_cfg.cir_Bps) {
+      if (pfe->odir == 0 && (qhent->qos_cfg.dir & QOS_DIR_UPLOAD)) {
+        qos_b = &qhent->qos_up;
+      } else if (pfe->odir == 1 && (qhent->qos_cfg.dir & QOS_DIR_DOWNLOAD)) {
+        qos_b = &qhent->qos_down;
+      }
+    }
+  }
+
   for (j = 0; j < PROXY_NUM_BURST_RX; j++) {
     int sret;
-    int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, SP_SOCK_MSG_LEN - pfe->rcv_off);
+    size_t rd_want = SP_SOCK_MSG_LEN - pfe->rcv_off;
+    uint64_t qos_grant = 0;
+
+    if (qos_b && rd_want > 0) {
+      qos_grant = qos_bucket_take(qos_b, rd_want);
+      if (qos_grant == 0) {
+        if (qos_park_reader(qos_b, pfe, fd) == 0) {
+          /* parked: the pending payload stays in the socket buffer; the
+           * refill wake re-arms EPOLLIN and this loop re-runs */
+          goto burst_break;
+        }
+        /* park ring full — pass unshaped this burst rather than stall */
+        qos_grant = rd_want;
+      }
+      rd_want = (size_t)qos_grant;
+    }
+
+    int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, rd_want);
     int saved_errno = errno;  // Save errno immediately after recv()
+
+    if (qos_b) {
+      if (rc > 0) {
+        if ((uint64_t)rc < qos_grant) {
+          /* short read: return the unread part of the grant */
+          qos_bucket_credit(qos_b, qos_grant - (uint64_t)rc);
+        }
+        atomic_fetch_add_explicit(&qos_b->bytes_pass, (uint64_t)rc,
+                                  memory_order_relaxed);
+        if (pfe->qos_was_parked) {
+          pfe->qos_was_parked = 0;
+          atomic_fetch_add_explicit(&qos_b->bytes_delayed, (uint64_t)rc,
+                                    memory_order_relaxed);
+        }
+      } else if (qos_grant) {
+        /* nothing read (EAGAIN/EOF/error): the whole grant goes back */
+        qos_bucket_credit(qos_b, qos_grant);
+      }
+    }
     
     // Log only errors and EOF for debugging
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -7493,12 +8172,32 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * After release rfd[0]==-1 so this SAME read falls into the parse branch and reframes
        * cleanly. No race with the Phase-89-pinned decode path: req N+1 only arrives after
        * req N's response fully drained, so pd_phase already went COMPLETE->NONE. */
+      /* AI-gateway arm of the same boundary release: on an ai_gw_mode
+       * connection EVERY keep-alive request must re-enter the parse phase, or
+       * the auth/RPS/model gate (and the future TPM charge) runs only on
+       * request #1 of the connection and a client that holds one connection
+       * open bypasses enforcement entirely. Same boundary guards as the P/D
+       * arm (rcv_off==0 request boundary; streamed-forward mid-body excluded
+       * above), plus sse_active==0 so an in-flight streamed response is never
+       * torn down by an early (pipelined) next request. Cost: the backend leg
+       * is re-established per request — which also re-runs endpoint selection,
+       * so a long-lived client connection no longer pins every request to the
+       * EP chosen for request #1. Like the P/D arm, this assumes the client
+       * does not pipeline request N+1 before N's response drains. */
+      int ai_gw_boundary = 0;
+      if (pfe->head) {
+        proxy_map_ent_t *ka_hent = (proxy_map_ent_t *)pfe->head;
+        if (ka_hent->val.ephash && ka_hent->val.ephash->ai_gw_mode &&
+            pfe->sse_active == 0)
+          ai_gw_boundary = 1;
+      }
       if (pfe->rcv_off == 0 && pfe->n_rfd > 0 &&
           pfe->pd_phase == PD_PHASE_NONE &&
-          pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) {
-        log_info("[KA_FIX] fd=%d releasing stale P/D backend leg before next keep-alive "
-                 "request (n_rfd=%d rfd0=%d) — reframe fix",
-                 pfe->fd, pfe->n_rfd, pfe->rfd[0]);
+          ((pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) ||
+           ai_gw_boundary)) {
+        log_info("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
+                 "request (n_rfd=%d rfd0=%d ai_gw=%d) — reframe/gate re-arm",
+                 pfe->fd, pfe->n_rfd, pfe->rfd[0], ai_gw_boundary);
         proxy_release_rfd_ctx(pfe);
       }
 

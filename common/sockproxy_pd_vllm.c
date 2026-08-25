@@ -834,4 +834,5 @@ const pd_dialect_ops_t pd_dialect_vllm = {
   .on_leg_error = NULL,
   .collect_retry = NULL,
   .reap = NULL,
+  .extract_usage = pd_usage_extract_openai,
 };

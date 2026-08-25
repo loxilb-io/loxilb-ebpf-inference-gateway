@@ -277,6 +277,11 @@ dp_do_nat(void *ctx, struct xfi *xf)
       xf->nm.sel_aid = sel;
       xf->nm.ito = act->ito;
       xf->pm.rule_id =  act->ca.cidx;
+      /* Rule-attached policer: dp_ing has already run (and consumed the port
+       * ipolid), so a rule polid discovered here is enforced by a separate
+       * policer call after the CT stage. CT-create persists it per-flow.
+       */
+      xf->qm.rpolid = act->polid;
       BPF_TRACE_PRINTK("[NAT] action %x", xf->pm.nf);
       /* Special case related to host-dnat */
       if (!xf->nm.nv6 && xf->l34m.saddr4 == xf->nm.nxip4 && xf->pm.nf == LLB_NAT_DST) {

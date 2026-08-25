@@ -431,6 +431,448 @@ extract_user_id(const char *body, size_t len, char *out, size_t cap)
   return -1;
 }
 
+// AI Gateway allowed_models: extract the top-level "model" field from an
+// OpenAI-compatible JSON body. Same top-level-only iteration as
+// extract_user_id so nested "model" strings (e.g. inside messages content)
+// are never matched. The token pool must fit the WHOLE body — jsmn fails
+// outright rather than partially when it runs out — so it is sized like
+// extract_llm_prefix's, not extract_user_id's 64.
+int
+extract_model_field(const char *body, size_t len, char *out, size_t cap)
+{
+  jsmn_parser p;
+  jsmntok_t tokens[2048];
+  int r, i, pair;
+
+  if (!body || len == 0 || !out || cap == 0) return -1;
+
+  jsmn_init(&p);
+  r = jsmn_parse(&p, body, len, tokens, 2048);
+  if (r < 2 || tokens[0].type != JSMN_OBJECT) return -1;
+
+  i = 1;
+  for (pair = 0; pair < tokens[0].size && i + 1 < r; pair++) {
+    if (tokens[i].type == JSMN_STRING &&
+        jsoneq(body, &tokens[i], "model") == 0 &&
+        tokens[i + 1].type == JSMN_STRING) {
+      json_extract_string(body, &tokens[i + 1], out, cap);
+      return (out[0] != '\0') ? 0 : -1;
+    }
+    /* Skip the key token (always 1) then skip the entire value subtree. */
+    i++;
+    i += jsmn_subtree_count(tokens, i, r);
+  }
+  return -1;
+}
+
+// AI Gateway token accounting: pull prompt_tokens / completion_tokens out of
+// the OpenAI "usage" object in a response byte window. The window is NOT a
+// complete JSON document — it is the tail of a response stream (SSE events
+// with their framing, or a JSON body possibly truncated at the front) — so
+// this scans backwards for the LAST `"usage"` key whose value is a complete
+// object and jsmn-parses ONLY that object. Model-generated text can never
+// spoof the key: inside a JSON string value every quote is escaped, so the
+// raw byte sequence "usage" with unescaped quotes cannot occur within
+// content deltas. Engines that put "usage":null on every content chunk
+// (SGLang) fail the value-must-be-an-object check and are skipped.
+// Counts inside nested detail objects (prompt_tokens_details.cached_tokens)
+// are never matched: only the usage object's DIRECT pairs are read.
+// Returns 0 when at least one count was extracted, -1 otherwise.
+int
+extract_usage_tokens(const char *buf, size_t len, int *prompt_tokens,
+                     int *completion_tokens)
+{
+  static const char key[] = "\"usage\"";
+  const size_t klen = sizeof(key) - 1;
+  size_t pos;
+  int failed_candidates = 0;
+
+  if (!prompt_tokens || !completion_tokens)
+    return -1;
+  *prompt_tokens = 0;
+  *completion_tokens = 0;
+  if (!buf || len < klen + 4)
+    return -1;
+
+  pos = len - klen;
+  for (;;) {
+    if (memcmp(buf + pos, key, klen) == 0 &&
+        (pos == 0 || buf[pos - 1] != '\\')) {
+      const char *p = buf + pos + klen;
+      const char *end = buf + len;
+      while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+        p++;
+      if (p < end && *p == ':') {
+        p++;
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+          p++;
+      } else {
+        p = end;  /* not a key:value shape — disqualify this candidate */
+      }
+      if (p < end && *p == '{') {
+        /* Balanced-brace scan (string- and escape-aware) to find the end of
+         * the usage object; an object still missing its closing brace in
+         * this window fails here and a later segment retries. */
+        const char *q = p;
+        int depth = 0, instr = 0, esc = 0, complete = 0;
+        for (; q < end; q++) {
+          char ch = *q;
+          if (esc) { esc = 0; continue; }
+          if (ch == '\\') { esc = 1; continue; }
+          if (instr) { if (ch == '"') instr = 0; continue; }
+          if (ch == '"') { instr = 1; continue; }
+          if (ch == '{') depth++;
+          else if (ch == '}') {
+            depth--;
+            if (depth == 0) { q++; complete = 1; break; }
+          }
+        }
+        if (complete) {
+          jsmn_parser jp;
+          jsmntok_t toks[64];
+          int r, ti, pair, got = 0;
+          jsmn_init(&jp);
+          r = jsmn_parse(&jp, p, (size_t)(q - p), toks, 64);
+          if (r >= 3 && toks[0].type == JSMN_OBJECT) {
+            ti = 1;
+            for (pair = 0; pair < toks[0].size && ti + 1 < r; pair++) {
+              if (toks[ti].type == JSMN_STRING &&
+                  toks[ti + 1].type == JSMN_PRIMITIVE) {
+                long v;
+                if (jsoneq(p, &toks[ti], "prompt_tokens") == 0) {
+                  v = strtol(p + toks[ti + 1].start, NULL, 10);
+                  if (v < 0) v = 0;
+                  if (v > 100000000L) v = 100000000L;
+                  *prompt_tokens = (int)v;
+                  got = 1;
+                } else if (jsoneq(p, &toks[ti], "completion_tokens") == 0) {
+                  v = strtol(p + toks[ti + 1].start, NULL, 10);
+                  if (v < 0) v = 0;
+                  if (v > 100000000L) v = 100000000L;
+                  *completion_tokens = (int)v;
+                  got = 1;
+                }
+              }
+              ti++;
+              ti += jsmn_subtree_count(toks, ti, r);
+            }
+          }
+          if (got)
+            return 0;
+        }
+      }
+      /* Matched "usage" but no extractable object — walk further back, but
+       * give up after a few dead candidates (null-usage chunks etc.). */
+      if (++failed_candidates > 4)
+        return -1;
+    }
+    if (pos == 0)
+      break;
+    pos--;
+  }
+  return -1;
+}
+
+/* Delimit one JSON value starting at vs: objects/arrays by string-aware
+ * bracket matching, strings by escape-aware quote scan, primitives by
+ * delimiter scan. Returns one past the value's last byte, or NULL when the
+ * value does not complete before end. */
+static const char *
+json_value_extent(const char *vs, const char *end)
+{
+  if (vs >= end)
+    return NULL;
+  if (*vs == '{' || *vs == '[') {
+    char open = *vs, close = (open == '{') ? '}' : ']';
+    int depth = 0, instr = 0, esc = 0;
+    const char *q;
+    for (q = vs; q < end; q++) {
+      char ch = *q;
+      if (esc) { esc = 0; continue; }
+      if (ch == '\\') { esc = 1; continue; }
+      if (instr) { if (ch == '"') instr = 0; continue; }
+      if (ch == '"') { instr = 1; continue; }
+      if (ch == open) depth++;
+      else if (ch == close) { depth--; if (depth == 0) return q + 1; }
+    }
+    return NULL;
+  }
+  if (*vs == '"') {
+    int esc = 0;
+    const char *q;
+    for (q = vs + 1; q < end; q++) {
+      if (esc) { esc = 0; continue; }
+      if (*q == '\\') { esc = 1; continue; }
+      if (*q == '"') return q + 1;
+    }
+    return NULL;
+  }
+  {
+    const char *q = vs;
+    while (q < end && *q != ',' && *q != '}' && *q != ']' &&
+           *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n')
+      q++;
+    return q;
+  }
+}
+
+/* Locate the value of a DIRECT (depth-1) key of a JSON object with a single
+ * string- and escape-aware depth walk. No token pool: unlike the jsmn-based
+ * extractors above this handles bodies of any size, and like them it can
+ * never be spoofed by key-shaped text inside string values (quotes there
+ * are escaped) or inside nested objects (depth != 1).
+ * Returns 0 with [*val_start, *val_end) set; -1 when the key is absent
+ * (*root_close then points at the object's closing brace); -2 when the
+ * input is not a complete JSON object. */
+static int
+json_top_find(const char *body, size_t len, const char *key, size_t klen,
+              const char **val_start, const char **val_end,
+              const char **root_close)
+{
+  const char *p = body, *end = body + len;
+  const char *str_start = NULL;
+  int depth = 0, instr = 0, esc = 0, expect_value = 0, key_matched = 0;
+
+  if (val_start) *val_start = NULL;
+  if (val_end) *val_end = NULL;
+  if (root_close) *root_close = NULL;
+  if (!body || len == 0)
+    return -2;
+
+  while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+    p++;
+  if (p >= end || *p != '{')
+    return -2;
+
+  for (; p < end; p++) {
+    char c = *p;
+    if (instr) {
+      if (esc) { esc = 0; continue; }
+      if (c == '\\') { esc = 1; continue; }
+      if (c == '"') {
+        instr = 0;
+        if (depth == 1 && !expect_value) {
+          key_matched = ((size_t)(p - str_start) == klen &&
+                         memcmp(str_start, key, klen) == 0);
+        }
+      }
+      continue;
+    }
+    switch (c) {
+    case '"':
+      instr = 1;
+      esc = 0;
+      str_start = p + 1;
+      break;
+    case ':':
+      if (depth == 1 && key_matched) {
+        const char *vs = p + 1, *ve;
+        while (vs < end &&
+               (*vs == ' ' || *vs == '\t' || *vs == '\r' || *vs == '\n'))
+          vs++;
+        ve = json_value_extent(vs, end);
+        if (!ve)
+          return -2;
+        if (val_start) *val_start = vs;
+        if (val_end) *val_end = ve;
+        return 0;
+      }
+      if (depth == 1)
+        expect_value = 1;
+      break;
+    case ',':
+      if (depth == 1) {
+        expect_value = 0;
+        key_matched = 0;
+      }
+      break;
+    case '{':
+    case '[':
+      depth++;
+      break;
+    case '}':
+    case ']':
+      depth--;
+      if (depth == 0) {
+        if (root_close) *root_close = p;
+        return -1;
+      }
+      break;
+    default:
+      break;
+    }
+  }
+  return -2;
+}
+
+/* Splice ins_len bytes into body at offset pos. Caller has verified
+ * body_len + ins_len <= cap. */
+static void
+json_splice_in(char *body, size_t body_len, size_t pos,
+               const char *ins, size_t ins_len)
+{
+  memmove(body + pos + ins_len, body + pos, body_len - pos);
+  memcpy(body + pos, ins, ins_len);
+}
+
+// AI Gateway token accounting: force stream_options.include_usage=true into
+// a streaming OpenAI-compatible request body so the backend's final SSE
+// chunk carries the usage object the response-path extractor charges from.
+// A client that omits the flag would otherwise stream tokens invisible to
+// the per-tenant quota. Non-streaming requests are left untouched — their
+// responses carry usage unconditionally.
+// Rewrites in place (cap is the buffer capacity behind body). Returns 0 when
+// the body was modified (*new_len updated), 1 when no change was needed or
+// the body could not be safely rewritten (*new_len == body_len).
+int
+inject_include_usage(char *body, size_t body_len, size_t cap, size_t *new_len)
+{
+  static const char frag_obj[] = ",\"stream_options\":{\"include_usage\":true}";
+  static const char frag_field[] = "\"include_usage\":true";
+  static const char frag_value[] = "{\"include_usage\":true}";
+  const char *vs, *ve, *root_close;
+  int rc;
+
+  if (new_len)
+    *new_len = body_len;
+  if (!body || body_len == 0 || !new_len)
+    return 1;
+
+  /* Streaming requests only. */
+  rc = json_top_find(body, body_len, "stream", 6, &vs, &ve, &root_close);
+  if (rc != 0 || (size_t)(ve - vs) != 4 || memcmp(vs, "true", 4) != 0)
+    return 1;
+
+  rc = json_top_find(body, body_len, "stream_options", 14,
+                     &vs, &ve, &root_close);
+  if (rc == -2)
+    return 1;
+
+  if (rc == -1) {
+    /* No stream_options — splice a full object before the root's closing
+     * brace ("stream" exists, so the object is non-empty and the leading
+     * comma is always right). */
+    size_t flen = sizeof(frag_obj) - 1;
+    if (!root_close || body_len + flen > cap)
+      return 1;
+    json_splice_in(body, body_len, (size_t)(root_close - body),
+                   frag_obj, flen);
+    *new_len = body_len + flen;
+    return 0;
+  }
+
+  if (*vs == '{') {
+    /* stream_options is an object — find its direct include_usage. */
+    const char *ivs, *ive, *iclose;
+    size_t so_len = (size_t)(ve - vs);
+    rc = json_top_find(vs, so_len, "include_usage", 13, &ivs, &ive, &iclose);
+    if (rc == -2)
+      return 1;
+    if (rc == 0) {
+      if ((size_t)(ive - ivs) == 4 && memcmp(ivs, "true", 4) == 0)
+        return 1;                       /* already on — nothing to do */
+      /* Present but not true (false/null/junk) — overwrite the value. */
+      {
+        size_t old_vlen = (size_t)(ive - ivs);
+        size_t pos = (size_t)(ivs - body);
+        if (body_len - old_vlen + 4 > cap)
+          return 1;
+        memmove(body + pos + 4, body + pos + old_vlen,
+                body_len - pos - old_vlen);
+        memcpy(body + pos, "true", 4);
+        *new_len = body_len - old_vlen + 4;
+      }
+      return 0;
+    }
+    /* Object without include_usage — splice the field in after its '{',
+     * with a trailing comma when the object already has members. */
+    {
+      const char *q = vs + 1;
+      size_t flen = sizeof(frag_field) - 1;
+      char frag[sizeof(frag_field) + 1];
+      int empty;
+      while (q < ve && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n'))
+        q++;
+      empty = (q < ve && *q == '}');
+      memcpy(frag, frag_field, flen);
+      if (!empty)
+        frag[flen++] = ',';
+      if (body_len + flen > cap)
+        return 1;
+      json_splice_in(body, body_len, (size_t)(vs + 1 - body), frag, flen);
+      *new_len = body_len + flen;
+      return 0;
+    }
+  }
+
+  /* stream_options present but not an object (null, string, number) —
+   * replace the whole value with an enabling object. */
+  {
+    size_t old_vlen = (size_t)(ve - vs);
+    size_t vlen = sizeof(frag_value) - 1;
+    size_t pos = (size_t)(vs - body);
+    if (body_len - old_vlen + vlen > cap)
+      return 1;
+    memmove(body + pos + vlen, body + pos + old_vlen,
+            body_len - pos - old_vlen);
+    memcpy(body + pos, frag_value, vlen);
+    *new_len = body_len - old_vlen + vlen;
+    return 0;
+  }
+}
+
+// AI Gateway token accounting, estimate net: size the request's prompt in
+// tokens from the byte extent of its top-level "messages" (chat) or
+// "prompt" (completions) value, at the ~4-bytes-per-token English-text
+// convention. Only charged — flagged as estimated — when the response's
+// usage object never materializes; the JSON scaffolding inside a messages
+// array makes this a mild overestimate, which is the right bias for a
+// quota backstop. Returns 0 when neither field is found.
+int
+estimate_prompt_tokens(const char *body, size_t len)
+{
+  const char *vs, *ve;
+  long est;
+
+  if (json_top_find(body, len, "messages", 8, &vs, &ve, NULL) != 0 &&
+      json_top_find(body, len, "prompt", 6, &vs, &ve, NULL) != 0)
+    return 0;
+  est = (long)(ve - vs) / 4;
+  if (est < 0) est = 0;
+  if (est > 100000000L) est = 100000000L;
+  return (int)est;
+}
+
+// AI Gateway pre-admission: read the request's declared completion ceiling.
+// max_completion_tokens (the current OpenAI chat name) wins over the legacy
+// max_tokens when both are present. Only a plain non-negative top-level
+// number counts — a negative value (llama.cpp uses -1 for "unlimited"), a
+// string, or a nested/spoofed occurrence reads as undeclared. Returns the
+// ceiling, or 0 when the request declares none: an undeclared ceiling
+// cannot be guessed, so the caller reserves the prompt estimate alone.
+int
+extract_max_tokens(const char *body, size_t len)
+{
+  const char *vs = NULL, *ve = NULL;
+  long val = 0;
+
+  if (json_top_find(body, len, "max_completion_tokens", 21, &vs, &ve, NULL) != 0 &&
+      json_top_find(body, len, "max_tokens", 10, &vs, &ve, NULL) != 0)
+    return 0;
+  if (!vs || !ve || vs >= ve || *vs == '"' || *vs == '{' || *vs == '[')
+    return 0;
+  if (*vs == '-')
+    return 0;
+  for (; vs < ve; vs++) {
+    if (*vs < '0' || *vs > '9')
+      return 0;               /* floats/exponents/junk: not a declared count */
+    val = val * 10 + (*vs - '0');
+    if (val > 100000000L)
+      return 100000000;
+  }
+  return (int)val;
+}
+
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
 /* User-prefix affinity fallback: chat bodies with NO system message used to
  * return -1 here, so every such request was sprayed (per-request hash) and

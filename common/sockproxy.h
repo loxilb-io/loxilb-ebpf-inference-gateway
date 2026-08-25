@@ -15,6 +15,8 @@
 #define JSMN_STATIC
 #include "jsmn.h"
 
+#include "sockproxy_qos.h"  /* Tier-1 byte-shaper config + bucket (proxy_map_ent members) */
+
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
 typedef struct proxy_h2_session proxy_h2_session_t;
@@ -709,6 +711,18 @@ typedef struct proxy_map_ent {
   // engine TU casts it to (proxy_epval_t *). Freed by proxy_detach_l7_policy and
   // when the proxy_map_ent is torn down.
   void   *l7_resolved_pool;         // struct proxy_epval * scratch (opaque here)
+
+  // L7 (Tier-1) byte shaper. Config + runtime bucket live HERE on the heap
+  // proxy_map_ent (per-service state), never on proxy_arg (the 4096-byte eBPF
+  // map value). qos_cfg.cir_Bps == 0 means the shaper is off and the relay
+  // path is byte-for-byte today's behaviour. Meters PLAINTEXT payload bytes;
+  // the Tier-0 eBPF policer meters L3 wire bytes — different units, never
+  // comparable. qos_up shapes client->backend reads (qos_cfg.dir bit 0);
+  // qos_down shapes backend->client reads (bit 1). The buckets are
+  // independent: each direction gets its own CIR, they never share tokens.
+  struct proxy_qos_cfg    qos_cfg;
+  struct proxy_qos_bucket qos_up;
+  struct proxy_qos_bucket qos_down;
 } proxy_map_ent_t;
 
 // ============================================================================
@@ -827,6 +841,18 @@ struct proxy_fd_ent {
   size_t cache_total_size;       // Total size of cached data
   int cache_backpressure;        // 1 if reading is paused due to high cache
   int read_paused;               // 1 if EPOLLIN is disabled due to backpressure
+  // 1 if the Tier-1 shaper parked this fd (empty bucket). Distinct from
+  // cache_backpressure on purpose: the backpressure clear/resume paths must
+  // never disengage a QoS park — only the shaper's refill wake clears this.
+  int qos_parked;
+  // 1 between a QoS resume and the next successful read; lets the first
+  // post-park read be accounted as delayed bytes.
+  int qos_was_parked;
+  // Wall-clock stamp of the last 1Hz health pass that observed this
+  // connection QoS-parked (0 = not parked at the last pass). The pass uses
+  // it to slide start-anchored duration caps forward by the exact paused
+  // span, so shaper-paused time never counts as idle/stream time.
+  time_t qos_park_seen_ts;
   int cache_draining;            // 1 if cache is currently being drained (prevents bypass)
   uint64_t chunk_seq;            // Chunk sequence number for ordering verification
 
@@ -995,6 +1021,35 @@ struct proxy_fd_ent {
                                       // streams to 0 and NTP steps could skew/negate the delta)
   uint8_t  sse_tail[20];              // Sliding tail buffer for TCP-fragmentation-safe [DONE] scanner
   uint8_t  sse_tail_len;              // Number of valid bytes in sse_tail
+
+  /* Token-accounting response scan state. usage_tail is a sliding window
+   * over the LAST bytes of the backend response relayed to this client fd —
+   * sized to hold the final SSE usage chunk (or the tail of a non-streamed
+   * JSON body) across TCP segment splits. The quota is charged exactly once
+   * per response (usage_consumed); all four fields reset with the other
+   * per-request captures at the next message begin. proxy_fd_ent is not
+   * xSync-serialized, so this growth is HA-safe (pd_last_decode_ts
+   * precedent below). */
+#define PROXY_USAGE_TAIL_KEEP 1024
+  uint8_t  usage_tail[PROXY_USAGE_TAIL_KEEP];
+  uint16_t usage_tail_len;            // Number of valid bytes in usage_tail
+  uint8_t  usage_consumed;            // 1 = token quota charged for the current response
+  int      usage_prompt_toks;         // extracted usage.prompt_tokens (0 = none seen)
+  int      usage_complet_toks;        // extracted usage.completion_tokens
+  /* Estimate net for responses whose usage object never materializes
+   * (chunked/oversize request bodies skip the include_usage inject; an
+   * engine may drop the final chunk). usage_est_prompt is sized from the
+   * request's messages/prompt bytes at dispatch; usage_sse_events counts
+   * relayed "data: {" SSE chunks (~1 completion token per content chunk).
+   * Charged with the estimated flag ONLY when extraction misses. */
+  uint32_t usage_est_prompt;          // prompt-token estimate from the request body
+  uint32_t usage_sse_events;          // relayed SSE data-object chunk count
+  /* Pre-admission reservation made at the gate (prompt estimate +
+   * declared max_tokens) and its quota-window tag; both echoed to the
+   * consume call at settlement, zeroed there and at message begin. An
+   * aborted request's claim self-heals at window rollover. */
+  uint32_t usage_reserved_toks;       // tokens reserved at admission (0 = none)
+  int64_t  usage_res_epoch;           // reservation window tag from the reserve call
   time_t   pd_last_decode_ts;         // wall-clock of the LAST decode backend byte relayed to the
                                       // client. Refreshed per byte during decode streaming so the safety-net
                                       // reaper (sockproxy_health.c) can gate graceful [DONE] synthesis on
@@ -1360,6 +1415,18 @@ int proxy_delete_entry(struct proxy_ent *ent, struct proxy_arg *arg);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);
 int proxy_update_ep_health_by_ip(struct proxy_ent *key, uint32_t ep_ip, uint8_t inactive);
 int proxy_set_drain_policy(struct proxy_ent *key, drain_policy_t policy, uint32_t timeout_sec);
+/* Tier-1 byte shaper control. Rates arrive in bits/sec (the policer API's
+ * native unit) and are converted to bytes/sec at store time. cir_bps == 0
+ * detaches: the stored config is cleared and any live entry stops shaping.
+ * Config is stored independently of entry existence, so a policy created
+ * before its LB rule converges when the rule appears (proxy_add_entry). */
+int proxy_update_qos_config(struct proxy_ent *key, uint64_t cir_bps,
+                            uint64_t pir_bps, uint32_t cbs_bytes,
+                            uint8_t dir, uint8_t mode);
+/* Notifier tick hook: refills active shaper buckets and wakes parked fds
+ * whose bucket regained tokens. Internally rate-limited; called from every
+ * notify worker's poll loop. */
+void proxy_qos_tick(int thread);
 int proxy_set_circuit_breaker(struct proxy_ent *key, uint8_t enabled, 
                                 uint32_t failure_threshold, uint32_t open_timeout_sec);
 

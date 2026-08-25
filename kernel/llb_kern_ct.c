@@ -2346,6 +2346,11 @@ dp_ct_in(void *ctx, struct xfi *xf)
       adat->nat_act.cdis = xf->nm.cdis;
       adat->nat_act.nmh = xf->nm.npmhh;
       adat->nat_act.ppv2 = xf->nm.ppv2;
+      /* Persist the rule policer id per-flow so established packets (which
+       * never hit nat_map again) keep policing. The reverse direction gets the
+       * same id below — the rule policer is bidirectional over one bucket.
+       */
+      adat->nat_act.polid = xf->qm.rpolid;
       adat->ito = xf->nm.ito;
     } else {
       adat->ito = 0;
@@ -2409,6 +2414,15 @@ dp_ct_in(void *ctx, struct xfi *xf)
       axdat->nat_act.cdis = xf->nm.cdis;
       axdat->nat_act.nmh = xf->nm.npmhh;
       axdat->nat_act.ppv2 = xf->nm.ppv2;
+      /* The rule policer is bidirectional: the reverse direction carries the
+       * same polid, so response traffic (arriving on the backend-facing NIC's
+       * ingress hook) drains the same bucket as the forward direction. One
+       * bucket, one CIR, both directions combined. The explicit write also
+       * matters for correctness — adat/axdat are per-CPU scratch reused across
+       * packets and this fill is field-by-field (no memset), so an unwritten
+       * polid would inherit a stale value from a previously processed flow.
+       */
+      axdat->nat_act.polid = xf->qm.rpolid;
       axdat->ito = xf->nm.ito;
     } else {
       axdat->ito = 0;

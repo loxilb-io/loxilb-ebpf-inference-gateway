@@ -9,27 +9,24 @@
 
 /* The intent here is to make this function non-inline
  * to keep code size in check
+ *
+ * The caller selects which policer id applies (port ipolid at dp_ing, rule rpolid
+ * after the NAT/CT stage, port opolid on the egress pipe) — the bucket math is
+ * identical for all of them.
  */
 static int
-do_dp_policer(void *ctx, struct xfi *xf, int egr)
+do_dp_policer(void *ctx, struct xfi *xf, __u32 polid)
 {
   struct dp_pol_tact *pla;
   int ret = 0;
   __u64 ts_now;
   __u64 ts_last;
   __u32 ntoks;
-  __u32 polid;
   __u32 inbytes;
   __u64 acc_toks;
   __u64 usecs_elapsed;
 
   ts_now = bpf_ktime_get_ns();
-
-  if (egr) {
-    polid = xf->qm.opolid;
-  } else {
-    polid = xf->qm.ipolid;
-  }
 
   pla = bpf_map_lookup_elem(&polx_map, &polid);
   if (!pla) { /*|| pla->ca.act_type != DP_SET_DO_POLICER) { */

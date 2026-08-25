@@ -263,6 +263,8 @@ dp_pipe_set_nat(void *ctx, struct xfi *xf,
   xf->nm.cdis = na->cdis;
   xf->nm.ppv2 = na->ppv2 ? 1 : 0;
   xf->nm.npmhh = na->nmh;
+  /* Re-arm the rule policer for established flows from the CT-persisted id */
+  xf->qm.rpolid = na->polid;
   BPF_DBG_PRINTK("[CT] NAT ACT %x", xf->pm.nf);
 
   return 0;

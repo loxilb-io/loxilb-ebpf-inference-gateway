@@ -54,6 +54,8 @@ do {                                  \
   ((x)->tm.tun_type == 0) &&                  \
   (x)->l2m.dl_type == bpf_htons(ETH_P_IP) &&  \
   (x)->qm.ipolid == 0 &&                      \
+  (x)->qm.rpolid == 0 &&                      \
+  (x)->qm.opolid == 0 &&                      \
   (x)->nm.npmhh == 0 &&                       \
   (x)->nm.xlate_proto == 0 &&                 \
   (x)->pm.dp_rec == 0 &&                      \
@@ -290,6 +292,10 @@ struct dp_qos_mdi {
     __u8             qfi;
     __u16            ipolid;
     __u16            opolid;
+    __u16            rpolid;   /* rule-attached policer (set at NAT/CT stage, after
+                                * dp_ing has already consumed ipolid — needs its own
+                                * policer call in the CT-stage program) */
+    __u16            resvd;
 };
 
 #define nxip4 nxip[0]

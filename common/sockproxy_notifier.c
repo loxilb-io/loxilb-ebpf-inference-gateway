@@ -573,6 +573,9 @@ proxy_main(sockmap_cb_t sockmap_cb, int ktls_enabled)
    * (notify_wake_worker), so the re-drive of setup_proxy_path never runs off-owner
    * (the Phase-89/90 cross-thread UAF invariant). Declared in sockproxy_internal.h. */
   cbs.resume = pd_resume_parked;
+  /* Tier-1 shaper refill/wake sweep. Runs from every worker's poll loop and
+   * rate-limits itself; with no shaper configured it is one atomic load. */
+  cbs.tick = proxy_qos_tick;
 
   proxy_struct = calloc(sizeof(proxy_struct_t), 1);
   if (proxy_struct == NULL) {

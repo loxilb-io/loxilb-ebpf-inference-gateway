@@ -420,6 +420,64 @@ check_draining_endpoints(void)
     node = node->next;
   }
 
+  /* Tier-1 shaper idle-accounting guard — must run BEFORE every reaper
+   * below. A QoS-parked connection is throttled, not idle: the shaper is
+   * deliberately holding its reads, so the activity anchors the reapers
+   * key on (last_activity, pd_last_decode_ts) freeze while the
+   * start-anchored wall-clock caps (stream_start_ts, pd_phase_start_ts)
+   * keep counting — left alone, the idle/session reapers and the SSE /
+   * P-D duration caps would manufacture disconnects against healthy
+   * shaped streams. A park on EITHER side starves the whole connection
+   * (a parked reader also stops the relay writes that advance its peer's
+   * anchors), so the group is examined: this pfe or any rfd peer parked.
+   * While parked: refresh the activity anchors (only when armed — the
+   * ==0 disarmed semantics of last_activity/pd_last_decode_ts are
+   * preserved) and slide the start anchors forward by the pause span
+   * observed between passes, excluding paused time from the caps. The
+   * span between park and the first pass that sees it (<1s) still
+   * counts — conservative by design. An un-parked idle connection is
+   * untouched, so the reapers stay fully armed for genuine idlers.
+   * Runs under the PROXY_LOCK already held by this pass. */
+  {
+    proxy_map_ent_t *qp_node = proxy_struct->head;
+    while (qp_node) {
+      proxy_fd_ent_t *pfe = qp_node->val.fdlist;
+      while (pfe) {
+        int qp_parked = pfe->qos_parked;
+        int qj;
+        if (!qp_parked) {
+          for (qj = 0; qj < pfe->n_rfd; qj++) {
+            if (pfe->rfd_ent[qj] && pfe->rfd_ent[qj]->qos_parked) {
+              qp_parked = 1;
+              break;
+            }
+          }
+        }
+        if (qp_parked) {
+          time_t qp_span = 0;
+          if (pfe->qos_park_seen_ts > 0 && now > pfe->qos_park_seen_ts) {
+            qp_span = now - pfe->qos_park_seen_ts;
+          }
+          pfe->qos_park_seen_ts = now;
+          if (pfe->last_activity > 0) {
+            pfe->last_activity = now;
+          }
+          if (pfe->pd_last_decode_ts > 0) {
+            pfe->pd_last_decode_ts = now;
+          }
+          pfe->stream_start_ts =
+              qos_slide_anchor(pfe->stream_start_ts, qp_span, now);
+          pfe->pd_phase_start_ts =
+              qos_slide_anchor(pfe->pd_phase_start_ts, qp_span, now);
+        } else {
+          pfe->qos_park_seen_ts = 0;
+        }
+        pfe = pfe->next;
+      }
+      qp_node = qp_node->next;
+    }
+  }
+
   /* C-3: SSE max-duration enforcement — walk all live client connections and
    * force-terminate SSE streams that have exceeded their configured cap.
    *
