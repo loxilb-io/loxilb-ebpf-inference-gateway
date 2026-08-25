@@ -3315,9 +3315,37 @@ qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd)
   pfe->qos_parked = 1;
   pfe->qos_was_parked = 1;
   pfe->read_paused = 1;
+  pfe->qos_park_ns = qos_now_ns();
   atomic_fetch_add_explicit(&b->parks, 1, memory_order_relaxed);
   notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
   return 0;
+}
+
+/* Resolve the shaper bucket this pfe reads against, or NULL when the service
+ * is un-shaped in this direction. Single definition shared by the relay burst
+ * loop (which meters against it) and the resume path (which closes out the
+ * park-duration counter) so the two can never disagree on which bucket owns a
+ * connection. An H2 session is never shaped: a connection-level pause would
+ * head-of-line-block every stream on it. */
+static struct proxy_qos_bucket *
+qos_bucket_for_pfe(proxy_fd_ent_t *pfe)
+{
+  proxy_map_ent_t *ent;
+
+  if (!pfe || !pfe->head || pfe->h2_session) {
+    return NULL;
+  }
+  ent = (proxy_map_ent_t *)pfe->head;
+  if (ent->qos_cfg.cir_Bps == 0) {
+    return NULL;
+  }
+  if (pfe->odir == 0 && (ent->qos_cfg.dir & QOS_DIR_UPLOAD)) {
+    return &ent->qos_up;
+  }
+  if (pfe->odir == 1 && (ent->qos_cfg.dir & QOS_DIR_DOWNLOAD)) {
+    return &ent->qos_down;
+  }
+  return NULL;
 }
 
 /* Resume half of the park/resume pair — invoked on the fd's OWNER worker via
@@ -3331,6 +3359,12 @@ qos_resume_reader(int fd, proxy_fd_ent_t *pfe)
   if (!pfe->qos_parked) {
     return 0;
   }
+  /* close out the park interval before the flags clear. The bucket is
+   * re-resolved rather than remembered: if the shaper was reconfigured off
+   * mid-park the interval is simply dropped, which is preferable to writing
+   * into a bucket that no longer meters this connection. */
+  qos_bucket_note_park(qos_bucket_for_pfe(pfe), pfe->qos_park_ns, qos_now_ns());
+  pfe->qos_park_ns = 0;
   pfe->qos_parked = 0;
   pfe->read_paused = 0;
   notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
@@ -3381,6 +3415,64 @@ proxy_qos_tick(int thread)
     }
   }
   PROXY_UNLOCK();
+}
+
+/* Snapshot the Tier-1 shaper state of every shaped service for the Prometheus
+ * exporter (api/prometheus/qos_shaper_metrics.go). Runs off the hot path on
+ * the metrics goroutine: it walks the service list under PROXY_RDLOCK and
+ * takes each bucket's park_lock only to read the parked depth — the same
+ * PROXY -> park_lock order qos_wake_all_parked already uses.
+ *
+ * Counters are exported RAW (cumulative, never reset here). A service that is
+ * deleted and re-created starts from zero, which Prometheus reads as a counter
+ * reset — the correct interpretation, since the shaper state is genuinely new.
+ */
+int
+proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max)
+{
+  proxy_map_ent_t *ent;
+  int n = 0;
+
+  if (!out || max <= 0 || !proxy_struct) {
+    return 0;
+  }
+
+  memset(out, 0, (size_t)max * sizeof(*out));
+
+  PROXY_RDLOCK();
+  for (ent = proxy_struct->head; ent && n < max; ent = ent->next) {
+    if (ent->qos_cfg.cir_Bps == 0) {
+      continue;
+    }
+
+    proxy_qos_svc_stat_t *st = &out[n];
+    struct proxy_qos_bucket *dirs[2] = { &ent->qos_up, &ent->qos_down };
+
+    st->xip = ent->key.xip;
+    st->xport = ntohs(ent->key.xport);
+    st->protocol = ent->key.protocol;
+    st->dir = ent->qos_cfg.dir;
+    st->cir_bps = ent->qos_cfg.cir_Bps;
+    st->cbs_bytes = qos_effective_cbs(&ent->qos_cfg);
+
+    for (int d = 0; d < 2; d++) {
+      struct proxy_qos_bucket *b = dirs[d];
+
+      st->bytes_pass[d] = atomic_load_explicit(&b->bytes_pass, memory_order_relaxed);
+      st->bytes_delayed[d] = atomic_load_explicit(&b->bytes_delayed, memory_order_relaxed);
+      st->parks[d] = atomic_load_explicit(&b->parks, memory_order_relaxed);
+      st->park_ns[d] = atomic_load_explicit(&b->park_ns_total, memory_order_relaxed);
+      st->tokens[d] = atomic_load_explicit(&b->tokens, memory_order_relaxed);
+
+      pthread_mutex_lock(&b->park_lock);
+      st->n_parked[d] = (uint32_t)(b->n_parked > 0 ? b->n_parked : 0);
+      pthread_mutex_unlock(&b->park_lock);
+    }
+    n++;
+  }
+  PROXY_UNLOCK();
+
+  return n;
 }
 
 // P2: Configure draining policy for a proxy service
@@ -5875,6 +5967,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->cache_backpressure = 0;
     npfe2->read_paused = 0;
     npfe2->qos_parked = 0;    /* pfe shells are pool-recycled, never re-zeroed */
+    npfe2->qos_park_ns = 0;
     npfe2->qos_was_parked = 0;
     npfe2->qos_park_seen_ts = 0;
 
@@ -7285,6 +7378,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->cache_backpressure = 0;
   npfe1->read_paused = 0;
   npfe1->qos_parked = 0;      /* pfe shells are pool-recycled, never re-zeroed */
+  npfe1->qos_park_ns = 0;
   npfe1->qos_was_parked = 0;
   npfe1->qos_park_seen_ts = 0;
 
@@ -7970,17 +8064,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
    * connection-level pause head-of-line-blocks every stream on it). The
    * token check sits INSIDE the burst loop and clamps the read length —
    * one readiness event can otherwise drain up to 1024 x 1MB unshaped. */
-  struct proxy_qos_bucket *qos_b = NULL;
-  if (pfe->head && !pfe->h2_session) {
-    proxy_map_ent_t *qhent = (proxy_map_ent_t *)pfe->head;
-    if (qhent->qos_cfg.cir_Bps) {
-      if (pfe->odir == 0 && (qhent->qos_cfg.dir & QOS_DIR_UPLOAD)) {
-        qos_b = &qhent->qos_up;
-      } else if (pfe->odir == 1 && (qhent->qos_cfg.dir & QOS_DIR_DOWNLOAD)) {
-        qos_b = &qhent->qos_down;
-      }
-    }
-  }
+  struct proxy_qos_bucket *qos_b = qos_bucket_for_pfe(pfe);
 
   for (j = 0; j < PROXY_NUM_BURST_RX; j++) {
     int sret;
