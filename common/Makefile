@@ -391,6 +391,15 @@ test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h xxhas
 test_usage: test_usage_extract
 	./test_usage_extract
 
+# Tier-1 byte-shaper bucket primitives (header-only, standalone):
+# grant/credit/refill arithmetic + multi-threaded token-conservation check
+test_qos_bucket: test_qos_bucket.c sockproxy_qos.h
+	$(CC) -Wall -Wextra -fsanitize=address,undefined -o $@ $< -I. -lpthread
+
+.PHONY: test_qos
+test_qos: test_qos_bucket
+	./test_qos_bucket
+
 # Phase 47 P47-R2: root-pipe cfg V2 validator + miss-dispatch unit test
 # Standalone -- mirrors the header struct inline, does NOT link against DOCA.
 test_doca_root_v2: test_doca_root_v2.c

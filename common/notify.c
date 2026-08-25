@@ -145,6 +145,7 @@ notify_ctx_new(notify_cbs_t *cbs, int n_thrs)
     nc->cbs.notify = cbs->notify;
     nc->cbs.pdestroy = cbs->pdestroy;
     nc->cbs.resume = cbs->resume;   /* (R1): owner-worker resume hook */
+    nc->cbs.tick = cbs->tick;       /* per-loop maintenance hook (self-rate-limited) */
   }
 
   if (n_thrs > MAX_NOTIFY_THREADS) {
@@ -712,6 +713,13 @@ notify_run(void *ctx, int thread)
       log_error("notify:poll:error(%s)", strerror_r(errno, estr, sizeof(estr)));
       usleep(200*1000);
       continue;
+    }
+
+    /* maintenance hook runs on every iteration, not just the timeout branch:
+     * under sustained event load poll never returns 0, and the hook's work
+     * (e.g. shaper refill/wake) must not starve behind traffic */
+    if (nctx->cbs.tick) {
+      nctx->cbs.tick(thread);
     }
 
     if (rc == 0) {

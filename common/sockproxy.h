@@ -15,6 +15,8 @@
 #define JSMN_STATIC
 #include "jsmn.h"
 
+#include "sockproxy_qos.h"  /* Tier-1 byte-shaper config + bucket (proxy_map_ent members) */
+
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
 typedef struct proxy_h2_session proxy_h2_session_t;
@@ -709,6 +711,16 @@ typedef struct proxy_map_ent {
   // engine TU casts it to (proxy_epval_t *). Freed by proxy_detach_l7_policy and
   // when the proxy_map_ent is torn down.
   void   *l7_resolved_pool;         // struct proxy_epval * scratch (opaque here)
+
+  // L7 (Tier-1) byte shaper. Config + runtime bucket live HERE on the heap
+  // proxy_map_ent (per-service state), never on proxy_arg (the 4096-byte eBPF
+  // map value). qos_cfg.cir_Bps == 0 means the shaper is off and the relay
+  // path is byte-for-byte today's behaviour. Meters PLAINTEXT payload bytes;
+  // the Tier-0 eBPF policer meters L3 wire bytes — different units, never
+  // comparable. qos_up shapes client->backend reads; the response direction
+  // has its own bucket when enabled via qos_cfg.dir.
+  struct proxy_qos_cfg    qos_cfg;
+  struct proxy_qos_bucket qos_up;
 } proxy_map_ent_t;
 
 // ============================================================================
@@ -827,6 +839,13 @@ struct proxy_fd_ent {
   size_t cache_total_size;       // Total size of cached data
   int cache_backpressure;        // 1 if reading is paused due to high cache
   int read_paused;               // 1 if EPOLLIN is disabled due to backpressure
+  // 1 if the Tier-1 shaper parked this fd (empty bucket). Distinct from
+  // cache_backpressure on purpose: the backpressure clear/resume paths must
+  // never disengage a QoS park — only the shaper's refill wake clears this.
+  int qos_parked;
+  // 1 between a QoS resume and the next successful read; lets the first
+  // post-park read be accounted as delayed bytes.
+  int qos_was_parked;
   int cache_draining;            // 1 if cache is currently being drained (prevents bypass)
   uint64_t chunk_seq;            // Chunk sequence number for ordering verification
 
@@ -1389,6 +1408,18 @@ int proxy_delete_entry(struct proxy_ent *ent, struct proxy_arg *arg);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);
 int proxy_update_ep_health_by_ip(struct proxy_ent *key, uint32_t ep_ip, uint8_t inactive);
 int proxy_set_drain_policy(struct proxy_ent *key, drain_policy_t policy, uint32_t timeout_sec);
+/* Tier-1 byte shaper control. Rates arrive in bits/sec (the policer API's
+ * native unit) and are converted to bytes/sec at store time. cir_bps == 0
+ * detaches: the stored config is cleared and any live entry stops shaping.
+ * Config is stored independently of entry existence, so a policy created
+ * before its LB rule converges when the rule appears (proxy_add_entry). */
+int proxy_update_qos_config(struct proxy_ent *key, uint64_t cir_bps,
+                            uint64_t pir_bps, uint32_t cbs_bytes,
+                            uint8_t dir, uint8_t mode);
+/* Notifier tick hook: refills active shaper buckets and wakes parked fds
+ * whose bucket regained tokens. Internally rate-limited; called from every
+ * notify worker's poll loop. */
+void proxy_qos_tick(int thread);
 int proxy_set_circuit_breaker(struct proxy_ent *key, uint8_t enabled, 
                                 uint32_t failure_threshold, uint32_t open_timeout_sec);
 

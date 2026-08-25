@@ -2091,6 +2091,12 @@ skip_deferred_masking:
 /* Session hash, conversation mapping, endpoint selection (proxy_setup_ep__),
  * proxy_conversation_cleanup_thread, proxy_run moved to sockproxy_ep.c */
 
+/* Tier-1 shaper (defined with its control plane further down) */
+static void qos_apply_stored_cfg(proxy_map_ent_t *ent);
+static void qos_service_teardown(proxy_ent_t *key);
+static int qos_park_reader(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, int fd);
+static int qos_resume_reader(int fd, proxy_fd_ent_t *pfe);
+
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 {
@@ -2106,6 +2112,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   while (ent) {
     if (cmp_proxy_ent(&ent->key, new_ent)) {
+      /* a shaper config stored before this add (or surviving a rule
+       * re-create) attaches here; no-op when none is stored */
+      qos_apply_stored_cfg(ent);
+
       // P6: Build composite key (host|path|model) or shorter form for backward compat
       char ephash_key[512];
       build_ephash_key(ephash_key, sizeof(ephash_key),
@@ -2792,6 +2802,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
                   tepval->ephash_key, strlen(tepval->ephash_key),
                   tepval);
 
+  /* new service: attach any shaper config stored ahead of rule creation */
+  qos_apply_stored_cfg(node);
+
   node->next = proxy_struct->head;
   proxy_struct->head = node;
 
@@ -2813,6 +2826,14 @@ proxy_delete_entry(proxy_ent_t *ent, proxy_arg_t *arg)
   void *ssl_epctx = NULL;
 
   PROXY_LOCK();
+
+  /* Release the shaper state for this service before teardown: drop the
+   * stored config (a later rule on the same VIP:port must not inherit it —
+   * a surviving policer association is re-driven by the policer ticker) and
+   * wake any parked readers so their connections tear down promptly instead
+   * of hanging HUP-armed until a client timeout. */
+  qos_service_teardown(ent);
+
   ret = proxy_delete_entry__(ent, arg, &fd, &ssl_ctx, &ssl_epctx);
   PROXY_UNLOCK();
 
@@ -3063,6 +3084,291 @@ proxy_update_ep_health_by_ip(proxy_ent_t *key, uint32_t ep_ip, uint8_t inactive)
   log_error("Proxy entry not found for %s:%u",
             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
   return -ENOENT;
+}
+
+/* ==========================================================================
+ * Tier-1 (L7) byte shaper — control plane + refill/wake engine.
+ *
+ * The bucket itself and the burst-loop enforcement live on the relay hot
+ * path (handle_client_data); everything here is control/slow path. Config is
+ * stored in a small key-indexed table so a policer attached BEFORE its LB
+ * rule exists converges when proxy_add_entry later creates the entry, and so
+ * a rule re-create keeps its shaper without a control-plane round trip.
+ *
+ * Locking: the store and all cfg mutation are under PROXY_LOCK (write); the
+ * tick walks entries under PROXY_RDLOCK. Bucket state is atomics-only.
+ * ========================================================================== */
+
+#define QOS_CFG_STORE_MAX   512
+#define QOS_TICK_QUANTUM_NS 5000000ULL   /* refill/wake sweep every 5ms */
+
+struct qos_cfg_slot {
+  proxy_ent_t key;
+  struct proxy_qos_cfg cfg;
+  int valid;
+};
+
+static struct qos_cfg_slot qos_cfg_store[QOS_CFG_STORE_MAX]; /* PROXY_LOCK */
+static _Atomic uint64_t qos_last_tick_ns;
+
+static uint64_t
+qos_now_ns(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* PROXY_LOCK held. Returns the slot for key; allocates a free one when
+ * alloc != 0. NULL when absent (or the store is full). */
+static struct qos_cfg_slot *
+qos_store_find(proxy_ent_t *key, int alloc)
+{
+  struct qos_cfg_slot *free_slot = NULL;
+  for (int i = 0; i < QOS_CFG_STORE_MAX; i++) {
+    if (qos_cfg_store[i].valid) {
+      if (cmp_proxy_ent(&qos_cfg_store[i].key, key)) {
+        return &qos_cfg_store[i];
+      }
+    } else if (!free_slot) {
+      free_slot = &qos_cfg_store[i];
+    }
+  }
+  if (alloc && free_slot) {
+    memset(free_slot, 0, sizeof(*free_slot));
+    memcpy(&free_slot->key, key, sizeof(*key));
+    return free_slot;
+  }
+  return NULL;
+}
+
+/* PROXY_LOCK held. Wake every parked fd on the bucket — used when shaping is
+ * disabled (a parked fd would otherwise stay HUP-armed forever) and on rate
+ * changes. Wakes route to each fd's owner worker; resume is gen-validated so
+ * stale entries are harmless. */
+static void
+qos_wake_all_parked(struct proxy_qos_bucket *b)
+{
+  struct qos_parked_fd wake[QOS_MAX_PARKED];
+  int n;
+
+  pthread_mutex_lock(&b->park_lock);
+  n = b->n_parked;
+  if (n > 0) {
+    memcpy(wake, b->parked, (size_t)n * sizeof(wake[0]));
+    b->n_parked = 0;
+  }
+  pthread_mutex_unlock(&b->park_lock);
+
+  for (int i = 0; i < n; i++) {
+    notify_wake_worker(proxy_struct->ns, wake[i].owner_thr, wake[i].fd);
+  }
+}
+
+/* PROXY_LOCK held. Applies cfg to a live entry. Enabling (or a rate change)
+ * re-inits the bucket to a full burst; disabling releases parked readers. */
+static void
+qos_apply_cfg(proxy_map_ent_t *ent, const struct proxy_qos_cfg *cfg)
+{
+  int was_on = ent->qos_cfg.cir_Bps != 0;
+  int now_on = cfg->cir_Bps != 0;
+
+  if (!was_on && now_on) {
+    pthread_mutex_init(&ent->qos_up.park_lock, NULL);
+    ent->qos_up.n_parked = 0;
+  }
+
+  ent->qos_cfg = *cfg;
+
+  if (now_on) {
+    qos_bucket_init(&ent->qos_up, cfg, qos_now_ns());
+    log_info("qos: shaper on %s:%u cir=%luB/s cbs=%uB dir=0x%x mode=%d",
+             inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+             (unsigned long)cfg->cir_Bps, qos_effective_cbs(cfg),
+             cfg->dir, cfg->mode);
+  }
+  if (was_on) {
+    /* rate change or disable: parked readers re-evaluate against the new
+     * config on their owner workers */
+    qos_wake_all_parked(&ent->qos_up);
+    if (!now_on) {
+      log_info("qos: shaper off %s:%u",
+               inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport));
+    }
+  }
+}
+
+/* Called from proxy_add_entry (PROXY_LOCK held) for both the create and the
+ * in-place refresh path: a stored config survives rule re-creation. */
+static void
+qos_apply_stored_cfg(proxy_map_ent_t *ent)
+{
+  struct qos_cfg_slot *slot = qos_store_find(&ent->key, 0);
+  if (slot && slot->cfg.cir_Bps && !ent->qos_cfg.cir_Bps) {
+    qos_apply_cfg(ent, &slot->cfg);
+  }
+}
+
+/* Called from proxy_delete_entry (PROXY_LOCK held): drop the stored config
+ * for the service and release its parked readers so teardown never leaves a
+ * connection HUP-armed with no wake source. */
+static void
+qos_service_teardown(proxy_ent_t *key)
+{
+  struct qos_cfg_slot *slot = qos_store_find(key, 0);
+  if (slot) {
+    slot->valid = 0;
+  }
+  for (proxy_map_ent_t *ent = proxy_struct->head; ent; ent = ent->next) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      if (ent->qos_cfg.cir_Bps) {
+        qos_wake_all_parked(&ent->qos_up);
+      }
+      break;
+    }
+  }
+}
+
+int
+proxy_update_qos_config(struct proxy_ent *key, uint64_t cir_bps,
+                        uint64_t pir_bps, uint32_t cbs_bytes,
+                        uint8_t dir, uint8_t mode)
+{
+  proxy_map_ent_t *ent;
+  struct proxy_qos_cfg cfg = { 0 };
+
+  if (!key) {
+    return -EINVAL;
+  }
+
+  /* rates arrive in bits/sec (policer API unit); the shaper meters bytes */
+  cfg.cir_Bps = cir_bps / 8;
+  cfg.pir_Bps = pir_bps / 8;   /* reserved: single-rate shaping for now */
+  cfg.cbs_bytes = cbs_bytes;
+  cfg.dir = dir ? dir : QOS_DIR_UPLOAD;
+  cfg.mode = mode ? mode : QOS_MODE_SHAPE;
+
+  if (cfg.mode != QOS_MODE_SHAPE && cfg.cir_Bps) {
+    log_error("qos: mode %d unsupported (shape only)", cfg.mode);
+    return -EOPNOTSUPP;
+  }
+
+  PROXY_LOCK();
+
+  if (cfg.cir_Bps == 0) {
+    struct qos_cfg_slot *slot = qos_store_find(key, 0);
+    if (slot) {
+      slot->valid = 0;
+    }
+  } else {
+    struct qos_cfg_slot *slot = qos_store_find(key, 1);
+    if (!slot) {
+      PROXY_UNLOCK();
+      log_error("qos: config store full (%d services)", QOS_CFG_STORE_MAX);
+      return -ENOSPC;
+    }
+    slot->cfg = cfg;
+    slot->valid = 1;
+  }
+
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      qos_apply_cfg(ent, &cfg);
+      break;
+    }
+  }
+
+  PROXY_UNLOCK();
+  return 0;
+}
+
+/* Park the reading side of fd on the entry's bucket. Returns 0 on success;
+ * -1 when the ring is full, in which case the caller lets the read proceed
+ * unshaped for this burst (availability over precision — a full ring means
+ * hundreds of throttled conns already queued). */
+static int
+qos_park_reader(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, int fd)
+{
+  struct proxy_qos_bucket *b = &ent->qos_up;
+  int owner = notify_owner_thr(proxy_struct->ns, fd);
+
+  pthread_mutex_lock(&b->park_lock);
+  if (b->n_parked >= QOS_MAX_PARKED) {
+    pthread_mutex_unlock(&b->park_lock);
+    return -1;
+  }
+  b->parked[b->n_parked].fd = fd;
+  b->parked[b->n_parked].gen =
+      atomic_load_explicit(&pfe->gen, memory_order_acquire);
+  b->parked[b->n_parked].owner_thr = owner;
+  b->n_parked++;
+  pthread_mutex_unlock(&b->park_lock);
+
+  /* flags BEFORE the poll-mask change so a racing event observes the park */
+  pfe->qos_parked = 1;
+  pfe->qos_was_parked = 1;
+  pfe->read_paused = 1;
+  atomic_fetch_add_explicit(&b->parks, 1, memory_order_relaxed);
+  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+  return 0;
+}
+
+/* Resume half of the park/resume pair — invoked on the fd's OWNER worker via
+ * the notify wake path (see pd_resume_parked, which dispatches here first).
+ * Re-arms EPOLLIN; the pending payload is still unread in the socket buffer,
+ * so level-triggered poll re-drives handle_client_data naturally. Returns 1
+ * when the fd was a QoS park (caller stops), 0 otherwise. */
+static int
+qos_resume_reader(int fd, proxy_fd_ent_t *pfe)
+{
+  if (!pfe->qos_parked) {
+    return 0;
+  }
+  pfe->qos_parked = 0;
+  pfe->read_paused = 0;
+  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  return 1;
+}
+
+/* Notifier tick: refill every active bucket and wake parked readers when
+ * tokens returned. Runs opportunistically from EVERY worker's poll loop (not
+ * only the timeout branch — under sustained event load poll never times out,
+ * and parked fds must not starve); the CAS on qos_last_tick_ns elects one
+ * refiller per quantum, so the common case is a single atomic load. */
+void
+proxy_qos_tick(int thread)
+{
+  (void)thread;
+  proxy_map_ent_t *ent;
+
+  if (!proxy_struct) {
+    return;
+  }
+
+  uint64_t now = qos_now_ns();
+  uint64_t last = atomic_load_explicit(&qos_last_tick_ns, memory_order_relaxed);
+  if (now - last < QOS_TICK_QUANTUM_NS) {
+    return;
+  }
+  if (!atomic_compare_exchange_strong_explicit(&qos_last_tick_ns, &last, now,
+                                               memory_order_acq_rel,
+                                               memory_order_relaxed)) {
+    return;
+  }
+
+  PROXY_RDLOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (ent->qos_cfg.cir_Bps == 0) {
+      continue;
+    }
+    struct proxy_qos_bucket *b = &ent->qos_up;
+    qos_bucket_refill(b, ent->qos_cfg.cir_Bps,
+                      qos_effective_cbs(&ent->qos_cfg), now);
+    if (atomic_load_explicit(&b->tokens, memory_order_relaxed) > 0) {
+      qos_wake_all_parked(b);
+    }
+  }
+  PROXY_UNLOCK();
 }
 
 // P2: Configure draining policy for a proxy service
@@ -5556,6 +5862,8 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->cache_total_size = 0;
     npfe2->cache_backpressure = 0;
     npfe2->read_paused = 0;
+    npfe2->qos_parked = 0;    /* pfe shells are pool-recycled, never re-zeroed */
+    npfe2->qos_was_parked = 0;
 
     PROXY_LOCK();
     npfe2->next = ent->val.fdlist;
@@ -6963,6 +7271,8 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->cache_total_size = 0;
   npfe1->cache_backpressure = 0;
   npfe1->read_paused = 0;
+  npfe1->qos_parked = 0;      /* pfe shells are pool-recycled, never re-zeroed */
+  npfe1->qos_was_parked = 0;
 
   // Initialize HTTP parser
   llhttp_settings_init(&npfe1->settings);
@@ -7503,6 +7813,16 @@ pd_resume_parked(int fd)
     log_warn("[PD_ADMISSION] resume fd=%d: gen mismatch (slot recycled) — drop", fd);
     return;
   }
+
+  /* Tier-1 shaper wake rides the same owner-worker resume path. A QoS park
+   * never consumed the pending payload, so re-arming EPOLLIN is the whole
+   * resume — level-triggered poll re-drives handle_client_data with a
+   * refilled bucket. Handled before the P/D-park gate below (a QoS-parked
+   * fd is not in PD_PHASE_PARKED). */
+  if (qos_resume_reader(fd, pfe)) {
+    return;
+  }
+
   if (pfe->pd_phase != PD_PHASE_PARKED) {
     /* Already resumed/reaped/torn down by another edge — idempotent no-op. */
     return;
@@ -7574,7 +7894,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
   for (j = 0; j < pfe->n_rfd; j++) {
     if (pfe->rfd_ent[j]) {
       // SAFETY: Clear backpressure if cache is actually empty (prevents stuck state)
-      if (pfe->rfd_ent[j]->cache_backpressure && pfe->rfd_ent[j]->cache_total_size == 0) {
+      // A QoS park is NOT backpressure: clearing read_paused here would
+      // disengage the shaper — only the shaper's refill wake may do that.
+      if (pfe->rfd_ent[j]->cache_backpressure && pfe->rfd_ent[j]->cache_total_size == 0 &&
+          !pfe->rfd_ent[j]->qos_parked) {
         pfe->rfd_ent[j]->cache_backpressure = 0;
         pfe->rfd_ent[j]->read_paused = 0;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -7611,8 +7934,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     }
     return 0; // Success (handled by pausing)
   } else {
-    // Re-enable reads if they were paused
-    if (pfe->read_paused) {
+    // Re-enable reads if they were paused — unless the pause belongs to the
+    // Tier-1 shaper: a QoS park is released only by the refill wake.
+    if (pfe->read_paused && !pfe->qos_parked) {
       pfe->read_paused = 0;
       notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, pfe, pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -7624,11 +7948,60 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
   // 🔍 DEBUG: Log start of burst loop
   log_trace("burst-start fd=%d odir=%d", fd, pfe->odir);
-  
+
+  /* Tier-1 byte shaper: resolve the service's bucket once per burst.
+   * Client->backend reads only; an H2 connection is never shaped (a
+   * connection-level pause head-of-line-blocks every stream on it). The
+   * token check sits INSIDE the burst loop and clamps the read length —
+   * one readiness event can otherwise drain up to 1024 x 1MB unshaped. */
+  proxy_map_ent_t *qos_ent = NULL;
+  if (pfe->odir == 0 && pfe->head && !pfe->h2_session) {
+    proxy_map_ent_t *qhent = (proxy_map_ent_t *)pfe->head;
+    if (qhent->qos_cfg.cir_Bps && (qhent->qos_cfg.dir & QOS_DIR_UPLOAD)) {
+      qos_ent = qhent;
+    }
+  }
+
   for (j = 0; j < PROXY_NUM_BURST_RX; j++) {
     int sret;
-    int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, SP_SOCK_MSG_LEN - pfe->rcv_off);
+    size_t rd_want = SP_SOCK_MSG_LEN - pfe->rcv_off;
+    uint64_t qos_grant = 0;
+
+    if (qos_ent && rd_want > 0) {
+      qos_grant = qos_bucket_take(&qos_ent->qos_up, rd_want);
+      if (qos_grant == 0) {
+        if (qos_park_reader(qos_ent, pfe, fd) == 0) {
+          /* parked: the pending payload stays in the socket buffer; the
+           * refill wake re-arms EPOLLIN and this loop re-runs */
+          goto burst_break;
+        }
+        /* park ring full — pass unshaped this burst rather than stall */
+        qos_grant = rd_want;
+      }
+      rd_want = (size_t)qos_grant;
+    }
+
+    int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, rd_want);
     int saved_errno = errno;  // Save errno immediately after recv()
+
+    if (qos_ent) {
+      if (rc > 0) {
+        if ((uint64_t)rc < qos_grant) {
+          /* short read: return the unread part of the grant */
+          qos_bucket_credit(&qos_ent->qos_up, qos_grant - (uint64_t)rc);
+        }
+        atomic_fetch_add_explicit(&qos_ent->qos_up.bytes_pass, (uint64_t)rc,
+                                  memory_order_relaxed);
+        if (pfe->qos_was_parked) {
+          pfe->qos_was_parked = 0;
+          atomic_fetch_add_explicit(&qos_ent->qos_up.bytes_delayed, (uint64_t)rc,
+                                    memory_order_relaxed);
+        }
+      } else if (qos_grant) {
+        /* nothing read (EAGAIN/EOF/error): the whole grant goes back */
+        qos_bucket_credit(&qos_ent->qos_up, qos_grant);
+      }
+    }
     
     // Log only errors and EOF for debugging
 #ifdef HAVE_PROXY_EXTRA_DEBUG
