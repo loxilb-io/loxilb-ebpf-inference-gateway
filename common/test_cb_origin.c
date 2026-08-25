@@ -6,7 +6,10 @@
  * connect-success reset that defeats failure_count cannot defeat the origin
  * streak), an origin success resets the streak, a HALF_OPEN probe that draws
  * another origin error re-trips immediately, and threshold 0 disables the
- * mechanism.
+ * mechanism. Recovery coupling: an origin-tripped breaker withholds the
+ * HALF_OPEN connect-success close (the EP accepts TCP fine — that is why it
+ * tripped) and closes only on an origin success; a connect-tripped breaker
+ * keeps the connect-success close.
  *
  * Self-contained in the repo's test idiom (test_cb_heal.c): it defines a
  * minimal circuit_breaker_t matching the real layout and the CB_STATE_*
@@ -37,16 +40,38 @@ typedef struct circuit_breaker {
   uint32_t half_open_max_requests;
   uint32_t half_open_requests;
   uint32_t origin_err_streak;
+  uint8_t  origin_tripped;
 } circuit_breaker_t;
 
 /* The actual production transition under test. */
 #include "circuit_breaker_origin.h"
 
-/* Mirrors sockproxy_health.c circuit_breaker_record_success() CLOSED arm —
- * the connect-level reset that makes failure_count blind to origin 5xx. */
+/* Mirrors sockproxy_health.c circuit_breaker_record_success() — the
+ * connect-level reset that makes failure_count blind to origin 5xx, and
+ * the HALF_OPEN close that the origin gate must withhold. */
 static void model_connect_success(circuit_breaker_t *cb) {
   if (cb->state == CB_STATE_CLOSED) {
     cb->failure_count = 0;
+  } else if (cb->state == CB_STATE_HALF_OPEN) {
+    if (circuit_breaker_origin_gates_connect_close(cb)) {
+      return;
+    }
+    cb->success_count++;
+    if (cb->success_count >= cb->success_threshold) {
+      cb->state = CB_STATE_CLOSED;
+      cb->failure_count = 0;
+    }
+  }
+}
+
+/* Mirrors sockproxy_health.c circuit_breaker_record_origin_success() close
+ * actions (the caller-owned side of note_success returning 1). */
+static void model_origin_success(circuit_breaker_t *cb) {
+  if (circuit_breaker_origin_note_success(cb)) {
+    cb->state = CB_STATE_CLOSED;
+    cb->failure_count = 0;
+    cb->success_count = 0;
+    cb->origin_tripped = 0;
   }
 }
 
@@ -134,6 +159,65 @@ static int test_threshold_one(void) {
   return 1;
 }
 
+/* CORE (recovery): an origin-tripped breaker in HALF_OPEN ignores the
+ * probe's connect success (the flap defect: TCP always succeeds on these
+ * EPs, so the old close re-admitted a still-broken EP every heal cycle)
+ * and closes only on the probe's origin success. */
+static int test_origin_trip_closes_on_origin_success_only(void) {
+  circuit_breaker_t cb = {0};
+  int i;
+  cb.state = CB_STATE_CLOSED;
+  cb.success_threshold = 1;
+  for (i = 0; i < 3; i++) {
+    (void)circuit_breaker_origin_note_error(&cb, 3);
+  }
+  ASSERT_EQ((int)cb.origin_tripped, 1, "trip marks origin_tripped");
+  cb.state = CB_STATE_HALF_OPEN;             /* heal timeout elapsed */
+  model_connect_success(&cb);                /* probe's TCP connect */
+  ASSERT_EQ(cb.state, CB_STATE_HALF_OPEN, "connect success withheld from closing");
+  model_origin_success(&cb);                 /* probe answered < 400 */
+  ASSERT_EQ(cb.state, CB_STATE_CLOSED, "origin success closes");
+  ASSERT_EQ((int)cb.origin_tripped, 0, "flag cleared on close");
+  model_connect_success(&cb);                /* back to normal semantics */
+  ASSERT_EQ(cb.state, CB_STATE_CLOSED, "post-recovery CLOSED behavior intact");
+  return 1;
+}
+
+/* A connect-tripped breaker (origin_tripped=0) keeps the legacy
+ * connect-success close — the gate must not leak into that path. */
+static int test_connect_trip_keeps_connect_close(void) {
+  circuit_breaker_t cb = {0};
+  cb.state = CB_STATE_HALF_OPEN;             /* opened by connect faults */
+  cb.success_threshold = 1;
+  ASSERT_EQ((int)cb.origin_tripped, 0, "precondition: connect trip");
+  model_connect_success(&cb);
+  ASSERT_EQ(cb.state, CB_STATE_CLOSED, "connect-tripped closes on connect success");
+  return 1;
+}
+
+/* An origin success on a CLOSED or connect-tripped breaker never asks for a
+ * close (note_success returns 1 only for origin-tripped HALF_OPEN). */
+static int test_origin_success_no_spurious_close_request(void) {
+  circuit_breaker_t cb = {0};
+  cb.state = CB_STATE_CLOSED;
+  ASSERT_EQ(circuit_breaker_origin_note_success(&cb), 0, "CLOSED: no close request");
+  cb.state = CB_STATE_HALF_OPEN;
+  cb.origin_tripped = 0;
+  ASSERT_EQ(circuit_breaker_origin_note_success(&cb), 0, "connect-tripped HALF_OPEN: no close request");
+  return 1;
+}
+
+/* HALF_OPEN origin error re-trips AND stays origin-tripped, so the next
+ * cycle still demands an origin success. */
+static int test_retrip_keeps_origin_gate(void) {
+  circuit_breaker_t cb = {0};
+  cb.state = CB_STATE_HALF_OPEN;
+  cb.origin_tripped = 1;
+  ASSERT_EQ(circuit_breaker_origin_note_error(&cb, 3), 1, "HALF_OPEN origin error re-trips");
+  ASSERT_EQ((int)cb.origin_tripped, 1, "gate persists across re-trip");
+  return 1;
+}
+
 int main(void) {
   printf("=== origin-error demotion (streak immune to connect-success reset) ===\n");
   RUN_TEST(test_streak_trips_despite_connect_success);
@@ -142,6 +226,10 @@ int main(void) {
   RUN_TEST(test_open_is_noop);
   RUN_TEST(test_threshold_zero_disables);
   RUN_TEST(test_threshold_one);
+  RUN_TEST(test_origin_trip_closes_on_origin_success_only);
+  RUN_TEST(test_connect_trip_keeps_connect_close);
+  RUN_TEST(test_origin_success_no_spurious_close_request);
+  RUN_TEST(test_retrip_keeps_origin_gate);
   printf("=== %d/%d passed ===\n", tests_passed, tests_run);
   return (tests_passed == tests_run) ? 0 : 1;
 }

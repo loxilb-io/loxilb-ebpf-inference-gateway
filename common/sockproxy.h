@@ -432,6 +432,13 @@ typedef struct circuit_breaker {
    * defeat it; at the threshold the breaker opens through the same trip
    * actions (trie removal, parked drain, selection/affinity skip). */
   uint32_t origin_err_streak;      // Consecutive origin 5xx responses
+  /* Set when the breaker OPENED on the origin streak (vs a connect fault).
+   * While set, a HALF_OPEN connect success must NOT close the breaker —
+   * the EP accepts TCP fine, that is exactly why it tripped; only an origin
+   * success (status < 400) closes it. Cleared on that close. Without this,
+   * every heal cycle instantly re-closed on the probe's CONNECT success and
+   * clients ate another full 5xx streak per cycle, forever. */
+  uint8_t  origin_tripped;         // 1 = OPENed by origin streak, not connect
 } circuit_breaker_t;
 
 // ============================================================================

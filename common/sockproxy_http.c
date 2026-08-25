@@ -1196,6 +1196,24 @@ skip_deferred_masking:
             uint64_t latency_us = (get_timestamp_ns() - rfd_ent->metric_req_start_ns) / 1000;
             record_latency_sample(latency_us);
           }
+          // Origin-error breaker feed for plain (non-P/D) relay: an endpoint
+          // that accepts TCP but keeps answering 5xx never trips the
+          // connect-level breaker, and prefix affinity keeps re-selecting it.
+          // P/D flows are excluded — their dialect handlers feed the breaker
+          // with leg-accurate EP indexes. The endpoint handle lives on the
+          // CLIENT entry (the backend entry keeps epv/ep_num unset by design
+          // for load accounting). 4xx neither extends nor resets the streak:
+          // engines answer 4xx/5xx to client-fault bodies, and only a
+          // consecutive-5xx streak should demote.
+          if (rfd_ent->pd_phase == PD_PHASE_NONE &&
+              rfd_ent->epv && rfd_ent->ep_num >= 0) {
+            proxy_epval_t *repval = (proxy_epval_t *)rfd_ent->epv;
+            if (status >= 500) {
+              circuit_breaker_record_origin_error(repval, rfd_ent->ep_num);
+            } else if (status < 400) {
+              circuit_breaker_record_origin_success(repval, rfd_ent->ep_num);
+            }
+          }
         }
       }
     }
