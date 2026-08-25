@@ -848,6 +848,11 @@ struct proxy_fd_ent {
   // 1 between a QoS resume and the next successful read; lets the first
   // post-park read be accounted as delayed bytes.
   int qos_was_parked;
+  // Wall-clock stamp of the last 1Hz health pass that observed this
+  // connection QoS-parked (0 = not parked at the last pass). The pass uses
+  // it to slide start-anchored duration caps forward by the exact paused
+  // span, so shaper-paused time never counts as idle/stream time.
+  time_t qos_park_seen_ts;
   int cache_draining;            // 1 if cache is currently being drained (prevents bypass)
   uint64_t chunk_seq;            // Chunk sequence number for ordering verification
 

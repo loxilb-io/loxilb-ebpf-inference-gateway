@@ -119,6 +119,35 @@ test_refill(void)
   CHECK(atomic_load(&b.tokens) == 100000);
 }
 
+static void
+test_slide_anchor(void)
+{
+  time_t now = 1000000;
+
+  /* unarmed anchors pass through untouched */
+  CHECK(qos_slide_anchor(0, 5, now) == 0);
+  CHECK(qos_slide_anchor(-1, 5, now) == -1);
+
+  /* zero/negative span is a no-op */
+  CHECK(qos_slide_anchor(999000, 0, now) == 999000);
+  CHECK(qos_slide_anchor(999000, -3, now) == 999000);
+
+  /* normal slide: paused span excluded from the cap */
+  CHECK(qos_slide_anchor(999000, 5, now) == 999005);
+
+  /* repeated 1s slides while parked walk the anchor toward now, never past */
+  time_t a = now - 2;
+  a = qos_slide_anchor(a, 1, now);
+  CHECK(a == now - 1);
+  a = qos_slide_anchor(a, 1, now);
+  CHECK(a == now);
+  a = qos_slide_anchor(a, 1, now);
+  CHECK(a == now);
+
+  /* a stale oversized span clamps to now — elapsed never goes negative */
+  CHECK(qos_slide_anchor(999990, 100000, now) == now);
+}
+
 /* --- conservation under concurrency ------------------------------------- */
 
 #define HAMMER_THREADS 4
@@ -200,6 +229,7 @@ main(void)
   test_take_grant_shapes();
   test_credit();
   test_refill();
+  test_slide_anchor();
   test_conservation();
   printf("test_qos_bucket: %d checks passed\n", n_pass);
   return 0;

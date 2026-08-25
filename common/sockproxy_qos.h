@@ -24,6 +24,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <string.h>
+#include <time.h>
 
 /* Direction bits for qos_cfg.dir */
 #define QOS_DIR_UPLOAD    0x1   /* client -> backend (request payload) */
@@ -186,6 +187,25 @@ qos_bucket_refill(struct proxy_qos_bucket *b, uint64_t rate_Bps,
     }
   }
   return 1;
+}
+
+/* Idle-accounting guard arithmetic: slide a start-anchored wall-clock cap
+ * (SSE stream start, P/D phase start) forward by the span a connection spent
+ * QoS-parked, so shaper-paused time is excluded from the cap. Unarmed
+ * anchors (<=0) pass through untouched, and a slide can never push the
+ * anchor past `now` (a stale park stamp must not make elapsed go negative
+ * and disarm the cap forever). */
+static inline time_t
+qos_slide_anchor(time_t anchor, time_t span, time_t now)
+{
+  if (anchor <= 0 || span <= 0) {
+    return anchor;
+  }
+  anchor += span;
+  if (anchor > now) {
+    anchor = now;
+  }
+  return anchor;
 }
 
 #endif /* __SOCKPROXY_QOS_H__ */

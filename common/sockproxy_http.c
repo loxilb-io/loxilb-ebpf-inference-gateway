@@ -5876,6 +5876,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->read_paused = 0;
     npfe2->qos_parked = 0;    /* pfe shells are pool-recycled, never re-zeroed */
     npfe2->qos_was_parked = 0;
+    npfe2->qos_park_seen_ts = 0;
 
     PROXY_LOCK();
     npfe2->next = ent->val.fdlist;
@@ -7285,6 +7286,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->read_paused = 0;
   npfe1->qos_parked = 0;      /* pfe shells are pool-recycled, never re-zeroed */
   npfe1->qos_was_parked = 0;
+  npfe1->qos_park_seen_ts = 0;
 
   // Initialize HTTP parser
   llhttp_settings_init(&npfe1->settings);
