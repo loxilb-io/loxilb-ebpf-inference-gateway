@@ -4102,6 +4102,18 @@ proxy_pdestroy(void *priv)
   } pd_retry_pend[MAX_PROXY_EP];
   int n_pd_retry_pend = 0;
 
+  /* An admission-time token reservation that this connection never settled.
+   * Collected under PROXY_LOCK and released after the final PROXY_UNLOCK, for
+   * the same reason the prefill retries are: the release crosses into Go.
+   * The strings are COPIED because the pfe may be freed by then. */
+  struct {
+    int      pending;
+    char     tenant[64];
+    char     model[MAX_MODEL_LEN];
+    int      reserved;
+    int64_t  res_epoch;
+  } resv_rel = { 0, {0}, {0}, 0, 0 };
+
   assert(pfe);
 
   // Log sticky session cleanup
@@ -4478,6 +4490,24 @@ proxy_pdestroy(void *priv)
       }
     }
 
+    /* Mid-flight teardown with an unspent admission claim. The claim is
+     * node-local and epoch-tagged, so it self-heals when the window rolls,
+     * but until then it counts against the tenant's headroom and can deny
+     * admissions for a request that died before it burned anything. Hand it
+     * back explicitly instead of waiting out the window. */
+    if (!is_listener && pfe->ai_gw_mode && pfe->usage_reserved_toks &&
+        !pfe->usage_consumed && pfe->tenant_id[0] != '\0') {
+      const char *m = proxy_effective_model(pfe);
+      resv_rel.pending = 1;
+      resv_rel.reserved = (int)pfe->usage_reserved_toks;
+      resv_rel.res_epoch = pfe->usage_res_epoch;
+      snprintf(resv_rel.tenant, sizeof(resv_rel.tenant), "%s", pfe->tenant_id);
+      snprintf(resv_rel.model, sizeof(resv_rel.model), "%s", m ? m : "");
+      /* Zero under the lock: nothing may release this claim twice. */
+      pfe->usage_reserved_toks = 0;
+      pfe->usage_res_epoch = 0;
+    }
+
     if (!is_listener) {
       proxy_release_rfd_ctx(pfe);
     }
@@ -4501,6 +4531,15 @@ proxy_pdestroy(void *priv)
     }
   }
   PROXY_UNLOCK();
+
+  /* Deferred reservation release (collected above under PROXY_LOCK). A zero
+   * count charges nothing and releases the claim. */
+  if (resv_rel.pending) {
+    llb_ai_token_quota_consume(resv_rel.tenant, resv_rel.model, 0, 0, 0,
+                               resv_rel.reserved, resv_rel.res_epoch, NULL);
+    log_info("[AI_TOKENS] released %d unspent reserved tokens on teardown "
+             "tenant=%s", resv_rel.reserved, resv_rel.tenant);
+  }
 
   /* Deferred prefill mid-request failovers (collected above under
    * PROXY_LOCK). Same-thread with the dying leg's teardown — the client pfe
@@ -6070,6 +6109,19 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->usage_complet_toks = 0;
     pfe->usage_est_prompt = 0;
     pfe->usage_sse_events = 0;
+    /* Request N may have left an unsettled claim (no countable usage came
+     * back, or its response was cut). Zeroing it here would strand it in the
+     * quota store until the window rolls; release it so request N+1 on this
+     * same connection is admitted against real headroom. Releasing before
+     * response N settles is safe: the claim is zeroed with it, so a later
+     * settle simply charges the actual tokens with nothing to give back. */
+    if (pfe->ai_gw_mode && pfe->usage_reserved_toks &&
+        pfe->tenant_id[0] != '\0') {
+      llb_ai_token_quota_consume((char *)pfe->tenant_id,
+                                 (char *)proxy_effective_model(pfe),
+                                 0, 0, 0, (int)pfe->usage_reserved_toks,
+                                 pfe->usage_res_epoch, NULL);
+    }
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
   }
