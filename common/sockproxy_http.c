@@ -6223,14 +6223,24 @@ handle_on_message_complete(llhttp_t* parser)
       int rl_rc = llb_ai_ratelimit_check(ai_dec.key_id, ai_dec.tenant_id, model, &rl_dec);
       if (rl_rc != 0) {
         char resp_429[320];
+        /* Report the reason this stage actually returned. Two different
+         * denials arrive here: the per-key/per-tenant request-rate limit,
+         * and the token-quota latch when an earlier response drove the
+         * bucket into debt. Hardcoding rate_limit_exceeded told a tenant
+         * who had exhausted its TOKEN budget that it was sending requests
+         * too fast — the log carried the true code while the body the
+         * client parses contradicted it. The reservation stage below has
+         * always reported its own code; this one now matches. */
+        const char *rl_err =
+          rl_dec.error_code[0] ? rl_dec.error_code : "rate_limit_exceeded";
         int n = snprintf(resp_429, sizeof(resp_429),
           "HTTP/1.1 429 Too Many Requests\r\n"
           "Content-Type: application/json\r\n"
           "Retry-After: %d\r\n"
           "Connection: close\r\n"
           "\r\n"
-          "{\"error\":\"rate_limit_exceeded\",\"retry_after\":%d}\r\n",
-          rl_dec.retry_after, rl_dec.retry_after);
+          "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+          rl_dec.retry_after, rl_err, rl_dec.retry_after);
         if (n > 0 && n < (int)sizeof(resp_429))
           send(pfe->fd, resp_429, (size_t)n, 0);
         shutdown(pfe->fd, SHUT_RDWR);
