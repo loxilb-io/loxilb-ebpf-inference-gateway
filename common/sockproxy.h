@@ -853,6 +853,11 @@ struct proxy_fd_ent {
   // it to slide start-anchored duration caps forward by the exact paused
   // span, so shaper-paused time never counts as idle/stream time.
   time_t qos_park_seen_ts;
+  // Monotonic ns stamp taken when the shaper parked this fd (0 = not parked).
+  // Consumed at resume to accumulate the bucket's park_ns_total observability
+  // counter; distinct from qos_park_seen_ts, which is the 1Hz health pass's
+  // second-resolution anchor and must stay on its own clock.
+  uint64_t qos_park_ns;
   int cache_draining;            // 1 if cache is currently being drained (prevents bypass)
   uint64_t chunk_seq;            // Chunk sequence number for ordering verification
 

@@ -206,7 +206,14 @@ static int __always_inline
     if (dp_do_fcv4_lkup(ctx, xf, &oif) == 1) {
       if (xf->pm.pipe_act == LLB_PIPE_RDR) {
         dp_unparse_packet_always(ctx, xf);
-        dp_unparse_packet(ctx, xf, 0);
+        /* Honour the failure. dp_unparse_packet() can drop a packet the
+         * pipeline must not forward — a vlan push or strip that did not fit,
+         * and now a transit-egress policer that ran out of tokens. The slow
+         * path has always checked this; the fast path discarding it meant a
+         * packet whose L2 rewrite had failed still got redirected. */
+        if (dp_unparse_packet(ctx, xf, 0) != 0) {
+          return DP_DROP;
+        }
         DP_EG_ACCOUNTING(ctx, xf);
         return bpf_redirect(oif, 0);         
       }

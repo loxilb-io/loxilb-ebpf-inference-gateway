@@ -112,6 +112,14 @@ typedef struct proxy_metrics_snapshot {
     /* TRT-LLM sequential-dialect counters. TAIL-APPEND ONLY — same
      * three-way lockstep contract as the SGLang block above. */
     uint64_t pd_trt_ctx_early_exit;
+
+    /* Relay-cache footprint gauges. The backpressure watermark is per
+     * connection (PROXY_CACHE_HIGH_WATER), so nothing reports what the
+     * process is holding in aggregate; these do. TAIL-APPEND ONLY — same
+     * three-way lockstep contract as the blocks above. */
+    uint64_t cache_bytes_total;
+    uint64_t cache_bytes_max_conn;
+    uint64_t cache_conns_queued;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================
@@ -131,6 +139,47 @@ proxy_metrics_snapshot_t proxy_get_metrics(void);
  * any other value -> 0. Called from proxy_get_metrics only.
  */
 uint64_t pd_admission_stats_get(int which);
+
+/* =========================================================================
+ * Tier-1 byte-shaper (QoS) per-service statistics.
+ *
+ * FIELD ORDER AND PADDING MUST MATCH the CGO block in
+ * api/prometheus/qos_shaper_metrics.go AND the weak stub in
+ * api/prometheus/proxy_metrics_stub.c. Three-way lockstep, same commit —
+ * tail-append only.
+ *
+ * Direction-indexed arrays: index 0 = upload (client->backend, QOS_DIR_UPLOAD),
+ * index 1 = download (backend->client, QOS_DIR_DOWNLOAD). A direction the
+ * config leaves un-shaped reports zeros; its bit is absent from `dir`.
+ *
+ * Byte units are PLAINTEXT payload bytes (post-decrypt), never the Tier-0
+ * eBPF policer's L3 wire bytes — the two must never be summed or compared.
+ * ========================================================================= */
+#define PROXY_QOS_STAT_MAX 256   /* services reported per proxy_get_qos_stats call */
+
+typedef struct proxy_qos_svc_stat {
+    uint32_t xip;              /* service VIP, network byte order (v4) */
+    uint16_t xport;            /* service port, HOST byte order */
+    uint8_t  protocol;         /* IPPROTO_* */
+    uint8_t  dir;              /* QOS_DIR_* bitmask in force */
+    uint64_t cir_bps;          /* committed rate, BYTES/sec */
+    uint32_t cbs_bytes;        /* effective burst depth */
+    uint32_t n_parked[2];      /* gauge: readers parked right now */
+    uint32_t pad;
+    uint64_t bytes_pass[2];    /* counter: payload bytes granted by the bucket */
+    uint64_t bytes_delayed[2]; /* counter: bytes that waited >=1 park/resume */
+    uint64_t parks[2];         /* counter: park events */
+    uint64_t park_ns[2];       /* counter: summed park->resume wall time (ns) */
+    int64_t  tokens[2];        /* gauge: bucket level in bytes */
+} proxy_qos_svc_stat_t;
+
+/*
+ * proxy_get_qos_stats - fill `out` with one entry per service that currently
+ * has the Tier-1 shaper enabled (cir_bps != 0). Returns the number of entries
+ * written, capped at `max`; 0 when no service is shaped. Called by Go CGO
+ * (api/prometheus/qos_shaper_metrics.go) off the hot path.
+ */
+int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
 
 /*
  * proxy_set_service_catalog - associate catalog_id with a service entry.

@@ -222,6 +222,41 @@ test_conservation(void)
          (unsigned long long)(cfg.cbs_bytes + refilled));
 }
 
+static void
+test_park_duration(void)
+{
+  struct proxy_qos_cfg cfg = { .cir_Bps = 1000 * 1000, .cbs_bytes = 100000 };
+  struct proxy_qos_bucket b;
+
+  memset(&b, 0, sizeof(b));
+  qos_bucket_init(&b, &cfg, 0);
+  CHECK(atomic_load(&b.park_ns_total) == 0);
+
+  /* a completed park adds exactly its span */
+  qos_bucket_note_park(&b, 1000ULL, 5000ULL);
+  CHECK(atomic_load(&b.park_ns_total) == 4000);
+
+  /* spans accumulate across parks */
+  qos_bucket_note_park(&b, 10000ULL, 10500ULL);
+  CHECK(atomic_load(&b.park_ns_total) == 4500);
+
+  /* a claimed (zeroed) stamp is a no-op: a double resume cannot inflate */
+  qos_bucket_note_park(&b, 0, 99999ULL);
+  CHECK(atomic_load(&b.park_ns_total) == 4500);
+
+  /* a non-advancing clock is a no-op, never a negative/huge unsigned add */
+  qos_bucket_note_park(&b, 8000ULL, 8000ULL);
+  qos_bucket_note_park(&b, 8000ULL, 7000ULL);
+  CHECK(atomic_load(&b.park_ns_total) == 4500);
+
+  /* a NULL bucket (shaper reconfigured off mid-park) is a no-op */
+  qos_bucket_note_park(NULL, 1000ULL, 2000ULL);
+  CHECK(atomic_load(&b.park_ns_total) == 4500);
+
+  /* the park counters are independent of the token arithmetic */
+  CHECK(atomic_load(&b.tokens) == 100000);
+}
+
 int
 main(void)
 {
@@ -230,6 +265,7 @@ main(void)
   test_credit();
   test_refill();
   test_slide_anchor();
+  test_park_duration();
   test_conservation();
   printf("test_qos_bucket: %d checks passed\n", n_pass);
   return 0;

@@ -76,6 +76,7 @@ struct proxy_qos_bucket {
   _Atomic uint64_t bytes_pass;
   _Atomic uint64_t bytes_delayed;  /* bytes that waited for >=1 park/resume cycle */
   _Atomic uint64_t parks;
+  _Atomic uint64_t park_ns_total;  /* summed park->resume wall time of every resumed reader */
 
   /* throttled connections waiting on refill (locked; off the hot path) */
   pthread_mutex_t park_lock;
@@ -145,6 +146,22 @@ qos_bucket_credit(struct proxy_qos_bucket *b, uint64_t unused_bytes)
     atomic_fetch_add_explicit(&b->tokens, (int64_t)unused_bytes,
                               memory_order_relaxed);
   }
+}
+
+/* Accumulate one completed park interval. Called on the resume side with the
+ * stamp taken at park time; a zero stamp (never parked, or the duration was
+ * already claimed) and a non-advancing clock are both no-ops, so a double
+ * resume cannot inflate the total. Parks that never resume (connection torn
+ * down while throttled) contribute nothing — the counter measures served
+ * delay, not outstanding delay, and parks/n_parked already expose the latter. */
+static inline void
+qos_bucket_note_park(struct proxy_qos_bucket *b, uint64_t park_ns, uint64_t now_ns)
+{
+  if (!b || park_ns == 0 || now_ns <= park_ns) {
+    return;
+  }
+  atomic_fetch_add_explicit(&b->park_ns_total, now_ns - park_ns,
+                            memory_order_relaxed);
 }
 
 /* Refill by elapsed wall time at rate_Bps, clamped to cbs. Exactly one caller
