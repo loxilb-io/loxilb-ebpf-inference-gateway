@@ -143,6 +143,18 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.conversation_sessions = 0;
     snapshot.h2_sessions = atomic_load(&global_stats.h2_sessions);
 
+    /* Relay-cache footprint. Backpressure is decided per connection against
+     * PROXY_CACHE_HIGH_WATER, so the aggregate the process holds is reported
+     * nowhere else. Summed in the walk that is already happening rather than
+     * kept as a running atomic: the cache add/drain path is hot and this is a
+     * scrape-rate gauge. cache_total_size is read without the per-entry cache
+     * lock, as cache_backpressure already is just below — a gauge tolerates a
+     * torn read, and taking the entry lock under PROXY_LOCK would invert the
+     * order the drain path takes them in. */
+    snapshot.cache_bytes_total = 0;
+    snapshot.cache_bytes_max_conn = 0;
+    snapshot.cache_conns_queued = 0;
+
     PROXY_LOCK();
     proxy_map_ent_t *node = proxy_struct->head;
     while (node) {
@@ -154,6 +166,14 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
             }
             if (pfe->cache_backpressure) {
                 snapshot.cache_backpressure_active++;
+            }
+            if (pfe->cache_total_size) {
+                uint64_t cb = (uint64_t)pfe->cache_total_size;
+                snapshot.cache_bytes_total += cb;
+                snapshot.cache_conns_queued++;
+                if (cb > snapshot.cache_bytes_max_conn) {
+                    snapshot.cache_bytes_max_conn = cb;
+                }
             }
             pfe = pfe->next;
         }
