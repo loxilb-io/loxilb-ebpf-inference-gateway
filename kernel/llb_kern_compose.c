@@ -1084,6 +1084,84 @@ dp_unparse_packet_always(void *ctx,  struct xfi *xf)
   return 0;
 }
 
+/* Defined in llb_kern_policer.c, which the single translation unit includes
+ * after this file. Declared here because the transit-egress policer below runs
+ * from dp_unparse_packet(), the one point where the slow path and the
+ * flow-cache fast path converge with a final output port.
+ */
+static int __always_inline
+do_dp_policer(void *ctx, struct xfi *xf, __u32 polid);
+
+/* Transit-egress port policing.
+ *
+ * The ingress hook stamps every transit packet and the egress hook passes
+ * stamped packets untouched, so transit never processes at an egress hook and
+ * dp_do_if_lkup()'s e_polid branch only ever sees host-originated traffic.
+ * Policing transit therefore has to happen after the forwarding decision, and
+ * this is that point: pm.oport is final and pm.bd already holds the VLAN the
+ * packet will leave with.
+ *
+ * The key is that same pm.bd, UNCONVERTED. dp_set_egr_vlan() stores the
+ * outgoing VLAN in network order — the control plane writes both it and
+ * intf_map's ing_vid through Htons — and dp_insert_vlan_tag() consumes it as a
+ * __be16, so the policer key and the tag that goes on the wire are the same
+ * value and cannot disagree. Adding an htons() here would be the silent miss
+ * this lookup exists to avoid, not a fix for it. Untagged egress leaves pm.bd
+ * at 0, which is exactly how a PVID port's entry is keyed.
+ *
+ * A key that matches nothing leaves the packet unpoliced rather than dropped.
+ * There is deliberately no fallback to {ifindex, 0}: a policer attached to a
+ * port propagates to that port's vlan sub-interfaces, but one attached to a
+ * sub-interface alone does not propagate upward, so a fallback would police
+ * traffic the operator never asked to police.
+ */
+static int __always_inline
+dp_do_transit_egr_pol(void *ctx, struct xfi *xf)
+{
+  struct intf_key key;
+  struct dp_intf_tact *l2a;
+  int pkey = xf->pm.oport;
+  int *oif;
+
+  /* dp_ing() already charged this packet against an egress policer if it was
+   * host-originated (qm.opolid is set from the ingress-side lookup for a
+   * packet with no ingress ifindex). Charging it again here would bill one
+   * packet to two buckets — and to the SAME bucket twice when it hairpins out
+   * of the port it arrived on. The two classes stay mutually exclusive by
+   * this test rather than by assumption. */
+  if (xf->qm.opolid != 0) {
+    return 0;
+  }
+
+  oif = bpf_map_lookup_elem(&tx_intf_map, &pkey);
+  if (!oif || *oif <= 0) {
+    return 0;
+  }
+
+  key.ifindex = (__u32)(*oif);
+  key.ing_vid = xf->pm.bd;
+  key.pad = 0;
+
+  l2a = bpf_map_lookup_elem(&intf_map, &key);
+  if (!l2a) {
+    /* Traced, because on the wire an absent policer and an unconfigured one
+     * are indistinguishable. */
+    BPF_TRACE_PRINTK("[EPOL] no intf for oif %d vid %d",
+                     key.ifindex, bpf_ntohs(key.ing_vid));
+    return 0;
+  }
+
+  if (l2a->ca.act_type != DP_SET_IFI || l2a->set_ifi.e_polid == 0) {
+    return 0;
+  }
+
+  BPF_TRACE_PRINTK("[EPOL] oif %d vid %d pol %d",
+                   key.ifindex, bpf_ntohs(key.ing_vid),
+                   l2a->set_ifi.e_polid);
+
+  return do_dp_policer(ctx, xf, l2a->set_ifi.e_polid) == 1 ? -1 : 0;
+}
+
 static int __always_inline
 dp_unparse_packet(void *ctx,  struct xfi *xf, int egr)
 {
@@ -1139,8 +1217,19 @@ dp_unparse_packet(void *ctx,  struct xfi *xf, int egr)
   }
 
   if (egr) {
+    /* Host-originated: it entered at an egress hook and dp_do_if_lkup() has
+     * already run its e_polid through the qm.opolid path. Returning here is
+     * what keeps the two classes from being policed twice, and it is a runtime
+     * argument rather than a compile-time define because the ingress and
+     * egress images share the pinned pgm_tbl. */
     dp_set_qmap(ctx, 0);
     return 0;
+  }
+
+  /* Police before the rewrite: pm.bd is final either way, and a dropped packet
+   * should not pay for a VLAN push it will never use. */
+  if (dp_do_transit_egr_pol(ctx, xf) != 0) {
+    return -1;
   }
 
   return dp_do_out_vlan(ctx, xf);
