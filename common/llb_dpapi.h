@@ -1012,6 +1012,7 @@ struct dp_proxy_tacts {
   uint8_t pd_cache_aware_mode;     // P/D cache-aware routing: 0=disabled, 1=enabled
   uint8_t pd_cache_threshold;      // Cache hit % threshold (default 20)
   uint8_t pd_balance_abs_threshold; // Load balance absolute threshold (default 3);
+  uint8_t apikey_auth;             // X-Api-Key enforcement: 1=required, 0=disabled (per-service policy)
   uint64_t lts;
   uint64_t base_to;
   uint32_t pmhh[LLB_MAX_MHOSTS];
@@ -1114,7 +1115,7 @@ struct dp_proxy_tacts {
 // ABI guard: explicit padding eliminates all implicit alignment gaps.
 // Layout: ca(16)+ito(8)+pto(8)+lock(4)+9×u8(9)+sel_hint(2)+5×u8(5)+pd_disagg_mode(1)+ai_gw_mode(1)
 //         +pd_cache_aware_mode(1)+pd_cache_threshold(1)+pd_balance_abs_threshold(1)
-//         +implicit_pad(4)+lts(8)+base_to(8)
+//         +apikey_auth(1)+implicit_pad(3)+lts(8)+base_to(8)
 //         +pmhh[3](12)+pad2(4)+nxfrms[32](1536)+host_url(256)+path_prefix(256)
 //         +session_header_name(128)+session_header_enabled(1)+model_name(128)
 //         +pad3a(1)+pd_kv_params_max(2)+sse_mode(1)+kv_exact_mode(1)+kv_hash_algo(1)+chwbl_prefix_hash_level(1)

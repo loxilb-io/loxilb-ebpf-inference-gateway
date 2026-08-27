@@ -35,6 +35,13 @@ endif
 all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 CFLAGS := -g -Wall -I../libbpf/src/ -DHAVE_DP_GPU_ROUTING=1 -DHAVE_LLM_SYSTEM_PROMPT_HASH=1 $(CFLAGS_TRACE) $(CFLAGS_PII) $(CFLAGS_MTLS)
+
+# Falling off a non-void function leaves an INDETERMINATE return value, and in
+# the HTTP callbacks that value IS the parser's errno — a deny path that
+# returned nothing admitted the request it had just rejected whenever the
+# garbage happened to be zero. -Wall only warns, and the warning sat in the
+# build output unread. Promote it: this class of defect must not compile.
+CFLAGS += -Werror=return-type
 # Phase 90 diag: opt-in AddressSanitizer hook for the full-binary conc=128 heap-
 # overflow hunt. Empty by default (zero effect on normal/CI builds); set
 # ASAN_CFLAGS='-fsanitize=address -fno-omit-frame-pointer' to instrument the

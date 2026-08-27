@@ -597,6 +597,46 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
 }
 
 /*
+ * ai_strip_upstream_api_key — remove the caller's X-Api-Key from a request on
+ * its way to the backend. Returns the (possibly shrunk) buffer length.
+ *
+ * Applied to EVERY AI service (ai_gw_mode == 1) whatever its api_key_auth
+ * policy: when the policy is "required" the credential has already been
+ * consumed by the gate, and when it is "disabled" the header was meaningless
+ * upstream to begin with. Either way it must not reach a GPU node's request
+ * logs, where it would sit in plaintext on a host the tenant does not own and
+ * the gateway does not control.
+ *
+ * Strip only, never splice. Removing a header shifts the body earlier without
+ * altering a byte of it, so a chunked body's framing survives — which is why
+ * this is NOT subject to the chunked-request guard the injection paths carry,
+ * where the hazard is an insertion needing space and shifting content the
+ * other way. Content-Length is not touched because it measures the body, not
+ * the header block.
+ *
+ * Plain L4 rules are out of scope: there is no HTTP parser in that path to
+ * strip with, and no AI service runs there.
+ */
+static size_t
+ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen)
+{
+  proxy_map_ent_t *node;
+  size_t cur = buflen;
+
+  if (!pfe || !buf)
+    return buflen;
+  node = (proxy_map_ent_t *)pfe->head;
+  if (!node || !node->val.ephash || !node->val.ephash->ai_gw_mode)
+    return buflen;
+  if (buflen < 4 || !memmem(buf, buflen, "\r\n\r\n", 4))
+    return buflen;
+
+  if (!l7h1_strip_header(buf, &cur, "X-Api-Key"))
+    return buflen;   /* terminator lost — leave the buffer as it was */
+  return cur;
+}
+
+/*
  * (CONTEXT) — H1 RESPONSE-side Set-Cookie
  * injection for stateless HTTP_COOKIE persistence. Splices a fixed-name
  * Set-Cookie carrying the opaque keyed-HMAC token of the BACKEND THIS REQUEST WAS
@@ -2194,8 +2234,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         // P/D disaggregation configuration
         tepval->pd_disagg_enabled = arg->pd_disagg_mode;
         tepval->ai_gw_mode = arg->ai_gw_mode;
-        log_info("[PD_CONFIG] proxy_add: pd_disagg=%d ai_gw=%d n_eps=%d",
-                 arg->pd_disagg_mode, arg->ai_gw_mode, arg->n_eps);
+        tepval->apikey_auth = arg->apikey_auth;
+        log_info("[PD_CONFIG] proxy_add: pd_disagg=%d ai_gw=%d apikey_auth=%d n_eps=%d",
+                 arg->pd_disagg_mode, arg->ai_gw_mode, arg->apikey_auth, arg->n_eps);
         if (arg->pd_disagg_mode) {
           tepval->n_prefill_eps = 0;
           tepval->n_decode_eps = 0;
@@ -2611,8 +2652,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   // P/D disaggregation configuration (new entry path)
   tepval->pd_disagg_enabled = arg->pd_disagg_mode;
   tepval->ai_gw_mode = arg->ai_gw_mode;
-  log_info("[PD_CONFIG] proxy_add(new): pd_disagg=%d ai_gw=%d n_eps=%d sse=%d",
-           arg->pd_disagg_mode, arg->ai_gw_mode, arg->n_eps, arg->sse_mode);
+  tepval->apikey_auth = arg->apikey_auth;
+  log_info("[PD_CONFIG] proxy_add(new): pd_disagg=%d ai_gw=%d apikey_auth=%d n_eps=%d sse=%d",
+           arg->pd_disagg_mode, arg->ai_gw_mode, arg->apikey_auth, arg->n_eps, arg->sse_mode);
   if (arg->pd_disagg_mode) {
     tepval->n_prefill_eps = 0;
     tepval->n_decode_eps = 0;
@@ -6184,10 +6226,56 @@ handle_on_message_complete(llhttp_t* parser)
                   : (pfe->prefix_key.model[0] ? pfe->prefix_key.model
                   : (pfe->x_model_header[0] ? pfe->x_model_header : ""));
 
-      /* Step 1: validate X-Api-Key → 401 (missing/invalid) or 403 (model denied) */
+      /* Step 1: validate X-Api-Key → 401 (missing/invalid) or 403 (model denied).
+       *
+       * Gated on the service's OWN policy, not on ai_gw_mode. The two are
+       * different questions: ai_gw_mode says this connection does AI
+       * accounting, apikey_auth says this service enforces a credential.
+       * Enforcement used to ride on whether the service streamed, which meant
+       * an operator could not turn on SSE without also turning on auth, or
+       * authenticate a non-streaming service at all.
+       *
+       * Read from the rule (ephash) rather than the accept-time copy on the
+       * pfe: this block runs once per request, and a keep-alive connection
+       * opened before the operator enabled enforcement must not keep skipping
+       * the gate for the life of that connection.
+       *
+       * With the policy disabled, ai_dec stays zeroed, so the rate-limit and
+       * token-quota stages below see an empty tenant and no-op — they are
+       * already written to skip on an empty tenant, so no second branch is
+       * needed here. */
+      if (!hent->val.ephash->apikey_auth) {
+        /* Served, but neither authenticated nor attributable to a tenant.
+         * Report it so the operator can see the consequence of the default
+         * rather than infer it from a bill. */
+        char um_vip[INET6_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &hent->key.xip, um_vip, sizeof(um_vip));
+        llb_ai_record_unmetered(um_vip);
+        goto ai_gate_done;
+      }
+
       int ai_rc = llb_ai_validate_key(pfe->x_api_key_raw, model, &ai_dec);
       if (ai_rc != 0) {
-        if (ai_dec.decision == 2) {
+        if (ai_dec.decision == 4) {
+          /* The policy requires a key and the store cannot answer. This is
+           * the gateway's fault, not the client's, and it is transient --
+           * so it must NOT be reported as 401. A client that retries a 503
+           * is behaving correctly; a client that retries a 401 is just
+           * replaying a credential that will never work.
+           *
+           * Retry-After is deliberately short: the store may be seconds
+           * from coming back, and this is the failing-closed path, so the
+           * cost of an early retry is one more cheap refusal. */
+          static const char resp_503[] =
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Retry-After: 5\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"policy_store_unavailable\","
+            "\"message\":\"API-key policy store is unavailable; request refused\"}\r\n";
+          send(pfe->fd, resp_503, sizeof(resp_503) - 1, 0);
+        } else if (ai_dec.decision == 2) {
           static const char resp_403[] =
             "HTTP/1.1 403 Forbidden\r\n"
             "Content-Type: application/json\r\n"
@@ -6209,7 +6297,12 @@ handle_on_message_complete(llhttp_t* parser)
         shutdown(pfe->fd, SHUT_RDWR);
         log_info("[AIGateway] fd=%d rejected: decision=%d key=%.8s...",
                  pfe->fd, ai_dec.decision, pfe->x_api_key_raw);
-        return;
+        /* Deny: stop the parser. A bare `return` here left an INDETERMINATE
+         * int as llhttp_execute's errno, and the relay path downstream runs
+         * only when that comes back HPE_OK — so whenever the garbage value
+         * happened to be 0, a request this gate had just rejected went on to
+         * the backend anyway. -1 is the documented callback error value. */
+        return -1;
       }
 
       /* Persist tenant_id for SSE token accounting and metrics */
@@ -6247,7 +6340,7 @@ handle_on_message_complete(llhttp_t* parser)
         log_info("[AIGateway] fd=%d rate-limited: key=%s tenant=%s error=%s retry=%d",
                  pfe->fd, ai_dec.key_id, ai_dec.tenant_id,
                  rl_dec.error_code, rl_dec.retry_after);
-        return;
+        return -1;   /* deny: stop the parser (see the 401/403 arm above) */
       }
 
       /* Step 3: pre-admission token reservation → 429 BEFORE dispatch.
@@ -6282,7 +6375,7 @@ handle_on_message_complete(llhttp_t* parser)
                      "want=%d+%d error=%s retry=%d",
                      pfe->fd, ai_dec.tenant_id, resv_prompt, resv_max,
                      rs_dec.error_code, rs_dec.retry_after);
-            return;
+            return -1;   /* deny: stop the parser (see the 401/403 arm above) */
           }
           if (rs_epoch != 0) {
             pfe->usage_reserved_toks = (uint32_t)(resv_prompt + resv_max);
@@ -6290,6 +6383,12 @@ handle_on_message_complete(llhttp_t* parser)
           }
         }
       }
+ai_gate_done:
+      /* Reached directly when the service's api_key_auth policy is disabled:
+       * no key was validated, no tenant established, and the rate-limit and
+       * token-quota stages above were therefore skipped rather than run
+       * against an empty tenant they would have no-opped on anyway. */
+      ;
     }
   }
 
@@ -6522,7 +6621,8 @@ handle_on_message_complete(llhttp_t* parser)
 
           // Free allocated memory before returning
           sockproxy_llamafirewall_free_result(&scan_result);
-          return;  // Don't process this request further
+          /* Same indeterminate-return hazard as the AI gate above. */
+          return -1;  // Don't process this request further
         } else {
           log_debug("[LlamaFirewall] ALLOWED: fd=%d path=%s score=%.2f masked=%d",
                    pfe->fd, path, scan_result.score, scanning_masked_content);
@@ -7400,6 +7500,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   // Copy SSE rule configuration to per-connection state (A-7)
   npfe1->sse_mode = 0;
   npfe1->ai_gw_mode = 0;           // AI-gateway connection marker (drives request accounting)
+  npfe1->apikey_auth = 0;          // per-service X-Api-Key policy (drives the auth gate)
   npfe1->metric_ai_recorded = 0;   // per-request request-accounting dedup guard
   npfe1->max_stream_duration_sec = 0;
   npfe1->backend_keepalive_sec = 0;
@@ -7412,6 +7513,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   if (ent && ent->val.ephash) {
     npfe1->sse_mode = ent->val.ephash->sse_mode;
     npfe1->ai_gw_mode = ent->val.ephash->ai_gw_mode;
+    npfe1->apikey_auth = ent->val.ephash->apikey_auth;
     npfe1->max_stream_duration_sec = ent->val.ephash->max_stream_duration_sec;
     npfe1->backend_keepalive_sec = ent->val.ephash->backend_keepalive_sec;
     npfe1->inactive_timeout_sec = ent->val.ephash->inactive_timeout_sec;
@@ -7685,6 +7787,10 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                                                 pfe->rcv_off, SP_SOCK_MSG_LEN, fd);
       }
     }
+
+    /* Drop the tenant credential before it leaves the gateway. Runs after the
+     * header policy so an operator-configured rule cannot re-add it. */
+    pfe->rcv_off = ai_strip_upstream_api_key(pfe, pfe->rcvbuf, pfe->rcv_off);
 
     /* P/D request-ID override — generate with prefill/decode addresses
  * so vllm-router can route correctly. Must happen BEFORE normal path. */
@@ -9009,6 +9115,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                                  (size_t)rc, SP_SOCK_MSG_LEN, fd);
         }
       }
+
+      /* Same strip on the keep-alive/burst egress: without it the second and
+       * later requests on a reused connection would carry the key upstream. */
+      rc = (ssize_t)ai_strip_upstream_api_key(pfe, pfe->rcvbuf, (size_t)rc);
 
       PROXY_ENT_LOCK(pfe);
       pfe_ent_accouting(pfe, rc, 0);

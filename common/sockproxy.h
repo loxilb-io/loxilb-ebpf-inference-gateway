@@ -541,6 +541,7 @@ typedef struct proxy_epval {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  uint8_t  apikey_auth;            // 1=X-Api-Key required (per-service policy, NOT derived)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
    * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG,
    * 2=trtllm ⇒ PD_ENGINE_TRTLLM) so the orchestration branch never reads a
@@ -952,6 +953,7 @@ struct proxy_fd_ent {
   uint64_t metric_req_start_ns;
   uint16_t metric_response_status;
   uint8_t  ai_gw_mode;                // 1=AI Gateway connection; copied from the rule at accept
+  uint8_t  apikey_auth;               // 1=X-Api-Key required; copied from the rule at accept
   uint8_t  metric_ai_recorded;       // 1=this request already counted in ai_requests_total (dedup guard)
 
   // HTTP/HTTPS Trace Context (: Protocol Analyzer)
@@ -1343,6 +1345,7 @@ struct proxy_arg {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  uint8_t  apikey_auth;            // 1=X-Api-Key required (per-service policy, NOT derived)
   // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
   // proxy_add). The nat2proxy hop of the additive chain
   // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).

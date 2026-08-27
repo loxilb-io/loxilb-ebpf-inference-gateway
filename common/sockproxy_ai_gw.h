@@ -30,6 +30,11 @@
  *   1  – deny with 401 (missing / disabled / expired API key)
  *   2  – deny with 403 (model not in key's AllowedModels list)
  *   3  – deny with 429 (rate limit exceeded; retry_after set in seconds)
+ *   4  – deny with 503 (policy store unavailable: the service's api_key_auth
+ *        policy requires a key and the store cannot answer. Deliberately NOT
+ *        a 401 -- a client must be able to tell "your key is wrong" from "the
+ *        gateway cannot tell right now", because only the second is worth
+ *        retrying.)
  */
 typedef struct {
     int  decision;
@@ -279,6 +284,19 @@ extern void llb_ai_pd_session_hit(char *model_name);
  *   model_name  effective model name (NUL-terminated)
  */
 extern void llb_ai_normal_session_hit(char *model_name);
+
+/*
+ * llb_ai_record_unmetered – record an AI request admitted without a credential.
+ *
+ * C sockproxy calls this from the AI gate when a connection has ai_gw_mode=1
+ * but the service's apikey_auth policy is 0, so no X-Api-Key was validated and
+ * no tenant was established. The request is served; this only makes the
+ * absence of metering visible to the operator who chose it.
+ *
+ * Parameters:
+ *   vip  service VIP the request arrived on (NUL-terminated)
+ */
+extern void llb_ai_record_unmetered(char *vip);
 
 /**
  * llb_ai_pd_record_ep – record per-endpoint P/D latency for Prometheus histogram.

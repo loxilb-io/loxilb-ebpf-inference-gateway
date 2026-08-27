@@ -152,6 +152,12 @@ llb_ai_normal_session_hit(char *model_name)
     (void)model_name;
 }
 
+void
+llb_ai_record_unmetered(char *vip)
+{
+    (void)vip;
+}
+
 /* llb_ai_update_ep_queue_depth is defined in sockproxy_metrics.c (C-side),
  * not a CGO export, so no stub needed here. */
 
