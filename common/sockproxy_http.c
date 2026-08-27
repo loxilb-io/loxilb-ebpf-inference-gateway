@@ -626,7 +626,15 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen)
   if (!pfe || !buf)
     return buflen;
   node = (proxy_map_ent_t *)pfe->head;
-  if (!node || !node->val.ephash || !node->val.ephash->ai_gw_mode)
+  /* Strip on any service that DECLARED itself AI-facing: enforcement armed
+   * (apikey_auth 1, which also arms ai_gw_mode), accounting armed (sse/pd),
+   * or the policy explicitly set to disabled (apikey_auth 2 — no check, but
+   * the credential namespace is still the gateway's, and a key forwarded
+   * through a non-enforcing service is replayable against enforcing ones).
+   * A service that declared NOTHING keeps byte-identical proxying: non-AI
+   * backends legitimately consume an X-Api-Key of their own. */
+  if (!node || !node->val.ephash ||
+      !(node->val.ephash->ai_gw_mode || node->val.ephash->apikey_auth))
     return buflen;
   if (buflen < 4 || !memmem(buf, buflen, "\r\n\r\n", 4))
     return buflen;
@@ -6244,7 +6252,13 @@ handle_on_message_complete(llhttp_t* parser)
        * token-quota stages below see an empty tenant and no-op — they are
        * already written to skip on an empty tenant, so no second branch is
        * needed here. */
-      if (!hent->val.ephash->apikey_auth) {
+      /* Skip enforcement only for the two DECLARED non-enforcing values.
+       * 1 enforces, and so does anything out of range: a wire value this
+       * code does not recognise is a corrupted policy, and a corrupted
+       * policy that admits keyless traffic fails open on exactly the
+       * services an operator tried to protect. */
+      if (hent->val.ephash->apikey_auth == 0 ||
+          hent->val.ephash->apikey_auth == 2) {
         /* Served, but neither authenticated nor attributable to a tenant.
          * Report it so the operator can see the consequence of the default
          * rather than infer it from a bill. */
@@ -6301,7 +6315,17 @@ handle_on_message_complete(llhttp_t* parser)
          * int as llhttp_execute's errno, and the relay path downstream runs
          * only when that comes back HPE_OK — so whenever the garbage value
          * happened to be 0, a request this gate had just rejected went on to
-         * the backend anyway. -1 is the documented callback error value. */
+         * the backend anyway. -1 is the documented callback error value.
+         *
+         * The flag is the second half of that fix. -1 surfaces to the read
+         * loop as a PARSE error, and the parse-error branch there is the
+         * not-actually-HTTP fallback: it resets the parser and still runs
+         * setup_proxy_path, after which the same iteration relays the buffer
+         * raw — the refused request, body and all, arriving at the backend
+         * with the client already holding its 401. The flag lets the read
+         * loop tell a policy denial from malformed traffic, because from
+         * llhttp's point of view they are the same errno. */
+        pfe->ai_gw_denied = 1;
         return -1;
       }
 
@@ -6323,23 +6347,41 @@ handle_on_message_complete(llhttp_t* parser)
          * who had exhausted its TOKEN budget that it was sending requests
          * too fast — the log carried the true code while the body the
          * client parses contradicted it. The reservation stage below has
-         * always reported its own code; this one now matches. */
+         * always reported its own code; this one now matches.
+         *
+         * decision 4 is a third arrival, and not a rate: the stage found a
+         * keyed identity with no store behind it (its own invariant guard).
+         * That is the gateway's outage, so it carries the 503 status the
+         * validate arm uses, never a 429 that reads as "slow down". */
         const char *rl_err =
           rl_dec.error_code[0] ? rl_dec.error_code : "rate_limit_exceeded";
-        int n = snprintf(resp_429, sizeof(resp_429),
-          "HTTP/1.1 429 Too Many Requests\r\n"
-          "Content-Type: application/json\r\n"
-          "Retry-After: %d\r\n"
-          "Connection: close\r\n"
-          "\r\n"
-          "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-          rl_dec.retry_after, rl_err, rl_dec.retry_after);
+        int n;
+        if (rl_dec.decision == 4) {
+          n = snprintf(resp_429, sizeof(resp_429),
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json\r\n"
+            "Retry-After: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+            rl_dec.retry_after, rl_err, rl_dec.retry_after);
+        } else {
+          n = snprintf(resp_429, sizeof(resp_429),
+            "HTTP/1.1 429 Too Many Requests\r\n"
+            "Content-Type: application/json\r\n"
+            "Retry-After: %d\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+            rl_dec.retry_after, rl_err, rl_dec.retry_after);
+        }
         if (n > 0 && n < (int)sizeof(resp_429))
           send(pfe->fd, resp_429, (size_t)n, 0);
         shutdown(pfe->fd, SHUT_RDWR);
         log_info("[AIGateway] fd=%d rate-limited: key=%s tenant=%s error=%s retry=%d",
                  pfe->fd, ai_dec.key_id, ai_dec.tenant_id,
                  rl_dec.error_code, rl_dec.retry_after);
+        pfe->ai_gw_denied = 1;
         return -1;   /* deny: stop the parser (see the 401/403 arm above) */
       }
 
@@ -6375,6 +6417,7 @@ handle_on_message_complete(llhttp_t* parser)
                      "want=%d+%d error=%s retry=%d",
                      pfe->fd, ai_dec.tenant_id, resv_prompt, resv_max,
                      rs_dec.error_code, rs_dec.retry_after);
+            pfe->ai_gw_denied = 1;
             return -1;   /* deny: stop the parser (see the 401/403 arm above) */
           }
           if (rs_epoch != 0) {
@@ -8837,6 +8880,21 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // Continue reading more data in next iteration
           continue;
           
+        } else if (pfe->ai_gw_denied) {
+          /* Not malformed HTTP — the AI gate refused this request from inside
+           * on_message_complete, already answered the client and shut its
+           * socket down. From llhttp's point of view that callback -1 is the
+           * same errno as garbage traffic, but the two must part ways HERE:
+           * the parse-error branch below is the not-actually-HTTP fallback,
+           * and it resets the parser, runs setup_proxy_path anyway, and lets
+           * this same iteration relay the buffer raw to the endpoint it just
+           * connected. Every denial — 401, 403, 429, 503 — escaped upstream
+           * through exactly that door, carrying its full body, while the
+           * client sat holding a refusal. Tear the connection down instead;
+           * there is nothing left to salvage on a socket the gate has
+           * already shut. */
+          pfe->ai_gw_denied = 0;
+          return -1; // Restart
         } else {
           // Parse error
           pfe->rcv_off = 0;

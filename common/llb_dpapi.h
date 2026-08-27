@@ -1012,7 +1012,7 @@ struct dp_proxy_tacts {
   uint8_t pd_cache_aware_mode;     // P/D cache-aware routing: 0=disabled, 1=enabled
   uint8_t pd_cache_threshold;      // Cache hit % threshold (default 20)
   uint8_t pd_balance_abs_threshold; // Load balance absolute threshold (default 3);
-  uint8_t apikey_auth;             // X-Api-Key enforcement: 1=required, 0=disabled (per-service policy)
+  uint8_t apikey_auth;             // X-Api-Key policy: 0=unset, 1=required (enforce+strip), 2=declared disabled (strip only)
   uint64_t lts;
   uint64_t base_to;
   uint32_t pmhh[LLB_MAX_MHOSTS];
