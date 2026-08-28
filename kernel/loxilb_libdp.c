@@ -2469,6 +2469,10 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // P/D disaggregation configuration
   pval->pd_disagg_mode = dat->pd_disagg_mode;
   pval->ai_gw_mode = dat->ai_gw_mode;
+  // Per-service X-Api-Key policy. Carried separately from ai_gw_mode because
+  // the two answer different questions: ai_gw_mode says "this connection does
+  // AI accounting", apikey_auth says "this service enforces a credential".
+  pval->apikey_auth = dat->apikey_auth;
   // SGLang bootstrap port (0 ⇒ defaulted at proxy_add) — the nat2proxy hop
   // of the additive chain (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
   pval->pd_bootstrap_port = dat->pd_bootstrap_port;
