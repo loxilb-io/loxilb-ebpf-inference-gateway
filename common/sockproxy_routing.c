@@ -152,6 +152,21 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     }
   }
 
+  /* A model-specific rule does not need a path_prefix. proxy_add_entry stores
+   * that valid shape as "host||model", so try it before falling back to any
+   * wildcard-model path. Without this lookup, a hostname-only model pool was
+   * inserted successfully and shown by the management API, yet every request
+   * for that model returned 503 model_unavailable. The older model-routing
+   * scenario always configured path_prefix="/" and therefore could not expose
+   * this missing branch. */
+  if (!best_match && model_name && model_name[0] != '\0') {
+    build_ephash_key(search_key, sizeof(search_key), host, "", model_name);
+    HASH_FIND_STR(ent->val.ephash, search_key, tepval);
+    if (tepval) {
+      return tepval;
+    }
+  }
+
   /* Criterion B: If model-specific path LPM found nothing, retry with wildcard model.
    * This implements two-level model routing: specific pool first, then wildcard pool.
    * Pure C hash-table lookup — zero CGO calls in this path. */
