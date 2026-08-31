@@ -319,4 +319,63 @@ int kv_compute_single_block_hash(uint8_t hash_algo,
  */
 void kv_hash_debug_test_set(int on);
 
+/* ========================================================================== */
+/* Binding-dataplane contract word                                             */
+/* ========================================================================== */
+
+/* Packed layout of proxy_epval.kv_exact_contract:
+ *   [ binding_gen:32 | flags:16 | api_mode:8 | eligible:8 ]
+ * binding_gen is a Rule-scoped monotonic handle (0 reserved = "no contract",
+ * equality-compared only, never ordered); flags are reserved (0) for now;
+ * eligible is normalized to 0/1 at the setter. The word is a HANDLE into the
+ * control plane's binding mapping — never identity proof by itself (the ACK
+ * pairs the readback with a Go-side binding-digest check). */
+#define KV_CONTRACT_PACK(gen, flags, api_mode, eligible)                    \
+  (((uint64_t)(uint32_t)(gen) << 32) |                                      \
+   ((uint64_t)((flags) & 0xffffu) << 16) |                                  \
+   ((uint64_t)((api_mode) & 0xffu) << 8) |                                  \
+   ((uint64_t)((eligible) & 0xffu)))
+#define KV_CONTRACT_GEN(w)       ((uint32_t)((w) >> 32))
+#define KV_CONTRACT_FLAGS(w)     ((uint16_t)(((w) >> 16) & 0xffffu))
+#define KV_CONTRACT_API_MODE(w)  ((uint8_t)(((w) >> 8) & 0xffu))
+#define KV_CONTRACT_ELIGIBLE(w)  ((uint8_t)((w) & 0xffu))
+
+/* api_mode byte vocabulary (mirrors the Go kvExactApiMode surfaces; 0 must
+ * mean "both" so an installed word with no surface restriction is still
+ * distinguishable from the legacy zero word via its binding_gen bits). */
+#define KV_EXACT_API_BOTH        0
+#define KV_EXACT_API_COMPLETIONS 1
+#define KV_EXACT_API_CHAT        2
+
+/* Typed bridge return codes (plan §8). Negative values returned by BOTH
+ * tokenize bridges in place of the old collapsed -1. Request-class codes
+ * (-1/-2) can NEVER change rule readiness (I-12) — they only count and fall
+ * back per request. Runtime-fault codes (-3..-6) are emitted ONLY on strict
+ * paths (binding_gen != 0), where admission proved the contract prerequisites
+ * — a legacy rule's failures stay request-class so attacker traffic can never
+ * degrade it. NOT_READY (-7) is the Go deny-set fence (plan §7.4): the
+ * authoritative backstop — no tokens => no hashes => Tier-2.
+ * Keep in lockstep with the Go mirror constants in
+ * pkg/loxinet/ai_kv_dataplane.go (twin-lockstep, same paired commits). */
+#define LLB_KV_TOK_ERR_REQUEST      (-1) /* bad JSON / no messages / empty text-model (legacy-compatible) */
+#define LLB_KV_TOK_ERR_UNSUPPORTED  (-2) /* excluded feature on a strict rule (tools/MM/cache_salt/...) */
+#define LLB_KV_TOK_ERR_PROFILE      (-3) /* binding generation unknown/retired, digest drift */
+#define LLB_KV_TOK_ERR_RENDERER     (-4) /* validated chat renderer failed on a strict rule */
+#define LLB_KV_TOK_ERR_TOKENIZER    (-5) /* admission-proven tokenizer unavailable/corrupt on a strict rule */
+#define LLB_KV_TOK_ERR_UNKNOWN      (-6) /* unclassified strict-path failure (conservative) */
+#define LLB_KV_TOK_ERR_NOT_READY    (-7) /* svc_id fenced by the Go deny set */
+
+struct proxy_epval;
+
+/*
+ * pd_kv_exact_contract_set — the single word-write primitive (unit-testable
+ * core of proxy_update_kv_exact_contract; the sockproxy_http.c wrapper owns
+ * the entry lookup + PROXY_LOCK). Stores with release ordering, reads back
+ * into *applied. Returns 0 on ACK (readback == requested word), -EINVAL on
+ * bad args or binding_gen 0, -EIO on readback mismatch.
+ */
+int pd_kv_exact_contract_set(struct proxy_epval *epv, uint32_t binding_gen,
+                             uint8_t api_mode, uint8_t eligible,
+                             uint64_t *applied);
+
 #endif /* __SOCKPROXY_KV_EXACT_H__ */

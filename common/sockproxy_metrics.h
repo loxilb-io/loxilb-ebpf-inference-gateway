@@ -80,6 +80,12 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_kv_t15_miss_no_worker;
     uint64_t pd_kv_t15_miss_excluded;
     uint64_t pd_kv_t15_miss_shallow;
+    /* Contract-gate + typed-bridge miss classes (lockstep with
+     * sockproxy.h atomics and the Go CGO mirror). */
+    uint64_t pd_kv_t15_miss_not_ready;
+    uint64_t pd_kv_t15_miss_api_mode;
+    uint64_t pd_kv_t15_miss_unsupported;
+    uint64_t pd_kv_t15_miss_runtime_fault;
     uint64_t pd_kv_t15_fallthrough_total;
 
     /* (OBS-01): CB proactive heal  + per-EP admission layer

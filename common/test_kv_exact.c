@@ -138,6 +138,10 @@ typedef struct proxy_epval {
    * sockproxy_kv_exact.c threads tepval->kv_svc_id to llb_ai_kv_best_worker.
    * Zero-init (kv_reset_tepval memset) == "no identity" == legacy loop. */
   uint32_t kv_svc_id;
+  /* Binding-dataplane contract word mirror — read once (acquire) by the
+   * #included pd_kv_exact_select gate, written by pd_kv_exact_contract_set.
+   * Zero-init (kv_reset_tepval memset) == "no contract" == legacy path. */
+  _Atomic uint64_t kv_exact_contract;
 } proxy_epval_t;
 
 typedef struct proxy_fd_ent {
@@ -166,6 +170,11 @@ typedef struct proxy_global_stats {
   _Atomic uint64_t pd_kv_t15_miss_no_worker;
   _Atomic uint64_t pd_kv_t15_miss_excluded;
   _Atomic uint64_t pd_kv_t15_miss_shallow;
+  /* Contract-gate + typed-bridge miss classes (mirror of sockproxy.h). */
+  _Atomic uint64_t pd_kv_t15_miss_not_ready;
+  _Atomic uint64_t pd_kv_t15_miss_api_mode;
+  _Atomic uint64_t pd_kv_t15_miss_unsupported;
+  _Atomic uint64_t pd_kv_t15_miss_runtime_fault;
   _Atomic uint64_t pd_kv_t15_fallthrough_total;
   /* C3 per-stage µs histograms (mirror of sockproxy.h proxy_global_stats):
    * [stage][outcome] where outcome 0=miss, 1=hit. */
@@ -210,12 +219,27 @@ static uint32_t stub_last_svc_id = 0xdeadbeefu;
  * (tepval->kv_exact_mode reaches the Go selector intact). */
 static uint32_t stub_last_kv_exact_mode = 0xdeadbeefu;
 
+/* Contract-seam captures: pin that the gate's loaded binding_gen and the
+ * rule's kv_svc_id reach the tokenize bridge intact, that the gate
+ * short-circuits BEFORE tokenize (call counter), and let the typed-code
+ * classification tests force a LLB_KV_TOK_ERR_* return. */
+static uint32_t stub_last_tok_svc_id = 0xdeadbeefu;
+static uint32_t stub_last_tok_binding_gen = 0xdeadbeefu;
+static int stub_tok_calls = 0;
+static int stub_tok_force_code = 0; /* <0 => both stubs return it verbatim */
+
 int
 llb_ai_kv_tokenize(char *text, char *model_name,
-                    uint32_t *out_ids, int max_ids)
+                    uint32_t *out_ids, int max_ids,
+                    uint32_t svc_id, uint32_t binding_gen)
 {
   (void)text;
   (void)model_name;
+  stub_tok_calls++;
+  stub_last_tok_svc_id = svc_id;
+  stub_last_tok_binding_gen = binding_gen;
+  if (stub_tok_force_code < 0)
+    return stub_tok_force_code;
   if (stub_token_count <= 0 || !out_ids || max_ids <= 0)
     return -1;
   int n = stub_token_count;
@@ -231,10 +255,16 @@ llb_ai_kv_tokenize(char *text, char *model_name,
  * real tokenize/template parity is proven Go-side in the design. */
 int
 llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
-                         uint32_t *out_ids, int max_ids)
+                         uint32_t *out_ids, int max_ids,
+                         uint32_t svc_id, uint32_t binding_gen)
 {
   (void)raw_body;
   (void)model_name;
+  stub_tok_calls++;
+  stub_last_tok_svc_id = svc_id;
+  stub_last_tok_binding_gen = binding_gen;
+  if (stub_tok_force_code < 0)
+    return stub_tok_force_code;
   if (stub_token_count <= 0 || !out_ids || max_ids <= 0)
     return -1;
   int n = stub_token_count;
@@ -2121,6 +2151,244 @@ test_json_unescape(void)
   }
 }
 
+/* ---- binding-dataplane contract tests ---- */
+
+static void
+kv_reset_tok_stub(void)
+{
+  stub_tok_calls = 0;
+  stub_tok_force_code = 0;
+  stub_last_tok_svc_id = 0xdeadbeefu;
+  stub_last_tok_binding_gen = 0xdeadbeefu;
+}
+
+/* pd_kv_exact_contract_set: packing, ACK readback, gen-0 refusal,
+ * eligible normalization. */
+static void
+test_contract_set_core(void)
+{
+  printf("Test: pd_kv_exact_contract_set packs, ACKs, refuses gen 0\n");
+  proxy_epval_t tepval;
+  uint64_t applied = 0;
+
+  kv_reset_tepval(&tepval);
+
+  /* gen 0 is reserved — the setter must never install the legacy zero word */
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 0, KV_EXACT_API_BOTH, 1, &applied),
+            -EINVAL, "contract_set: binding_gen 0 refused");
+  ASSERT_EQ((int)(atomic_load(&tepval.kv_exact_contract) != 0), 0,
+            "contract_set: refused call leaves the word zero");
+
+  /* install: word == PACK, applied readback == word, rc == 0 (the ACK) */
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 7, KV_EXACT_API_CHAT, 1, &applied),
+            0, "contract_set: install ACKs");
+  ASSERT_EQ((int)(applied == KV_CONTRACT_PACK(7, 0, KV_EXACT_API_CHAT, 1)), 1,
+            "contract_set: applied == requested packed word");
+  ASSERT_EQ((int)KV_CONTRACT_GEN(applied), 7, "contract_set: gen extract");
+  ASSERT_EQ((int)KV_CONTRACT_API_MODE(applied), KV_EXACT_API_CHAT,
+            "contract_set: api_mode extract");
+  ASSERT_EQ((int)KV_CONTRACT_ELIGIBLE(applied), 1, "contract_set: eligible extract");
+  ASSERT_EQ((int)KV_CONTRACT_FLAGS(applied), 0, "contract_set: flags reserved 0");
+
+  /* eligible normalization: any nonzero input stores exactly 1 */
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 8, KV_EXACT_API_BOTH, 0xff, &applied),
+            0, "contract_set: re-install new gen ACKs");
+  ASSERT_EQ((int)KV_CONTRACT_ELIGIBLE(applied), 1,
+            "contract_set: eligible normalized to 1");
+
+  /* fence: eligible=0 keeps the gen (word stays nonzero — never legacy) */
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 8, KV_EXACT_API_BOTH, 0, &applied),
+            0, "contract_set: fence ACKs");
+  ASSERT_EQ((int)KV_CONTRACT_ELIGIBLE(applied), 0, "contract_set: fenced");
+  ASSERT_EQ((int)(applied != 0), 1, "contract_set: fenced word stays nonzero");
+}
+
+/* CONTRACT GATE: fenced word => not_ready miss BEFORE tokenize. */
+static void
+test_contract_gate_not_ready(void)
+{
+  printf("Test: contract gate !eligible -> miss_not_ready, no tokenize\n");
+  proxy_epval_t tepval;
+  proxy_fd_ent_t pfe;
+  uint64_t applied = 0;
+  int ep = -1;
+
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);
+  kv_reset_pfe(&pfe);
+  kv_reset_tok_stub();
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 3, KV_EXACT_API_BOTH, 0, &applied),
+            0, "gate/not_ready: fenced install ACKs");
+
+  int rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(rc, -1, "gate/not_ready: returns -1 (Tier-2)");
+  ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_not_ready), 1,
+            "gate/not_ready: pd_kv_t15_miss_not_ready incremented");
+  ASSERT_EQ(stub_tok_calls, 0, "gate/not_ready: tokenize NEVER reached");
+}
+
+/* CONTRACT GATE: api_mode surface exclusion, both directions. */
+static void
+test_contract_gate_api_mode(void)
+{
+  printf("Test: contract gate api_mode excludes the declared-off surface\n");
+  proxy_epval_t tepval;
+  proxy_fd_ent_t pfe;
+  uint64_t applied = 0;
+  int ep = -1;
+
+  /* chat request on a completions-only contract */
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);
+  kv_reset_pfe(&pfe);
+  kv_reset_tok_stub();
+  pfe.is_chat = 1;
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 4, KV_EXACT_API_COMPLETIONS, 1,
+                                     &applied), 0,
+            "gate/api_mode: completions-only install ACKs");
+  int rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(rc, -1, "gate/api_mode: chat on completions-only -> -1");
+  ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_api_mode), 1,
+            "gate/api_mode: chat exclusion counted");
+  ASSERT_EQ(stub_tok_calls, 0, "gate/api_mode: no tokenize on exclusion");
+
+  /* completions request on a chat-only contract */
+  kv_reset_stats();
+  kv_reset_tok_stub();
+  pfe.is_chat = 0;
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 4, KV_EXACT_API_CHAT, 1,
+                                     &applied), 0,
+            "gate/api_mode: chat-only install ACKs");
+  rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(rc, -1, "gate/api_mode: completions on chat-only -> -1");
+  ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_api_mode), 1,
+            "gate/api_mode: completions exclusion counted");
+  ASSERT_EQ(stub_tok_calls, 0, "gate/api_mode: no tokenize on exclusion (2)");
+}
+
+/* CONTRACT GATE: eligible word admits, and the loaded binding_gen + the
+ * rule's kv_svc_id ride the tokenize CGO call intact. */
+static void
+test_contract_gate_threads_binding_gen(void)
+{
+  printf("Test: eligible contract threads (svc_id, binding_gen) to tokenize\n");
+  proxy_epval_t tepval;
+  proxy_fd_ent_t pfe;
+  uint64_t applied = 0;
+  int ep = -1;
+
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);
+  kv_reset_pfe(&pfe);
+  kv_reset_tok_stub();
+  tepval.kv_svc_id = 91;
+  stub_token_count = 32;      /* tokenize succeeds */
+  stub_best_ep = -1;          /* pipeline then misses at GUARD_G — fine */
+  stub_best_score = 0;
+  ASSERT_EQ(pd_kv_exact_contract_set(&tepval, 12, KV_EXACT_API_BOTH, 1,
+                                     &applied), 0,
+            "gate/thread: eligible install ACKs");
+
+  (void)pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(stub_tok_calls, 1, "gate/thread: tokenize reached once");
+  ASSERT_EQ((int)stub_last_tok_svc_id, 91, "gate/thread: svc_id threaded");
+  ASSERT_EQ((int)stub_last_tok_binding_gen, 12,
+            "gate/thread: binding_gen threaded from the loaded word");
+  ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_not_ready), 0,
+            "gate/thread: no not_ready miss on eligible word");
+
+  stub_token_count = 0;
+}
+
+/* CONTRACT GATE: zero word == legacy passthrough — the gate contributes no
+ * misses and tokenize runs with binding_gen 0 (today's path, byte-identical). */
+static void
+test_contract_zero_word_legacy(void)
+{
+  printf("Test: zero contract word is the legacy passthrough\n");
+  proxy_epval_t tepval;
+  proxy_fd_ent_t pfe;
+  int ep = -1;
+
+  kv_reset_stats();
+  kv_reset_tepval(&tepval);   /* memset -> kv_exact_contract == 0 */
+  kv_reset_pfe(&pfe);
+  kv_reset_tok_stub();
+  stub_token_count = 32;
+  stub_best_ep = -1;
+  stub_best_score = 0;
+
+  (void)pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+  ASSERT_EQ(stub_tok_calls, 1, "gate/legacy: tokenize reached");
+  ASSERT_EQ((int)stub_last_tok_binding_gen, 0, "gate/legacy: binding_gen 0");
+  ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_not_ready), 0,
+            "gate/legacy: no not_ready miss");
+  ASSERT_EQ((int)atomic_load(&global_stats.pd_kv_t15_miss_api_mode), 0,
+            "gate/legacy: no api_mode miss");
+
+  stub_token_count = 0;
+}
+
+/* GUARD E typed-code classification: each LLB_KV_TOK_ERR_* class lands on
+ * its own counter; the legacy collapsed -1 keeps today's `tokenize` label. */
+static void
+test_guard_e_typed_code_classes(void)
+{
+  printf("Test: GUARD_E classifies typed bridge codes onto distinct counters\n");
+  proxy_epval_t tepval;
+  proxy_fd_ent_t pfe;
+  int ep = -1;
+
+  static const struct { int code; const char *name; } legs[] = {
+    { LLB_KV_TOK_ERR_UNSUPPORTED, "unsupported" },
+    { LLB_KV_TOK_ERR_PROFILE,     "profile" },
+    { LLB_KV_TOK_ERR_RENDERER,    "renderer" },
+    { LLB_KV_TOK_ERR_TOKENIZER,   "tokenizer" },
+    { LLB_KV_TOK_ERR_UNKNOWN,     "unknown" },
+    { LLB_KV_TOK_ERR_NOT_READY,   "not_ready" },
+    { LLB_KV_TOK_ERR_REQUEST,     "request(-1 legacy)" },
+  };
+
+  for (size_t i = 0; i < sizeof(legs) / sizeof(legs[0]); i++) {
+    kv_reset_stats();
+    kv_reset_tepval(&tepval);
+    kv_reset_pfe(&pfe);
+    kv_reset_tok_stub();
+    stub_tok_force_code = legs[i].code;
+
+    int rc = pd_kv_exact_select(&tepval, &pfe, &ep, 0);
+    ASSERT_EQ(rc, -1, "GUARD_E typed: falls back to Tier-2");
+
+    uint64_t unsupported = atomic_load(&global_stats.pd_kv_t15_miss_unsupported);
+    uint64_t runtime_fault = atomic_load(&global_stats.pd_kv_t15_miss_runtime_fault);
+    uint64_t not_ready = atomic_load(&global_stats.pd_kv_t15_miss_not_ready);
+    uint64_t tokenize = atomic_load(&global_stats.pd_kv_t15_miss_tokenize);
+    switch (legs[i].code) {
+    case LLB_KV_TOK_ERR_UNSUPPORTED:
+      ASSERT_EQ((int)unsupported, 1, "GUARD_E typed: -2 -> unsupported");
+      ASSERT_EQ((int)(runtime_fault + not_ready + tokenize), 0,
+                "GUARD_E typed: -2 -> only unsupported");
+      break;
+    case LLB_KV_TOK_ERR_NOT_READY:
+      ASSERT_EQ((int)not_ready, 1, "GUARD_E typed: -7 -> not_ready");
+      ASSERT_EQ((int)(runtime_fault + unsupported + tokenize), 0,
+                "GUARD_E typed: -7 -> only not_ready");
+      break;
+    case LLB_KV_TOK_ERR_REQUEST:
+      ASSERT_EQ((int)tokenize, 1, "GUARD_E typed: -1 -> legacy tokenize label");
+      ASSERT_EQ((int)(runtime_fault + unsupported + not_ready), 0,
+                "GUARD_E typed: -1 -> only tokenize");
+      break;
+    default: /* -3..-6 */
+      ASSERT_EQ((int)runtime_fault, 1, "GUARD_E typed: fault -> runtime_fault");
+      ASSERT_EQ((int)(unsupported + not_ready + tokenize), 0,
+                "GUARD_E typed: fault -> only runtime_fault");
+      break;
+    }
+  }
+  kv_reset_tok_stub();
+}
+
 /* ---- Main ---- */
 int
 main(int argc, char **argv)
@@ -2162,6 +2430,12 @@ main(int argc, char **argv)
   test_block_boundary_special_token();
   test_block_boundary_chat();
   test_sglang_parity_vectors();
+  test_contract_set_core();
+  test_contract_gate_not_ready();
+  test_contract_gate_api_mode();
+  test_contract_gate_threads_binding_gen();
+  test_contract_zero_word_legacy();
+  test_guard_e_typed_code_classes();
 
   printf("\n=== Results: %d/%d passed", tests_passed, tests_run);
   if (tests_failed > 0)

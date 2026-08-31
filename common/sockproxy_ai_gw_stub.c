@@ -182,23 +182,29 @@ llb_ai_pd_record_ep(char *model_name, int64_t prefill_latency_ms,
 
 int
 llb_ai_kv_tokenize(char *text, char *model_name,
-                    uint32_t *out_ids, int max_ids)
+                    uint32_t *out_ids, int max_ids,
+                    uint32_t svc_id, uint32_t binding_gen)
 {
     (void)text;
     (void)model_name;
     (void)out_ids;
     (void)max_ids;
+    (void)svc_id;
+    (void)binding_gen;
     return -1;  /* no tokenizer in C-only builds */
 }
 
 int
 llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
-                         uint32_t *out_ids, int max_ids)
+                         uint32_t *out_ids, int max_ids,
+                         uint32_t svc_id, uint32_t binding_gen)
 {
     (void)raw_body;
     (void)model_name;
     (void)out_ids;
     (void)max_ids;
+    (void)svc_id;
+    (void)binding_gen;
     return -1;  /* no tokenizer/chat-template in C-only builds */
 }
 

@@ -3073,6 +3073,61 @@ proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
   return -ENOENT;
 }
 
+// KV binding-dataplane contract: install/refresh the packed
+// [binding_gen|flags|api_mode|eligible] word on every ephash entry of the
+// keyed service (lookup + lock pattern: proxy_update_ep_health above; the
+// word write itself is pd_kv_exact_contract_set, the tree's single writer).
+// Synchronous CGO setter — the Go caller's ACK is (rc == 0 && *applied ==
+// the word it requested); any other outcome escalates per plan §7.4 (retry,
+// then the Go deny set fences the rule regardless of C-side state).
+int
+proxy_update_kv_exact_contract(proxy_ent_t *key, uint32_t binding_gen,
+                               uint8_t api_mode, uint8_t eligible,
+                               uint64_t *applied)
+{
+  proxy_map_ent_t *ent;
+  proxy_epval_t *tepval, *tmp_epval;
+  int rc = -ENOENT;
+
+  if (!key || !applied) {
+    log_error("proxy_update_kv_exact_contract - invalid parameters");
+    return -EINVAL;
+  }
+
+  PROXY_LOCK();
+
+  ent = proxy_struct->head;
+  while (ent) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
+        rc = pd_kv_exact_contract_set(tepval, binding_gen, api_mode,
+                                      eligible, applied);
+        if (rc != 0) {
+          PROXY_UNLOCK();
+          log_error("proxy_update_kv_exact_contract - set failed rc=%d gen=%u",
+                    rc, binding_gen);
+          return rc;
+        }
+      }
+      PROXY_UNLOCK();
+      if (rc == -ENOENT) {
+        log_error("proxy_update_kv_exact_contract - no ephash entry found");
+        return rc;
+      }
+      log_info("KV contract updated - %s:%u gen=%u api_mode=%u eligible=%u",
+               inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+               binding_gen, api_mode, eligible);
+      return 0;
+    }
+    ent = ent->next;
+  }
+
+  PROXY_UNLOCK();
+  log_error("proxy_update_kv_exact_contract - entry not found for %s:%u",
+            inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
+  return -ENOENT;
+}
+
 // P2 GPU-Aware: Update endpoint health by IP address lookup
 // This is a helper for GPU-aware load balancing where we have endpoint IP but not index
 // Returns: 0 on success, -1 on error

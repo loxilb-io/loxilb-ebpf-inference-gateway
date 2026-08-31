@@ -380,6 +380,13 @@ extern void llb_ai_ctrl_set_mode(uint32_t service_ip, uint16_t service_port,
 
 /* KV-Cache Exact Routing CGO exports */
 
+/* Typed bridge return codes: LLB_KV_TOK_ERR_* live in
+ * sockproxy_kv_exact.h (the tokenize call sites and the GUARD_E counter
+ * classification also compile in the TEST_KV_EXACT unit build, which never
+ * sees this header). Included here so every consumer of these externs has
+ * the code vocabulary in scope. */
+#include "sockproxy_kv_exact.h"
+
 /*
  * llb_ai_kv_tokenize — tokenize a prompt using a HuggingFace tokenizer.
  *
@@ -388,11 +395,18 @@ extern void llb_ai_ctrl_set_mode(uint32_t service_ip, uint16_t service_port,
  *   model_name  model name for tokenizer lookup (NUL-terminated)
  *   out_ids     output array for token IDs
  *   max_ids     maximum number of token IDs to return
+ *   svc_id      calling rule identity (proxy_epval.kv_svc_id; 0 = legacy)
+ *   binding_gen contract generation from the kv_exact_contract word loaded
+ *               by THIS request (0 = legacy/no contract). Rides the CGO call
+ *               so Go resolves exactly one immutable binding snapshot — late
+ *               in-flight requests are correct-by-snapshot across a fence.
  *
- * Returns: number of token IDs written to out_ids, or -1 on error.
+ * Returns: number of token IDs written to out_ids, or a negative
+ *   LLB_KV_TOK_ERR_* code.
  */
 extern int llb_ai_kv_tokenize(char *text, char *model_name,
-                               uint32_t *out_ids, int max_ids);
+                               uint32_t *out_ids, int max_ids,
+                               uint32_t svc_id, uint32_t binding_gen);
 
 /*
  * llb_ai_kv_tokenize_chat — tokenize a /v1/chat/completions request to vLLM
@@ -411,13 +425,17 @@ extern int llb_ai_kv_tokenize(char *text, char *model_name,
  *   out_ids     output array for token IDs
  *   max_ids     maximum number of token IDs to return
  *
- * Returns: number of token IDs written to out_ids, or -1 on error
- *   (no messages / no known chat template / tokenize fail). On -1 the C caller
+ *   svc_id / binding_gen — as in llb_ai_kv_tokenize above.
+ *
+ * Returns: number of token IDs written to out_ids, or a negative
+ *   LLB_KV_TOK_ERR_* code (no messages / no known chat template / tokenize
+ *   fail / typed strict-path faults). On ANY negative return the C caller
  *   MUST fall back and NOT route the request through KV-exact (a mis-hashed
  *   prefix would route to the wrong worker).
  */
 extern int llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
-                                    uint32_t *out_ids, int max_ids);
+                                    uint32_t *out_ids, int max_ids,
+                                    uint32_t svc_id, uint32_t binding_gen);
 
 /*
  * llb_ai_kv_best_worker — find the prefill EP with maximum KV block overlap.

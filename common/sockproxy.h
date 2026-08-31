@@ -162,6 +162,13 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_miss_no_worker;    // llb_ai_kv_best_worker returned no candidate
     _Atomic uint64_t pd_kv_t15_miss_excluded;     // candidate EP excluded (health / load)
     _Atomic uint64_t pd_kv_t15_miss_shallow;      // best match under the minimum token depth
+    // Binding-dataplane contract: gate + typed-bridge miss classes.
+    // Same alignment contract as the nine above: C atomic <-> snapshot field
+    // (sockproxy_metrics.h) <-> Go CGO mirror + reason label, all in lockstep.
+    _Atomic uint64_t pd_kv_t15_miss_not_ready;    // contract word fenced (!eligible) or bridge returned NOT_READY (Go deny set)
+    _Atomic uint64_t pd_kv_t15_miss_api_mode;     // request surface excluded by the contract api_mode byte
+    _Atomic uint64_t pd_kv_t15_miss_unsupported;  // bridge: excluded feature on a strict rule (request-class, never readiness)
+    _Atomic uint64_t pd_kv_t15_miss_runtime_fault;// bridge: profile/renderer/tokenizer/unknown fault on a strict rule
     _Atomic uint64_t pd_kv_t15_fallthrough_total; // Tier 1.5 skipped entirely -> Tier 2 path
     // Failover observability: endpoint-death and failover EVENTS (as detected
     // per connection), distinct from the request-outcome counters in
@@ -640,6 +647,18 @@ typedef struct proxy_epval {
    * identity" and the Go side keeps today's all-services loop — the seam is
  * independently default-off (kv_weight twin-lockstep precedent). */
   uint32_t kv_svc_id;            // calling rule identity for the Go selector (0 = no identity)
+
+  /* Binding-dataplane contract word:
+   *   [ binding_gen:32 | flags:16 | api_mode:8 | eligible:8 ]
+   * Written ONLY by proxy_update_kv_exact_contract (single-writer; the Go
+   * control plane's fence-first transactions), read once per request with
+   * acquire semantics in pd_kv_exact_select before tokenize. Zero means "no
+   * contract installed" — the legacy passthrough (binding_gen 0 is reserved,
+   * so an installed word is never zero even while fenced). Deliberately NOT
+   * copied at proxy_add_entry: an entry rebuild starts legacy/ineligible and
+   * the control plane re-installs after ACK; the Go-side per-svc_id deny set
+   * fences the strict rule across that window (plan-fix I-14 backstop). */
+  _Atomic uint64_t kv_exact_contract;
 
   UT_hash_handle hh;
 } proxy_epval_t;
@@ -1426,6 +1445,17 @@ int proxy_add_entry(struct proxy_ent *new_ent, struct proxy_arg *arg);
 int proxy_delete_entry(struct proxy_ent *ent, struct proxy_arg *arg);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);
 int proxy_update_ep_health_by_ip(struct proxy_ent *key, uint32_t ep_ip, uint8_t inactive);
+
+/* Synchronous single-writer setter for the per-entry kv_exact_contract
+ * word (pattern: proxy_update_ep_health). Packs
+ * [binding_gen:32|flags=0:16|api_mode:8|eligible:8], stores with release
+ * ordering and reads the word back into *applied — the caller's ACK is
+ * (return == 0 && *applied == the requested word). binding_gen 0 is refused
+ * (reserved as "no contract"); there is deliberately NO way to return an
+ * entry to the legacy zero word short of entry teardown. */
+int proxy_update_kv_exact_contract(struct proxy_ent *key, uint32_t binding_gen,
+                                   uint8_t api_mode, uint8_t eligible,
+                                   uint64_t *applied);
 int proxy_set_drain_policy(struct proxy_ent *key, drain_policy_t policy, uint32_t timeout_sec);
 /* Tier-1 byte shaper control. Rates arrive in bits/sec (the policer API's
  * native unit) and are converted to bytes/sec at store time. cir_bps == 0
