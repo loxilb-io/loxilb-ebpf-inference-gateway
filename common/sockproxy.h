@@ -69,17 +69,18 @@ struct dp_proxy_ct_ent;
 #define PD_KV_PARAMS_MAX_LEN 65536  // P/D kv_transfer_params buffer (64KB for real vLLM block_ids)
 
 /* P/D orchestration engine flavor (proxy_epval_t.pd_engine). Values equal
- * the wire kv_engine_type encoding (0=vllm, 1=sglang, 2=trtllm) —
- * the proxy_add stamp goes through pd_engine_from_kv_engine_type()
- * (sockproxy_pd_core.c), these names exist so the orchestration branch reads
- * an orchestration-named constant. Adding an engine = new constant here +
- * mapper/resolver case + (when it diverges) its own dialect ops table. */
-#define PD_ENGINE_VLLM   0
-#define PD_ENGINE_SGLANG 1
-/* TensorRT-LLM disaggregation is sequential ctx-first — a parameterization
- * of the vLLM machine with its own body dialect (sockproxy_pd_trtllm.c:
- * disaggregated_params splice/extract/re-splice + context early exit). */
-#define PD_ENGINE_TRTLLM 2
+ * the wire kv_engine_type encoding and are GENERATED from the code-owned
+ * engine-contract manifest (engine-contracts/contracts.yaml, via ecgen) so
+ * the Go and C sides can never drift — sockproxy_pd_ids.h is the single
+ * value authority and must never be hand-edited. The proxy_add stamp goes
+ * through pd_engine_from_kv_engine_type() (sockproxy_pd_core.c). Adding an
+ * engine = manifest change + regeneration + mapper/resolver case + (when
+ * it diverges) its own dialect ops table. An UNKNOWN value resolves to no
+ * dialect at all (fail closed) — never to vLLM.
+ * (TensorRT-LLM disaggregation is sequential ctx-first — a
+ * parameterization of the vLLM machine with its own body dialect,
+ * sockproxy_pd_trtllm.c.) */
+#include "sockproxy_pd_ids.h"
 
 /* SGLang --disaggregation-bootstrap-port default (server_args.py). Applied
  * at proxy_add when the rule leaves pd_bootstrap_port at 0. */

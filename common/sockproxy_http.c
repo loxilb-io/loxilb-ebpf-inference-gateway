@@ -2265,6 +2265,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * defaulting idiom). */
         tepval->pd_engine = pd_engine_from_kv_engine_type(arg->kv_engine_type);
         tepval->pd_ops = pd_dialect_resolve(tepval->pd_engine);
+        if (tepval->pd_ops == NULL && tepval->pd_disagg_enabled) {
+          /* Unknown engine dialect: P/D orchestration must not run on a
+           * contract nobody declared (fail closed — no vLLM fallback).
+           * Plain L7 forwarding continues via the pd_dialect_plain
+           * fallback in proxy_usage_ops. Admission refuses unknown
+           * engines, so this is last-line, not a working configuration. */
+          log_error("proxy_add: kv_engine_type %u has no dialect — P/D orchestration disabled (fail-closed)",
+                    arg->kv_engine_type);
+          tepval->pd_disagg_enabled = 0;
+        }
         tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
                                     arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
 
@@ -2681,6 +2691,13 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
    * idiom for the port). */
   tepval->pd_engine = pd_engine_from_kv_engine_type(arg->kv_engine_type);
   tepval->pd_ops = pd_dialect_resolve(tepval->pd_engine);
+  if (tepval->pd_ops == NULL && tepval->pd_disagg_enabled) {
+    /* Unknown engine dialect: fail closed, mirroring the
+     * update-existing-tepval branch above. */
+    log_error("proxy_add: kv_engine_type %u has no dialect — P/D orchestration disabled (fail-closed)",
+              arg->kv_engine_type);
+    tepval->pd_disagg_enabled = 0;
+  }
   tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
                               arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
 
@@ -7821,7 +7838,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
          * injects the bootstrap triple. A negative return means the dialect
          * terminated the request fail-closed (error response already sent)
          * — restart the fd. */
-        if (pd_body_start && pd_body_len > 0 &&
+        if (pd_body_start && pd_body_len > 0 && pd_tepval->pd_ops &&
             pd_tepval->pd_ops->prepare_request(pfe, pd_tepval, pd_hdr_len,
                                                pd_body_start,
                                                pd_body_len) < 0) {
@@ -8011,7 +8028,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
         ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled &&
         ((proxy_epval_t *)pfe->epv)->pd_engine == PD_ENGINE_SGLANG) {
       pd_sg_oversize_reject(pfe);
-    } else if (pfe->epv &&
+    } else if (pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_ops &&
         (pfe->pd_phase == PD_PHASE_PREFILL_SENDING ||
          (pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE))) {
       ((proxy_epval_t *)pfe->epv)->pd_ops->dispatch(pfe);
