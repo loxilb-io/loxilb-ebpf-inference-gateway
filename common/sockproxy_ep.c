@@ -910,6 +910,40 @@ pd_fallback_normal:
         
         ep_sel->ep_cfds[0].ep_cfd = proxy_setup_ep_connect(epip, epport, (uint8_t)epprotocol,
                                                            ssl_ctx, ssl, pfe, pp2hdr, pp2len);
+
+        /* Same-EP reconnect on transient connect failure (affinity-bearing
+         * services only — pd_connect_retry_budget returns 0 for plain LB, so
+         * their fast failover below is byte-identical). connect() completing
+         * is a kernel handshake: one 500ms poll timeout does NOT mean the EP
+         * is down (SYN loss / accept-path stall under load), and the failover
+         * below would exclude the KV cache-owner and silently demote the
+         * request to Tier-2. Bounded budget (default 1, env
+         * LLB_PD_CONNECT_RETRY_SAME_EP 0..3); each attempt costs at most one
+         * more connect poll. Circuit-breaker accounting is unchanged: still
+         * exactly ONE recorded failure per request, on FINAL failure below —
+         * a retry that succeeds proves the EP alive, and double-counting
+         * would halve the effective trip threshold. */
+        if (ep_sel->ep_cfds[0].ep_cfd < 0) {
+          /* single policy site: returns 0 for plain LB (no affinity) */
+          uint32_t rt_budget = pd_connect_retry_budget(
+              tepval->pd_disagg_enabled, tepval->kv_exact_mode);
+          for (uint32_t rt = 0; rt < rt_budget &&
+               ep_sel->ep_cfds[0].ep_cfd < 0; rt++) {
+            atomic_fetch_add(&global_stats.pd_connect_retry_same_ep, 1);
+            log_info("[PD_CONN_RETRY] fd=%d ep=%d attempt=%u/%u — transient "
+                     "backend connect failure, retrying SAME EP to preserve "
+                     "affinity", pfe ? pfe->fd : -1, sel, rt + 1, rt_budget);
+            ep_sel->ep_cfds[0].ep_cfd =
+                proxy_setup_ep_connect(epip, epport, (uint8_t)epprotocol,
+                                       ssl_ctx, ssl, pfe, pp2hdr, pp2len);
+            if (ep_sel->ep_cfds[0].ep_cfd >= 0) {
+              atomic_fetch_add(&global_stats.pd_connect_retry_same_ep_ok, 1);
+              log_info("[PD_CONN_RETRY] fd=%d ep=%d attempt=%u succeeded — "
+                       "affinity preserved", pfe ? pfe->fd : -1, sel, rt + 1);
+            }
+          }
+        }
+
         if (ep_sel->ep_cfds[0].ep_cfd < 0) {
           // P2 Task 2.3: Record connection failure for circuit breaker
           circuit_breaker_record_failure(tepval, sel);

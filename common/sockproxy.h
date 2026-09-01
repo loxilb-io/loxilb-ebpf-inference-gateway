@@ -178,6 +178,12 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_decode_ep_died;         // decode EP failure: init-connect failure or zero-byte EOF
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
+    // Same-EP reconnect on transient backend connect failure (affinity-bearing
+    // services only — P/D disagg / KV-exact). A retry that succeeds keeps the
+    // cache-owner EP; without it a single 500ms connect stall silently demotes
+    // the request to Tier-2 (observed as a lone KV_T15 fallthrough under load).
+    _Atomic uint64_t pd_connect_retry_same_ep;    // same-EP reconnect attempts
+    _Atomic uint64_t pd_connect_retry_same_ep_ok; // attempts that succeeded (affinity preserved)
     _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
     // SGLang P/D dual-dispatch observability (mirrors the failover family above)
     _Atomic uint64_t pd_sg_prefill_abort_decode; // prefill drain-leg failure forced a decode-leg abort
@@ -1591,6 +1597,14 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
 #endif
 int pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                       uint32_t excluded_mask);
+/* same-EP reconnect budget on transient backend connect failure
+ * (sockproxy_pd.c). Affinity-bearing services (P/D disagg or KV-exact) get
+ * LLB_PD_CONNECT_RETRY_SAME_EP retries (getenv-once; default 1, clamp 0..3)
+ * of the ORIGINALLY SELECTED EP before the mid-cycle failover excludes it —
+ * a 500ms accept stall on the cache-owner EP otherwise silently demotes the
+ * request to Tier-2 (observed as a lone KV_T15 fallthrough). Plain LB
+ * services return 0: their fast-failover semantics are byte-identical. */
+uint32_t pd_connect_retry_budget(int pd_disagg_enabled, uint32_t kv_exact_mode);
 /* bounded-admission FIFO dequeue/reap primitives (sockproxy_pd.c).
  * Pure ring ops on ONE pd_parked_fifo_t — the CALLER must hold tepval->pd_parked_lock.
  * They never touch a pfe, never free, never dispatch (UAF-critical re-drive/teardown
