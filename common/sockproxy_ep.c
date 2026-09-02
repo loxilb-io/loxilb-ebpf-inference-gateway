@@ -38,6 +38,7 @@
 #include "sockproxy_health.h"   /* is_endpoint_healthy, circuit_breaker_record_failure/success */
 #include "sockproxy_kv_exact.h" /* pd_kv_exact_select (single-role Tier-1.5 branch) */
 #include "sockproxy_ep.h"       /* own header */
+#include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
 
 #define XXH_STATIC_LINKING_ONLY
 /* XXH_IMPLEMENTATION is defined ONLY in sockproxy_lb.c -- see sockproxy_refactoring_plan.md P4 */
@@ -820,41 +821,67 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
         }
 
 pd_fallback_normal:
-        /* L7 session-header stickiness (default-off). When a session header is
-         * configured and present on the request, a previously learned binding
-         * PINS the backend (PRIORITY 0), overriding any algorithmic/RR choice.
-         * On a miss we deterministically hash the header value (PRIORITY 1) so
-         * the same id stays consistent until the response-learn step binds it. */
-        if (tepval->session_header_enabled &&
-            custom_session_header && custom_session_header[0] != '\0') {
-          /* PRIORITY 0: learned binding for the session-header value. */
-          snprintf(ns_session_key, sizeof(ns_session_key), "custom_%s_%s",
-                   tepval->session_header_name, custom_session_header);
-          int ns_bound = -1;
-          if (lookup_conversation_endpoint(node, ns_session_key, &ns_bound) == 0 &&
-              ns_bound >= 0 && ns_bound < tepval->n_eps &&
-              tepval->eps[ns_bound].inv == 0 && is_endpoint_healthy(tepval, ns_bound)) {
-            algorithm_selection = ns_bound;
-            ns_used_learned = 1;
-            log_info("[NS_STICKY_HIT] key='%s' -> ep[%d] (DFL)", ns_session_key, ns_bound);
-          } else if (algorithm_selection < 0) {
-            /* PRIORITY 1: deterministic hash of the header value until learned.
-             * Health check includes the circuit breaker: a condemned EP leaves
-             * algorithm_selection unset so the round-robin fallback below picks
-             * a healthy one; the hash re-pins unchanged once the EP heals. */
-            int h = (int)(session_key_hash(ns_session_key) % (uint32_t)tepval->n_eps);
-            if (is_endpoint_healthy(tepval, h)) algorithm_selection = h;
+        /* L7 session-header / IP-persist stickiness overlay (default-off).
+         * A configured session header pins the backend to a previously
+         * learned binding (PRIORITY 0), else a deterministic hash of the
+         * header value (PRIORITY 1); with no header, RR_PERSIST pins on the
+         * client IP (PRIORITY 2). The priority ORDERING and the G-1 P/D gate
+         * live in ns_overlay_resolve (sockproxy_ns_overlay.h) so they are
+         * unit-tested; this block only resolves the live-map dependencies
+         * (lookup, health, hashes) the pure function consumes. On a P/D rule
+         * the gate skips the whole overlay — the ladder's prefill selection,
+         * with its paired active_conns accounting, is authoritative. */
+        {
+          ns_overlay_in_t nso = {
+            .pd_disagg_enabled = tepval->pd_disagg_enabled,
+            .session_header_enabled = tepval->session_header_enabled,
+            .header_present = (custom_session_header &&
+                               custom_session_header[0] != '\0'),
+            .learned_ep = -1, .learned_ok = 0,
+            .hash_ep = -1, .hash_ok = 0,
+            .sel_sticky = (tepval->select == PROXY_SEL_STICKY),
+            .ip_ep = -1, .ip_ok = 0,
+          };
+          if (!nso.pd_disagg_enabled && nso.session_header_enabled &&
+              nso.header_present) {
+            snprintf(ns_session_key, sizeof(ns_session_key), "custom_%s_%s",
+                     tepval->session_header_name, custom_session_header);
+            int ns_bound = -1;
+            if (lookup_conversation_endpoint(node, ns_session_key, &ns_bound) == 0 &&
+                ns_bound >= 0 && ns_bound < tepval->n_eps &&
+                tepval->eps[ns_bound].inv == 0 &&
+                is_endpoint_healthy(tepval, ns_bound)) {
+              nso.learned_ep = ns_bound;
+              nso.learned_ok = 1;
+            } else {
+              /* Health check includes the circuit breaker: a condemned EP
+               * leaves the candidate unhealthy so the round-robin fallback
+               * below picks a healthy one; the hash re-pins once it heals. */
+              int h = (int)(session_key_hash(ns_session_key) %
+                            (uint32_t)tepval->n_eps);
+              if (is_endpoint_healthy(tepval, h)) {
+                nso.hash_ep = h;
+                nso.hash_ok = 1;
+              }
+            }
+          } else if (!nso.pd_disagg_enabled && nso.sel_sticky &&
+                     algorithm_selection < 0) {
+            char ns_ipkey[64];
+            snprintf(ns_ipkey, sizeof(ns_ipkey), "ip_%s",
+                     inet_ntoa(*(struct in_addr *)(&client_ip)));
+            int h = (int)(session_key_hash(ns_ipkey) % (uint32_t)tepval->n_eps);
+            if (is_endpoint_healthy(tepval, h)) {
+              nso.ip_ep = h;
+              nso.ip_ok = 1;
+            }
           }
-        } else if (tepval->select == PROXY_SEL_STICKY && algorithm_selection < 0) {
-          /* PRIORITY 2: IP-based persistence (RR_PERSIST with no session header) —
-           * same client always pinned to the same backend. Mirrors the legacy
-           * PROXY_MODE_ALL persist path, now unified in DFL. */
-          char ns_ipkey[64];
-          snprintf(ns_ipkey, sizeof(ns_ipkey), "ip_%s",
-                   inet_ntoa(*(struct in_addr *)(&client_ip)));
-          int h = (int)(session_key_hash(ns_ipkey) % (uint32_t)tepval->n_eps);
-          /* Same health semantics as the session-header hash above. */
-          if (is_endpoint_healthy(tepval, h)) algorithm_selection = h;
+          ns_overlay_kind_t nsk;
+          algorithm_selection = ns_overlay_resolve(algorithm_selection, &nso, &nsk);
+          if (nsk == NS_OVERLAY_LEARNED) {
+            ns_used_learned = 1;
+            log_info("[NS_STICKY_HIT] key='%s' -> ep[%d] (DFL)", ns_session_key,
+                     nso.learned_ep);
+          }
         }
 
         // If algorithm didn't select an endpoint, use round-robin
@@ -1184,7 +1211,9 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
          * the connection so a server-issued id (e.g. MCP's Mcp-Session-Id) carried
          * in the backend response is learned too. Branch-agnostic ep_sel plumbing
          * (sockproxy_http.c) consumes needs_learning/session_header_name. */
-        if (tepval->session_header_enabled && !ns_used_learned) {
+        if (ns_overlay_should_learn(tepval->pd_disagg_enabled,
+                                    tepval->session_header_enabled,
+                                    ns_used_learned)) {
           if (ns_session_key[0] != '\0') {
             store_conversation_endpoint(node, ns_session_key, sel);
           }
