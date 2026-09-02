@@ -229,6 +229,10 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_connect_failover        = atomic_load(&global_stats.pd_connect_failover);
     snapshot.lb_select_failure_shutdown = atomic_load(&global_stats.lb_select_failure_shutdown);
 
+    /* Same-EP reconnect counters (tail-appended snapshot fields). */
+    snapshot.pd_connect_retry_same_ep    = atomic_load(&global_stats.pd_connect_retry_same_ep);
+    snapshot.pd_connect_retry_same_ep_ok = atomic_load(&global_stats.pd_connect_retry_same_ep_ok);
+
     /* SGLang P/D dual-dispatch counters */
     snapshot.pd_sg_prefill_abort_decode = atomic_load(&global_stats.pd_sg_prefill_abort_decode);
     snapshot.pd_sg_decode_close_drain   = atomic_load(&global_stats.pd_sg_decode_close_drain);
@@ -251,6 +255,10 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_kv_t15_miss_no_worker    = atomic_load(&global_stats.pd_kv_t15_miss_no_worker);
     snapshot.pd_kv_t15_miss_excluded     = atomic_load(&global_stats.pd_kv_t15_miss_excluded);
     snapshot.pd_kv_t15_miss_shallow      = atomic_load(&global_stats.pd_kv_t15_miss_shallow);
+    snapshot.pd_kv_t15_miss_not_ready    = atomic_load(&global_stats.pd_kv_t15_miss_not_ready);
+    snapshot.pd_kv_t15_miss_api_mode     = atomic_load(&global_stats.pd_kv_t15_miss_api_mode);
+    snapshot.pd_kv_t15_miss_unsupported  = atomic_load(&global_stats.pd_kv_t15_miss_unsupported);
+    snapshot.pd_kv_t15_miss_runtime_fault = atomic_load(&global_stats.pd_kv_t15_miss_runtime_fault);
     snapshot.pd_kv_t15_fallthrough_total = atomic_load(&global_stats.pd_kv_t15_fallthrough_total);
 
     /* (OBS-01): CB proactive heal (global_stats) + per-EP

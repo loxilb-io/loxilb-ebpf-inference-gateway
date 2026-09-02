@@ -35,6 +35,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <pthread.h>
+#include <errno.h>
 #include <openssl/sha.h>
 #include "log.h"
 #include "uthash.h"
@@ -671,6 +672,36 @@ kv_compute_block_hashes(uint8_t hash_algo, const uint32_t *tokens,
 }
 
 /* ========================================================================== */
+/* Binding-dataplane contract word                                             */
+/* ========================================================================== */
+
+/* pd_kv_exact_contract_set — the single-writer word update (plan §7.1/§17.3).
+ * The ONLY writer of proxy_epval.kv_exact_contract in the whole tree; the
+ * outer proxy_update_kv_exact_contract (sockproxy_http.c) owns entry lookup +
+ * PROXY_LOCK and calls this per ephash entry. Release store + acquire
+ * readback: the readback into *applied is the data-plane half of the ACK (the
+ * Go caller pairs it with the binding-digest check). binding_gen 0 is refused
+ * — the zero word is reserved as "no contract installed" (legacy passthrough
+ * in pd_kv_exact_select), so it must be unreachable through the setter. */
+int
+pd_kv_exact_contract_set(struct proxy_epval *epv, uint32_t binding_gen,
+                         uint8_t api_mode, uint8_t eligible,
+                         uint64_t *applied)
+{
+  if (!epv || !applied)
+    return -EINVAL;
+  if (binding_gen == 0)
+    return -EINVAL;
+
+  uint64_t word = KV_CONTRACT_PACK(binding_gen, 0, api_mode,
+                                   eligible ? 1 : 0);
+  atomic_store_explicit(&epv->kv_exact_contract, word, memory_order_release);
+  *applied = atomic_load_explicit(&epv->kv_exact_contract,
+                                  memory_order_acquire);
+  return (*applied == word) ? 0 : -EIO;
+}
+
+/* ========================================================================== */
 /* Tier 1.5: KV Block-Hash Exact Routing                                       */
 /* ========================================================================== */
 
@@ -710,6 +741,38 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
       atomic_fetch_add(&global_stats.pd_kv_t15_miss_warmup, 1);
       return -1;
     }
+  }
+
+  /* CONTRACT GATE (plan §7.3): ONE acquire load of the packed
+   * [binding_gen|flags|api_mode|eligible] word per request, BEFORE tokenize.
+   * word == 0 => no contract installed (legacy rule / rebuilt entry) — the
+   * gate disengages and today's path runs byte-identical; for strict rules
+   * that window is fenced Go-side by the per-svc_id deny set. An installed
+   * word gates pre-tokenization (no CGO crossing for excluded requests):
+   * !eligible => not_ready miss, Tier-2; a surface excluded by api_mode =>
+   * api_mode miss, Tier-2. The loaded binding_gen rides the tokenize CGO
+   * call so a request that started before a fence resolves the OLD binding
+   * snapshot in Go (correct-by-snapshot; never mixes generations). */
+  uint64_t kv_contract = atomic_load_explicit(&tepval->kv_exact_contract,
+                                              memory_order_acquire);
+  uint32_t kv_binding_gen = 0;
+  if (kv_contract != 0) {
+    if (!KV_CONTRACT_ELIGIBLE(kv_contract)) {
+      log_info("[KV_T15] fd=%d GUARD_CONTRACT not_ready gen=%u word=0x%llx",
+               pfe->fd, KV_CONTRACT_GEN(kv_contract),
+               (unsigned long long)kv_contract);
+      atomic_fetch_add(&global_stats.pd_kv_t15_miss_not_ready, 1);
+      return -1;
+    }
+    uint8_t kv_api_mode = KV_CONTRACT_API_MODE(kv_contract);
+    if ((pfe->is_chat && kv_api_mode == KV_EXACT_API_COMPLETIONS) ||
+        (!pfe->is_chat && kv_api_mode == KV_EXACT_API_CHAT)) {
+      log_info("[KV_T15] fd=%d GUARD_CONTRACT api_mode_excluded is_chat=%u api_mode=%u",
+               pfe->fd, pfe->is_chat, kv_api_mode);
+      atomic_fetch_add(&global_stats.pd_kv_t15_miss_api_mode, 1);
+      return -1;
+    }
+    kv_binding_gen = KV_CONTRACT_GEN(kv_contract);
   }
 
   /* Extract text for tokenization.
@@ -833,21 +896,43 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
         kv_restore = 1;
       }
     }
-    n_tokens = llb_ai_kv_tokenize_chat(raw_body, model, tokens, KV_MAX_TOKENS);
+    n_tokens = llb_ai_kv_tokenize_chat(raw_body, model, tokens, KV_MAX_TOKENS,
+                                       tepval->kv_svc_id, kv_binding_gen);
     if (kv_restore) {
       ((char *)pfe->rcvbuf)[kv_body_end] = kv_saved_end;
     }
   } else {
-    n_tokens = llb_ai_kv_tokenize(text, model, tokens, KV_MAX_TOKENS);
+    n_tokens = llb_ai_kv_tokenize(text, model, tokens, KV_MAX_TOKENS,
+                                  tepval->kv_svc_id, kv_binding_gen);
   }
   stage_us[KV_STAGE_TOKENIZE] = kv_now_us() - _t0;
   measured[KV_STAGE_TOKENIZE] = 1;
 
-  /* GUARD E: tokenize fail */
+  /* GUARD E: tokenize fail — classified by the typed bridge code (plan
+   * §8). Request-class codes and the legacy collapsed -1 keep landing on the
+   * historical `tokenize` reason (metric continuity for legacy rules);
+   * strict-path classes get their own counters. Every negative return falls
+   * back to Tier-2 identically — classification changes ONLY attribution. */
   if (n_tokens <= 0) {
     log_info("[KV_T15] fd=%d GUARD_E tokenize_fail model='%s' n_tokens=%d",
              pfe->fd, model, n_tokens);
-    atomic_fetch_add(&global_stats.pd_kv_t15_miss_tokenize, 1);
+    switch (n_tokens) {
+    case LLB_KV_TOK_ERR_UNSUPPORTED:
+      atomic_fetch_add(&global_stats.pd_kv_t15_miss_unsupported, 1);
+      break;
+    case LLB_KV_TOK_ERR_PROFILE:
+    case LLB_KV_TOK_ERR_RENDERER:
+    case LLB_KV_TOK_ERR_TOKENIZER:
+    case LLB_KV_TOK_ERR_UNKNOWN:
+      atomic_fetch_add(&global_stats.pd_kv_t15_miss_runtime_fault, 1);
+      break;
+    case LLB_KV_TOK_ERR_NOT_READY:
+      atomic_fetch_add(&global_stats.pd_kv_t15_miss_not_ready, 1);
+      break;
+    default: /* LLB_KV_TOK_ERR_REQUEST and 0: today's label, unchanged */
+      atomic_fetch_add(&global_stats.pd_kv_t15_miss_tokenize, 1);
+      break;
+    }
     KV_T15_FLUSH(KV_STAGE_OUTCOME_MISS);
     return -1;
   }

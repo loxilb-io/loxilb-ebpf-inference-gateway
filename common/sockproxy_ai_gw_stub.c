@@ -23,18 +23,40 @@
  * live in pkg/loxinet/ai_gateway_dp.go and are only
  * available when the binary is linked with the Go CGO runtime.
  *
- * This stub is linked into C-only debug binaries (loxilb_dp_debug) so that
- * sockproxy.c compiles and links without the Go runtime.  All stubs are
- * intentional no-ops that return "allow" (0) so the data path is transparent
- * during C-only debugging sessions.
+ * Every stub is defined __attribute__((weak)) and the object is archived
+ * into libloxilbdp.a, so the archive is self-contained for ANY consumer:
+ * the gateway's Go CGO exports (strong) always win, while C-only debug
+ * binaries (loxilb_dp_debug) and cgo consumers that do not link pkg/loxinet
+ * (the REST handler package's test binary) resolve against these no-ops
+ * instead of failing to link.  All stubs intentionally return "allow" (0)
+ * so the data path is transparent wherever they end up bound.
+ *
+ * Weak linkage must never become a SILENT enforcement bypass: if a binary
+ * that was supposed to carry the Go exports ever runs on these stubs (a
+ * build regression would previously have failed the link outright), the
+ * first invocation of each stub logs an error. A correctly linked gateway
+ * never executes them, so production stays quiet; a binary that does run
+ * them says so loudly instead of silently allowing every request.
  */
 
 #include <stdint.h>
+#include "log.h"
 #include "sockproxy_ai_gw.h"
 
-int
+#define AI_GW_STUB_TRIPWIRE(fn_flag)                                        \
+    do {                                                                    \
+        static int fn_flag;                                                 \
+        if (!fn_flag) {                                                     \
+            fn_flag = 1;                                                    \
+            log_error("ai-gw: weak stub %s invoked - Go bridge exports "    \
+                      "not linked (no-op enforcement)", __func__);          \
+        }                                                                   \
+    } while (0)
+
+__attribute__((weak)) int
 llb_ai_validate_key(char *raw_key, char *model_name, ai_gw_decision_t *result)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)raw_key;
     (void)model_name;
     if (result) {
@@ -43,10 +65,11 @@ llb_ai_validate_key(char *raw_key, char *model_name, ai_gw_decision_t *result)
     return 0;
 }
 
-int
+__attribute__((weak)) int
 llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
                        ai_gw_decision_t *result)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)key_id;
     (void)tenant_id;
     (void)model;
@@ -54,9 +77,10 @@ llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
     return 0;  /* allow */
 }
 
-int
+__attribute__((weak)) int
 llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int burst)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)key_id;
     (void)tenant_id;
     (void)rps;
@@ -64,11 +88,12 @@ llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int burst)
     return 0;
 }
 
-void
+__attribute__((weak)) void
 llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                       int64_t latency_ms, int prompt_tokens, int complet_tokens,
                       int stream_start, int stream_end, char *error_code)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
     (void)status_code;
@@ -80,28 +105,31 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
     (void)error_code;
 }
 
-int
+__attribute__((weak)) int
 llb_ai_stream_start(char *tenant_id, char *model_name)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
     return 0;
 }
 
-int
+__attribute__((weak)) int
 llb_ai_stream_end(char *tenant_id, char *model_name)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
     return 0;
 }
 
-int
+__attribute__((weak)) int
 llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                            int prompt_tokens, int complet_tokens,
                            int estimated, int reserved_toks,
                            int64_t res_epoch, ai_gw_decision_t *result)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
     (void)prompt_tokens;
@@ -113,11 +141,12 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
     return 0;  /* allow — no quota enforcement in C-only debug builds */
 }
 
-int
+__attribute__((weak)) int
 llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                            int prompt_est, int max_tokens,
                            int64_t *res_epoch, ai_gw_decision_t *result)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
     (void)prompt_est;
@@ -128,11 +157,12 @@ llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
     return 0;  /* allow — no quota enforcement in C-only debug builds */
 }
 
-void
+__attribute__((weak)) void
 llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
                   int64_t decode_latency_ms, int kv_params_found,
                   int error_phase)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)model_name;
     (void)prefill_latency_ms;
     (void)decode_latency_ms;
@@ -140,21 +170,24 @@ llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
     (void)error_phase;
 }
 
-void
+__attribute__((weak)) void
 llb_ai_pd_session_hit(char *model_name)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)model_name;
 }
 
-void
+__attribute__((weak)) void
 llb_ai_normal_session_hit(char *model_name)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)model_name;
 }
 
-void
+__attribute__((weak)) void
 llb_ai_record_unmetered(char *vip)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)vip;
 }
 
@@ -163,12 +196,13 @@ llb_ai_record_unmetered(char *vip)
 
 /* Per-EP P/D latency recording stub */
 
-void
+__attribute__((weak)) void
 llb_ai_pd_record_ep(char *model_name, int64_t prefill_latency_ms,
                     int64_t decode_latency_ms, int kv_params_found,
                     int error_phase, uint32_t prefill_ep_ip,
                     uint32_t decode_ep_ip)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)model_name;
     (void)prefill_latency_ms;
     (void)decode_latency_ms;
@@ -180,29 +214,37 @@ llb_ai_pd_record_ep(char *model_name, int64_t prefill_latency_ms,
 
 /* KV-Cache Exact Routing stubs */
 
-int
+__attribute__((weak)) int
 llb_ai_kv_tokenize(char *text, char *model_name,
-                    uint32_t *out_ids, int max_ids)
+                    uint32_t *out_ids, int max_ids,
+                    uint32_t svc_id, uint32_t binding_gen)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)text;
     (void)model_name;
     (void)out_ids;
     (void)max_ids;
+    (void)svc_id;
+    (void)binding_gen;
     return -1;  /* no tokenizer in C-only builds */
 }
 
-int
+__attribute__((weak)) int
 llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
-                         uint32_t *out_ids, int max_ids)
+                         uint32_t *out_ids, int max_ids,
+                         uint32_t svc_id, uint32_t binding_gen)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)raw_body;
     (void)model_name;
     (void)out_ids;
     (void)max_ids;
+    (void)svc_id;
+    (void)binding_gen;
     return -1;  /* no tokenizer/chat-template in C-only builds */
 }
 
-int
+__attribute__((weak)) int
 llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
                        int n_hashes, char *model_name,
                        uint32_t prefill_mask, uint32_t excluded_mask,
@@ -211,6 +253,7 @@ llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
                        int n_ep_slots, uint32_t kv_svc_id,
                        uint32_t kv_exact_mode, int *out_score)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)block_hashes;
     (void)hash_size;
     (void)n_hashes;
@@ -236,8 +279,9 @@ llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
  * against this symbol cleanly. Forward-declare the typedef shape to avoid
  * pulling sockproxy_internal.h here. */
 struct proxy_sync_event;
-void
+__attribute__((weak)) void
 llb_sockproxy_emit_sync_event(const struct proxy_sync_event *ev)
 {
+    AI_GW_STUB_TRIPWIRE(warned);
     (void)ev;
 }

@@ -618,6 +618,36 @@ static void run_forked(void (*child)(void), const char *msg) {
   CHECK(pid > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, msg);
 }
 
+/* ===== pd_connect_retry_budget: same-EP reconnect policy =====
+ * Forked like the AC-4 resolver tests (getenv-once cache isolation).
+ * The plain-LB==0 case is the regression-critical gate: a nonzero budget
+ * there would add up to +500ms to every non-affinity failover. */
+static void test_cr_default_child(void) {
+  unsetenv("LLB_PD_CONNECT_RETRY_SAME_EP");
+  int ok = pd_connect_retry_budget(1, 0) == 1     /* P/D disagg -> default 1 */
+        && pd_connect_retry_budget(0, 1) == 1     /* KV-exact   -> default 1 */
+        && pd_connect_retry_budget(1, 1) == 1     /* both       -> default 1 */
+        && pd_connect_retry_budget(0, 0) == 0;    /* plain LB   -> NEVER retries */
+  _exit(ok ? 0 : 1);
+}
+static void test_cr_env_zero_child(void) {
+  setenv("LLB_PD_CONNECT_RETRY_SAME_EP", "0", 1);
+  int ok = pd_connect_retry_budget(1, 0) == 0     /* explicit 0 = kill switch */
+        && pd_connect_retry_budget(0, 1) == 0
+        && pd_connect_retry_budget(0, 0) == 0;
+  _exit(ok ? 0 : 1);
+}
+static void test_cr_env_clamp_child(void) {
+  setenv("LLB_PD_CONNECT_RETRY_SAME_EP", "9", 1);
+  uint32_t v = pd_connect_retry_budget(1, 0);
+  /* cached: a second read must agree, and reject a later mutation. */
+  setenv("LLB_PD_CONNECT_RETRY_SAME_EP", "2", 1);
+  int ok = (v == 3)                               /* 9 clamps to 3 */
+        && pd_connect_retry_budget(1, 0) == 3     /* cache holds */
+        && pd_connect_retry_budget(0, 0) == 0;    /* plain LB still 0 */
+  _exit(ok ? 0 : 1);
+}
+
 int main(void) {
   printf("=== /05/06 admission-layer unit tests (test_pd_admission) ===\n");
 
@@ -665,6 +695,14 @@ int main(void) {
              "AC-4: LLB_PD_MAX_TOTAL_INFLIGHT unset -> pd_max_total_inflight()==0 (DISABLED)");
   run_forked(test_ac4_resolver_set_child,
              "AC-4: LLB_PD_MAX_TOTAL_INFLIGHT=256 -> resolver caches 256 (ignores later mutation)");
+
+  /* Same-EP reconnect budget (pd_connect_retry_budget). */
+  run_forked(test_cr_default_child,
+             "CR-1: env unset -> affinity paths (P/D, KV-exact) get 1 retry, plain LB gets 0");
+  run_forked(test_cr_env_zero_child,
+             "CR-2: LLB_PD_CONNECT_RETRY_SAME_EP=0 -> kill switch, budget 0 everywhere");
+  run_forked(test_cr_env_clamp_child,
+             "CR-3: LLB_PD_CONNECT_RETRY_SAME_EP=9 -> clamps to 3, caches, plain LB stays 0");
 
   if (g_failures) {
     printf("test_pd_admission: FAIL (%d)\n", g_failures);

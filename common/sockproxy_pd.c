@@ -1421,6 +1421,44 @@ pd_max_inflight_per_ep(void)
   return (uint32_t)v;
 }
 
+/* same-EP reconnect budget (env LLB_PD_CONNECT_RETRY_SAME_EP, cached
+ * getenv-once; mirrors pd_max_inflight_per_ep). Default 1 retry, clamp 0..3.
+ * Explicit 0 disables. Consumed via pd_connect_retry_budget below. */
+static uint32_t
+pd_connect_retry_same_ep(void)
+{
+  static int cached = -1;  /* -1 = unresolved; >=0 = resolved retries */
+  int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+  if (v >= 0) return (uint32_t)v;
+  v = 1;  /* default: one bounded same-EP reconnect */
+  const char *e = getenv("LLB_PD_CONNECT_RETRY_SAME_EP");
+  if (e && *e) {
+    long n = strtol(e, NULL, 10);
+    if (n < 0) n = 0;
+    if (n > 3) n = 3;
+    v = (int)n;
+  }
+  __atomic_store_n(&cached, v, __ATOMIC_RELEASE);
+  return (uint32_t)v;
+}
+
+/* Same-EP reconnect budget for a service (contract in sockproxy.h).
+ * Affinity-bearing services (P/D disagg or KV-exact) get the env budget of
+ * reconnects to the ORIGINALLY SELECTED EP before mid-cycle failover excludes
+ * it: connect() completing is a kernel handshake, so a transient SYN loss /
+ * accept-path stall past the 500ms connect poll does NOT mean the EP is down,
+ * and excluding the cache-owner on one stall silently demotes the request to
+ * Tier-2 min-load (KV_T15 fallthrough) even though the owner is healthy.
+ * Plain LB services return 0 — no affinity to preserve, fast failover to the
+ * next EP stays byte-identical. */
+uint32_t
+pd_connect_retry_budget(int pd_disagg_enabled, uint32_t kv_exact_mode)
+{
+  if (!pd_disagg_enabled && kv_exact_mode == 0)
+    return 0;
+  return pd_connect_retry_same_ep();
+}
+
 /* count of requests shed by the in-flight cap (observability; also logged
  * per shed via [PD_ADMISSION]). File-static atomic — no global_stats struct churn. */
 static _Atomic uint64_t pd_admission_shed_total = 0;

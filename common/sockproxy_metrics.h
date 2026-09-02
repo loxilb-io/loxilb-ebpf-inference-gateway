@@ -80,6 +80,12 @@ typedef struct proxy_metrics_snapshot {
     uint64_t pd_kv_t15_miss_no_worker;
     uint64_t pd_kv_t15_miss_excluded;
     uint64_t pd_kv_t15_miss_shallow;
+    /* Contract-gate + typed-bridge miss classes (lockstep with
+     * sockproxy.h atomics and the Go CGO mirror). */
+    uint64_t pd_kv_t15_miss_not_ready;
+    uint64_t pd_kv_t15_miss_api_mode;
+    uint64_t pd_kv_t15_miss_unsupported;
+    uint64_t pd_kv_t15_miss_runtime_fault;
     uint64_t pd_kv_t15_fallthrough_total;
 
     /* (OBS-01): CB proactive heal  + per-EP admission layer
@@ -120,6 +126,13 @@ typedef struct proxy_metrics_snapshot {
     uint64_t cache_bytes_total;
     uint64_t cache_bytes_max_conn;
     uint64_t cache_conns_queued;
+
+    /* Same-EP reconnect counters (transient backend connect failure on an
+     * affinity-bearing service; see pd_connect_retry_budget in sockproxy.h).
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks
+     * above. */
+    uint64_t pd_connect_retry_same_ep;
+    uint64_t pd_connect_retry_same_ep_ok;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

@@ -69,17 +69,18 @@ struct dp_proxy_ct_ent;
 #define PD_KV_PARAMS_MAX_LEN 65536  // P/D kv_transfer_params buffer (64KB for real vLLM block_ids)
 
 /* P/D orchestration engine flavor (proxy_epval_t.pd_engine). Values equal
- * the wire kv_engine_type encoding (0=vllm, 1=sglang, 2=trtllm) —
- * the proxy_add stamp goes through pd_engine_from_kv_engine_type()
- * (sockproxy_pd_core.c), these names exist so the orchestration branch reads
- * an orchestration-named constant. Adding an engine = new constant here +
- * mapper/resolver case + (when it diverges) its own dialect ops table. */
-#define PD_ENGINE_VLLM   0
-#define PD_ENGINE_SGLANG 1
-/* TensorRT-LLM disaggregation is sequential ctx-first — a parameterization
- * of the vLLM machine with its own body dialect (sockproxy_pd_trtllm.c:
- * disaggregated_params splice/extract/re-splice + context early exit). */
-#define PD_ENGINE_TRTLLM 2
+ * the wire kv_engine_type encoding and are GENERATED from the code-owned
+ * engine-contract manifest (engine-contracts/contracts.yaml, via ecgen) so
+ * the Go and C sides can never drift — sockproxy_pd_ids.h is the single
+ * value authority and must never be hand-edited. The proxy_add stamp goes
+ * through pd_engine_from_kv_engine_type() (sockproxy_pd_core.c). Adding an
+ * engine = manifest change + regeneration + mapper/resolver case + (when
+ * it diverges) its own dialect ops table. An UNKNOWN value resolves to no
+ * dialect at all (fail closed) — never to vLLM.
+ * (TensorRT-LLM disaggregation is sequential ctx-first — a
+ * parameterization of the vLLM machine with its own body dialect,
+ * sockproxy_pd_trtllm.c.) */
+#include "sockproxy_pd_ids.h"
 
 /* SGLang --disaggregation-bootstrap-port default (server_args.py). Applied
  * at proxy_add when the rule leaves pd_bootstrap_port at 0. */
@@ -162,6 +163,13 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_kv_t15_miss_no_worker;    // llb_ai_kv_best_worker returned no candidate
     _Atomic uint64_t pd_kv_t15_miss_excluded;     // candidate EP excluded (health / load)
     _Atomic uint64_t pd_kv_t15_miss_shallow;      // best match under the minimum token depth
+    // Binding-dataplane contract: gate + typed-bridge miss classes.
+    // Same alignment contract as the nine above: C atomic <-> snapshot field
+    // (sockproxy_metrics.h) <-> Go CGO mirror + reason label, all in lockstep.
+    _Atomic uint64_t pd_kv_t15_miss_not_ready;    // contract word fenced (!eligible) or bridge returned NOT_READY (Go deny set)
+    _Atomic uint64_t pd_kv_t15_miss_api_mode;     // request surface excluded by the contract api_mode byte
+    _Atomic uint64_t pd_kv_t15_miss_unsupported;  // bridge: excluded feature on a strict rule (request-class, never readiness)
+    _Atomic uint64_t pd_kv_t15_miss_runtime_fault;// bridge: profile/renderer/tokenizer/unknown fault on a strict rule
     _Atomic uint64_t pd_kv_t15_fallthrough_total; // Tier 1.5 skipped entirely -> Tier 2 path
     // Failover observability: endpoint-death and failover EVENTS (as detected
     // per connection), distinct from the request-outcome counters in
@@ -170,6 +178,12 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_decode_ep_died;         // decode EP failure: init-connect failure or zero-byte EOF
     _Atomic uint64_t pd_decode_zero_byte_eof;   // decode EOF with ZERO response bytes relayed (subset of above)
     _Atomic uint64_t pd_connect_failover;       // prefill connect retry against another EP succeeded
+    // Same-EP reconnect on transient backend connect failure (affinity-bearing
+    // services only — P/D disagg / KV-exact). A retry that succeeds keeps the
+    // cache-owner EP; without it a single 500ms connect stall silently demotes
+    // the request to Tier-2 (observed as a lone KV_T15 fallthrough under load).
+    _Atomic uint64_t pd_connect_retry_same_ep;    // same-EP reconnect attempts
+    _Atomic uint64_t pd_connect_retry_same_ep_ok; // attempts that succeeded (affinity preserved)
     _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
     // SGLang P/D dual-dispatch observability (mirrors the failover family above)
     _Atomic uint64_t pd_sg_prefill_abort_decode; // prefill drain-leg failure forced a decode-leg abort
@@ -640,6 +654,18 @@ typedef struct proxy_epval {
    * identity" and the Go side keeps today's all-services loop — the seam is
  * independently default-off (kv_weight twin-lockstep precedent). */
   uint32_t kv_svc_id;            // calling rule identity for the Go selector (0 = no identity)
+
+  /* Binding-dataplane contract word:
+   *   [ binding_gen:32 | flags:16 | api_mode:8 | eligible:8 ]
+   * Written ONLY by proxy_update_kv_exact_contract (single-writer; the Go
+   * control plane's fence-first transactions), read once per request with
+   * acquire semantics in pd_kv_exact_select before tokenize. Zero means "no
+   * contract installed" — the legacy passthrough (binding_gen 0 is reserved,
+   * so an installed word is never zero even while fenced). Deliberately NOT
+   * copied at proxy_add_entry: an entry rebuild starts legacy/ineligible and
+   * the control plane re-installs after ACK; the Go-side per-svc_id deny set
+   * fences the strict rule across that window (plan-fix I-14 backstop). */
+  _Atomic uint64_t kv_exact_contract;
 
   UT_hash_handle hh;
 } proxy_epval_t;
@@ -1426,6 +1452,17 @@ int proxy_add_entry(struct proxy_ent *new_ent, struct proxy_arg *arg);
 int proxy_delete_entry(struct proxy_ent *ent, struct proxy_arg *arg);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);
 int proxy_update_ep_health_by_ip(struct proxy_ent *key, uint32_t ep_ip, uint8_t inactive);
+
+/* Synchronous single-writer setter for the per-entry kv_exact_contract
+ * word (pattern: proxy_update_ep_health). Packs
+ * [binding_gen:32|flags=0:16|api_mode:8|eligible:8], stores with release
+ * ordering and reads the word back into *applied — the caller's ACK is
+ * (return == 0 && *applied == the requested word). binding_gen 0 is refused
+ * (reserved as "no contract"); there is deliberately NO way to return an
+ * entry to the legacy zero word short of entry teardown. */
+int proxy_update_kv_exact_contract(struct proxy_ent *key, uint32_t binding_gen,
+                                   uint8_t api_mode, uint8_t eligible,
+                                   uint64_t *applied);
 int proxy_set_drain_policy(struct proxy_ent *key, drain_policy_t policy, uint32_t timeout_sec);
 /* Tier-1 byte shaper control. Rates arrive in bits/sec (the policer API's
  * native unit) and are converted to bytes/sec at store time. cir_bps == 0
@@ -1560,6 +1597,14 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
 #endif
 int pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                       uint32_t excluded_mask);
+/* same-EP reconnect budget on transient backend connect failure
+ * (sockproxy_pd.c). Affinity-bearing services (P/D disagg or KV-exact) get
+ * LLB_PD_CONNECT_RETRY_SAME_EP retries (getenv-once; default 1, clamp 0..3)
+ * of the ORIGINALLY SELECTED EP before the mid-cycle failover excludes it —
+ * a 500ms accept stall on the cache-owner EP otherwise silently demotes the
+ * request to Tier-2 (observed as a lone KV_T15 fallthrough). Plain LB
+ * services return 0: their fast-failover semantics are byte-identical. */
+uint32_t pd_connect_retry_budget(int pd_disagg_enabled, uint32_t kv_exact_mode);
 /* bounded-admission FIFO dequeue/reap primitives (sockproxy_pd.c).
  * Pure ring ops on ONE pd_parked_fifo_t — the CALLER must hold tepval->pd_parked_lock.
  * They never touch a pfe, never free, never dispatch (UAF-critical re-drive/teardown

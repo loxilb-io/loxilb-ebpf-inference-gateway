@@ -26,36 +26,46 @@
 #include "sockproxy_json.h"
 
 /* Wire kv_engine_type → PD_ENGINE_*. Values are equal by construction for
- * the engines the control plane emits today; unknown/future values degrade
- * to the sequential vLLM flavor (the machine with no injection prerequisite)
- * rather than to a dialect whose contract the peer engine cannot speak. */
+ * the engines the control plane emits today (both sides generate from the
+ * same manifest — sockproxy_pd_ids.h). An unknown/future value is STRICT:
+ * it maps to PD_ENGINE_INVALID, never silently to vLLM — applying another
+ * engine's dialect to a peer that cannot speak it is a wire-corruption
+ * class, and gateway-side admission already refuses unknown engines, so
+ * this path is the last-line fail-closed, not a working degrade. */
 uint8_t
 pd_engine_from_kv_engine_type(uint8_t kv_engine_type)
 {
   switch (kv_engine_type) {
+  case PD_ENGINE_VLLM:
+    return PD_ENGINE_VLLM;
   case PD_ENGINE_SGLANG:
     return PD_ENGINE_SGLANG;
   case PD_ENGINE_TRTLLM:
     return PD_ENGINE_TRTLLM;
-  case PD_ENGINE_VLLM:
   default:
-    return PD_ENGINE_VLLM;
+    return PD_ENGINE_INVALID;
   }
 }
 
+/* Resolve an engine's dialect ops table. Unknown values — including
+ * PD_ENGINE_INVALID from the mapper above — resolve to NULL: the callers
+ * treat a NULL table as "P/D orchestration must not activate" (plain L7
+ * forwarding still works via the pd_dialect_plain fallback in
+ * proxy_usage_ops). */
 const pd_dialect_ops_t *
 pd_dialect_resolve(uint8_t pd_engine)
 {
   switch (pd_engine) {
+  case PD_ENGINE_VLLM:
+    return &pd_dialect_vllm;
   case PD_ENGINE_SGLANG:
     return &pd_dialect_sglang;
   case PD_ENGINE_TRTLLM:
     /* Sequential ctx-first disaggregation: own context-splice rewrite,
      * everything else riding the vLLM machine (sockproxy_pd_trtllm.c). */
     return &pd_dialect_trtllm;
-  case PD_ENGINE_VLLM:
   default:
-    return &pd_dialect_vllm;
+    return NULL;
   }
 }
 
