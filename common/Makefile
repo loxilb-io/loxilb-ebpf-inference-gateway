@@ -263,6 +263,18 @@ test_rid: test_request_id
 test_pd_rewriter: test_pd_rewriter.c sockproxy_pd.c
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< -I. -DTEST_PD_REWRITER
 
+# G-1 (UNIFIED-ENGINE-ROUTING-ANALYSIS T-1): session-header/IP overlay
+# resolution + the P/D gate that keeps the converged learned-binding overlay
+# from repointing a P/D rule's ladder prefill selection. Standalone — the
+# pure sockproxy_ns_overlay.h decision only (no proxy machinery).
+test_pd_ns_overlay: test_pd_ns_overlay.c sockproxy_ns_overlay.h
+	$(CC) -Wall -Wextra -ffunction-sections -fdata-sections \
+		-Wl,--gc-sections -o $@ $< -I.
+
+.PHONY: test_nsov
+test_nsov: test_pd_ns_overlay
+	./test_pd_ns_overlay
+
 # Phase 76-03 (FR-08/FR-10): non-terminal H2 response-header injector proof.
 # Links the REAL shipped proxy_h2_inject_resp_headers() out of sockproxy_h2.c
 # (no copy, no drift) and proves, against a real in-process nghttp2 server
