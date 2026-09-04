@@ -2325,6 +2325,30 @@ dp_ct_in(void *ctx, struct xfi *xf)
   atdat = bpf_map_lookup_elem(&ct_map, &key);
   if (atdat == NULL) {
 
+    /* A TCP SYN|ACK can never open a flow: it is the second leg of a
+     * handshake whose opening SYN this datapath has no entry for — either a
+     * stale/orphan return packet, or a reply that raced the opening SYN's
+     * ct commit (e.g. while the backend's nexthop was still resolving, the
+     * punted SYN reaches the backend before the SYN's map inserts are
+     * visible to the CPU handling the reply). Creating a fresh ct here is
+     * always wrong: the CLOSED-state machine immediately errors the entry,
+     * the error teardown also removes the opening flow's reverse key, and
+     * the packet falls through to the kernel UNTRANSLATED — the client sees
+     * the backend's real address, answers with a RST that is then NAT'd
+     * onto the live backend socket, and the flow is wedged until the client
+     * gives up. Drop it instead: the backend retransmits the SYN|ACK, and
+     * by then the opening SYN's entries are in place so the retransmit is
+     * reverse-translated normally. DSR flows are exempt — any first packet
+     * may legitimately seed their ct (see CT_TCP_CLOSED handling).
+     */
+    if (key.l4proto == IPPROTO_TCP && !xf->nm.dsr &&
+        (xf->pm.tcp_flags & (LLB_TCP_SYN|LLB_TCP_ACK)) ==
+        (LLB_TCP_SYN|LLB_TCP_ACK)) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLCT_ERR);
+      dp_update_ct_error_stats(CT_ERR_STAT_TCP_ERR, 1);
+      return 0;
+    }
+
     BPF_TRACE_PRINTK("[CTRK] new-ct ent");
     adat->ca.ftrap = 0;
     adat->ca.oaux = 0;
