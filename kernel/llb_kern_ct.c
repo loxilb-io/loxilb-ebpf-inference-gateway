@@ -2564,6 +2564,21 @@ dp_ct_in(void *ctx, struct xfi *xf)
         }
       }
     } else if (smr == CT_SMR_ERR || smr == CT_SMR_CTD) {
+      /* A translated flow whose conntrack just errored must not fall through
+       * to the kernel untranslated: doing so emits the backend's real address
+       * to the client (or the client's address to the backend) and desyncs the
+       * handshake, which cannot recover because the reverse key is torn down
+       * here too. Mark the packet for drop so the pipeline discards it; the
+       * peer retransmits and re-establishes against a clean entry. Only
+       * CT_SMR_ERR (a protocol/handshake error) needs this — CT_SMR_CTD is an
+       * orderly teardown whose packet is a legitimate FIN/RST. */
+      if (smr == CT_SMR_ERR &&
+          (atdat->ca.act_type == DP_SET_DNAT ||
+           atdat->ca.act_type == DP_SET_SNAT ||
+           axtdat->ca.act_type == DP_SET_DNAT ||
+           axtdat->ca.act_type == DP_SET_SNAT)) {
+        LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_PLCT_ERR);
+      }
       bpf_map_delete_elem(&ct_map, &xkey);
       bpf_map_delete_elem(&ct_map, &key);
       dp_ct_related_fc_rm(&xkey);

@@ -603,6 +603,12 @@ ct_start:
   BPF_TRACE_PRINTK("[CTRK] ct-start");
   val = dp_ct_in(ctx, xf);
   if (val < 0) {
+    /* Conntrack errored. A translated flow marks the packet for drop (see
+     * llb_kern_ct.c) so it is never forwarded untranslated; untracked flows
+     * keep the historical pass-to-stack behaviour. */
+    if (xf->pm.pipe_act & LLB_PIPE_DROP) {
+      return DP_DROP;
+    }
     return DP_PASS;
   }
   xf->nm.ct_sts = LLB_PIPE_CT_INP;
