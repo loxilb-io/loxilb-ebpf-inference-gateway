@@ -28,6 +28,13 @@ int extract_user_id(const char *body, size_t len, char *out, size_t cap);
  */
 int extract_model_field(const char *body, size_t len, char *out, size_t cap);
 
+/* Extract a complete direct top-level "model" string from an incomplete JSON
+ * prefix. Returns 0 on success, 1 when more bytes may complete the field, and
+ * -1 when a complete root object has no usable model or the value is invalid.
+ * Used only to select a model-specific pool before streaming an oversize body. */
+int extract_model_field_prefix(const char *body, size_t len,
+                               char *out, size_t cap);
+
 /* Extract prompt_tokens / completion_tokens from the last complete OpenAI
  * "usage" object in a response byte window (SSE tail or JSON body tail;
  * the window need not be a complete JSON document).

@@ -189,6 +189,7 @@ proxy_sock_setnb(int fd)
   }
 }
 
+
 static void
 proxy_sock_setnodelay(int fd)
 {
@@ -1004,6 +1005,8 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   fd_ent->http_body_complete = 0;
   fd_ent->http_content_length = 0;
   fd_ent->is_streamable = 0;
+  fd_ent->json_stream_route_pending = 0;
+  fd_ent->json_stream_continue_sent = 0;
   fd_ent->rcv_off = 0;
   fd_ent->parsed_off = 0;
   fd_ent->last_header_name[0] = '\0';
@@ -1062,4 +1065,3 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
     }
   }
 }
-

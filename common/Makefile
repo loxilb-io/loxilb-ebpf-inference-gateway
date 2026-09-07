@@ -132,6 +132,7 @@ sockproxy_ep.o: sockproxy_ep.c sockproxy_ep.h sockproxy_internal.h \
 
 sockproxy_http.o: sockproxy_http.c sockproxy_http.h sockproxy_internal.h \
                   sockproxy_metrics.h sockproxy_routing.h sockproxy_json.h \
+                  sockproxy_stream_fallback.h \
                   sockproxy_trace.h sockproxy_cache.h sockproxy_lb.h \
                   sockproxy_health.h sockproxy_ssl.h sockproxy_conn.h \
                   sockproxy_ep.h sockproxy_ktls.h sockproxy_h2.h sockproxy_pd.h
@@ -420,6 +421,15 @@ test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h xxhas
 test_usage: test_usage_extract
 	./test_usage_extract
 
+# Oversize JSON stream fallback: local Expect acknowledgement/removal and
+# byte-exact body/remaining accounting helpers.
+test_stream_fallback: test_stream_fallback.c sockproxy_stream_fallback.h
+	$(CC) -Wall -Wextra -Werror -fsanitize=address,undefined -o $@ $< -I.
+
+.PHONY: test_stream
+test_stream: test_stream_fallback
+	./test_stream_fallback
+
 # Tier-1 byte-shaper bucket primitives (header-only, standalone):
 # grant/credit/refill arithmetic + multi-threaded token-conservation check
 test_qos_bucket: test_qos_bucket.c sockproxy_qos.h
@@ -461,7 +471,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids
+	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

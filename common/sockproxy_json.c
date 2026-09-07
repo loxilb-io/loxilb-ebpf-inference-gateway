@@ -705,6 +705,28 @@ json_top_find(const char *body, size_t len, const char *key, size_t klen,
   return -2;
 }
 
+int
+extract_model_field_prefix(const char *body, size_t len, char *out, size_t cap)
+{
+  const char *vs = NULL, *ve = NULL, *root_close = NULL;
+  int rc;
+
+  if (!body || len == 0 || !out || cap == 0)
+    return -1;
+  out[0] = '\0';
+
+  rc = json_top_find(body, len, "model", 5, &vs, &ve, &root_close);
+  if (rc == -2)
+    return 1;
+  if (rc != 0 || !vs || !ve)
+    return -1;
+  if (ve - vs < 2 || *vs != '"' || ve[-1] != '"')
+    return -1;
+
+  kv_json_unescape_copy(vs + 1, (size_t)(ve - vs - 2), out, cap);
+  return out[0] != '\0' ? 0 : -1;
+}
+
 /* Splice ins_len bytes into body at offset pos. Caller has verified
  * body_len + ins_len <= cap. */
 static void

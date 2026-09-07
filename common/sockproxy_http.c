@@ -71,6 +71,7 @@
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
  * pd_teardown_legs; pd_detect_http_msg_end here is buffer-only). */
 #include "sockproxy_pd_leak.h"
+#include "sockproxy_stream_fallback.h"
 
 #ifdef HAVE_MTLS
 #include "sockproxy_mtls.h"
@@ -185,6 +186,82 @@ pd_framing_v2_test_set(int on)
 static int handle_resp_headers_complete(llhttp_t *parser);
 static int handle_resp_body(llhttp_t *parser, const char *at, size_t length);
 static int handle_resp_message_complete(llhttp_t *parser);
+
+static ssize_t
+proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
+                      int *retryable)
+{
+  proxy_fd_ent_t *pfe = arg;
+  ssize_t n;
+  short events = POLLOUT;
+
+  *retryable = 0;
+  if (pfe->ssl) {
+    int ssl_err;
+
+    n = SSL_write(pfe->ssl, buf, len > INT_MAX ? INT_MAX : (int)len);
+    if (n > 0)
+      return n;
+    ssl_err = SSL_get_error(pfe->ssl, (int)n);
+    if (ssl_err == SSL_ERROR_WANT_READ)
+      events = POLLIN;
+    else if (ssl_err != SSL_ERROR_WANT_WRITE) {
+      if (ssl_err == SSL_ERROR_SYSCALL && errno == EINTR) {
+        *retryable = 1;
+      }
+      return -1;
+    }
+  } else {
+    n = send(pfe->fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n > 0)
+      return n;
+    if (n < 0 && errno == EINTR) {
+      *retryable = 1;
+      return -1;
+    }
+    if (n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+      return -1;
+  }
+
+  {
+    struct pollfd pf = { .fd = pfe->fd, .events = events | POLLERR };
+    int rc;
+
+    do {
+      rc = poll(&pf, 1, 500);
+    } while (rc < 0 && errno == EINTR);
+    if (rc > 0 && !(pf.revents & (POLLERR | POLLHUP | POLLNVAL)) &&
+        (pf.revents & events))
+      *retryable = 1;
+  }
+  return -1;
+}
+
+static int
+proxy_send_local_response(proxy_fd_ent_t *pfe, const void *buf, size_t len)
+{
+  return sp_send_all_bounded(proxy_send_local_once, pfe, buf, len,
+                             SP_LOCAL_SEND_RETRY_MAX);
+}
+
+static int
+proxy_send_local_100_continue(proxy_fd_ent_t *pfe)
+{
+  static const char response[] = "HTTP/1.1 100 Continue\r\n\r\n";
+
+  if (!sp_http_should_send_100_continue(pfe->rcvbuf, pfe->rcv_off,
+                                        pfe->json_stream_continue_sent))
+    return 0;
+
+  if (proxy_send_local_response(pfe, response, sizeof(response) - 1) != 0) {
+    log_error("[JSON_STREAM_CONTINUE] fd=%d failed to send complete bounded "
+              "100 Continue", pfe->fd);
+    return -1;
+  }
+  pfe->json_stream_continue_sent = 1;
+  log_info("[JSON_STREAM_CONTINUE] fd=%d sent local 100 Continue", pfe->fd);
+  return 0;
+}
 
 /**
  * Inject X-Forwarded-* headers into HTTP request before forwarding to backend
@@ -6222,6 +6299,8 @@ handle_on_message_begin(llhttp_t* parser)
   if (pfe->odir == 0) {
     pfe->x_api_key_raw[0] = '\0';
     pfe->x_model_header[0] = '\0';
+    pfe->json_stream_route_pending = 0;
+    pfe->json_stream_continue_sent = 0;
     /* Token-accounting state is per-response: without this reset, request
      * N+1 on a reused connection would inherit request N's consumed flag
      * (never charging again) or its stale counts. */
@@ -7759,6 +7838,18 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
   // NOW forward accumulated data to backend
   if (pfe->rfd[0] > 0) {  // Backend connected successfully
 
+    /* The proxy already acknowledged this expectation locally so it could
+     * obtain the authoritative body model before endpoint selection. Never
+     * forward the header and expose the client to a duplicate backend 100. */
+    if (pfe->json_stream_continue_sent) {
+      size_t old_len = pfe->rcv_off;
+      int removed = sp_http_strip_expect_100_continue(pfe->rcvbuf,
+                                                       &pfe->rcv_off);
+      log_info("[JSON_STREAM_CONTINUE] fd=%d stripped %d upstream Expect "
+               "header(s), request bytes %zu->%zu", pfe->fd, removed,
+               old_len, pfe->rcv_off);
+    }
+
     /* AI-gateway token accounting: force stream_options.include_usage=true
      * into streaming request bodies BEFORE any dialect rewrite, so the
      * backend's final SSE chunk carries the usage object the response path
@@ -8060,7 +8151,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       size_t sb_body_fwd = pfe->rcv_off > sb_hdr_len ?
                            pfe->rcv_off - sb_hdr_len : 0;
       if (pfe->http_content_length > sb_body_fwd) {
-        pfe->stream_body_remaining = pfe->http_content_length - sb_body_fwd;
+        pfe->stream_body_remaining =
+            sp_stream_body_remaining(pfe->http_content_length, sb_body_fwd);
         log_info("[STREAM_BODY_TRACK] fd=%d streamed request: %zu of %zu body "
                  "bytes forwarded with headers, %zu outstanding — relay mode "
                  "until drained", pfe->fd, sb_body_fwd,
@@ -8077,6 +8169,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->http_body_complete = 0;
     pfe->http_content_length = 0;
     pfe->is_streamable = 0;
+    pfe->json_stream_route_pending = 0;
+    pfe->json_stream_continue_sent = 0;
 
     /* Snapshot the effective model BEFORE the model sources are cleared below:
      * the backend response has not arrived yet, and its consumers (SSE
@@ -8353,6 +8447,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     int sret;
     size_t rd_want = SP_SOCK_MSG_LEN - pfe->rcv_off;
     uint64_t qos_grant = 0;
+
+    if (pfe->json_stream_route_pending)
+      rd_want = sp_json_route_read_want(pfe->rcvbuf, pfe->rcv_off, rd_want);
 
     if (qos_b && rd_want > 0) {
       qos_grant = qos_bucket_take(qos_b, rd_want);
@@ -8633,6 +8730,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
         
         // Reset flags before parsing
+        int json_stream_was_pending = pfe->json_stream_route_pending;
         pfe->http_pok = 0;
         pfe->http_hok = 0;
         pfe->http_hvok = 0;
@@ -8661,6 +8759,15 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         
         // Update how much we've parsed
         pfe->parsed_off = pfe->rcv_off;
+
+        /* llhttp reports the Host callbacks only while parsing the headers.
+         * An oversize JSON request deliberately spans another read while we
+         * wait for its body model, so restore the already-proven header state
+         * for that continuation read. */
+        if (json_stream_was_pending) {
+          pfe->http_hok = 1;
+          pfe->http_hvok = pfe->host_url[0] != '\0';
+        }
         
         if (err == HPE_OK) {
           /* headers complete — clear the accumulation anchor so the tcp_inspect
@@ -8731,18 +8838,67 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // through to Tier-2 — fail-open, same degradation contract as every
           // other KV miss path. Requires Content-Length (chunked TE has none;
           // those already skip inspection via the content_length==0 gate).
+          int json_stream_fallback = pfe->json_stream_route_pending;
           if (needs_body_inspection &&
               pfe->http_content_length > SP_JSON_INSPECT_MAX) {
-            log_info("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
-                     "inspect cap %d - streaming, body inspection skipped "
-                     "(Tier-2 fail-open)",
-                     fd, pfe->http_content_length, SP_JSON_INSPECT_MAX);
+            if (!pfe->json_stream_route_pending) {
+              log_info("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
+                       "inspect cap %d - bounded model routing before streaming "
+                       "(Tier-2 fail-open)",
+                       fd, pfe->http_content_length, SP_JSON_INSPECT_MAX);
+            }
+            pfe->json_stream_route_pending = 1;
+            json_stream_fallback = 1;
             needs_body_inspection = 0;
           }
 
           int is_streamable = !needs_body_inspection;
           
           if (pfe->http_hok && is_streamable && pfe->http_content_length > (64 * 1024)) {
+            if (json_stream_fallback) {
+              const uint8_t *route_body = NULL;
+              size_t route_body_len = 0;
+              int route_body_at_limit = 0;
+              int body_rc = sp_json_route_body_prefix(
+                  pfe->rcvbuf, pfe->rcv_off, &route_body, &route_body_len,
+                  &route_body_at_limit);
+              char body_model[MAX_MODEL_LEN] = {0};
+              int model_rc = body_rc == 0 ?
+                  extract_model_field_prefix((const char *)route_body,
+                                             route_body_len,
+                                             body_model, sizeof(body_model)) : 1;
+
+              if (model_rc != 0) {
+                if (proxy_send_local_100_continue(pfe) != 0)
+                  return -1;
+                if (route_body_at_limit) {
+                  static const char model_late[] =
+                      "HTTP/1.1 400 Bad Request\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Connection: close\r\n\r\n"
+                      "{\"error\":\"model_required_early\","
+                      "\"detail\":\"top-level model not found in routing prefix\"}\r\n";
+                  if (proxy_send_local_response(pfe, model_late,
+                                                sizeof(model_late) - 1) != 0)
+                    log_error("[JSON_STREAM_MODEL] fd=%d failed to send "
+                              "complete bounded 400 response", fd);
+                  pfe->lb_err_body_sent = 1;
+                  log_info("[JSON_STREAM_MODEL] fd=%d no complete top-level "
+                           "model within %u buffered body bytes", fd,
+                           SP_JSON_ROUTE_PREFIX_MAX);
+                  return -1;
+                }
+                continue;
+              }
+
+              sp_store_authoritative_body_model(
+                  pfe->prefix_key.model, sizeof(pfe->prefix_key.model),
+                  pfe->x_model_header, body_model);
+              log_info("[JSON_STREAM_MODEL] fd=%d model='%s' resolved from %zu "
+                       "buffered body bytes", fd, pfe->prefix_key.model,
+                       route_body_len);
+            }
+
             log_error("🚀 [EARLY_BACKEND_CONNECT] fd=%d: LARGE CONTENT detected (Content-Length=%zu bytes, %.2f KB) - "
                      "Streaming mode enabled (not application/json or form-urlencoded, no body inspection needed)",
                      fd, pfe->http_content_length, pfe->http_content_length / 1024.0);
@@ -8976,6 +9132,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->http_hvok = 0;
           pfe->http_body_complete = 0;
           pfe->http_content_length = 0;
+          pfe->json_stream_route_pending = 0;
+          pfe->json_stream_continue_sent = 0;
           memset(&pfe->prefix_key, 0, sizeof(pfe->prefix_key));  // P0.2: Reset prefix
           pfe->has_conv_id = 0;  // P0.3: Reset conversation ID flag
           memset(pfe->conversation_id, 0, sizeof(pfe->conversation_id));  // P0.3: Clear conversation ID

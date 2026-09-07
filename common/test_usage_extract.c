@@ -28,10 +28,12 @@
  */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 
 #include "log.h"
+#include "sockproxy_stream_fallback.h"
 
 /* log.c is not linked into this standalone test */
 void
@@ -44,6 +46,24 @@ log_log(int level, const char *file, int line, const char *fmt, ...)
 
 static int g_fails = 0;
 static int g_cases = 0;
+
+static void
+expect_model_prefix(const char *name, const char *body, size_t len,
+                    int want_rc, const char *want_model)
+{
+  char model[128] = {0};
+  int rc = extract_model_field_prefix(body, len, model, sizeof(model));
+
+  g_cases++;
+  if (rc != want_rc ||
+      (want_rc == 0 && strcmp(model, want_model ? want_model : "") != 0)) {
+    printf("FAIL %-38s rc=%d model='%s' (want rc=%d model='%s')\n",
+           name, rc, model, want_rc, want_model ? want_model : "");
+    g_fails++;
+    return;
+  }
+  printf("ok   %-38s rc=%d model='%s'\n", name, rc, model);
+}
 
 static void
 expect(const char *name, const char *window, int want_rc,
@@ -109,6 +129,68 @@ expect_inject(const char *name, const char *body, int want_rc,
 int
 main(void)
 {
+  /* Oversize JSON routing needs a complete direct top-level model before the
+   * rest of the document exists. Every truncated key/value remains pending;
+   * nested or string-embedded spoof keys never win. */
+  expect_model_prefix("model-prefix-open-object", "{", 1, 1, NULL);
+  expect_model_prefix("model-prefix-split-key", "{\"mo", 4, 1, NULL);
+  expect_model_prefix("model-prefix-split-value", "{\"model\":\"Qwen/", 15,
+                      1, NULL);
+  expect_model_prefix("model-prefix-complete-no-root",
+                      "{\"model\":\"Qwen/Qwen3-0.6B\"",
+                      strlen("{\"model\":\"Qwen/Qwen3-0.6B\""),
+                      0, "Qwen/Qwen3-0.6B");
+  expect_model_prefix("model-prefix-nested-spoof",
+                      "{\"meta\":{\"model\":\"evil\"},"
+                      "\"model\":\"good\",\"prompt\":\"partial",
+                      strlen("{\"meta\":{\"model\":\"evil\"},"
+                             "\"model\":\"good\",\"prompt\":\"partial"),
+                      0, "good");
+  expect_model_prefix("model-prefix-string-spoof",
+                      "{\"note\":\"\\\"model\\\":\\\"evil\\\"\","
+                      "\"model\":\"good\",\"prompt\":",
+                      strlen("{\"note\":\"\\\"model\\\":\\\"evil\\\"\","
+                             "\"model\":\"good\",\"prompt\":"),
+                      0, "good");
+  expect_model_prefix("model-prefix-escaped",
+                      "{\"model\":\"Qwen\\/Qwen3\",\"prompt\":",
+                      strlen("{\"model\":\"Qwen\\/Qwen3\",\"prompt\":"),
+                      0, "Qwen/Qwen3");
+  expect_model_prefix("model-prefix-non-string",
+                      "{\"model\":123,", strlen("{\"model\":123,"),
+                      -1, NULL);
+
+  /* The stream fallback's limit is a body-prefix contract, including when a
+   * single initial read already contains bytes beyond it. A complete model at
+   * the final allowed byte is routable; one wholly after the cap is not. */
+  {
+    static const char edge_model[] = "\"model\":\"edge\"";
+    static const char late_model[] = "\"model\":\"late\"";
+    char *body = malloc(SP_JSON_ROUTE_PREFIX_MAX + sizeof(late_model) + 8);
+
+    if (!body) return 2;
+    body[0] = '{';
+    memset(body + 1, ' ', SP_JSON_ROUTE_PREFIX_MAX - 1);
+    memcpy(body + SP_JSON_ROUTE_PREFIX_MAX - (sizeof(edge_model) - 1),
+           edge_model, sizeof(edge_model) - 1);
+    expect_model_prefix("model-at-body-cap", body,
+                        SP_JSON_ROUTE_PREFIX_MAX, 0, "edge");
+
+    memset(body + SP_JSON_ROUTE_PREFIX_MAX - (sizeof(edge_model) - 1), ' ',
+           sizeof(edge_model) - 1);
+    memcpy(body + SP_JSON_ROUTE_PREFIX_MAX, late_model,
+           sizeof(late_model) - 1);
+    /* Direct framing/header arithmetic is exercised separately in
+     * test_stream_fallback; here the extractor receives the exact clamped
+     * production body prefix. */
+    expect_model_prefix("model-after-body-cap-clamped", body,
+                        SP_JSON_ROUTE_PREFIX_MAX, 1, NULL);
+    expect_model_prefix("model-after-body-cap-full-control", body,
+                        SP_JSON_ROUTE_PREFIX_MAX + sizeof(late_model) - 1,
+                        0, "late");
+    free(body);
+  }
+
   /* vLLM final chunk: usage object last, empty choices, then [DONE]. */
   expect("vllm-final-chunk",
          "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\","
