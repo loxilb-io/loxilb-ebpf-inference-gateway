@@ -45,3 +45,7 @@ COMMON_DIR = ../common
 LDFLAGS +=  -lz 
 
 include $(COMMON_DIR)/common.mk
+
+.PHONY: test_l4_trace_helper_compat
+test_l4_trace_helper_compat: $(TC_OBJ) test_l4_trace_helper_compat.sh
+	sh ./test_l4_trace_helper_compat.sh llb_ebpf_main.o

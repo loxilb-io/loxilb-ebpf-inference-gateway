@@ -175,8 +175,10 @@ lxb_l4_should_sample(struct xfi *xf, uint64_t span_id, uint8_t event_type,
     bpf_map_update_elem(&l4_sampling_map, &span_id, &new_decision, BPF_ANY);
     
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-    bpf_printk("[L4_TRACE_SAMPLE] span=%016llx new=%d rate=%d hash=%d event=%d",
-               span_id, sampled, cfg->sampling_rate, hash_mod, event_type);
+    bpf_printk("[L4_TRACE_SAMPLE] span=%016llx new=%d rate=%d",
+               span_id, sampled, cfg->sampling_rate);
+    bpf_printk("[L4_TRACE_SAMPLE] span=%016llx hash=%d event=%d",
+               span_id, hash_mod, event_type);
 #endif
     
     return sampled;
@@ -380,8 +382,10 @@ lxb_l4_emit_event(struct xfi *xf,
   lxb_l4_populate_event(event, xf, ts, state_and_dir);
   
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-  bpf_printk("[L4_TRACE_EMIT] span=%016llx type=%d state=%d->%d proto=%d",
-             span_id, event_type, old_state, new_state, protocol);
+  bpf_printk("[L4_TRACE_EMIT] span=%016llx type=%d proto=%d",
+             span_id, event_type, protocol);
+  bpf_printk("[L4_TRACE_EMIT] span=%016llx state=%d->%d",
+             span_id, old_state, new_state);
 #endif
   
   // Submit event to ring buffer
