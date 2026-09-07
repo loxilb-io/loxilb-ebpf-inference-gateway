@@ -245,6 +245,29 @@ proxy_send_local_response(proxy_fd_ent_t *pfe, const void *buf, size_t len)
 }
 
 static int
+proxy_shutdown_local(void *ctx)
+{
+  proxy_fd_ent_t *pfe = ctx;
+
+  /* Preserve the neighboring terminal-path convention: try to emit TLS
+   * close_notify before forcing the transport closed. This is best-effort;
+   * the raw shutdown below is what guarantees the notifier cannot reuse the
+   * close-delimited error connection. */
+  if (pfe->ssl)
+    (void)SSL_shutdown(pfe->ssl);
+  return shutdown(pfe->fd, SHUT_RDWR);
+}
+
+static int
+proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
+                                       const void *buf, size_t len)
+{
+  return sp_send_all_bounded_then_shutdown(
+      proxy_send_local_once, proxy_shutdown_local, pfe, buf, len,
+      SP_LOCAL_SEND_RETRY_MAX);
+}
+
+static int
 proxy_send_local_100_continue(proxy_fd_ent_t *pfe)
 {
   static const char response[] = "HTTP/1.1 100 Continue\r\n\r\n";
@@ -7906,8 +7929,10 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * set phase to PREFILL_SENDING. */
     if (pfe->epv) {
       proxy_epval_t *pd_tepval = (proxy_epval_t *)pfe->epv;
-      if (pd_tepval->pd_disagg_enabled && pfe->odir == 0 &&
-          pfe->pd_phase == PD_PHASE_NONE) {
+      if (sp_pd_prepare_eligible(1, pd_tepval->pd_disagg_enabled,
+                                 pfe->odir == 0,
+                                 pfe->pd_phase == PD_PHASE_NONE,
+                                 pfe->is_streamable)) {
         /* Client request complete — begin P/D orchestration */
         const uint8_t *pd_body_start = NULL;
         size_t pd_body_len = 0;
@@ -8873,13 +8898,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                   return -1;
                 if (route_body_at_limit) {
                   static const char model_late[] =
-                      "HTTP/1.1 400 Bad Request\r\n"
-                      "Content-Type: application/json\r\n"
-                      "Connection: close\r\n\r\n"
-                      "{\"error\":\"model_required_early\","
-                      "\"detail\":\"top-level model not found in routing prefix\"}\r\n";
-                  if (proxy_send_local_response(pfe, model_late,
-                                                sizeof(model_late) - 1) != 0)
+                      SP_MODEL_REQUIRED_EARLY_RESPONSE;
+                  if (proxy_send_local_response_and_shutdown(
+                          pfe, model_late, sizeof(model_late) - 1) != 0)
                     log_error("[JSON_STREAM_MODEL] fd=%d failed to send "
                               "complete bounded 400 response", fd);
                   pfe->lb_err_body_sent = 1;

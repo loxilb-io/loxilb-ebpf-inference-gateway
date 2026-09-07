@@ -13,9 +13,24 @@
  * the direct top-level model may be retained before the backend is selected. */
 #define SP_JSON_ROUTE_PREFIX_MAX (64U * 1024U)
 #define SP_LOCAL_SEND_RETRY_MAX 8U
+#define SP_MODEL_REQUIRED_EARLY_BODY                                      \
+  "{\"error\":\"model_required_early\","                              \
+  "\"detail\":\"top-level model not found in routing prefix\"}\r\n"
+#define SP_MODEL_REQUIRED_EARLY_BODY_LEN \
+  (sizeof(SP_MODEL_REQUIRED_EARLY_BODY) - 1U)
+#define SP_MODEL_REQUIRED_EARLY_RESPONSE                                  \
+  "HTTP/1.1 400 Bad Request\r\n"                                         \
+  "Content-Type: application/json\r\n"                                  \
+  "Content-Length: 89\r\n"                                              \
+  "Connection: close\r\n\r\n"                                          \
+  SP_MODEL_REQUIRED_EARLY_BODY
+
+_Static_assert(SP_MODEL_REQUIRED_EARLY_BODY_LEN == 89U,
+               "update the model-required-early Content-Length");
 
 typedef ssize_t (*sp_send_once_fn)(void *ctx, const uint8_t *buf, size_t len,
                                    int *retryable);
+typedef int (*sp_shutdown_once_fn)(void *ctx);
 
 static inline const uint8_t *
 sp_http_header_end(const uint8_t *buf, size_t len)
@@ -59,6 +74,33 @@ sp_send_all_bounded(sp_send_once_fn send_once, void *ctx,
       return -1;
   }
   return 0;
+}
+
+/* A terminal local response advertises Connection: close, so completing the
+ * response also completes the transport contract. Always attempt shutdown,
+ * including after a failed bounded send, to avoid returning a live fd to the
+ * notifier restart loop. */
+static inline int
+sp_send_all_bounded_then_shutdown(sp_send_once_fn send_once,
+                                  sp_shutdown_once_fn shutdown_once,
+                                  void *ctx, const uint8_t *buf, size_t len,
+                                  unsigned retry_max)
+{
+  int send_rc = sp_send_all_bounded(send_once, ctx, buf, len, retry_max);
+  int shutdown_rc = shutdown_once ? shutdown_once(ctx) : -1;
+
+  return send_rc != 0 ? send_rc : shutdown_rc;
+}
+
+/* Dialect body preparation is valid only for a complete, buffered client
+ * request. Streamable requests contain only a routing prefix at this point and
+ * must remain byte-exact PLAIN relays. */
+static inline int
+sp_pd_prepare_eligible(int has_ep, int pd_enabled, int is_client_dir,
+                       int phase_is_none, int is_streamable)
+{
+  return has_ep && pd_enabled && is_client_dir && phase_is_none &&
+         !is_streamable;
 }
 
 /* Locate the HTTP body and expose at most the routing prefix. `at_limit` is

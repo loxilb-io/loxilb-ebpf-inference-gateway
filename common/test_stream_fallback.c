@@ -11,6 +11,7 @@ struct send_script {
   size_t step;
   uint8_t output[256];
   size_t output_len;
+  unsigned shutdowns;
 };
 
 static ssize_t
@@ -30,6 +31,14 @@ scripted_send(void *arg, const uint8_t *buf, size_t len, int *retryable)
   memcpy(script->output + script->output_len, buf, (size_t)n);
   script->output_len += (size_t)n;
   return n;
+}
+
+static int
+scripted_shutdown(void *arg)
+{
+  struct send_script *script = arg;
+  script->shutdowns++;
+  return 0;
 }
 
 int
@@ -129,6 +138,40 @@ main(void)
     assert(header_model[0] == '\0');
   }
 
-  puts("ALL PASS (30/30)");
+  /* P/D preparation requires the complete buffered body. A bounded streaming
+   * prefix must never reach a dialect rewriter, even when nested JSON happens
+   * to contain a closing brace inside that incomplete prefix. */
+  assert(sp_pd_prepare_eligible(1, 1, 1, 1, 0));
+  assert(!sp_pd_prepare_eligible(1, 1, 1, 1, 1));
+  assert(!sp_pd_prepare_eligible(0, 1, 1, 1, 0));
+  assert(!sp_pd_prepare_eligible(1, 0, 1, 1, 0));
+  assert(!sp_pd_prepare_eligible(1, 1, 0, 1, 0));
+  assert(!sp_pd_prepare_eligible(1, 1, 1, 0, 0));
+
+  {
+    static const uint8_t response[] = SP_MODEL_REQUIRED_EARLY_RESPONSE;
+    static const ssize_t steps[] = { 11, -1, 23, 154 };
+    struct send_script script = {
+      .steps = steps,
+      .step_count = sizeof(steps) / sizeof(steps[0]),
+    };
+    const uint8_t *body = sp_http_header_end(response, sizeof(response) - 1);
+
+    assert(SP_MODEL_REQUIRED_EARLY_BODY_LEN == 89);
+    assert(body != NULL);
+    body += 4;
+    assert((size_t)(response + sizeof(response) - 1 - body) ==
+           SP_MODEL_REQUIRED_EARLY_BODY_LEN);
+    assert(strstr((const char *)response, "Content-Length: 89\r\n") != NULL);
+    assert(sp_send_all_bounded_then_shutdown(
+               scripted_send, scripted_shutdown, &script,
+               response, sizeof(response) - 1,
+               SP_LOCAL_SEND_RETRY_MAX) == 0);
+    assert(script.output_len == sizeof(response) - 1);
+    assert(memcmp(script.output, response, sizeof(response) - 1) == 0);
+    assert(script.shutdowns == 1);
+  }
+
+  puts("ALL PASS (43/43)");
   return 0;
 }
