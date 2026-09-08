@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 CFLAGS := -g -Wall -I../libbpf/src/ -DHAVE_DP_GPU_ROUTING=1 -DHAVE_LLM_SYSTEM_PROMPT_HASH=1 $(CFLAGS_TRACE) $(CFLAGS_PII) $(CFLAGS_MTLS)
 
@@ -148,7 +148,10 @@ sockproxy_notifier.o: sockproxy_notifier.c sockproxy_notifier.h sockproxy_intern
 sockproxy_ktls.o: sockproxy_ktls.c sockproxy_ktls.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-sockproxy_h2.o: sockproxy_h2.c sockproxy_h2.h
+sockproxy_h2.o: sockproxy_h2.c sockproxy_h2.h sockproxy_ai_security.h sockproxy_json.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_ai_security.o: sockproxy_ai_security.c sockproxy_ai_security.h sockproxy_ai_gw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 notify.o: notify.c notify.h
@@ -300,6 +303,15 @@ sockproxy_h2_gc.o: sockproxy_h2.c sockproxy_h2.h
 .PHONY: test_h2inj
 test_h2inj: test_h2_inject
 	./test_h2_inject
+
+# S03: protocol-neutral admission matrix plus HTTP/2 credential bounds/strip.
+test_ai_security: test_ai_security.c sockproxy_ai_security.c sockproxy_ai_security.h
+	$(CC) -Wall -Wextra -o $@ test_ai_security.c sockproxy_ai_security.c \
+		-I. -lnghttp2
+
+.PHONY: test_aisec
+test_aisec: test_ai_security
+	./test_ai_security
 
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
@@ -471,7 +483,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
+	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

@@ -25,6 +25,8 @@
 
 #include "sockproxy_h2.h"
 #include "sockproxy.h"
+#include "sockproxy_ai_security.h"
+#include "sockproxy_json.h"
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "notify.h"
 #include "log.h"
@@ -383,6 +385,12 @@ proxy_h2_on_header_callback(nghttp2_session *session,
   } else if (HEADER_MATCHES("x-conversation-id")) {
     snprintf(stream->conversation_id, sizeof(stream->conversation_id), "%.*s", (int)valuelen, value);
     stream->has_conv_id = 1;
+  } else if (HEADER_MATCHES("x-api-key")) {
+    /* Credentials are stream state, never connection state: concurrent H2
+     * streams may carry different tenants.  An oversized value is cleared so
+     * a required policy treats it exactly like a missing credential. */
+    ai_security_copy_api_key(stream->x_api_key_raw,
+                             sizeof(stream->x_api_key_raw), value, valuelen);
   }
 
   // append into the bounded generic L7 header/cookie store on
@@ -2403,6 +2411,39 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   }
   
   ent = (proxy_map_ent_t *)pfe->head;
+
+  /* Mandatory security admission is the first service-dependent decision on
+   * this stream.  It MUST precede L7 dispatch, model lookup, all Tier 0/1/1.5/2
+   * selectors, conversation/CHWBL fallback and backend connection creation.
+   * HTTP/1 performs the same validation from llhttp's message-complete
+   * callback; HTTP/2 bypasses llhttp and therefore needs this stream gate. */
+  if (ent->val.ephash) {
+    ai_gw_decision_t decision = {0};
+    char body_model[MAX_MODEL_LEN] = {0};
+    char *model = "";
+
+    if (stream->data_buf && stream->data_len > 0)
+      extract_model_field((const char *)stream->data_buf, stream->data_len,
+                          body_model, sizeof(body_model));
+    if (body_model[0])
+      model = body_model;
+
+    int deny_status = ai_security_admit(ent->val.ephash->apikey_auth,
+                                        stream->x_api_key_raw, model, &decision);
+    if (deny_status != 0) {
+      /* The existing synthetic responder frames a terminal response on one
+       * stream and leaves the multiplexed connection alive.  Return success
+       * so the caller marks this stream response_sent and never redispatches. */
+      pfe->h2_session->l7_active_stream_id = stream->stream_id;
+      proxy_h2_send_l7_synthetic(pfe, deny_status, NULL, NULL);
+      pfe->h2_session->l7_active_stream_id = 0;
+      log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
+               "status=%d decision=%d credential_present=%d",
+               stream->stream_id, deny_status, decision.decision,
+               stream->x_api_key_raw[0] != '\0');
+      return 0;
+    }
+  }
   
   // ✅ FIX: Use stream->authority for HTTP/2 endpoint lookup (not pfe->host_url)
   // In HTTP/2, hostname comes from :authority pseudo-header stored in stream->authority
@@ -2977,6 +3018,29 @@ h2_have_tepval:
      * the unmodified request rather than dropping it. */
   }
 
+  /* Strip the gateway credential AFTER optional L7 mutation (so a header rule
+   * cannot re-add it) and BEFORE nghttp2_submit_request.  Allocation failure
+   * fails closed for services that claimed this namespace; forwarding the
+   * secret is never an acceptable fallback. */
+  nghttp2_nv *security_headers_nv = NULL;
+  int security_headers_built = 0;
+  uint8_t security_policy = ent->val.ephash ? ent->val.ephash->apikey_auth : 0;
+  uint8_t security_ai_mode = ent->val.ephash ? ent->val.ephash->ai_gw_mode : 0;
+  if (security_ai_mode || security_policy) {
+    security_headers_nv = calloc(nheaders, sizeof(*security_headers_nv));
+    if (!security_headers_nv) {
+      if (l7_hdr_built)
+        proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
+      log_error("[AIGateway][HTTP/2] cannot allocate credential-safe header set");
+      return -1;
+    }
+    nheaders = ai_security_filter_h2_headers(headers, nheaders,
+                                             security_headers_nv, nheaders,
+                                             security_policy, security_ai_mode);
+    headers = security_headers_nv;
+    security_headers_built = 1;
+  }
+
   // Prepare data provider for request body (if present)
   nghttp2_data_provider data_prd;
   nghttp2_data_provider *data_prd_ptr = NULL;
@@ -2987,6 +3051,9 @@ h2_have_tepval:
     data_src = malloc(sizeof(h2_data_source_t));
     if (!data_src) {
       log_error("[HTTP/2] stream %d: Failed to allocate data source", stream->stream_id);
+      free(security_headers_nv);
+      if (l7_hdr_built)
+        proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
       return -1;
     }
 
@@ -3019,6 +3086,11 @@ h2_have_tepval:
     proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
     l7_headers_nv = NULL;
     l7_hdr_built = 0;
+  }
+  if (security_headers_built) {
+    free(security_headers_nv);
+    security_headers_nv = NULL;
+    security_headers_built = 0;
   }
 
   if (backend_stream_id < 0) {

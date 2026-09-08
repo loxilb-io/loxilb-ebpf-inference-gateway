@@ -953,7 +953,15 @@ pd_trt_stream_requested(const uint8_t *body, size_t body_len)
 #endif
 
 #define PD_SESSION_MAX_ENTRIES 4096
-#define PD_SESSION_DEFAULT_TTL 300  /* 5 minutes */
+#define PD_SESSION_DEFAULT_TTL 300  /* Gateway affinity idle TTL, not engine KV lifetime. */
+
+/* Keep lookup and maintenance on the same contract: zero selects the default,
+ * never unlimited retention. Positive service values are already seconds. */
+static inline uint32_t
+pd_session_effective_ttl(const proxy_epval_t *tepval)
+{
+  return tepval->pd_session_ttl_sec ? tepval->pd_session_ttl_sec : PD_SESSION_DEFAULT_TTL;
+}
 
 /* sockproxy HA state-sync emit helpers.
  *
@@ -1084,7 +1092,7 @@ pd_session_lookup(proxy_epval_t *tepval, const char *key,
   if (!tepval || !key || !key[0] || !prefill_ep || !decode_ep)
     return -1;
 
-  ttl = tepval->pd_session_ttl_sec ? tepval->pd_session_ttl_sec : PD_SESSION_DEFAULT_TTL;
+  ttl = pd_session_effective_ttl(tepval);
 
   pthread_rwlock_rdlock(&tepval->pd_session_lock);
   HASH_FIND_STR(tepval->pd_session_map, key, m);
@@ -1252,7 +1260,7 @@ pd_session_evict(proxy_epval_t *tepval)
   if (!tepval)
     return;
 
-  ttl = tepval->pd_session_ttl_sec ? tepval->pd_session_ttl_sec : PD_SESSION_DEFAULT_TTL;
+  ttl = pd_session_effective_ttl(tepval);
   now = (uint64_t)time(NULL);
 
   pthread_rwlock_wrlock(&tepval->pd_session_lock);
