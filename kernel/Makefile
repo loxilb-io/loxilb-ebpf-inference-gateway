@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
 
+.DEFAULT_GOAL := all
+
 XDP_DEPS := llb_kern_devif.c      \
             llb_kern_l2fwd.c      \
             llb_kern_l3fwd.c      \
@@ -32,9 +34,18 @@ LLC ?= llc
 CLANG ?= clang
 CC := gcc
 
+.PHONY: test_unparse_gate
+test_unparse_gate: test_unparse_gate.c llb_kern_unparse_gate.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_unparse_gate.c
+	./$@
+
 LIBBPF_DIR = ../libbpf/src/
 COMMON_DIR = ../common
 
 LDFLAGS +=  -lz 
 
 include $(COMMON_DIR)/common.mk
+
+.PHONY: test_l4_trace_helper_compat
+test_l4_trace_helper_compat: $(TC_OBJ) test_l4_trace_helper_compat.sh
+	sh ./test_l4_trace_helper_compat.sh llb_ebpf_main.o

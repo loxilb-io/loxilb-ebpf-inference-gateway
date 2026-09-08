@@ -911,6 +911,11 @@ struct proxy_fd_ent {
   int http_body_complete;
   size_t http_content_length;
   int is_streamable;  // Flag: Content can be streamed (not JSON/form-urlencoded)
+  /* Oversize JSON cannot be routed at headers-only time when the only pool is
+   * model-specific. Hold a bounded prefix until its authoritative body model
+   * is complete; acknowledge Expect locally at most once while waiting. */
+  uint8_t json_stream_route_pending;
+  uint8_t json_stream_continue_sent;
   /* F-GPU-4: outstanding request-body bytes of a STREAMED request (early
    * backend connect forwarded the headers before the body finished arriving).
    * While >0, client reads are raw-relayed to rfd[0] — they are BODY, not a

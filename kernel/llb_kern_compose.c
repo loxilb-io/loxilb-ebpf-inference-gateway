@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
  */
 
+#include "llb_kern_unparse_gate.h"
+
 #ifdef HAVE_DP_LOG_LVL_TRACE
 static void __always_inline
 dp_dump_xfi(struct xfi *xf)
@@ -1041,7 +1043,18 @@ dp_unparse_packet_always(void *ctx,  struct xfi *xf)
       }
     }
   }
-  if (xf->tm.new_tunnel_id) {
+  /* Reverse NAT normally happens in dp_unparse_packet() after a redirect has
+   * been selected.  PASS/TRAP returns before that helper, however, which is
+   * exactly what an unresolved ordinary next-hop does.  Preserve the NAT
+   * contract on that early-return path instead of leaking the backend tuple
+   * to the client (and provoking a TCP RST).
+   *
+   * Tunnel packets already need their source rewrite here, before tunnel
+   * insertion, so keep that behavior under the same gate.
+   */
+  if (dp_unparse_needs_early_snat(
+          xf->tm.new_tunnel_id, xf->pm.pipe_act,
+          LLB_PIPE_TRAP | LLB_PIPE_PASS, DP_LLB_IS_EGR(ctx))) {
     if (xf->pm.nf & LLB_NAT_SRC && xf->nm.dsr == 0) {
       if (xf->pm.rcode & (LLB_PIPE_RC_NODMAC|LLB_PIPE_RC_NH_UNK|LLB_PIPE_RC_RT_TRAP)) {
         xf->pm.pten = DP_PTEN_ALL;
