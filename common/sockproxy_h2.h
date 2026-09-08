@@ -60,6 +60,7 @@ typedef struct proxy_h2_stream {
   char path[512];                    // Request path
   char authority[256];               // :authority pseudo-header (Host)
   char content_type[128];            // Content-Type header
+  char x_api_key_raw[256];           // Per-stream gateway credential (never forwarded upstream)
 
   // Generic request header storage (for gRPC and protocol transparency)
   nghttp2_nv *request_headers;       // All request headers (malloc'd)

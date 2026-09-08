@@ -1032,7 +1032,7 @@ struct dp_proxy_tacts {
   uint8_t  chwbl_prefix_hash_level;  // CHWBL prefix hash level: 1=L1, 2=L1+L2, 3=L1+L2+L3 (replaces pad3)
   uint32_t max_stream_duration_sec;  // Max stream duration cap in seconds (0=use PROXY_SSE_HARD_CAP_SEC)
   uint32_t backend_keepalive_sec;    // Backend TCP keepalive interval (0=disabled)
-  uint32_t pd_session_ttl_sec;       // P/D session TTL in seconds (0=default 300s)
+  uint32_t pd_session_ttl_sec;       // P/D sliding idle TTL in seconds (0=default 300s)
   uint32_t kv_block_size;            // KV token block size (default 16)
   uint32_t kv_warmup_sec;           // KV warmup seconds before Tier 1.5 activates 
   uint16_t kv_zmq_port;             // KV ZMQ PUB port (default 5557)

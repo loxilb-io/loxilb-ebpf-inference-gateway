@@ -264,6 +264,15 @@ uint64_t pd_capacity_blend_score(uint32_t a, uint32_t q, uint32_t s,
 }
 
 /* ===== Include implementations ===== */
+/* Override wall time only in this standalone translation unit. The default
+ * delegates to the real clock so unrelated concurrency tests are unchanged. */
+static time_t session_test_now;
+static time_t session_test_time(time_t *out) {
+  time_t now = session_test_now ? session_test_now : time(NULL);
+  if (out) *out = now;
+  return now;
+}
+#define time session_test_time
 /* Trie must be included BEFORE sockproxy_pd.c (defines pd_trie_t type) */
 #include "sockproxy_pd_trie.c"
 #include "sockproxy_pd.c"
@@ -594,6 +603,146 @@ static int test_session_batch_evict(void) {
 }
 
 /* ===== Suite C: Integration Tests (5 cases) ===== */
+
+/* Zero means the 300s default. Literal expectations deliberately do not use
+ * the production default constant: changing it accidentally must fail tests.
+ * Clean up before assertions so expected RED does not create fixture leaks. */
+static int test_session_zero_ttl_lookup(void) {
+  for (unsigned age = 299; age <= 301; age++) {
+    proxy_epval_t ev;
+    init_cache_aware_epval(&ev, 3, 2);
+    ev.pd_session_ttl_sec = 0;
+    session_test_now = 1700000000;
+    pd_session_store(&ev, "zero-lookup", 1, 4);
+    session_test_now += age;
+    int p = -1, d = -1;
+    int rc = pd_session_lookup(&ev, "zero-lookup", &p, &d);
+    cleanup_cache_aware_epval(&ev);
+    session_test_now = 0;
+    ASSERT_EQ(rc, age <= 300 ? 0 : -1, "default lookup boundary is idle > 300s");
+    ASSERT_EQ(p, age <= 300 ? 1 : -1, "lookup only returns a live prefill hint");
+    ASSERT_EQ(d, age <= 300 ? 4 : -1, "lookup only returns a live decode hint");
+  }
+  return 1;
+}
+
+static int test_session_zero_ttl_evict(void) {
+  for (unsigned age = 299; age <= 301; age++) {
+    proxy_epval_t ev;
+    init_cache_aware_epval(&ev, 3, 2);
+    ev.pd_session_ttl_sec = 0;
+    session_test_now = 1700000000;
+    pd_session_store(&ev, "zero-evict", 1, 4);
+    session_test_now += age;
+    pd_session_evict(&ev);
+    unsigned count = HASH_COUNT(ev.pd_session_map);
+    cleanup_cache_aware_epval(&ev);
+    session_test_now = 0;
+    ASSERT_EQ(count, age <= 300 ? 1 : 0, "default eviction boundary is idle > 300s");
+  }
+  return 1;
+}
+
+static int test_session_positive_ttl_controls(void) {
+  const uint32_t ttls[] = {1, 300, 600, INT32_MAX};
+  for (unsigned i = 0; i < sizeof(ttls) / sizeof(ttls[0]); i++) {
+    for (int offset = -1; offset <= 1; offset++) {
+      for (int lookup = 0; lookup <= 1; lookup++) {
+        proxy_epval_t ev;
+        init_cache_aware_epval(&ev, 3, 2);
+        ev.pd_session_ttl_sec = ttls[i];
+        session_test_now = 1700000000;
+        pd_session_store(&ev, "positive-ttl", 1, 4);
+        session_test_now += (time_t)ttls[i] + offset;
+        int p = -1, d = -1;
+        int live;
+        if (lookup) {
+          live = pd_session_lookup(&ev, "positive-ttl", &p, &d) == 0;
+        } else {
+          pd_session_evict(&ev);
+          live = HASH_COUNT(ev.pd_session_map) == 1;
+        }
+        cleanup_cache_aware_epval(&ev);
+        session_test_now = 0;
+        ASSERT_EQ(live, offset <= 0, "positive TTL lookup and eviction honor exact override boundary");
+      }
+    }
+  }
+  return 1;
+}
+
+static int test_session_sliding_ttl_refresh(void) {
+  const uint32_t ttls[] = {0, 600};
+  for (unsigned i = 0; i < sizeof(ttls) / sizeof(ttls[0]); i++) {
+  proxy_epval_t ev;
+  init_cache_aware_epval(&ev, 3, 2);
+  ev.pd_session_ttl_sec = ttls[i];
+  session_test_now = 1700000000;
+  pd_session_store(&ev, "refresh-ttl", 1, 4);
+  pd_session_mapping_t *m = NULL;
+  HASH_FIND_STR(ev.pd_session_map, "refresh-ttl", m);
+  session_test_now += 200;
+  uint64_t start = (uint64_t)session_test_now;
+  int p = -1, d = -1;
+  int rc = pd_session_lookup(&ev, "refresh-ttl", &p, &d);
+  uint64_t refreshed = atomic_load(&m->last_access_ts);
+  session_test_now += 200;
+  pd_session_evict(&ev);
+  unsigned retained = HASH_COUNT(ev.pd_session_map);
+  pd_session_store(&ev, "refresh-ttl", 1, 4);
+  HASH_FIND_STR(ev.pd_session_map, "refresh-ttl", m);
+  uint64_t stored = atomic_load(&m->last_access_ts);
+  cleanup_cache_aware_epval(&ev);
+  session_test_now = 0;
+  ASSERT_EQ(rc, 0, "unexpired session lookup succeeds");
+  ASSERT_TRUE(refreshed == start, "successful access refreshes sliding expiry");
+  ASSERT_EQ(retained, 1, "TTL is idle time, not time since creation");
+  ASSERT_TRUE(stored == start + 200, "upsert refreshes the idle timestamp");
+  }
+  return 1;
+}
+
+static int test_session_zero_ttl_capacity_bound(void) {
+  proxy_epval_t ev;
+  init_cache_aware_epval(&ev, 3, 2);
+  ev.pd_session_ttl_sec = 0;
+  char key[64];
+  for (int i = 0; i <= PD_SESSION_MAX_ENTRIES; i++) {
+    snprintf(key, sizeof(key), "zero-capacity-%d", i);
+    pd_session_store(&ev, key, 0, 3);
+  }
+  unsigned count = HASH_COUNT(ev.pd_session_map);
+  cleanup_cache_aware_epval(&ev);
+  ASSERT_EQ(count, PD_SESSION_MAX_ENTRIES, "default TTL must preserve the memory capacity bound");
+  return 1;
+}
+
+static int test_session_ttl_without_trie(void) {
+  proxy_epval_t ev;
+  proxy_fd_ent_t pfe;
+  init_cache_aware_epval(&ev, 3, 2);
+  init_test_pfe(&pfe);
+  ev.pd_cache_aware_mode = 0;
+  ev.pd_session_ttl_sec = 0;
+  pfe.has_user_id = 1;
+  strcpy(pfe.user_id, "ttl-without-trie");
+  session_test_now = 1700000000;
+  pd_session_store(&ev, pfe.user_id, 1, 4);
+  int pre = -1;
+  int hit = pd_select_prefill(&ev, &pfe, &pre, 0);
+  int hinted_decode = pfe.pd_decode_ep_idx;
+  session_test_now += 301;
+  pfe.pd_decode_ep_idx = -1;
+  int fallback = pd_select_prefill(&ev, &pfe, &pre, 0);
+  int expired_hint = pfe.pd_decode_ep_idx;
+  cleanup_cache_aware_epval(&ev);
+  session_test_now = 0;
+  ASSERT_EQ(hit, 0, "Tier 0 works without trie affinity");
+  ASSERT_EQ(hinted_decode, 4, "Tier 0 supplies the stored pair hint");
+  ASSERT_EQ(fallback, 0, "expiry proceeds to lower-tier selection");
+  ASSERT_EQ(expired_hint, -1, "expired pair does not supply a decode hint");
+  return 1;
+}
 
 /* C1: Tier 0 session hit returns cached EP */
 static int test_select_prefill_tier0_session(void) {
@@ -1015,6 +1164,12 @@ int main(int argc, char **argv) {
   RUN_TEST(test_session_evict_key);
   RUN_TEST(test_session_upsert);
   RUN_TEST(test_session_batch_evict);
+  RUN_TEST(test_session_zero_ttl_lookup);
+  RUN_TEST(test_session_zero_ttl_evict);
+  RUN_TEST(test_session_positive_ttl_controls);
+  RUN_TEST(test_session_sliding_ttl_refresh);
+  RUN_TEST(test_session_zero_ttl_capacity_bound);
+  RUN_TEST(test_session_ttl_without_trie);
 
   printf("\nSuite C: Integration Tests\n");
   RUN_TEST(test_select_prefill_tier0_session);

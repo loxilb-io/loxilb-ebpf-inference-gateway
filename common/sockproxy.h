@@ -591,7 +591,7 @@ typedef struct proxy_epval {
   uint8_t  pd_balance_abs_threshold;   // default 3
   _Atomic uint32_t pd_tier2_rr;       // RR tie-breaker for Tier 2 min-load
   _Atomic uint32_t pd_decode_rr;      // RR tie-breaker for decode EP tie-breaking (P2 fix: TB3/TB4)
-  uint32_t pd_session_ttl_sec;         // session TTL in seconds, 0=no expiry
+  uint32_t pd_session_ttl_sec;         // P/D sliding idle TTL in seconds; 0=default 300s
   ep_load_tracker_t pd_ep_loads[MAX_PROXY_EP]; // independent of chwbl_config_t
 
   /* global-controller advisory influence. Packed per-EP atomic:
