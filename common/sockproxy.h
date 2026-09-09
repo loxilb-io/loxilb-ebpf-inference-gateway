@@ -310,7 +310,7 @@ typedef struct llm_prefix_key {
   char lora_adapter[MAX_LORA_LEN];    // LoRA adapter name
   char image_hash[MAX_HASH_LEN];      // Image content hash (vision models)
   char audio_hash[MAX_HASH_LEN];      // Audio content hash (audio models)
-  char cache_salt[MAX_SALT_LEN];      // Cache isolation salt (multi-tenant)
+  char cache_salt[MAX_SALT_LEN];      // Optional cache-key namespace input (not authentication)
   char tool_schemas_hash[MAX_HASH_LEN]; // Tool definitions hash
   
   // LEVEL 2: Session Context (optional)
@@ -324,6 +324,7 @@ typedef struct llm_prefix_key {
   uint64_t hash;   // Final computed hash
   int valid;       // 1 if extraction succeeded, 0 otherwise
   int level;       // Hash level: 1 (global), 2 (session), 3 (RAG)
+  int cache_salt_invalid; // Present but not a non-empty JSON string of at most 63 bytes
 } llm_prefix_key_t;
 
 #define MAX_CONV_ID_LEN 128
@@ -370,7 +371,7 @@ typedef struct pd_trie pd_trie_t;
 
 // P1.3: CHWBL configuration
 typedef struct chwbl_config {
-  int mean_load_factor;      // Max load = average × this factor (default: 125)
+  int mean_load_factor;      // Max load = average × this factor (default: 175)
   int prefix_char_length;    // Prefix extraction length (unused for now)
   int replication;           // Virtual nodes per endpoint (default: 256)
   ep_load_tracker_t ep_loads[MAX_PROXY_EP];
@@ -520,6 +521,7 @@ typedef struct proxy_epval {
   proxy_epstat_t ep_stats[MAX_PROXY_EP];
   
   // P1.2/P1.3: CHWBL support
+  pthread_rwlock_t chwbl_state_lock; // Guards selector, endpoints, ring and config as one generation
   chwbl_ring_t *hash_ring;      // Consistent hash ring (NULL if not CHWBL mode)
   chwbl_config_t *chwbl_config; // CHWBL configuration & load tracking
   
@@ -1405,9 +1407,14 @@ struct proxy_arg {
   uint8_t  kv_engine_type;       // 0=vllm (default), 1=sglang, 2=trtllm
   uint8_t  kv_dp_rank_count;     // SGLang DP ranks (1..8; 0 defaulted to 1 at the CGO fill)
 
-  // CHWBL prefix hash level: 0=use default(1), 1=L1 only, 2=L1+L2, 3=L1+L2+L3
-  // Populated from dp_proxy_tacts.chwbl_prefix_hash_level during proxy_add_entry
-  uint32_t chwbl_prefix_hash_level;
+  // CHWBL/WRR_HASH rule contract. These values are admission-validated by the
+  // control plane and copied verbatim through dp_proxy_tacts.
+  uint8_t  chwbl_prefix_hash_level;
+  uint8_t  chwbl_prefix_hash_flags;
+  uint8_t  chwbl_enable_cache_salt;
+  uint8_t  chwbl_pad;
+  uint16_t chwbl_mean_load_factor;
+  uint16_t chwbl_replication;
 
 #ifdef HAVE_MTLS
   // ============================================================================

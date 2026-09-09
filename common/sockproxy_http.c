@@ -2280,10 +2280,35 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * Only membership/health state is touched; the P/D trie, per-EP loads,
          * chwbl_config, session maps and locks are intentionally preserved
          * across the update (adapted from loxilb-ebpf upstream facdb93). */
+#ifdef HAVE_DP_GPU_ROUTING
+        proxy_epval_t candidate = {0};
+        proxy_epval_t retired = {0};
+        candidate.n_eps = arg->n_eps;
+        candidate._id = arg->_id;
+        candidate.select = arg->select;
+        memcpy(candidate.eps, arg->eps, sizeof(arg->eps));
+        if (chwbl_prepare_runtime(&candidate, arg, tepval) < 0) {
+          PROXY_UNLOCK();
+          log_error("sockproxy: rejected CHWBL/WRR_HASH candidate for rule %u", arg->_id);
+          return -ENOMEM;
+        }
+        pthread_rwlock_wrlock(&tepval->chwbl_state_lock);
+        retired.hash_ring = tepval->hash_ring;
+        retired.chwbl_config = tepval->chwbl_config;
+        tepval->n_eps = candidate.n_eps;
+        tepval->_id = candidate._id;
+        tepval->select = candidate.select;
+        memcpy(tepval->eps, candidate.eps, sizeof(candidate.eps));
+        tepval->hash_ring = candidate.hash_ring;
+        tepval->chwbl_config = candidate.chwbl_config;
+        pthread_rwlock_unlock(&tepval->chwbl_state_lock);
+        chwbl_release_runtime(&retired);
+#else
         tepval->n_eps = arg->n_eps;
         tepval->_id = arg->_id;
         tepval->select = arg->select;
         memcpy(tepval->eps, arg->eps, sizeof(arg->eps));
+#endif
         if (tepval->pd_disagg_enabled) {
           tepval->n_prefill_eps = 0;
           tepval->n_decode_eps = 0;
@@ -2306,6 +2331,15 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->select = arg->select;
         strncpy(tepval->host_url, arg->host_url, sizeof(tepval->host_url) - 1);
         memcpy(tepval->eps, arg->eps, sizeof(arg->eps));
+        pthread_rwlock_init(&tepval->chwbl_state_lock, NULL);
+#ifdef HAVE_DP_GPU_ROUTING
+        if (chwbl_prepare_runtime(tepval, arg, NULL) < 0) {
+          pthread_rwlock_destroy(&tepval->chwbl_state_lock);
+          free(tepval);
+          PROXY_UNLOCK();
+          return -ENOMEM;
+        }
+#endif
         
         // P6: Store composite key for hash table
         strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
@@ -2432,7 +2466,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
 #ifdef HAVE_DP_GPU_ROUTING
         // P1.2/P1.3: Initialize CHWBL structures if using CHWBL selection
-        if (tepval->select == PROXY_SEL_CHWBL) {
+        if (tepval->select == PROXY_SEL_CHWBL && !tepval->chwbl_config) {
           // Allocate and initialize CHWBL config
           tepval->chwbl_config = calloc(1, sizeof(chwbl_config_t));
           if (tepval->chwbl_config) {
@@ -2489,7 +2523,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         
 #ifdef HAVE_DP_GPU_ROUTING
         // P3.5: Initialize WRR_HASH if selection mode is WRR_HASH
-        if (tepval->select == PROXY_SEL_WRR_HASH) {
+        if (tepval->select == PROXY_SEL_WRR_HASH && !tepval->chwbl_config) {
           // Allocate CHWBL config for load tracking
           tepval->chwbl_config = calloc(1, sizeof(chwbl_config_t));
           if (tepval->chwbl_config) {
@@ -2690,6 +2724,28 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   node->val.conv_map = NULL;
   pthread_rwlock_init(&node->val.conv_lock, NULL);
 
+  /* Build the complete selector generation before registering the listener.
+   * A ring allocation/validation failure therefore cannot leave a closed fd
+   * behind in the notifier. */
+  tepval = calloc(1, sizeof(*tepval));
+  assert(tepval);
+  tepval->n_eps = arg->n_eps;
+  tepval->_id = arg->_id;
+  tepval->select = arg->select;
+  strncpy(tepval->host_url, arg->host_url, sizeof(tepval->host_url) - 1);
+  tepval->host_url[sizeof(tepval->host_url) - 1] = '\0';
+  memcpy(tepval->eps, arg->eps, sizeof(arg->eps));
+  pthread_rwlock_init(&tepval->chwbl_state_lock, NULL);
+#ifdef HAVE_DP_GPU_ROUTING
+  if (chwbl_prepare_runtime(tepval, arg, NULL) < 0) {
+    pthread_rwlock_destroy(&tepval->chwbl_state_lock);
+    free(tepval);
+    close(lsd);
+    PROXY_UNLOCK();
+    return -ENOMEM;
+  }
+#endif
+
   // Note: SNI certificates now stored globally - no per-proxy cert_map needed
   
   fd_ctx = pfe_alloc();   /* D2 root fix: pooled pfe shell + heap rcvbuf */
@@ -2711,6 +2767,12 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport));
     PROXY_UNLOCK();
     close(lsd);
+#ifdef HAVE_DP_GPU_ROUTING
+    chwbl_release_runtime(tepval);
+#endif
+    pthread_rwlock_destroy(&tepval->chwbl_state_lock);
+    free(tepval);
+    pfe_recycle(fd_ctx);
     if (node->val.ssl_ctx) {
       SSL_CTX_free(node->val.ssl_ctx);
       node->val.ssl_ctx = NULL;
@@ -2719,15 +2781,6 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   }
   fd_ctx->used++;
 
-  tepval = calloc(1, sizeof(*tepval));
-  assert(tepval);
-  tepval->n_eps = arg->n_eps;
-  tepval->_id = arg->_id;
-  tepval->select = arg->select;
-  strncpy(tepval->host_url, arg->host_url, sizeof(tepval->host_url) - 1);
-  tepval->host_url[sizeof(tepval->host_url) - 1] = '\0';
-  memcpy(tepval->eps, arg->eps, sizeof(arg->eps));
-  
   // P6: Build composite key based on path_prefix and model_name configuration
   char ephash_key[512];
   build_ephash_key(ephash_key, sizeof(ephash_key),
@@ -2861,7 +2914,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
 #ifdef HAVE_DP_GPU_ROUTING
   // P1.2/P1.3: Initialize CHWBL structures if using CHWBL selection
-  if (tepval->select == PROXY_SEL_CHWBL) {
+  if (tepval->select == PROXY_SEL_CHWBL && !tepval->chwbl_config) {
     // Allocate and initialize CHWBL config
     tepval->chwbl_config = calloc(1, sizeof(chwbl_config_t));
     if (tepval->chwbl_config) {
@@ -2919,7 +2972,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   
 #ifdef HAVE_DP_GPU_ROUTING
   // P3.5: Initialize WRR_HASH if selection mode is WRR_HASH (second location)
-  if (tepval->select == PROXY_SEL_WRR_HASH) {
+  if (tepval->select == PROXY_SEL_WRR_HASH && !tepval->chwbl_config) {
     // Allocate CHWBL config for load tracking
     tepval->chwbl_config = calloc(1, sizeof(chwbl_config_t));
     if (tepval->chwbl_config) {
@@ -5227,7 +5280,7 @@ cleanup_expired_sessions(void)
         if (fd_ent->epv && fd_ent->ep_num >= 0) {
           proxy_epval_t *epv = (proxy_epval_t *)fd_ent->epv;
           if ((epv->select == PROXY_SEL_CHWBL || epv->select == PROXY_SEL_WRR_HASH) && epv->chwbl_config) {
-            chwbl_dec_load(epv->chwbl_config, fd_ent->ep_num);
+            chwbl_dec_runtime(epv, fd_ent->ep_num);
             log_debug("CHWBL/WRR_HASH: Decremented load for expired session on EP%d", fd_ent->ep_num);
           }
         }
@@ -6077,7 +6130,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       // Connection was established but failed to get socket metadata
       if (tepval && ep_num >= 0) {
         if ((tepval->select == PROXY_SEL_CHWBL || tepval->select == PROXY_SEL_WRR_HASH) && tepval->chwbl_config) {
-          chwbl_dec_load(tepval->chwbl_config, ep_num);
+          chwbl_dec_runtime(tepval, ep_num);
           log_debug("CHWBL/WRR_HASH: Decremented load for EP%d after skmap key extraction failure", ep_num);
         }
       }
@@ -6274,7 +6327,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       if (npfe1->epv && npfe1->ep_num >= 0) {
         proxy_epval_t *epv = (proxy_epval_t *)npfe1->epv;
         if ((epv->select == PROXY_SEL_CHWBL || epv->select == PROXY_SEL_WRR_HASH) && epv->chwbl_config) {
-          chwbl_dec_load(epv->chwbl_config, npfe1->ep_num);
+          chwbl_dec_runtime(epv, npfe1->ep_num);
           log_debug("CHWBL/WRR_HASH: Decremented load for EP%d after notify registration failure", npfe1->ep_num);
         }
       }
@@ -9082,7 +9135,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               if ((old_epv->select == PROXY_SEL_CHWBL ||
                    old_epv->select == PROXY_SEL_WRR_HASH) &&
                   old_epv->chwbl_config) {
-                chwbl_dec_load(old_epv->chwbl_config, pfe->ep_num);
+                chwbl_dec_runtime(old_epv, pfe->ep_num);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
                 log_debug("[CHWBL_KEEPALIVE_DEC] fd=%d ep=%d: decremented stale"
                           " active_conns before keep-alive re-select",

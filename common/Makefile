@@ -433,6 +433,17 @@ test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h xxhas
 test_usage: test_usage_extract
 	./test_usage_extract
 
+# S07: exact CHWBL/WRR_HASH ring geometry and five-field runtime contract.
+test_chwbl_contract: test_chwbl_contract.c sockproxy_lb.c sockproxy_lb.h sockproxy_json.c sockproxy_json.h
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -c -o sockproxy_lb_chwbl_test.o sockproxy_lb.c
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -c -o test_chwbl_contract.o test_chwbl_contract.c
+	$(CC) -o $@ test_chwbl_contract.o sockproxy_lb_chwbl_test.o \
+		-Wl,--gc-sections -lpthread
+
+.PHONY: test_chwbl
+test_chwbl: test_chwbl_contract
+	./test_chwbl_contract
+
 # Oversize JSON stream fallback: local Expect acknowledgement/removal and
 # byte-exact body/remaining accounting helpers.
 test_stream_fallback: test_stream_fallback.c sockproxy_stream_fallback.h

@@ -251,195 +251,224 @@ static int compare_vnodes(const void *a, const void *b)
   return 0;
 }
 
-// P1.2: Build consistent hash ring with virtual nodes
-int chwbl_build_ring(proxy_epval_t *epv, int replication)
+static chwbl_ring_t *
+chwbl_alloc_ring(int n_eps, int n_vnodes, int replication)
 {
-  int i, j, idx;
+  chwbl_ring_t *ring;
+
+  if (n_eps <= 0 || n_eps > MAX_PROXY_EP || n_vnodes <= 0 ||
+      (size_t)n_vnodes > SIZE_MAX / sizeof(chwbl_vnode_t))
+    return NULL;
+
+  ring = calloc(1, sizeof(*ring));
+  if (!ring)
+    return NULL;
+  ring->vnodes = calloc((size_t)n_vnodes, sizeof(*ring->vnodes));
+  if (!ring->vnodes) {
+    free(ring);
+    return NULL;
+  }
+  ring->n_eps = n_eps;
+  ring->n_vnodes = n_vnodes;
+  ring->replication = replication;
+  pthread_rwlock_init(&ring->lock, NULL);
+  return ring;
+}
+
+chwbl_ring_t *
+chwbl_create_ring(const proxy_epval_t *epv, int replication)
+{
   char vnode_key[128];
-  
-  if (!epv || epv->n_eps <= 0) {
-    log_error("Invalid arguments for hash ring build");
-    return -1;
-  }
-  
-  // Allocate ring structure
-  epv->hash_ring = calloc(1, sizeof(chwbl_ring_t));
-  if (!epv->hash_ring) {
-    log_error("Failed to allocate hash ring");
-    return -1;
-  }
-  
-  epv->hash_ring->replication = replication;
-  epv->hash_ring->n_eps = epv->n_eps;
-  epv->hash_ring->n_vnodes = epv->n_eps * replication;
-  pthread_rwlock_init(&epv->hash_ring->lock, NULL);
-  
-  // Allocate virtual nodes array
-  epv->hash_ring->vnodes = calloc(epv->hash_ring->n_vnodes, 
-                                   sizeof(chwbl_vnode_t));
-  if (!epv->hash_ring->vnodes) {
-    log_error("Failed to allocate vnodes");
-    free(epv->hash_ring);
-    epv->hash_ring = NULL;
-    return -1;
-  }
-  
-  // Create virtual nodes for each physical endpoint
-  idx = 0;
-  for (i = 0; i < epv->n_eps; i++) {
-    for (j = 0; j < replication; j++) {
-      // Generate unique key for each virtual node
-      // Format: "endpoint_IP:port#replica_number"
+  chwbl_ring_t *ring;
+  size_t total;
+  int idx = 0;
+
+  if (!epv || epv->n_eps <= 0 || epv->n_eps > MAX_PROXY_EP ||
+      replication <= 0 || (size_t)epv->n_eps > SIZE_MAX / (size_t)replication)
+    return NULL;
+  total = (size_t)epv->n_eps * (size_t)replication;
+  if (total > INT32_MAX)
+    return NULL;
+  ring = chwbl_alloc_ring(epv->n_eps, (int)total, replication);
+  if (!ring)
+    return NULL;
+
+  for (int i = 0; i < epv->n_eps; i++) {
+    for (int j = 0; j < replication; j++) {
       snprintf(vnode_key, sizeof(vnode_key), "%u:%u#%d",
                epv->eps[i].xip, epv->eps[i].xport, j);
-      
-      // FIX #2: Add random seed to break sequential IP clustering
-      // Use prime number (7919) to ensure good distribution
-      epv->hash_ring->vnodes[idx].hash = XXH64(vnode_key, strlen(vnode_key), 
-                                                0xDEADBEEF + (i * 7919));
-      epv->hash_ring->vnodes[idx].ep_idx = i;
-      idx++;
+      ring->vnodes[idx].hash = XXH64(vnode_key, strlen(vnode_key),
+                                     0xDEADBEEF + (i * 7919));
+      ring->vnodes[idx++].ep_idx = i;
     }
   }
-  
-  // Sort virtual nodes by hash value for binary search
-  qsort(epv->hash_ring->vnodes, epv->hash_ring->n_vnodes,
-        sizeof(chwbl_vnode_t), compare_vnodes);  
-  
+  qsort(ring->vnodes, ring->n_vnodes, sizeof(*ring->vnodes), compare_vnodes);
+  return ring;
+}
+
+int chwbl_build_ring(proxy_epval_t *epv, int replication)
+{
+  chwbl_ring_t *candidate = chwbl_create_ring(epv, replication);
+  if (!candidate)
+    return -1;
+  epv->hash_ring = candidate;
   return 0;
 }
 
-// P3.5: Build weighted consistent hash ring with weight-proportional virtual nodes
-// This allocates vnodes proportionally to endpoint weights for heterogeneous server capacity
-// Example: weights [50, 30, 20] with 256 total vnodes → [128, 77, 51] vnodes per endpoint
-int chwbl_build_weighted_ring(proxy_epval_t *epv)
+/* Weighted ring geometry uses an exact total budget. Every active positive-
+ * weight endpoint first receives one vnode; the remainder is distributed by
+ * largest remainder with endpoint order as the deterministic tie breaker. */
+chwbl_ring_t *
+chwbl_create_weighted_ring(const proxy_epval_t *epv, int budget)
 {
-  int i, j, idx;
+  uint64_t total_weight = 0;
+  uint64_t remainder[MAX_PROXY_EP] = {0};
+  int allocation[MAX_PROXY_EP] = {0};
+  int positive = 0, allocated = 0, idx = 0;
   char vnode_key[128];
-  const int TOTAL_VNODES = 256;  // Global constant for all hash ring modes
-  
-  if (!epv || epv->n_eps <= 0) {
-    log_error("WRR_HASH: Invalid arguments for weighted hash ring build");
-    return -1;
-  }
-  
-  // Allocate ring structure
-  epv->hash_ring = calloc(1, sizeof(chwbl_ring_t));
-  if (!epv->hash_ring) {
-    log_error("WRR_HASH: Failed to allocate hash ring");
-    return -1;
-  }
-  
-  epv->hash_ring->n_eps = epv->n_eps;
-  pthread_rwlock_init(&epv->hash_ring->lock, NULL);
-  
-  // Calculate total weight (sum of all endpoint weights)
-  int total_weight = 0;
-  for (i = 0; i < epv->n_eps; i++) {
-    int weight = epv->eps[i].weight ? epv->eps[i].weight : 1;  // Default weight = 1
-    total_weight += weight;
-  }
-  
-  if (total_weight == 0) {
-    log_error("WRR_HASH: Total weight is zero, using equal distribution");
-    total_weight = epv->n_eps;  // Fallback to equal weights
-  }
-  
-  // Allocate vnodes array (max TOTAL_VNODES)
-  epv->hash_ring->vnodes = calloc(TOTAL_VNODES, sizeof(chwbl_vnode_t));
-  if (!epv->hash_ring->vnodes) {
-    log_error("WRR_HASH: Failed to allocate vnodes");
-    free(epv->hash_ring);
-    epv->hash_ring = NULL;
-    return -1;
-  }
-  
-  // Allocate vnodes proportionally to weights
-  idx = 0;
-  int vnodes_allocated[MAX_PROXY_EP] = {0};  // Track allocation per endpoint
-  
-  for (i = 0; i < epv->n_eps && idx < TOTAL_VNODES; i++) {
-    int weight = epv->eps[i].weight ? epv->eps[i].weight : 1;
-    
-    // Calculate proportional vnodes: (TOTAL_VNODES * weight) / total_weight
-    int num_vnodes = (TOTAL_VNODES * weight) / total_weight;
-    
-    // Ensure at least 1 vnode per active endpoint (for availability)
-    if (num_vnodes == 0 && epv->eps[i].inv == 0) {
-      num_vnodes = 1;
+  chwbl_ring_t *ring;
+
+  if (!epv || epv->n_eps <= 0 || epv->n_eps > MAX_PROXY_EP || budget <= 0)
+    return NULL;
+  for (int i = 0; i < epv->n_eps; i++) {
+    if (epv->eps[i].inv == 0 && epv->eps[i].weight > 0) {
+      positive++;
+      total_weight += (uint64_t)epv->eps[i].weight;
     }
-    
-    vnodes_allocated[i] = num_vnodes;
-    
-    // Generate virtual nodes for this endpoint
-    for (j = 0; j < num_vnodes && idx < TOTAL_VNODES; j++) {
-      // Generate unique key for each virtual node
-      // Format: "endpoint_IP:port#replica_number"
+  }
+  if (positive == 0 || budget < positive || total_weight == 0)
+    return NULL;
+
+  int distributable = budget - positive;
+  for (int i = 0; i < epv->n_eps; i++) {
+    if (epv->eps[i].inv != 0 || epv->eps[i].weight <= 0)
+      continue;
+    uint64_t product = (uint64_t)distributable * (uint64_t)epv->eps[i].weight;
+    allocation[i] = 1 + (int)(product / total_weight);
+    remainder[i] = product % total_weight;
+    allocated += allocation[i];
+  }
+  while (allocated < budget) {
+    int best = -1;
+    for (int i = 0; i < epv->n_eps; i++) {
+      if (epv->eps[i].inv != 0 || epv->eps[i].weight <= 0)
+        continue;
+      if (best < 0 || remainder[i] > remainder[best])
+        best = i;
+    }
+    if (best < 0)
+      return NULL;
+    allocation[best]++;
+    remainder[best] = 0;
+    allocated++;
+  }
+
+  ring = chwbl_alloc_ring(epv->n_eps, budget, budget);
+  if (!ring)
+    return NULL;
+  for (int i = 0; i < epv->n_eps; i++) {
+    for (int j = 0; j < allocation[i]; j++) {
       snprintf(vnode_key, sizeof(vnode_key), "%u:%u#%d",
                epv->eps[i].xip, epv->eps[i].xport, j);
-      
-      // Use XXH64 with seed to generate hash (same as CHWBL)
-      // Add prime number (7919) to break sequential IP clustering
-      epv->hash_ring->vnodes[idx].hash = XXH64(vnode_key, strlen(vnode_key), 
-                                                0xDEADBEEF + (i * 7919));
-      epv->hash_ring->vnodes[idx].ep_idx = i;
-      idx++;
+      ring->vnodes[idx].hash = XXH64(vnode_key, strlen(vnode_key),
+                                     0xDEADBEEF + (i * 7919));
+      ring->vnodes[idx++].ep_idx = i;
     }
   }
-  
-  // Handle rounding errors: distribute remaining vnodes to endpoints with highest weights
-  int remaining = TOTAL_VNODES - idx;
-  if (remaining > 0) {
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-    log_debug("WRR_HASH: Distributing %d remaining vnodes due to rounding", remaining);
-#endif
-    for (i = 0; i < epv->n_eps && remaining > 0 && idx < TOTAL_VNODES; i++) {
-      // Skip inactive endpoints
-      if (epv->eps[i].inv != 0) continue;
-      
-      // Add one more vnode
-      snprintf(vnode_key, sizeof(vnode_key), "%u:%u#extra_%d",
-               epv->eps[i].xip, epv->eps[i].xport, remaining);
-      epv->hash_ring->vnodes[idx].hash = XXH64(vnode_key, strlen(vnode_key), 
-                                                0xDEADBEEF + (i * 7919) + remaining);
-      epv->hash_ring->vnodes[idx].ep_idx = i;
-      idx++;
-      remaining--;
-      vnodes_allocated[i]++;
-    }
-  }
-  
-  epv->hash_ring->n_vnodes = idx;
-  epv->hash_ring->replication = idx;  // Store actual total for consistency
-  
-  // Sort virtual nodes by hash value for binary search
-  qsort(epv->hash_ring->vnodes, epv->hash_ring->n_vnodes,
-        sizeof(chwbl_vnode_t), compare_vnodes);
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-  // Log vnode allocation for debugging
-  log_info("WRR_HASH: Built weighted ring with %d vnodes for %d endpoints",
-           epv->hash_ring->n_vnodes, epv->n_eps);
-  for (i = 0; i < epv->n_eps; i++) {
-    log_debug("WRR_HASH:   EP%d (weight=%d): %d vnodes (%.1f%%)",
-              i, epv->eps[i].weight ? epv->eps[i].weight : 1,
-              vnodes_allocated[i],
-              (100.0 * vnodes_allocated[i]) / epv->hash_ring->n_vnodes);
-  }
-  
-  // Log first/last few vnodes to see distribution
-  log_debug("WRR_HASH: First 5 vnodes:");
-  for (i = 0; i < 5 && i < epv->hash_ring->n_vnodes; i++) {
-    log_debug("  [%d]: hash=0x%016lx → EP%d", i, 
-              epv->hash_ring->vnodes[i].hash, epv->hash_ring->vnodes[i].ep_idx);
-  }
-  log_debug("WRR_HASH: Last 5 vnodes:");
-  for (i = epv->hash_ring->n_vnodes - 5; i < epv->hash_ring->n_vnodes && i >= 0; i++) {
-    log_debug("  [%d]: hash=0x%016lx → EP%d", i, 
-              epv->hash_ring->vnodes[i].hash, epv->hash_ring->vnodes[i].ep_idx);
-  }
-#endif
-  
+  qsort(ring->vnodes, ring->n_vnodes, sizeof(*ring->vnodes), compare_vnodes);
+  return ring;
+}
+
+int chwbl_build_weighted_ring(proxy_epval_t *epv)
+{
+  int budget = epv && epv->chwbl_config ? epv->chwbl_config->replication : 0;
+  chwbl_ring_t *candidate = chwbl_create_weighted_ring(epv, budget);
+  if (!candidate)
+    return -1;
+  epv->hash_ring = candidate;
   return 0;
+}
+
+int
+chwbl_prepare_runtime(proxy_epval_t *candidate, const proxy_arg_t *arg,
+                      const proxy_epval_t *previous)
+{
+  chwbl_config_t *config;
+
+  if (!candidate || !arg)
+    return -1;
+  candidate->hash_ring = NULL;
+  candidate->chwbl_config = NULL;
+  if (candidate->select != PROXY_SEL_CHWBL &&
+      candidate->select != PROXY_SEL_WRR_HASH)
+    return 0;
+  if (candidate->n_eps <= 0 || candidate->n_eps > MAX_PROXY_EP)
+    return -1;
+
+  config = calloc(1, sizeof(*config));
+  if (!config)
+    return -1;
+  config->prefix_hash_level = arg->chwbl_prefix_hash_level ?
+                              arg->chwbl_prefix_hash_level : 1;
+  config->prefix_hash_flags = arg->chwbl_prefix_hash_flags;
+  config->mean_load_factor = arg->chwbl_mean_load_factor ?
+                             arg->chwbl_mean_load_factor : 175;
+  config->replication = arg->chwbl_replication ? arg->chwbl_replication : 256;
+  config->enable_cache_salt = arg->chwbl_enable_cache_salt ? 1 : 0;
+  uint32_t level_mask = 0x1f;
+  if (config->prefix_hash_level >= 2)
+    level_mask |= PREFIX_HAS_SESSION_CTX;
+  if (config->prefix_hash_level >= 3)
+    level_mask |= PREFIX_HAS_RAG_TEMPLATE | PREFIX_HAS_RAG_DOC_IDS;
+  if (config->prefix_hash_level < 1 || config->prefix_hash_level > 3 ||
+      config->mean_load_factor < 100 || config->mean_load_factor > 300 ||
+      config->replication < 1 || config->replication > 1024 ||
+      (config->prefix_hash_flags && (config->prefix_hash_flags & ~level_mask)) ||
+      (config->enable_cache_salt && config->prefix_hash_flags &&
+       !(config->prefix_hash_flags & PREFIX_HAS_CACHE_SALT))) {
+    free(config);
+    return -1;
+  }
+
+  for (int i = 0; i < candidate->n_eps; i++) {
+    uint32_t active = 0, requests = 0;
+    if (previous && previous->chwbl_config) {
+      for (int j = 0; j < previous->n_eps; j++) {
+        if (candidate->eps[i].xip == previous->eps[j].xip &&
+            candidate->eps[i].xport == previous->eps[j].xport) {
+          active = atomic_load(&previous->chwbl_config->ep_loads[j].active_conns);
+          requests = atomic_load(&previous->chwbl_config->ep_loads[j].total_requests);
+          break;
+        }
+      }
+    }
+    atomic_init(&config->ep_loads[i].active_conns, active);
+    atomic_init(&config->ep_loads[i].total_requests, requests);
+    config->ep_loads[i].last_update_ts = time(NULL);
+    config->ep_loads[i].ep_available = candidate->eps[i].inv == 0;
+  }
+  candidate->chwbl_config = config;
+  candidate->hash_ring = candidate->select == PROXY_SEL_CHWBL ?
+      chwbl_create_ring(candidate, config->replication) :
+      chwbl_create_weighted_ring(candidate, config->replication);
+  if (!candidate->hash_ring) {
+    free(config);
+    candidate->chwbl_config = NULL;
+    return -1;
+  }
+  return 0;
+}
+
+void
+chwbl_release_runtime(proxy_epval_t *epv)
+{
+  if (!epv)
+    return;
+  if (epv->hash_ring)
+    chwbl_destroy_ring(epv->hash_ring);
+  free(epv->chwbl_config);
+  epv->hash_ring = NULL;
+  epv->chwbl_config = NULL;
 }
 
 // P1.2: Lookup endpoint in hash ring (clockwise search)
@@ -496,6 +525,7 @@ int chwbl_select_endpoint(chwbl_ring_t *ring, chwbl_config_t *config,
                                    uint64_t hash, proxy_epval_t *tepval,
                                    int *selected_ep, int skip_load_balance)
 {
+  (void)skip_load_balance;
   if (!ring || !config || !tepval || !selected_ep) {
     return -1;
   }
@@ -520,15 +550,13 @@ int chwbl_select_endpoint(chwbl_ring_t *ring, chwbl_config_t *config,
     }
   }
   
-  // 3. Check load bounds with proper rounding to avoid premature spillover
-  //    SKIP when skip_load_balance=1: content-based prefix_hash routing for KV cache
-  //    locality must not be overridden by bounded load — let the backend queue handle
-  //    concurrency. Only health-based failover applies in strict hash mode.
+  // 3. Check the FUTURE load (including this request). Hashed traffic never
+  // bypasses the configured bounded-load policy.
   uint32_t max_load = UINT32_MAX;  // default: no spillover
   uint32_t current_load = atomic_load(&config->ep_loads[initial_ep].active_conns);
   int sel = initial_ep;
 
-  if (!skip_load_balance) {
+  {
     uint32_t total_load = 0;
     for (int i = 0; i < tepval->n_eps; i++) {
       total_load += atomic_load(&config->ep_loads[i].active_conns);
@@ -545,19 +573,14 @@ int chwbl_select_endpoint(chwbl_ring_t *ring, chwbl_config_t *config,
     //   2 EPs, total=0: avg=0, max=max(1, 2) = 2 (allow some initial imbalance)
     //   2 EPs, total=2: avg=1, max=ceil(1*1.75) = 2 (allow 25% imbalance)
     //   2 EPs, total=4: avg=2, max=ceil(2*1.75) = 3 (allow 3 on one EP)
-    uint32_t avg_load = (tepval->n_eps > 0) ? (total_load / tepval->n_eps) : 0;
+    uint64_t future_total = (uint64_t)total_load + 1;
+    uint64_t denominator = (uint64_t)tepval->n_eps * 100;
+    max_load = (uint32_t)((future_total * config->mean_load_factor + denominator - 1) /
+                          denominator);
+    if (max_load < 1)
+      max_load = 1;
     
-    // Calculate max with ceiling: ceil(avg * factor) = (avg * factor + 99) / 100
-    max_load = (avg_load * config->mean_load_factor + 99) / 100;
-    
-    // Minimum bound: Allow at least 1 connection, or n_eps connections total
-    // This prevents spurious spillover at low load (e.g., first connection)
-    uint32_t min_bound = (total_load < tepval->n_eps) ? tepval->n_eps : 1;
-    if (max_load < min_bound) {
-      max_load = min_bound;
-    }
-    
-    if (current_load >= max_load) {
+    if ((uint64_t)current_load + 1 > max_load) {
       log_debug("CHWBL: EP%d at max load (%u/%u), probing alternatives",
                 initial_ep, current_load, max_load);
       
@@ -613,6 +636,7 @@ int wrr_hash_select_endpoint(chwbl_ring_t *ring, chwbl_config_t *config,
                                      uint64_t hash, proxy_epval_t *tepval,
                                      int *selected_ep, int skip_load_balance)
 {
+  (void)skip_load_balance;
   if (!ring || !config || !tepval || !selected_ep) {
     log_error("WRR_HASH: Invalid arguments (NULL pointer)");
     return -1;
@@ -656,32 +680,26 @@ int wrr_hash_select_endpoint(chwbl_ring_t *ring, chwbl_config_t *config,
     }
   }
   
-  // 3. Check load bounds (same formula as CHWBL for consistency)
-  //    SKIP when skip_load_balance=1: strict prefix_hash routing must not be
-  //    overridden by bounded load for KV cache locality in LLM serving.
+  // 3. Check the future load. Content hashes are not exempt from bounds.
   uint32_t max_load = UINT32_MAX;  // default: no spillover
   uint32_t current_load = atomic_load(&config->ep_loads[initial_ep].active_conns);
   int sel = initial_ep;
 
-  if (!skip_load_balance) {
+  {
     uint32_t total_load = 0;
     for (int i = 0; i < tepval->n_eps; i++) {
       total_load += atomic_load(&config->ep_loads[i].active_conns);
     }
     
-    // Calculate max_load with ceiling: ceil(avg * factor) = (avg * factor + 99) / 100
-    // load_factor = mean_load_factor / 100 (default: 175 → 1.75x average)
-    uint32_t avg_load = (tepval->n_eps > 0) ? (total_load / tepval->n_eps) : 0;
-    max_load = (avg_load * config->mean_load_factor + 99) / 100;
-    
-    // Minimum bound: Allow at least 1 connection, or n_eps connections total
-    uint32_t min_bound = (total_load < tepval->n_eps) ? tepval->n_eps : 1;
-    if (max_load < min_bound) {
-      max_load = min_bound;
-    }
+    uint64_t future_total = (uint64_t)total_load + 1;
+    uint64_t denominator = (uint64_t)tepval->n_eps * 100;
+    max_load = (uint32_t)((future_total * config->mean_load_factor + denominator - 1) /
+                          denominator);
+    if (max_load < 1)
+      max_load = 1;
     
     // 4. If initial endpoint is overloaded, probe alternative
-    if (current_load >= max_load) {
+    if ((uint64_t)current_load + 1 > max_load) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("WRR_HASH: EP%d at max load (%u/%u), probing alternatives",
                 initial_ep, current_load, max_load);
@@ -769,6 +787,95 @@ void chwbl_dec_load(chwbl_config_t *config, int ep_idx)
   }
   
   config->ep_loads[ep_idx].last_update_ts = time(NULL);
+}
+
+int
+chwbl_select_runtime(proxy_epval_t *epv, uint64_t hash, int *selected_ep)
+{
+  int rc = -1;
+  if (!epv)
+    return -1;
+  pthread_rwlock_rdlock(&epv->chwbl_state_lock);
+  if (epv->select == PROXY_SEL_CHWBL)
+    rc = chwbl_select_endpoint(epv->hash_ring, epv->chwbl_config, hash,
+                               epv, selected_ep, 0);
+  else if (epv->select == PROXY_SEL_WRR_HASH)
+    rc = wrr_hash_select_endpoint(epv->hash_ring, epv->chwbl_config, hash,
+                                  epv, selected_ep, 0);
+  pthread_rwlock_unlock(&epv->chwbl_state_lock);
+  return rc;
+}
+
+int
+chwbl_apply_hash_policy(const chwbl_config_t *config, llm_prefix_key_t *key)
+{
+  uint32_t level_mask = 0x1f;
+  if (!config || !key)
+    return -1;
+  /* Salt admission is independent of prefix extraction. Otherwise a malformed
+   * salt or a required-but-missing salt could bypass the local 400 by taking
+   * the ordinary no-prefix fallback path. */
+  if (key->cache_salt_invalid)
+    return -2;
+  if (config->enable_cache_salt && !(key->flags & PREFIX_HAS_CACHE_SALT))
+    return -2;
+  if (!key->valid)
+    return -1;
+  if (config->prefix_hash_level >= 2)
+    level_mask |= PREFIX_HAS_SESSION_CTX;
+  if (config->prefix_hash_level >= 3)
+    level_mask |= PREFIX_HAS_RAG_TEMPLATE | PREFIX_HAS_RAG_DOC_IDS;
+  key->level = config->prefix_hash_level;
+  key->flags &= config->prefix_hash_flags ? config->prefix_hash_flags : level_mask;
+  return 0;
+}
+
+int
+chwbl_hash_and_select_runtime(proxy_epval_t *epv, llm_prefix_key_t *key,
+                              int *selected_ep)
+{
+  int rc;
+  if (!epv)
+    return -1;
+  pthread_rwlock_rdlock(&epv->chwbl_state_lock);
+  rc = chwbl_apply_hash_policy(epv->chwbl_config, key);
+  if (rc == 0) {
+    key->hash = compute_prefix_hash(key);
+    if (epv->select == PROXY_SEL_CHWBL)
+      rc = chwbl_select_endpoint(epv->hash_ring, epv->chwbl_config, key->hash,
+                                 epv, selected_ep, 0);
+    else if (epv->select == PROXY_SEL_WRR_HASH)
+      rc = wrr_hash_select_endpoint(epv->hash_ring, epv->chwbl_config, key->hash,
+                                    epv, selected_ep, 0);
+    else
+      rc = -1;
+  }
+  pthread_rwlock_unlock(&epv->chwbl_state_lock);
+  return rc;
+}
+
+void
+chwbl_dec_runtime(proxy_epval_t *epv, int ep_idx)
+{
+  if (!epv)
+    return;
+  pthread_rwlock_rdlock(&epv->chwbl_state_lock);
+  if ((epv->select == PROXY_SEL_CHWBL || epv->select == PROXY_SEL_WRR_HASH) &&
+      epv->chwbl_config)
+    chwbl_dec_load(epv->chwbl_config, ep_idx);
+  pthread_rwlock_unlock(&epv->chwbl_state_lock);
+}
+
+void
+chwbl_inc_runtime(proxy_epval_t *epv, int ep_idx)
+{
+  if (!epv || ep_idx < 0 || ep_idx >= MAX_PROXY_EP)
+    return;
+  pthread_rwlock_rdlock(&epv->chwbl_state_lock);
+  if ((epv->select == PROXY_SEL_CHWBL || epv->select == PROXY_SEL_WRR_HASH) &&
+      epv->chwbl_config)
+    atomic_fetch_add(&epv->chwbl_config->ep_loads[ep_idx].active_conns, 1);
+  pthread_rwlock_unlock(&epv->chwbl_state_lock);
 }
 
 // P1.3: PRODUCTION: Validate CHWBL load counter consistency

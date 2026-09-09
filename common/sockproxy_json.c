@@ -925,7 +925,7 @@ int extract_llm_prefix(const char *json_body, size_t len,
 {
   jsmn_parser parser;
   jsmntok_t tokens[2048];  // Increased from 512 to handle large system prompts
-  int r, i;
+  int r, i, pair;
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
   char first_user[MAX_PREFIX_LEN] = {0};
   int has_first_user = 0;
@@ -952,6 +952,31 @@ int extract_llm_prefix(const char *json_body, size_t len,
               r, r > 0 ? tokens[0].type : -1);
     return -1;  // Non-fatal
   }
+
+  /* cache_salt is a top-level request contract. Scan direct object pairs
+   * separately so a nested field cannot satisfy the requirement, and reject
+   * duplicate declarations as ambiguous instead of letting one silently win. */
+  int cache_salt_seen = 0;
+  i = 1;
+  for (pair = 0; pair < tokens[0].size && i + 1 < r; pair++) {
+    if (tokens[i].type == JSMN_STRING &&
+        jsoneq(json_body, &tokens[i], "cache_salt") == 0) {
+      int salt_len = tokens[i + 1].end - tokens[i + 1].start;
+      if (cache_salt_seen || tokens[i + 1].type != JSMN_STRING ||
+          salt_len <= 0 || salt_len >= MAX_SALT_LEN) {
+        prefix_key->cache_salt_invalid = 1;
+        prefix_key->flags &= ~PREFIX_HAS_CACHE_SALT;
+      } else {
+        json_extract_string(json_body, &tokens[i + 1],
+                            prefix_key->cache_salt,
+                            sizeof(prefix_key->cache_salt));
+        prefix_key->flags |= PREFIX_HAS_CACHE_SALT;
+      }
+      cache_salt_seen = 1;
+    }
+    i++;
+    i += jsmn_subtree_count(tokens, i, r);
+  }
   
   // FIRST PASS: Extract model and lora_adapter (top-level fields)
   for (i = 1; i < r; ) {
@@ -977,18 +1002,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
       }
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[EXTRACT_L1] Found lora_adapter: '%s'", prefix_key->lora_adapter);
-#endif
-      i += 2;
-      continue;
-    }
-    else if (jsoneq(json_body, &tokens[i], "cache_salt") == 0) {
-      json_extract_string(json_body, &tokens[i+1],
-                         prefix_key->cache_salt, sizeof(prefix_key->cache_salt));
-      if (prefix_key->cache_salt[0] != '\0') {
-        prefix_key->flags |= PREFIX_HAS_CACHE_SALT;
-      }
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-      log_debug("[EXTRACT_L1] Found cache_salt: '%s'", prefix_key->cache_salt);
 #endif
       i += 2;
       continue;

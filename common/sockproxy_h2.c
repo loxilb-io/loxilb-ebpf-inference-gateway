@@ -27,6 +27,7 @@
 #include "sockproxy.h"
 #include "sockproxy_ai_security.h"
 #include "sockproxy_json.h"
+#include "sockproxy_lb.h"
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "notify.h"
 #include "log.h"
@@ -2570,7 +2571,8 @@ h2_have_tepval:
   // CHWBL PHASE 1: Extract LLM prefix from JSON request body
   // Mirrors HTTP/1.1 implementation in sockproxy.c:7000-7020
   // ============================================================================
-  if (pfe->seltype == PROXY_SEL_CHWBL && 
+  if ((tepval->select == PROXY_SEL_CHWBL ||
+       tepval->select == PROXY_SEL_WRR_HASH) &&
       stream->data_len > 0 && 
       stream->data_buf &&
       stream->prefix_key == NULL) {  // Only extract once per stream
@@ -2578,7 +2580,7 @@ h2_have_tepval:
     // Check if content-type is application/json (case-insensitive)
     int is_json = 0;
     if (stream->content_type[0] != '\0') {
-      is_json = (strcasestr(stream->content_type, "application/json") != NULL);
+      is_json = (strncasecmp(stream->content_type, "application/json", 16) == 0);
     }
     
     if (is_json) {
@@ -2596,8 +2598,10 @@ h2_have_tepval:
                     stream->stream_id, prefix_key->level, prefix_key->flags, prefix_key->hash);
 #endif
         } else {
-          // Extraction failed - free and fall back to round-robin
-          free(prefix_key);
+          /* Retain the parsed salt status even when no routing prefix was
+           * found. The shared policy must still reject a malformed or
+           * required-but-missing cache_salt instead of silently falling back. */
+          stream->prefix_key = prefix_key;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[HTTP/2 CHWBL] stream %d: Prefix extraction failed, falling back to round-robin",
                     stream->stream_id);
@@ -2653,41 +2657,19 @@ h2_have_tepval:
   }
   
 #ifdef HAVE_DP_GPU_ROUTING
-  // P1.2: CHWBL routing (Consistent Hash with Bounded Loads)
-  if (ep_idx < 0 && pfe->seltype == PROXY_SEL_CHWBL && stream->prefix_key) {
-    llm_prefix_key_t *prefix_key = (llm_prefix_key_t *)stream->prefix_key;
-    if (prefix_key->valid && tepval->chwbl_config && tepval->hash_ring) {
-      // Use consistent hash ring to select endpoint
-      ep_idx = chwbl_ring_lookup(tepval->hash_ring, prefix_key->hash);
-      
-      // CRITICAL-3 FIX: Add NULL check and bounds validation
-      if (ep_idx >= 0 && 
-          ep_idx < MAX_PROXY_EP &&                 // Bounds check
-          tepval->chwbl_config != NULL &&          // NULL check (defense in depth)
-          tepval->chwbl_config->ep_loads[ep_idx].ep_available) {
-        uint32_t current_load = tepval->chwbl_config->ep_loads[ep_idx].active_conns;
-        uint32_t avg_load = 0;
-        int available_eps = 0;
-        
-        // Calculate average load across available endpoints
-        for (int i = 0; i < tepval->n_eps; i++) {
-          if (i >= MAX_PROXY_EP) break;            // Prevent array overrun
-          if (tepval->chwbl_config->ep_loads[i].ep_available) {
-            avg_load += tepval->chwbl_config->ep_loads[i].active_conns;
-            available_eps++;
-          }
-        }
-        if (available_eps > 0) {
-          avg_load /= available_eps;
-        }
-        
-        // Check if endpoint is overloaded (load > avg * mean_load_factor / 100)
-        uint32_t max_load = (avg_load * tepval->chwbl_config->mean_load_factor) / 100;
-        if (current_load > max_load) {
-          ep_idx = find_next_healthy_endpoint(tepval, ep_idx);
-        }
-      }
+  // CHWBL/WRR_HASH share the same configured hash identity and bounded-load selector.
+  if (ep_idx < 0 &&
+      (tepval->select == PROXY_SEL_CHWBL || tepval->select == PROXY_SEL_WRR_HASH)) {
+    llm_prefix_key_t empty_prefix = {0};
+    llm_prefix_key_t *prefix_key = stream->prefix_key ?
+        (llm_prefix_key_t *)stream->prefix_key : &empty_prefix;
+    int policy_rc = chwbl_hash_and_select_runtime(tepval, prefix_key, &ep_idx);
+    if (policy_rc == -2) {
+      proxy_h2_send_l7_synthetic(pfe, 400, NULL, NULL);
+      return -1;
     }
+    if (policy_rc != 0)
+      ep_idx = -1;
   }
   
   // P5: GPU-Aware routing (if enabled and no CHWBL match)
