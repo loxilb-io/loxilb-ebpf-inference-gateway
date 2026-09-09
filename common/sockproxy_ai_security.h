@@ -32,12 +32,21 @@ int ai_security_copy_api_key(char *dst, size_t cap,
                              const uint8_t *value, size_t value_len);
 
 /*
+ * Whether the service claimed the gateway X-Api-Key namespace.
+ *
+ * Wire value 0 is the compatibility state: no declaration, so a backend-owned
+ * header must pass through unchanged. Every non-zero value is a declaration;
+ * unknown values strip as the safe fallback even though admission fails them.
+ */
+int ai_security_should_strip_api_key(uint8_t policy);
+
+/*
  * Remove X-Api-Key from an HTTP/2 name/value array when the service has
  * claimed the gateway credential namespace.  The output is a shallow copy;
  * nghttp2_submit_request copies the bytes before either source array is freed.
  */
 size_t ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
                                      nghttp2_nv *output, size_t output_cap,
-                                     uint8_t policy, uint8_t ai_gw_mode);
+                                     uint8_t policy);
 
 #endif /* __SOCKPROXY_AI_SECURITY_H__ */

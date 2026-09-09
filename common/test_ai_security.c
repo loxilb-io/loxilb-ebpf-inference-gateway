@@ -134,13 +134,33 @@ test_header_filter(void)
     nv("content-type", "application/json"),
   };
   nghttp2_nv output[3];
+  const struct {
+    uint8_t policy;
+    size_t want;
+  } cases[] = {
+    {0, 3}, /* undeclared: backend-owned credential passes through */
+    {1, 2}, /* required: gateway credential is consumed and stripped */
+    {2, 2}, /* declared disabled: namespace is still reserved */
+    {99, 2}, /* unknown: fail closed and do not forward credential bytes */
+  };
 
-  assert(ai_security_filter_h2_headers(input, 3, output, 3, 0, 0) == 3);
-  assert(ai_security_filter_h2_headers(input, 3, output, 3, 1, 1) == 2);
-  assert(strncmp((char *)output[0].name, ":method", output[0].namelen) == 0);
-  assert(strncmp((char *)output[1].name, "content-type", output[1].namelen) == 0);
-  assert(ai_security_filter_h2_headers(input, 3, output, 3, 2, 0) == 2);
-  assert(ai_security_filter_h2_headers(input, 3, output, 3, 0, 1) == 2);
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    assert(ai_security_should_strip_api_key(cases[i].policy) ==
+           (cases[i].policy != 0));
+    assert(ai_security_filter_h2_headers(input, 3, output, 3,
+                                         cases[i].policy) == cases[i].want);
+    assert(strncmp((char *)output[0].name, ":method",
+                   output[0].namelen) == 0);
+    if (cases[i].want == 2)
+      assert(strncmp((char *)output[1].name, "content-type",
+                     output[1].namelen) == 0);
+    else {
+      assert(strncmp((char *)output[1].name, "x-api-key",
+                     output[1].namelen) == 0);
+      assert(output[1].valuelen == sizeof("secret") - 1);
+      assert(memcmp(output[1].value, "secret", sizeof("secret") - 1) == 0);
+    }
+  }
 }
 
 int
@@ -149,6 +169,6 @@ main(void)
   test_admission_matrix();
   test_bounded_copy();
   test_header_filter();
-  puts("PASS: AI security admission and HTTP/2 credential handling");
+  puts("PASS: AI security admission and policy-owned credential handling");
   return 0;
 }
