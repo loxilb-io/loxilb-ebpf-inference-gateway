@@ -258,7 +258,7 @@ int pd_kv_exact_select(struct proxy_epval *tepval, struct proxy_fd_ent *pfe,
  *   hash_algo     KV_HASH_SHA256_CBOR or KV_HASH_XXHASH_CBOR
  *   tokens        array of token IDs
  *   n_tokens      number of tokens
- *   block_size    tokens per block
+ *   block_size    tokens per block (1..KV_MAX_TOKENS)
  *   out_hashes    output buffer for block hashes (hash_stride * max_blocks bytes)
  *   hash_stride   bytes per hash (32 for sha256, 16 for xxhash128)
  *   max_blocks    maximum blocks to compute

@@ -544,6 +544,16 @@ test_hash_edge_cases(void)
                               hashes, 32, 1);
   ASSERT_EQ(n, -1, "Zero block_size returns -1");
 
+  /* The fixed token/CBOR workspace is the operational block-size ceiling.
+   * Reject the first out-of-range value and the historical signed-cast hazard
+   * without entering the offset loop. */
+  n = kv_compute_block_hashes(KV_HASH_SHA256_CBOR, tokens, 1,
+                              KV_MAX_TOKENS + 1U, hashes, 32, 1);
+  ASSERT_EQ(n, -1, "block_size above KV_MAX_TOKENS returns -1");
+  n = kv_compute_block_hashes(KV_HASH_SHA256_CBOR, tokens, 1,
+                              UINT32_MAX, hashes, 32, 1);
+  ASSERT_EQ(n, -1, "UINT32_MAX block_size returns -1 without signed wrap");
+
   /* Invalid hash algo */
   n = kv_compute_block_hashes(99, tokens, 1, 1,
                               hashes, 32, 1);
