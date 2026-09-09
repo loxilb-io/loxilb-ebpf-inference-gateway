@@ -46,6 +46,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_ai_gw.h"
+#include "sockproxy_ai_security.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
@@ -700,12 +701,12 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
  * ai_strip_upstream_api_key — remove the caller's X-Api-Key from a request on
  * its way to the backend. Returns the (possibly shrunk) buffer length.
  *
- * Applied to EVERY AI service (ai_gw_mode == 1) whatever its api_key_auth
- * policy: when the policy is "required" the credential has already been
- * consumed by the gate, and when it is "disabled" the header was meaningless
- * upstream to begin with. Either way it must not reach a GPU node's request
- * logs, where it would sit in plaintext on a host the tenant does not own and
- * the gateway does not control.
+ * Applied only when api_key_auth is explicitly declared. "required" consumes
+ * the gateway credential at admission and "disabled" still reserves the
+ * gateway credential namespace, so both strip. Wire value 0 is deliberately
+ * different: the service made no authentication declaration and a backend-owned
+ * X-Api-Key must pass through unchanged, even when SSE or P/D accounting makes
+ * ai_gw_mode non-zero.
  *
  * Strip only, never splice. Removing a header shifts the body earlier without
  * altering a byte of it, so a chunked body's framing survives — which is why
@@ -726,15 +727,10 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen)
   if (!pfe || !buf)
     return buflen;
   node = (proxy_map_ent_t *)pfe->head;
-  /* Strip on any service that DECLARED itself AI-facing: enforcement armed
-   * (apikey_auth 1, which also arms ai_gw_mode), accounting armed (sse/pd),
-   * or the policy explicitly set to disabled (apikey_auth 2 — no check, but
-   * the credential namespace is still the gateway's, and a key forwarded
-   * through a non-enforcing service is replayable against enforcing ones).
-   * A service that declared NOTHING keeps byte-identical proxying: non-AI
-   * backends legitimately consume an X-Api-Key of their own. */
+  /* Header ownership follows api_key_auth only. ai_gw_mode is accounting and
+   * streaming state, not an authorization declaration. */
   if (!node || !node->val.ephash ||
-      !(node->val.ephash->ai_gw_mode || node->val.ephash->apikey_auth))
+      !ai_security_should_strip_api_key(node->val.ephash->apikey_auth))
     return buflen;
   if (buflen < 4 || !memmem(buf, buflen, "\r\n\r\n", 4))
     return buflen;

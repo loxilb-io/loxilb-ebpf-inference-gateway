@@ -3025,8 +3025,7 @@ h2_have_tepval:
   nghttp2_nv *security_headers_nv = NULL;
   int security_headers_built = 0;
   uint8_t security_policy = ent->val.ephash ? ent->val.ephash->apikey_auth : 0;
-  uint8_t security_ai_mode = ent->val.ephash ? ent->val.ephash->ai_gw_mode : 0;
-  if (security_ai_mode || security_policy) {
+  if (ai_security_should_strip_api_key(security_policy)) {
     security_headers_nv = calloc(nheaders, sizeof(*security_headers_nv));
     if (!security_headers_nv) {
       if (l7_hdr_built)
@@ -3036,7 +3035,7 @@ h2_have_tepval:
     }
     nheaders = ai_security_filter_h2_headers(headers, nheaders,
                                              security_headers_nv, nheaders,
-                                             security_policy, security_ai_mode);
+                                             security_policy);
     headers = security_headers_nv;
     security_headers_built = 1;
   }

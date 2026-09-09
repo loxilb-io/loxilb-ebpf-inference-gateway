@@ -75,13 +75,19 @@ ai_security_copy_api_key(char *dst, size_t cap,
   return 0;
 }
 
+int
+ai_security_should_strip_api_key(uint8_t policy)
+{
+  return policy != 0;
+}
+
 size_t
 ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
                               nghttp2_nv *output, size_t output_cap,
-                              uint8_t policy, uint8_t ai_gw_mode)
+                              uint8_t policy)
 {
   size_t written = 0;
-  int strip = (ai_gw_mode != 0 || policy != 0);
+  int strip = ai_security_should_strip_api_key(policy);
 
   if (!input || !output)
     return 0;
