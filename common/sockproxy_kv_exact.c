@@ -528,7 +528,12 @@ kv_compute_block_hashes(uint8_t hash_algo, const uint32_t *tokens,
                         uint8_t *out_hashes, int hash_stride,
                         int max_blocks)
 {
-  if (!tokens || n_tokens <= 0 || block_size == 0 || !out_hashes)
+  /* The tokenizer and CBOR workspace are both fixed at KV_MAX_TOKENS.
+   * Reject larger declarations before any uint32_t -> int conversion: the old
+   * loop cast could become negative for values above INT_MAX and turn the
+   * offset walk into undefined/non-progressing arithmetic. */
+  if (!tokens || n_tokens <= 0 || block_size == 0 ||
+      block_size > KV_MAX_TOKENS || !out_hashes)
     return -1;
 
   uint8_t parent_hash[KV_MAX_HASH_BYTES];
