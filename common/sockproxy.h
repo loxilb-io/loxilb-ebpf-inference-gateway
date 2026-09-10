@@ -557,7 +557,8 @@ typedef struct proxy_epval {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
-  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled (per-service policy, NOT derived)
+  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
+  char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
    * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG,
    * 2=trtllm ⇒ PD_ENGINE_TRTLLM) so the orchestration branch never reads a
@@ -1046,7 +1047,32 @@ struct proxy_fd_ent {
 
   // AI Gateway per-connection state
   char     x_api_key_raw[256];        // Raw value of X-Api-Key request header (extracted by handle_header_val)
-  char     tenant_id[64];             // Tenant ID from llb_ai_validate_key decision
+  // Raw Authorization header VALUE (scheme tag included) accumulated by
+  // handle_header_val. Unlike the short single-shot captures around it,
+  // this one APPENDS: llhttp is fed per read and may deliver one value in
+  // several fragments, and JWTs run bigger than API keys — real-world
+  // Keycloak access tokens with role-stuffed payloads clear 2 KB, so a
+  // fragment boundary inside the value is an expected event. The Bearer
+  // prefix is stripped by the admission gate AFTER reassembly, so a
+  // boundary can never split the tag the dispatch keys on. Cap is 4 KB; a
+  // value that does not fit sets bearer_oversize instead of storing a
+  // truncated token: a truncated JWT would fail signature verification
+  // anyway, but as an indistinguishable bad_signature — the flag keeps the
+  // denial reason honest (401 invalid_token, counted as oversize).
+  // Lifetime mirrors x_api_key_raw: cleared per request at message-begin.
+  char     bearer_raw[4096];
+  uint16_t bearer_len;                // accumulated value bytes (< sizeof(bearer_raw))
+  uint8_t  bearer_capturing;          // 1 = mid-value; cleared by every new header name
+  uint8_t  bearer_oversize;           // 1 = Authorization value exceeded the 4 KB cap
+  char     tenant_id[128];            // Tenant ID from the deciding credential arm; sized to
+                                      // ai_gw_decision_t.tenant_id — JWT tenants come from IdP
+                                      // claims whose length the operator does not control
+  char     auth_user_id[128];         // Per-user identity from the deciding credential arm ("" = none);
+                                      // distinct from user_id below, which is a BODY field capture
+  // Upstream hygiene, stamped by the admission gate per request:
+  uint8_t  auth_strip_authz;          // 1 = strip Authorization before dispatch (JWT arm decided, no passthrough)
+  uint8_t  auth_fwd_identity;         // 1 = inject X-Auth-Tenant/X-Auth-User upstream (verified values)
+  uint8_t  auth_jwt_capable;          // 1 = rule mode consults the JWT arm (3/4): always strip client X-Auth-*
   uint8_t  ai_gw_denied;              // 1 = the AI gate refused this request (response already sent,
                                       // socket shut down). Read after llhttp_execute to keep a policy
                                       // denial out of the parse-error fallback, which relays the buffer
@@ -1191,6 +1217,18 @@ struct proxy_fd_ent {
                                       // response arrives, so response-phase consumers (SSE
                                       // activation/[DONE] metrics, stream cap/reaper, P/D
                                       // completion records) must read the model here.
+
+  char     effective_model[MAX_MODEL_LEN]; // The admission gate's single body-first model
+                                      // resolution (ai_gw_admit), written only on ENFORCING
+                                      // services after the body/header conflict check. When
+                                      // set, routing and response-phase consumers use it
+                                      // verbatim -- one resolver, every consumer. Empty on
+                                      // non-enforcing services, which keep the legacy
+                                      // header-first derivation (no silent behavior change
+                                      // for unauthenticated consumers). Cleared with the
+                                      // other per-request captures in handle_on_message_begin
+                                      // and snapshotted into resp_model at the keep-alive
+                                      // reset boundary like the fields it supersedes.
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 
@@ -1200,6 +1238,12 @@ typedef struct proxy_fd_ent proxy_fd_ent_t;
 static inline const char *
 proxy_effective_model(const proxy_fd_ent_t *pfe)
 {
+  /* The admission gate's resolution is authoritative when present: it is
+   * the model authorization was checked against, so routing and accounting
+   * following anything else would re-open the authorize-A-serve-B split. */
+  if (pfe->effective_model[0] != '\0') {
+    return pfe->effective_model;
+  }
   if (pfe->x_model_header[0] != '\0') {
     return pfe->x_model_header;
   }
@@ -1382,7 +1426,8 @@ struct proxy_arg {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
-  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled (per-service policy, NOT derived)
+  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
+  char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
   // proxy_add). The nat2proxy hop of the additive chain
   // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).

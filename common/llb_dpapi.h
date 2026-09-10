@@ -1104,6 +1104,12 @@ struct dp_proxy_tacts {
   char     tls_ciphers[256];          // inline cipher string; empty ⇒ today's ciphers
   char     backend_ca_cert_id[64];    // backend CA certId; empty ⇒ system default
   char     backend_client_cert_id[64];// backend client certId; empty ⇒ none
+  // JWT auth profile the Bearer arm resolves against (apikey_auth modes 3/4).
+  // Rule validation guarantees the pairing (non-empty iff a JWT-capable
+  // mode), so the data plane treats an empty string on those modes as the
+  // fail-closed "no profile" arm (503), never as allow. Copied verbatim into
+  // proxy_arg by llb_conv_nat2proxy; no Go mirror (cgo direct).
+  uint8_t  jwt_auth_profile[64];      // empty ⇒ no Bearer arm on this rule
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1146,21 +1152,24 @@ struct dp_proxy_tacts {
 //   +backend_ca_cert_id(64)+backend_client_cert_id(64) = +392 bytes (8-aligned region): all four
 //   asserts shift by +392 (2448→2840, 2440→2832, 2968→3360, 2960→3352). These scalars are copied
 // verbatim into the proxy_arg fields added by llb_conv_nat2proxy; no Go mirror (cgo direct).
+// ABI guard updated for: +jwt_auth_profile(64) (8-aligned region): all four
+//   asserts shift by +64 (2848→2912, 2840→2904, 3624→3688, 3616→3680). Copied
+//   verbatim into proxy_arg by llb_conv_nat2proxy; no Go mirror (cgo direct).
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2848,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2912,
               "dp_proxy_tacts ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2840,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2904,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// mTLS-enabled layout: 2848→3624 bytes, DPU slim 2840→3616 bytes.
+// mTLS-enabled layout: 2912→3688 bytes, DPU slim 2904→3680 bytes.
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3624,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3688,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3616,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3680,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */
