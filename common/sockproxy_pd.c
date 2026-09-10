@@ -34,6 +34,8 @@
 #include <stdatomic.h>
 /* AI Gateway CGO bridge: P/D session hit counter */
 extern void llb_ai_pd_session_hit(char *model_name);
+/* AI Gateway CGO bridge: terminal routing-tier selection counter */
+extern void llb_ai_pd_tier_selected(char *model_name, int tier);
 /* Forward-declare overflow counter increment (defined in sockproxy_metrics.c) */
 extern void pd_kv_overflow_inc(void);
 #else
@@ -1745,6 +1747,33 @@ pd_ctrl_eff_cap(proxy_epval_t *tepval, int i, uint64_t clamped_cap, uint8_t cmod
   return eff;
 }
 
+/* Record the terminal routing-tier decision for Prometheus. Tier encoding:
+ * 0=Tier-0 session, 1=Tier-1 trie, 15=Tier-1.5 KV-exact, 2=Tier-2 min-load.
+ * Model fallback matches the session-hit counters:
+ * x_model_header > prefix_key.model > "" (model-less traffic). Call ONLY at
+ * the four terminal selection returns, never in helpers — admission outcomes
+ * (PARKED / NO_CAPACITY) and pre-routing failures are not selections. */
+#if !defined(TEST_PD_REWRITER) && !defined(TEST_PD_CACHE_AWARE)
+static void
+pd_record_tier_selected(proxy_fd_ent_t *pfe, int tier)
+{
+  const char *model = "";
+  if (pfe->x_model_header[0] != '\0') {
+    model = pfe->x_model_header;
+  } else if (pfe->prefix_key.model[0] != '\0') {
+    model = pfe->prefix_key.model;
+  }
+  llb_ai_pd_tier_selected((char *)model, tier);
+}
+#else
+static inline void
+pd_record_tier_selected(proxy_fd_ent_t *pfe, int tier)
+{
+  (void)pfe;
+  (void)tier;
+}
+#endif
+
 int
 pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                   uint32_t excluded_mask)
@@ -1915,6 +1944,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           llb_ai_pd_session_hit((char *)sh_model);
         }
 #endif
+        pd_record_tier_selected(pfe, 0);
         return 0;  /* Tier 0 hit */
       }
       /* Stale session: evict, fall through */
@@ -1960,6 +1990,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                        strlen(pfe->prefix_key.prefix), trie_ep);
         pthread_rwlock_unlock(&tepval->pd_trie_lock);
         *ep_out = trie_ep;
+        pd_record_tier_selected(pfe, 1);
         return 0;
       }
     }
@@ -2002,6 +2033,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     if (kv_loadguard_ok &&
         pd_kv_exact_select(tepval, pfe, ep_out,
                            excluded_mask | ctrl_drain) == 0) {
+      pd_record_tier_selected(pfe, 15);
       return 0;  /* Tier 1.5 hit */
     }
     if (kv_loadguard_ok) {
@@ -2118,6 +2150,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     uint32_t rr = (n_cand > 1) ? atomic_fetch_add(&tepval->pd_tier2_rr, 1) : 0;
     best_ep = candidates[rr % (uint32_t)n_cand];
     *ep_out = best_ep;
+    pd_record_tier_selected(pfe, 2);
 
     /* Update trie after Tier 2 selection + evict if needed */
     if (tepval->pd_cache_aware_mode && tepval->pd_trie &&
