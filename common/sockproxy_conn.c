@@ -877,14 +877,15 @@ proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
 
 #ifdef HAVE_DP_GPU_ROUTING
     // P1.2/P1.3: Cleanup CHWBL resources
-    if (tepval->hash_ring) {
-      chwbl_destroy_ring(tepval->hash_ring);
-      tepval->hash_ring = NULL;
-    }
-    if (tepval->chwbl_config) {
-      free(tepval->chwbl_config);
-      tepval->chwbl_config = NULL;
-    }
+    proxy_epval_t retired_chwbl = {0};
+    pthread_rwlock_wrlock(&tepval->chwbl_state_lock);
+    retired_chwbl.hash_ring = tepval->hash_ring;
+    retired_chwbl.chwbl_config = tepval->chwbl_config;
+    tepval->hash_ring = NULL;
+    tepval->chwbl_config = NULL;
+    tepval->select = PROXY_SEL_RR;
+    pthread_rwlock_unlock(&tepval->chwbl_state_lock);
+    chwbl_release_runtime(&retired_chwbl);
 #endif /* HAVE_DP_GPU_ROUTING */
 
     // P/D Session stickiness cleanup
@@ -992,9 +993,7 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   // P1.3/P3.5: Decrement CHWBL/WRR_HASH load counter when connection closes
   if (fd_ent->epv && fd_ent->ep_num >= 0) {
     proxy_epval_t *epv = (proxy_epval_t *)fd_ent->epv;
-    if ((epv->select == PROXY_SEL_CHWBL || epv->select == PROXY_SEL_WRR_HASH) && epv->chwbl_config) {
-      chwbl_dec_load(epv->chwbl_config, fd_ent->ep_num);
-    }
+    chwbl_dec_runtime(epv, fd_ent->ep_num);
   }
 #endif /* HAVE_DP_GPU_ROUTING */
 

@@ -2612,14 +2612,22 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
       break;
     case NAT_LB_SEL_CHWBL:
       pval->select = PROXY_SEL_CHWBL;
-      // Propagate CHWBL prefix hash level (0 means use default=1 in sockproxy)
       pval->chwbl_prefix_hash_level = dat->chwbl_prefix_hash_level;
+      pval->chwbl_prefix_hash_flags = dat->chwbl_prefix_hash_flags;
+      pval->chwbl_mean_load_factor = dat->chwbl_mean_load_factor;
+      pval->chwbl_replication = dat->chwbl_replication;
+      pval->chwbl_enable_cache_salt = dat->chwbl_enable_cache_salt;
       break;
     case NAT_LB_SEL_GPU_AWARE:
       pval->select = PROXY_SEL_GPU_AWARE;
       break;
     case NAT_LB_SEL_WRR_HASH:  // P3.5: Weighted Consistent Hash
       pval->select = PROXY_SEL_WRR_HASH;
+      pval->chwbl_prefix_hash_level = dat->chwbl_prefix_hash_level;
+      pval->chwbl_prefix_hash_flags = dat->chwbl_prefix_hash_flags;
+      pval->chwbl_mean_load_factor = dat->chwbl_mean_load_factor;
+      pval->chwbl_replication = dat->chwbl_replication;
+      pval->chwbl_enable_cache_salt = dat->chwbl_enable_cache_salt;
       break;
     default:
       pval->select = PROXY_SEL_RR;

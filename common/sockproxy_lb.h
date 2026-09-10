@@ -38,9 +38,24 @@ int  wrr_select_endpoint(proxy_epval_t *epv);
 
 /* Build the consistent hash ring with replication factor */
 int  chwbl_build_ring(proxy_epval_t *epv, int replication);
+chwbl_ring_t *chwbl_create_ring(const proxy_epval_t *epv, int replication);
 
 /* Build the weighted hash ring (WRR_HASH variant) */
 int  chwbl_build_weighted_ring(proxy_epval_t *epv);
+chwbl_ring_t *chwbl_create_weighted_ring(const proxy_epval_t *epv, int budget);
+
+/* Build a complete candidate runtime without mutating the live endpoint pool. */
+int chwbl_prepare_runtime(proxy_epval_t *candidate, const proxy_arg_t *arg,
+                          const proxy_epval_t *previous);
+void chwbl_release_runtime(proxy_epval_t *epv);
+
+/* Generation-safe selection/load accounting wrappers. */
+int chwbl_select_runtime(proxy_epval_t *epv, uint64_t hash, int *selected_ep);
+int chwbl_hash_and_select_runtime(proxy_epval_t *epv, llm_prefix_key_t *key,
+                                  int *selected_ep);
+int chwbl_apply_hash_policy(const chwbl_config_t *config, llm_prefix_key_t *key);
+void chwbl_dec_runtime(proxy_epval_t *epv, int ep_idx);
+void chwbl_inc_runtime(proxy_epval_t *epv, int ep_idx);
 
 /* Look up the ring for a given hash value; returns endpoint index */
 int  chwbl_ring_lookup(chwbl_ring_t *ring, uint64_t hash);
@@ -48,15 +63,13 @@ int  chwbl_ring_lookup(chwbl_ring_t *ring, uint64_t hash);
 /* Destroy and free a hash ring */
 void chwbl_destroy_ring(chwbl_ring_t *ring);
 
-/* Select endpoint using CHWBL with health-aware probing.
- * skip_load_balance=1: skip bounded-load overflow for strict prefix_hash routing
- *                       (KV cache locality; only health failover applies). */
+/* Select endpoint using CHWBL with health-aware, future-state load bounds.
+ * skip_load_balance is retained for ABI compatibility and ignored. */
 int  chwbl_select_endpoint(chwbl_ring_t *ring, chwbl_config_t *config,
                             uint64_t hash, proxy_epval_t *tepval,
                             int *selected_ep, int skip_load_balance);
 
-/* Select endpoint using WRR_HASH (weighted consistent hashing).
- * skip_load_balance=1: same strict-hash semantics as chwbl_select_endpoint. */
+/* Select endpoint using WRR_HASH. skip_load_balance is ignored. */
 int  wrr_hash_select_endpoint(chwbl_ring_t *ring, chwbl_config_t *config,
                                uint64_t hash, proxy_epval_t *tepval,
                                int *selected_ep, int skip_load_balance);

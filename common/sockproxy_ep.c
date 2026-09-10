@@ -532,6 +532,20 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           case PROXY_SEL_CHWBL:
             {              
               uint64_t routing_hash = 0;
+              if (pfe) {
+                int policy_rc = chwbl_hash_and_select_runtime(
+                    tepval, &pfe->prefix_key, &algorithm_selection);
+                if (policy_rc == -2) {
+                  static const char bad_salt[] =
+                      "HTTP/1.1 400 Bad Request\r\n"
+                      "Content-Type: application/json\r\nConnection: close\r\n\r\n"
+                      "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
+                  send(pfe->fd, bad_salt, sizeof(bad_salt) - 1, MSG_NOSIGNAL);
+                  return -1;
+                }
+                if (policy_rc == 0)
+                  break;
+              }
               
               // Determine routing hash from available sources
               // PRIMARY: prefix_hash (model+prompt content) for KV cache locality
@@ -549,16 +563,12 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 tepval->ep_sel++;
               }
               
-              if (tepval->hash_ring && tepval->chwbl_config) {
-                if (chwbl_select_endpoint(tepval->hash_ring, tepval->chwbl_config,
-                                           routing_hash, tepval, &algorithm_selection,
-                                           (prefix_hash != 0) ? 1 : 0) < 0) {
+              {
+                if (chwbl_select_runtime(tepval, routing_hash,
+                                         &algorithm_selection) < 0) {
                   log_error("P1.3: CHWBL selection failed, falling back to round-robin");
                   algorithm_selection = -1;
-                } 
-              } else {
-                log_debug("P2: CHWBL not configured, using round-robin fallback");
-                algorithm_selection = -1;
+                }
               }
             }
             break;
@@ -591,6 +601,20 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           case PROXY_SEL_WRR_HASH:  // P3.5: Weighted Consistent Hash + Bounded Loads
             {
               uint64_t routing_hash = 0;
+              if (pfe) {
+                int policy_rc = chwbl_hash_and_select_runtime(
+                    tepval, &pfe->prefix_key, &algorithm_selection);
+                if (policy_rc == -2) {
+                  static const char bad_salt[] =
+                      "HTTP/1.1 400 Bad Request\r\n"
+                      "Content-Type: application/json\r\nConnection: close\r\n\r\n"
+                      "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
+                  send(pfe->fd, bad_salt, sizeof(bad_salt) - 1, MSG_NOSIGNAL);
+                  return -1;
+                }
+                if (policy_rc == 0)
+                  break;
+              }
               
               // Determine routing hash from available sources (same priority as CHWBL)
               // PRIMARY: prefix_hash (model+prompt content) for KV cache locality
@@ -606,9 +630,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
               }
               
               int wrr_hash_ep = -1;
-              if (wrr_hash_select_endpoint(tepval->hash_ring, tepval->chwbl_config,
-                                           routing_hash, tepval, &wrr_hash_ep,
-                                           (prefix_hash != 0) ? 1 : 0) == 0) {
+              if (chwbl_select_runtime(tepval, routing_hash, &wrr_hash_ep) == 0) {
                 algorithm_selection = wrr_hash_ep;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
                 log_info("P3.5: WRR_HASH selected EP%d (weight=%d, hash=0x%016lx)",
@@ -988,10 +1010,8 @@ pd_fallback_normal:
 #ifdef HAVE_DP_GPU_ROUTING
           // CRITICAL FIX: Decrement CHWBL/WRR_HASH load counter on connection failure
           // Without this, failed connections leak load forever!
-          if ((tepval->select == PROXY_SEL_CHWBL || tepval->select == PROXY_SEL_WRR_HASH) && tepval->chwbl_config) {
-            chwbl_dec_load(tepval->chwbl_config, sel);
-            log_debug("CHWBL/WRR_HASH: Decremented load for EP%d after connection failure", sel);
-          }
+          chwbl_dec_runtime(tepval, sel);
+          log_debug("CHWBL/WRR_HASH: Released load for EP%d after connection failure", sel);
 #endif /* HAVE_DP_GPU_ROUTING */
 
           /* single-role KV load — release the held
@@ -1151,11 +1171,7 @@ pd_fallback_normal:
               /* CHWBL/WRR_HASH charge their load inside selection; teardown
                * decrements by ep_num — re-apply for the replacement so the
                * pairing holds (the failed EP's unit was released above). */
-              if ((tepval->select == PROXY_SEL_CHWBL ||
-                   tepval->select == PROXY_SEL_WRR_HASH) && tepval->chwbl_config) {
-                atomic_fetch_add(
-                    &tepval->chwbl_config->ep_loads[nx_sel].active_conns, 1);
-              }
+              chwbl_inc_runtime(tepval, nx_sel);
 #endif /* HAVE_DP_GPU_ROUTING */
               /* Single-role Tier-1.5: re-claim the active_conns unit on the
                * replacement so the adaptive/CHWBL blend keeps a true load
@@ -1876,4 +1892,3 @@ proxy_run(void *arg)
  * pd_wrr_select_from_role, pd_select_worker_pair) have been deleted.
  * will implement pd_select_prefill/pd_select_decode with 3-tier logic.
  */
-

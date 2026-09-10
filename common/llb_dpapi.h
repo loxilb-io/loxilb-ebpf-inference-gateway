@@ -1030,6 +1030,11 @@ struct dp_proxy_tacts {
   uint8_t  kv_exact_mode;            // KV-cache exact routing: 0=off, 1=zmq 
   uint8_t  kv_hash_algo;             // KV hash algorithm: 0=sha256_cbor, 1=xxhash_cbor 
   uint8_t  chwbl_prefix_hash_level;  // CHWBL prefix hash level: 1=L1, 2=L1+L2, 3=L1+L2+L3 (replaces pad3)
+  uint8_t  chwbl_prefix_hash_flags;  // Hash-input bitfield; 0 means level-derived auto mode
+  uint8_t  chwbl_enable_cache_salt;  // Require a non-empty cache_salt hash input
+  uint16_t chwbl_mean_load_factor;   // Bounded-load percentage (100..300; default 175)
+  uint16_t chwbl_replication;        // CHWBL vnodes/EP or WRR_HASH total vnode budget
+  uint16_t chwbl_pad;                // Keep following u32 fields naturally aligned
   uint32_t max_stream_duration_sec;  // Max stream duration cap in seconds (0=use PROXY_SSE_HARD_CAP_SEC)
   uint32_t backend_keepalive_sec;    // Backend TCP keepalive interval (0=disabled)
   uint32_t pd_session_ttl_sec;       // P/D sliding idle TTL in seconds (0=default 300s)
@@ -1143,19 +1148,19 @@ struct dp_proxy_tacts {
 // verbatim into the proxy_arg fields added by llb_conv_nat2proxy; no Go mirror (cgo direct).
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2840,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2848,
               "dp_proxy_tacts ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2832,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2840,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// +mtls_client_crl_path(256) = +256 (HAVE_MTLS only): 3360→3616, 3352→3608.
+// mTLS-enabled layout: 2848→3624 bytes, DPU slim 2840→3616 bytes.
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3616,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3624,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3608,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3616,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */
