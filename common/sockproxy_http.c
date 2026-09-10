@@ -720,7 +720,8 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
  * strip with, and no AI service runs there.
  */
 static size_t
-ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen)
+ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
+                          size_t bufsize)
 {
   proxy_map_ent_t *node;
   size_t cur = buflen;
@@ -738,6 +739,45 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen)
 
   if (!l7h1_strip_header(buf, &cur, "X-Api-Key"))
     return buflen;   /* terminator lost — leave the buffer as it was */
+
+  /* Upstream hygiene for JWT-capable services (apikey_auth 3/4).
+   *
+   * Strip order matters only in that CLIENT-sent X-Auth-* must go before
+   * any injection: those names carry gateway-verified identity upstream,
+   * so a client-supplied copy is a spoof whether or not this request's
+   * profile forwards identity — stripped ALWAYS on JWT-capable rules.
+   *
+   * Authorization is stripped only when the JWT arm decided this request
+   * and the profile did not opt into passthrough (the gate stamped
+   * auth_strip_authz from the profile's switches): the gateway consumed
+   * that credential, and replaying an access token to a backend hands
+   * every backend operator a bearer credential they never needed. On the
+   * API-key arm (including mode 4 with a key present) Authorization rides
+   * through untouched, exactly as it does today on mode 1 services.
+   *
+   * Injection (forward_identity) mirrors the inject_forwarded_headers
+   * chunked guard: a strip only shifts body bytes earlier, an insertion
+   * needs headroom — skip insertion on chunked requests. */
+  if (pfe->auth_jwt_capable) {
+    if (!l7h1_strip_header(buf, &cur, "X-Auth-Tenant") ||
+        !l7h1_strip_header(buf, &cur, "X-Auth-User"))
+      return buflen;
+    if (pfe->auth_strip_authz) {
+      if (!l7h1_strip_header(buf, &cur, "Authorization"))
+        return buflen;
+    }
+    if (pfe->auth_fwd_identity && pfe->tenant_id[0]) {
+      size_t scan = (cur < 2048) ? cur : 2048;
+      if (!memmem(buf, scan, "Transfer-Encoding: chunked", 26) &&
+          !memmem(buf, scan, "transfer-encoding: chunked", 26)) {
+        (void)l7h1_splice_header(buf, &cur, bufsize, "X-Auth-Tenant",
+                                 pfe->tenant_id);
+        if (pfe->auth_user_id[0])
+          (void)l7h1_splice_header(buf, &cur, bufsize, "X-Auth-User",
+                                   pfe->auth_user_id);
+      }
+    }
+  }
   return cur;
 }
 
@@ -2374,8 +2414,12 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->pd_disagg_enabled = arg->pd_disagg_mode;
         tepval->ai_gw_mode = arg->ai_gw_mode;
         tepval->apikey_auth = arg->apikey_auth;
-        log_info("[PD_CONFIG] proxy_add: pd_disagg=%d ai_gw=%d apikey_auth=%d n_eps=%d",
-                 arg->pd_disagg_mode, arg->ai_gw_mode, arg->apikey_auth, arg->n_eps);
+        strncpy(tepval->jwt_auth_profile, arg->jwt_auth_profile,
+                sizeof(tepval->jwt_auth_profile) - 1);
+        tepval->jwt_auth_profile[sizeof(tepval->jwt_auth_profile) - 1] = '\0';
+        log_info("[PD_CONFIG] proxy_add: pd_disagg=%d ai_gw=%d apikey_auth=%d jwt_prof=%s n_eps=%d",
+                 arg->pd_disagg_mode, arg->ai_gw_mode, arg->apikey_auth,
+                 arg->jwt_auth_profile, arg->n_eps);
         if (arg->pd_disagg_mode) {
           tepval->n_prefill_eps = 0;
           tepval->n_decode_eps = 0;
@@ -2821,8 +2865,12 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   tepval->pd_disagg_enabled = arg->pd_disagg_mode;
   tepval->ai_gw_mode = arg->ai_gw_mode;
   tepval->apikey_auth = arg->apikey_auth;
-  log_info("[PD_CONFIG] proxy_add(new): pd_disagg=%d ai_gw=%d apikey_auth=%d n_eps=%d sse=%d",
-           arg->pd_disagg_mode, arg->ai_gw_mode, arg->apikey_auth, arg->n_eps, arg->sse_mode);
+  strncpy(tepval->jwt_auth_profile, arg->jwt_auth_profile,
+          sizeof(tepval->jwt_auth_profile) - 1);
+  tepval->jwt_auth_profile[sizeof(tepval->jwt_auth_profile) - 1] = '\0';
+  log_info("[PD_CONFIG] proxy_add(new): pd_disagg=%d ai_gw=%d apikey_auth=%d jwt_prof=%s n_eps=%d sse=%d",
+           arg->pd_disagg_mode, arg->ai_gw_mode, arg->apikey_auth,
+           arg->jwt_auth_profile, arg->n_eps, arg->sse_mode);
   if (arg->pd_disagg_mode) {
     tepval->n_prefill_eps = 0;
     tepval->n_decode_eps = 0;
@@ -6371,6 +6419,12 @@ handle_on_message_begin(llhttp_t* parser)
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
     pfe->x_api_key_raw[0] = '\0';
+    pfe->bearer_raw[0] = '\0';
+    pfe->bearer_oversize = 0;
+    pfe->auth_user_id[0] = '\0';
+    pfe->auth_strip_authz = 0;
+    pfe->auth_fwd_identity = 0;
+    pfe->auth_jwt_capable = 0;
     pfe->x_model_header[0] = '\0';
     pfe->effective_model[0] = '\0';
     pfe->json_stream_route_pending = 0;
@@ -6454,6 +6508,9 @@ handle_on_message_complete(llhttp_t* parser)
        * response emission and the pfe wiring. */
       ai_gw_req_ctx_t adm_req = {
         .api_key = pfe->x_api_key_raw,
+        .bearer = pfe->bearer_raw,
+        .bearer_oversize = pfe->bearer_oversize,
+        .jwt_profile = hent->val.ephash->jwt_auth_profile,
         .body = gate_body,
         .body_len = gate_body_len,
         .prefix_model = pfe->prefix_key.model,
@@ -6541,10 +6598,18 @@ handle_on_message_complete(llhttp_t* parser)
       } else {
         /* Admitted. Persist the identity for SSE token accounting and
          * metrics, the gate's model resolution for routing and
-         * response-phase consumers, and the token reservation for the
-         * settle call. */
+         * response-phase consumers, the token reservation for the settle
+         * call, and the deciding arm's upstream-hygiene switches for
+         * the dispatch-time strip/inject. */
         strncpy(pfe->tenant_id, adm.tenant_id, sizeof(pfe->tenant_id) - 1);
         pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
+        strncpy(pfe->auth_user_id, adm.user_id, sizeof(pfe->auth_user_id) - 1);
+        pfe->auth_user_id[sizeof(pfe->auth_user_id) - 1] = '\0';
+        pfe->auth_strip_authz = (adm.auth_flags & AI_GW_AUTHF_STRIP_AUTHZ) ? 1 : 0;
+        pfe->auth_fwd_identity = (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
+        pfe->auth_jwt_capable =
+          (hent->val.ephash->apikey_auth == 3 ||
+           hent->val.ephash->apikey_auth == 4) ? 1 : 0;
         strncpy(pfe->effective_model, adm.effective_model,
                 sizeof(pfe->effective_model) - 1);
         pfe->effective_model[sizeof(pfe->effective_model) - 1] = '\0';
@@ -7321,11 +7386,35 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
     }
   }
 
-  // AI Gateway: Extract X-Api-Key header for data-plane enforcement 
+  // AI Gateway: Extract X-Api-Key header for data-plane enforcement
   if (!strncasecmp("X-Api-Key", pfe->last_header_name, 9)) {
     if (length > 0 && length < sizeof(pfe->x_api_key_raw)) {
       strncpy(pfe->x_api_key_raw, at, length);
       pfe->x_api_key_raw[length] = '\0';
+    }
+  }
+
+  // AI Gateway: capture Authorization: Bearer for the JWT admission arm.
+  // Only the Bearer scheme is taken — Basic stays with the session-affinity
+  // extractor, which tells the two apart by the same prefix. The scheme tag
+  // (plus any extra RFC 7235 SP) is stripped so the gate hands the bare
+  // compact JWS to the verifier. A value over the 4 KB cap is NOT stored
+  // truncated: a truncated JWT would fail verification anyway, but as an
+  // indistinguishable bad_signature — the oversize flag keeps the 401
+  // reason honest. Lifetime mirrors x_api_key_raw (overwritten per capture).
+  if (!strncasecmp("Authorization", pfe->last_header_name, 13)) {
+    if (length > 7 && !strncasecmp(at, "Bearer ", 7)) {
+      const char *tok = at + 7;
+      size_t tok_len = length - 7;
+      while (tok_len > 0 && *tok == ' ') { tok++; tok_len--; }
+      if (tok_len > 0 && tok_len < sizeof(pfe->bearer_raw)) {
+        memcpy(pfe->bearer_raw, tok, tok_len);
+        pfe->bearer_raw[tok_len] = '\0';
+        pfe->bearer_oversize = 0;
+      } else if (tok_len >= sizeof(pfe->bearer_raw)) {
+        pfe->bearer_raw[0] = '\0';
+        pfe->bearer_oversize = 1;
+      }
     }
   }
 
@@ -7970,7 +8059,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 
     /* Drop the tenant credential before it leaves the gateway. Runs after the
      * header policy so an operator-configured rule cannot re-add it. */
-    pfe->rcv_off = ai_strip_upstream_api_key(pfe, pfe->rcvbuf, pfe->rcv_off);
+    pfe->rcv_off = ai_strip_upstream_api_key(pfe, pfe->rcvbuf, pfe->rcv_off,
+                                             SP_SOCK_MSG_LEN);
 
     /* P/D request-ID override — generate with prefill/decode addresses
  * so vllm-router can route correctly. Must happen BEFORE normal path. */
@@ -9379,7 +9469,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
       /* Same strip on the keep-alive/burst egress: without it the second and
        * later requests on a reused connection would carry the key upstream. */
-      rc = (ssize_t)ai_strip_upstream_api_key(pfe, pfe->rcvbuf, (size_t)rc);
+      rc = (ssize_t)ai_strip_upstream_api_key(pfe, pfe->rcvbuf, (size_t)rc,
+                                              SP_SOCK_MSG_LEN);
 
       PROXY_ENT_LOCK(pfe);
       pfe_ent_accouting(pfe, rc, 0);

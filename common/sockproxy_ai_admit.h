@@ -67,12 +67,17 @@ typedef enum {
  * NUL-terminated. body may be NULL when the request carried none. */
 typedef struct ai_gw_req_ctx {
   const char *api_key;       /* captured X-Api-Key value ("" when absent) */
+  const char *bearer;        /* captured Authorization Bearer token, scheme
+                              * stripped ("" when absent) */
+  int         bearer_oversize; /* 1 = capture exceeded its cap; token dropped */
+  const char *jwt_profile;   /* rule jwt_auth_profile ("" when none) */
   const char *body;          /* request body bytes, or NULL */
   size_t      body_len;
   const char *prefix_model;  /* body model captured earlier by prefix extraction ("") */
   const char *hdr_model;     /* X-Model header value ("") */
-  int         auth_mode;     /* rule api_key_auth wire value (0 unset / 1 required /
-                              * 2 disabled; anything else enforces, fail-closed) */
+  int         auth_mode;     /* rule api_key_auth wire value (0 unset / 1 apikey
+                              * required / 2 disabled / 3 jwt / 4 apikey-or-jwt;
+                              * anything else enforces the API-key arm, fail-closed) */
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {
@@ -90,10 +95,15 @@ typedef struct ai_gw_admit_result {
   char error_msg[128];
 
   /* ALLOW: the single body-first model resolution (may be "" when the
-   * request named no model anywhere), and the validated identity. */
+   * request named no model anywhere), and the validated identity. user_id
+   * is filled by the JWT arm only (API keys do not map to users today);
+   * auth_flags carries the deciding arm's upstream-hygiene switches
+   * (AI_GW_AUTHF_* in sockproxy_ai_gw.h). */
   char effective_model[AI_GW_MODEL_LEN];
   char tenant_id[128];
   char key_id[64];
+  char user_id[128];
+  int  auth_flags;
 
   /* ALLOW: pre-admission token reservation to ride the connection to its
    * settle call. Zero epoch = nothing reserved. */

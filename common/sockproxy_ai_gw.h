@@ -43,7 +43,23 @@ typedef struct {
     char model_name[128];
     char key_id[64];
     char error_code[64];
+    /* Per-user identity from the deciding credential arm. The JWT arm fills
+     * it from the profile's user claim (usually sub); the API-key arm leaves
+     * it empty today (keys do not map to users) but the field is shared so
+     * the QoS ladder's user dimension reads ONE place regardless of arm. */
+    char user_id[128];
+    /* Upstream-hygiene switches resolved by the deciding arm (bits from
+     * AI_GW_AUTHF_*). Only the JWT arm sets them; the API-key arm's strip
+     * policy stays keyed on the rule's apikey_auth declaration as before. */
+    int  auth_flags;
 } ai_gw_decision_t;
+
+/* auth_flags bits */
+#define AI_GW_AUTHF_STRIP_AUTHZ  0x1  /* strip Authorization before dispatch */
+#define AI_GW_AUTHF_FWD_IDENTITY 0x2  /* inject X-Auth-Tenant/X-Auth-User upstream */
+
+/* bearer_flags bits for llb_ai_validate_bearer */
+#define AI_GW_BEARERF_OVERSIZE   0x1  /* capture exceeded the 4 KB cap; token dropped */
 
 /*
  * llb_ai_validate_key – validate the X-API-Key HTTP header.
@@ -58,6 +74,37 @@ typedef struct {
  *   -1  request must be rejected; inspect result->decision for HTTP status
  */
 extern int llb_ai_validate_key(char *raw_key, char *model_name, ai_gw_decision_t *result);
+
+/*
+ * llb_ai_validate_bearer – validate an Authorization: Bearer JWT.
+ *
+ * The JWT sibling of llb_ai_validate_key, deciding the Bearer arm of
+ * apikey_auth modes 3 (jwt) and 4 (apikey-or-jwt). Verification runs
+ * against the named JWT auth profile's live JWKS keyset in the Go layer;
+ * the claim mapping there yields the tenant (metering identity), the user
+ * (QoS identity) and the token's model accept-list.
+ *
+ * Parameters:
+ *   bearer       compact JWS from the Authorization header, scheme tag
+ *                already stripped ("" when the header was absent)
+ *   model_name   effective model from the request; "" if absent
+ *   profile_name the rule's jwt_auth_profile ("" is an invariant violation
+ *                on modes 3/4 and denies 503 — fail closed, never open)
+ *   bearer_flags AI_GW_BEARERF_* bits from the capture (oversize denies 401
+ *                invalid_token, counted under its own reason)
+ *   result       output structure filled on both allow and deny paths;
+ *                user_id and auth_flags are meaningful on allow
+ *
+ * Returns:
+ *    0  request is allowed; result->decision == 0
+ *   -1  request must be rejected; result->decision selects the HTTP status
+ *       (1=401 missing/invalid/expired token, 2=403 model denied,
+ *        4=503 keyset never fetched / store unavailable — deliberately NOT
+ *        a 401: only the 503 is worth the client retrying)
+ */
+extern int llb_ai_validate_bearer(char *bearer, char *model_name,
+                                  char *profile_name, int bearer_flags,
+                                  ai_gw_decision_t *result);
 
 /*
  * llb_ai_ratelimit_check – enforce per-key and per-tenant RPS limits.

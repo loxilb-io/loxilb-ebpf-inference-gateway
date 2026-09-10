@@ -2473,6 +2473,12 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // the two answer different questions: ai_gw_mode says "this connection does
   // AI accounting", apikey_auth says "this service enforces a credential".
   pval->apikey_auth = dat->apikey_auth;
+  // JWT auth profile for the Bearer arm (apikey_auth modes 3/4) — the
+  // nat2proxy hop of the additive chain (dp_proxy_tacts -> proxy_arg ->
+  // proxy_add_entry).
+  strncpy(pval->jwt_auth_profile, (const char *)dat->jwt_auth_profile,
+          sizeof(pval->jwt_auth_profile) - 1);
+  pval->jwt_auth_profile[sizeof(pval->jwt_auth_profile) - 1] = '\0';
   // SGLang bootstrap port (0 ⇒ defaulted at proxy_add) — the nat2proxy hop
   // of the additive chain (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
   pval->pd_bootstrap_port = dat->pd_bootstrap_port;

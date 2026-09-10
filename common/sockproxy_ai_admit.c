@@ -98,19 +98,50 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
   /* Stage 1: validate the credential → 401 (missing/invalid), 403 (model
    * denied), 503 (store cannot answer). The store outage is deliberately
    * NOT a 401: a client that retries a 503 is behaving correctly; a client
-   * that retries a 401 is replaying a credential that will never work. */
+   * that retries a 401 is replaying a credential that will never work.
+   *
+   * Arm dispatch: mode 1 is the API-key arm and mode 3 the JWT arm.
+   * Mode 4 (apikey-or-jwt) picks by which credential is PRESENT, API key
+   * winning: a present X-Api-Key decides alone and its refusal is final —
+   * falling back to the JWT arm after a failed key would let a caller
+   * probe one credential per request behind a single 401. With no key the
+   * Bearer arm decides (its missing-token 401 covers the neither-present
+   * case). Unknown wire values keep the old fail-closed posture and
+   * enforce the API-key arm — a JWT-only client is denied there, never
+   * admitted unchecked. Identities are never merged across arms. */
+  const char *bearer = req->bearer ? req->bearer : "";
+  const char *jwt_profile = req->jwt_profile ? req->jwt_profile : "";
+  int jwt_arm = (req->auth_mode == 3) ||
+                (req->auth_mode == 4 && api_key[0] == '\0');
+
   ai_gw_decision_t key_dec = {0};
-  int ai_rc = llb_ai_validate_key((char *)api_key, (char *)model, &key_dec);
+  int ai_rc;
+  if (jwt_arm) {
+    int bearer_flags = req->bearer_oversize ? AI_GW_BEARERF_OVERSIZE : 0;
+    ai_rc = llb_ai_validate_bearer((char *)bearer, (char *)model,
+                                   (char *)jwt_profile, bearer_flags,
+                                   &key_dec);
+  } else {
+    ai_rc = llb_ai_validate_key((char *)api_key, (char *)model, &key_dec);
+  }
   if (ai_rc != 0) {
+    /* The Go arm names its refusal (invalid_token/token_expired/…); fall
+     * back to the arm-appropriate legacy code when it did not. */
+    const char *deny_code = key_dec.error_code[0] ? key_dec.error_code
+                          : (jwt_arm ? "invalid_token" : "invalid_api_key");
     if (key_dec.decision == 4) {
-      set_deny(res, AI_GW_STAGE_AUTH, 503, 5, 0, "policy_store_unavailable",
-               "API-key policy store is unavailable; request refused");
+      set_deny(res, AI_GW_STAGE_AUTH, 503, 5, 0,
+               key_dec.error_code[0] ? key_dec.error_code
+                                     : "policy_store_unavailable",
+               "Credential policy store is unavailable; request refused");
     } else if (key_dec.decision == 2) {
       set_deny(res, AI_GW_STAGE_AUTH, 403, 0, 0, "model_not_allowed",
-               "Model not permitted for this API key");
+               jwt_arm ? "Model not permitted for this token"
+                       : "Model not permitted for this API key");
     } else {
-      set_deny(res, AI_GW_STAGE_AUTH, 401, 0, 0, "invalid_api_key",
-               "Missing or invalid X-Api-Key header");
+      set_deny(res, AI_GW_STAGE_AUTH, 401, 0, 0, deny_code,
+               jwt_arm ? "Missing or invalid bearer token"
+                       : "Missing or invalid X-Api-Key header");
     }
     return -1;
   }
@@ -133,6 +164,8 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
 
   snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
   snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
+  snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
+  res->auth_flags = key_dec.auth_flags;
   snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
 
   /* Stage 3: per-key then per-tenant RPS check → 429. The body-bound model

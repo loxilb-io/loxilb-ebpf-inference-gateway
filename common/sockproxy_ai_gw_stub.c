@@ -66,6 +66,21 @@ llb_ai_validate_key(char *raw_key, char *model_name, ai_gw_decision_t *result)
 }
 
 __attribute__((weak)) int
+llb_ai_validate_bearer(char *bearer, char *model_name, char *profile_name,
+                       int bearer_flags, ai_gw_decision_t *result)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)bearer;
+    (void)model_name;
+    (void)profile_name;
+    (void)bearer_flags;
+    if (result) {
+        result->decision = 0;  /* allow */
+    }
+    return 0;
+}
+
+__attribute__((weak)) int
 llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
                        ai_gw_decision_t *result)
 {

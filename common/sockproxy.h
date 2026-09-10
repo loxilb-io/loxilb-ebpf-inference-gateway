@@ -557,7 +557,8 @@ typedef struct proxy_epval {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
-  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled (per-service policy, NOT derived)
+  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
+  char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
    * kv_engine_type (0=vllm ⇒ PD_ENGINE_VLLM, 1=sglang ⇒ PD_ENGINE_SGLANG,
    * 2=trtllm ⇒ PD_ENGINE_TRTLLM) so the orchestration branch never reads a
@@ -1046,7 +1047,23 @@ struct proxy_fd_ent {
 
   // AI Gateway per-connection state
   char     x_api_key_raw[256];        // Raw value of X-Api-Key request header (extracted by handle_header_val)
+  // Raw Authorization: Bearer token (scheme prefix stripped) captured by
+  // handle_header_val. JWTs run bigger than API keys — real-world Keycloak
+  // access tokens with role-stuffed payloads clear 2 KB — so the cap is
+  // 4 KB. A value that does not fit sets bearer_oversize instead of storing
+  // a truncated token: a truncated JWT would fail signature verification
+  // anyway, but as an indistinguishable bad_signature — the flag keeps the
+  // denial reason honest (401 invalid_token, counted as oversize).
+  // Lifetime mirrors x_api_key_raw: cleared per request at message-begin.
+  char     bearer_raw[4096];
+  uint8_t  bearer_oversize;           // 1 = Authorization Bearer value exceeded the 4 KB cap
   char     tenant_id[64];             // Tenant ID from llb_ai_validate_key decision
+  char     auth_user_id[128];         // Per-user identity from the deciding credential arm ("" = none);
+                                      // distinct from user_id below, which is a BODY field capture
+  // Upstream hygiene, stamped by the admission gate per request:
+  uint8_t  auth_strip_authz;          // 1 = strip Authorization before dispatch (JWT arm decided, no passthrough)
+  uint8_t  auth_fwd_identity;         // 1 = inject X-Auth-Tenant/X-Auth-User upstream (verified values)
+  uint8_t  auth_jwt_capable;          // 1 = rule mode consults the JWT arm (3/4): always strip client X-Auth-*
   uint8_t  ai_gw_denied;              // 1 = the AI gate refused this request (response already sent,
                                       // socket shut down). Read after llhttp_execute to keep a policy
                                       // denial out of the parse-error fallback, which relays the buffer
@@ -1400,7 +1417,8 @@ struct proxy_arg {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
-  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled (per-service policy, NOT derived)
+  uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
+  char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
   // proxy_add). The nat2proxy hop of the additive chain
   // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
