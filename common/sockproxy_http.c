@@ -4779,6 +4779,57 @@ proxy_pdestroy(void *priv)
       pfe->usage_res_epoch = 0;
     }
 
+    /* A backend teardown must not discard a client's undelivered payload.
+     * A fast backend can be fully read (or hard-reset) while the slow client
+     * it fed still owes up to a full cache high-water mark from its xmit
+     * cache; cascading proxy_release_rfd_ctx here destroys that cache and
+     * truncates the response (CURLE_PARTIAL_FILE). Detach such a client
+     * instead: mark peer_eof so the drain path (proxy_xmit_cache) closes it
+     * gracefully once the cache empties — or the graceful timeout fires —
+     * exactly the contract the EOF-deferral path establishes. Plain relays
+     * only: P/D flows have their own teardown semantics above. */
+    if (!is_listener && pfe->odir == 1) {
+      for (int di = 0; di < MAX_PROXY_EP; di++) {
+        proxy_fd_ent_t *cpfe = pfe->rfd_ent[di];
+        if (!cpfe || cpfe->odir != 0 || cpfe->pd_phase != PD_PHASE_NONE) {
+          continue;
+        }
+        PROXY_ENT_LOCK(cpfe);
+        if (cpfe->fd > 0 && cpfe->cache_head && !cpfe->ssl_err) {
+          if (!cpfe->peer_eof) {
+            cpfe->peer_eof = 1;
+            cpfe->eof_timestamp = time(NULL);
+            atomic_fetch_add(&global_stats.peer_eof_graceful, 1);
+          }
+          log_info("[EOF_DEFER_TEARDOWN] backend fd=%d destroyed; client fd=%d "
+                   "still owes cache_count=%u (%.2f MB) — detaching client for "
+                   "graceful drain",
+                   pfe->fd, cpfe->fd, cpfe->cache_count,
+                   cpfe->cache_total_size / (1024.0 * 1024.0));
+          /* Unlink both directions so proxy_release_rfd_ctx skips it. */
+          for (int dj = 0; dj < MAX_PROXY_EP; dj++) {
+            if (cpfe->rfd_ent[dj] == pfe) {
+              cpfe->rfd_ent[dj] = NULL;
+              cpfe->rfd[dj] = -1;
+              if (cpfe->n_rfd > 0) {
+                cpfe->n_rfd--;
+              }
+            }
+          }
+          pfe->rfd_ent[di] = NULL;
+          pfe->rfd[di] = -1;
+          if (pfe->n_rfd > 0) {
+            pfe->n_rfd--;
+          }
+          /* Keep the drain moving: the cache flushes on client EPOLLOUT. */
+          notify_add_ent(proxy_struct->ns, cpfe->fd,
+                         NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP,
+                         cpfe, cpfe->gen);
+        }
+        PROXY_ENT_UNLOCK(cpfe);
+      }
+    }
+
     if (!is_listener) {
       proxy_release_rfd_ctx(pfe);
     }
@@ -5582,6 +5633,14 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             // Keep WRITE side open for peer to drain cache
             shutdown(pfe->fd, SHUT_RD);
 
+            /* The FIN is consumed but POLLRDHUP is level-triggered: with the
+             * fd still armed the worker would spin re-dispatching this EOF
+             * until the peer's cache drains. Disarm its poll events; the fd
+             * stays registered/owned, and the peer's teardown (or a hard
+             * reset -> POLLERR/POLLHUP, still reported when disarmed)
+             * finishes the cleanup. */
+            notify_disarm_ent(proxy_struct->ns, pfe->fd);
+
             // Return 1 to keep connection tracked (not -1 which removes from epoll)
             return 1;
           } else {
@@ -5794,6 +5853,11 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             // Shutdown SSL and READ side only
             SSL_shutdown(pfe->ssl);
             shutdown(pfe->fd, SHUT_RD);
+
+            /* Same as the plaintext deferral: disarm the level-triggered
+             * RDHUP so the worker doesn't spin; the fd stays registered and
+             * the peer's teardown finishes the cleanup. */
+            notify_disarm_ent(proxy_struct->ns, pfe->fd);
 
             // Return 1 to keep connection tracked
             return 1;
@@ -8588,7 +8652,14 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     }
 
     // CRITICAL FIX: Handle EAGAIN/EWOULDBLOCK properly (not an error, just no more data)
-    if (rc <= 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) {
+    // rc < 0 ONLY: recv()==0 is an orderly EOF and does NOT set errno, so a
+    // stale EAGAIN from an earlier syscall must never reclassify an EOF as
+    // "no more data" — that skips proxy_sock_read_err entirely, leaving the
+    // fd armed while POLLIN(EOF) is level-triggered: the worker spins on the
+    // dead connection until an unrelated syscall happens to change errno.
+    // (Masked historically because the FIN's POLLRDHUP was treated as a fatal
+    // HUP and tore the pair down — the response-truncation bug.)
+    if (rc < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) {
       // No more data available - this is NORMAL for non-blocking sockets
       // Break out of read loop and wait for next NOTI_TYPE_IN event
       log_trace("📭 [NO_MORE_DATA] fd=%d (odir=%d): No more data available (EAGAIN/EWOULDBLOCK), exiting burst loop",

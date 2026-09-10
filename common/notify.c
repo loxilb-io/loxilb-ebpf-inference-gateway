@@ -125,8 +125,17 @@ notify_conv4mpoll_events(short events)
   if (events & POLLOUT) {
     type |= NOTI_TYPE_OUT;
   }
-  if (events & (POLLRDHUP|POLLHUP)) {
+  /* POLLHUP (peer fully gone / reset) stays fatal; POLLRDHUP is only a
+   * half-close — data can still be queued ahead of the FIN, and our write
+   * side is still open. Mapping RDHUP to the fatal HUP type made the
+   * dispatcher cascade proxy_pdestroy on a backend's FIN while the (slow)
+   * client's xmit cache still held up to a full high-water mark of
+   * undelivered response — the client saw a truncated body. */
+  if (events & POLLHUP) {
     type |= NOTI_TYPE_HUP;
+  }
+  if (events & POLLRDHUP) {
+    type |= NOTI_TYPE_RDHUP;
   }
   if (events & (POLLERR|POLLNVAL)) {
     type |= NOTI_TYPE_ERROR;
@@ -605,6 +614,41 @@ notify_deregister_ent(void *ctx, int fd)
   nctx->n_fds--;
   pctx->n_pfds--;
 
+  NOTI_UNLOCK(nctx);
+
+  return 0;
+}
+
+/* Disarm poll events for a registered fd WITHOUT removing its entry (see
+ * notify.h). The worker polls a snapshot of pfds, so one already-queued event
+ * may still dispatch after this returns; callers must tolerate that. */
+int
+notify_disarm_ent(void *ctx, int fd)
+{
+  notify_ctx_t *nctx = ctx;
+  notify_ent_t *ent;
+  notify_poll_ctx_t *pctx;
+
+  assert(ctx);
+
+  if (fd <= 0 || fd >= MAX_NOTIFY_FDS) {
+    return -EINVAL;
+  }
+
+  NOTI_LOCK(nctx);
+  ent = &nctx->earr[fd];
+  if (ent->fd <= 0) {
+    NOTI_UNLOCK(nctx);
+    return -ENOENT;
+  }
+  if (ent->poll_slot < 0 || ent->poll_slot >= MAX_NOTIFY_POLL_FDS ||
+      ent->thr_id < 0 || ent->thr_id >= MAX_NOTIFY_THREADS) {
+    NOTI_UNLOCK(nctx);
+    return -EINVAL;
+  }
+  ent->type = 0;
+  pctx = &nctx->poll_ctx[ent->thr_id];
+  pctx->pfds[ent->poll_slot].events = 0;
   NOTI_UNLOCK(nctx);
 
   return 0;
