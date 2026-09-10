@@ -907,6 +907,17 @@ pd_fallback_normal:
           algorithm_selection = ns_overlay_resolve(algorithm_selection, &nso, &nsk);
           if (nsk == NS_OVERLAY_LEARNED) {
             ns_used_learned = 1;
+            /* Record the normal-mode session hit metric here, on the DFL
+             * path that actually serves L7 stickiness. The twin call on the
+             * PROXY_MODE_ALL path cannot fire for L7 rules (that branch is
+             * non-L7 only, so no parsed session header ever reaches it),
+             * which left this counter dead while [NS_STICKY_HIT] logged. */
+            if (pfe) {
+              const char *sh_model = "";
+              if (pfe->x_model_header[0] != '\0') sh_model = pfe->x_model_header;
+              else if (pfe->prefix_key.model[0] != '\0') sh_model = pfe->prefix_key.model;
+              llb_ai_normal_session_hit((char *)sh_model);
+            }
             log_info("[NS_STICKY_HIT] key='%s' -> ep[%d] (DFL)", ns_session_key,
                      nso.learned_ep);
           }
