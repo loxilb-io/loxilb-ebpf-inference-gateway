@@ -321,6 +321,21 @@ extern void llb_ai_pd_record(char *model_name, int64_t prefill_latency_ms,
 extern void llb_ai_pd_session_hit(char *model_name);
 
 /*
+ * llb_ai_pd_tier_selected – record the terminal P/D routing-tier decision.
+ *
+ * C sockproxy calls this exactly once per successful prefill selection, at
+ * the terminal return of the tier that produced the endpoint. Admission
+ * outcomes (parked, no-capacity) and pre-routing failures never call it, so
+ * per window: accepted P/D selections == sum over the four tiers.
+ *
+ * Parameters:
+ *   model_name  effective model name (NUL-terminated; "" for model-less)
+ *   tier        0=Tier-0 session, 1=Tier-1 trie, 15=Tier-1.5 KV-exact,
+ *               2=Tier-2 min-load
+ */
+extern void llb_ai_pd_tier_selected(char *model_name, int tier);
+
+/*
  * llb_ai_normal_session_hit – record a normal-mode session-stickiness cache hit.
  *
  * C sockproxy calls this when PRIORITY 0 (learned conv_map lookup) succeeds
