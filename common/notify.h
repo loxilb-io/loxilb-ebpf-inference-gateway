@@ -14,6 +14,12 @@ typedef enum {
   NOTI_TYPE_OUT    = 0x1 << 2,
   NOTI_TYPE_ERROR  = 0x1 << 3,
   NOTI_TYPE_SHUT   = 0x1 << 4,
+  /* Peer half-close (POLLRDHUP): the peer shut its write side, but data may
+   * still be queued ahead of the FIN and OUR write side is still usable. Unlike
+   * NOTI_TYPE_HUP this is NOT fatal — the dispatcher must not auto-destroy the
+   * connection on it, or a relay tears down with undelivered payload still in
+   * its xmit cache and in the socket buffer. */
+  NOTI_TYPE_RDHUP  = 0x1 << 5,
 } notify_type_t;
 
 typedef struct notify_cbs {
@@ -44,6 +50,14 @@ int notify_delete_ent(void *ctx, int fd, int evict);
  * cascades into proxy_pdestroy — the caller owns closing the fd and freeing the
  * pfe exactly once. Used by the reaper's pd_teardown_conn(). */
 int notify_deregister_ent(void *ctx, int fd);
+/* Disarm poll events for a registered fd WITHOUT removing its entry: the fd
+ * stays owned/tracked (the evict-based final cleanup still works) but poll
+ * stops watching IN/OUT/RDHUP for it. poll(2) still reports POLLHUP/POLLERR
+ * regardless of the requested mask, so a hard peer reset is never missed.
+ * Used to park a half-closed source whose reads are backpressure-paused: a
+ * level-triggered POLLRDHUP would otherwise spin the worker. Re-arm with
+ * notify_add_ent (same priv updates the mask in place). */
+int notify_disarm_ent(void *ctx, int fd);
 /* D2 root fix: `gen` is the pfe's generation stamp at registration time; it is
  * stored on the notify entry and handed back to cbs.notify at dispatch so the
  * callback can detect a recycled-slot stale event. Pass 0 for non-pooled priv. */

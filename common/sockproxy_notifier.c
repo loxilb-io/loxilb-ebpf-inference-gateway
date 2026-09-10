@@ -362,6 +362,11 @@ restart:
   while (type) {
     if (type & NOTI_TYPE_IN) {
       type &= ~NOTI_TYPE_IN;
+      /* An IN|RDHUP event needs no separate RDHUP handling: the read path
+       * below consumes the queued tail and the EOF itself, and the EOF
+       * handler (proxy_sock_read_err) already defers the close while the
+       * peer's xmit cache still owes data. */
+      type &= ~NOTI_TYPE_RDHUP;
 
       if (pfe->stype == PROXY_SOCK_LISTEN) {
         // Handle new connection acceptance (extracted for clarity)
@@ -400,6 +405,41 @@ restart:
           PROXY_ENT_UNLOCK(pfe);
         }
       }
+    } else if (type & NOTI_TYPE_RDHUP) {
+      type &= ~NOTI_TYPE_RDHUP;
+      /* Peer half-close with no readable data requested/pending in this
+       * event. Historically this was folded into the fatal HUP type and the
+       * notifier core cascaded proxy_pdestroy — which destroyed the peer's
+       * xmit cache mid-relay: a fast backend's FIN truncated a slow client
+       * by up to a cache high-water mark (CURLE_PARTIAL_FILE). Route it by
+       * state instead; only a true POLLHUP/POLLERR tears down eagerly. */
+      if (pfe->stype == PROXY_SOCK_ACTIVE) {
+        if (!pfe->read_paused) {
+          /* Reads are live: run the normal read path — it drains any tail
+           * queued ahead of the FIN and lands in the EOF handling, which
+           * defers the close while the peer still owes cached data. */
+          int result = handle_client_data(fd, pfe, &key, &rkey);
+          if (result < 0) {
+            goto restart;
+          }
+        } else if (pfe->odir == 1) {
+          /* Backend half-closed while its reads are paused (relay-cache
+           * backpressure or QoS park): the response tail is still unread in
+           * the socket buffer. Disarm the fd's poll events — RDHUP is
+           * level-triggered and would spin — but keep it registered and
+           * owned. The backpressure release / shaper refill re-arms EPOLLIN
+           * and the read path then consumes tail + EOF and closes
+           * gracefully. */
+          notify_disarm_ent(proxy_struct->ns, fd);
+        } else {
+          /* A paused CLIENT (parked upload / admission park) half-closed:
+           * nothing is owed to a departing client — keep the historic
+           * teardown semantics. Full shutdown surfaces POLLHUP, which
+           * cascades the normal destroy path. */
+          shutdown(pfe->fd, SHUT_RDWR);
+        }
+      }
+      /* Non-ACTIVE socks (listeners) never see RDHUP: ignore. */
     } else {
       /* Unhandled */
       return 0;
