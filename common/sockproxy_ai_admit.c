@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -111,6 +112,23 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
    * admitted unchecked. Identities are never merged across arms. */
   const char *bearer = req->bearer ? req->bearer : "";
   const char *jwt_profile = req->jwt_profile ? req->jwt_profile : "";
+
+  /* The capture hands over the RAW Authorization value, reassembled from
+   * however many fragments the parser delivered it in. Only the Bearer
+   * scheme feeds the JWT arm — Basic belongs to the session-affinity
+   * extractor — and the tag is stripped HERE, after reassembly, so a
+   * fragment boundary inside the header can never split the prefix this
+   * dispatch keys on. RFC 7235 allows more than one SP before the token.
+   * A non-Bearer value reads as "no bearer credential": on the JWT arm
+   * that is the missing-token 401. */
+  if (!strncasecmp(bearer, "Bearer ", 7)) {
+    bearer += 7;
+    while (*bearer == ' ')
+      bearer++;
+  } else {
+    bearer = "";
+  }
+
   int jwt_arm = (req->auth_mode == 3) ||
                 (req->auth_mode == 4 && api_key[0] == '\0');
 

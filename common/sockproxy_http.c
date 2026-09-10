@@ -4428,7 +4428,7 @@ proxy_pdestroy(void *priv)
    * The strings are COPIED because the pfe may be freed by then. */
   struct {
     int      pending;
-    char     tenant[64];
+    char     tenant[128];
     char     model[MAX_MODEL_LEN];
     int      reserved;
     int64_t  res_epoch;
@@ -6420,6 +6420,8 @@ handle_on_message_begin(llhttp_t* parser)
   if (pfe->odir == 0) {
     pfe->x_api_key_raw[0] = '\0';
     pfe->bearer_raw[0] = '\0';
+    pfe->bearer_len = 0;
+    pfe->bearer_capturing = 0;
     pfe->bearer_oversize = 0;
     pfe->auth_user_id[0] = '\0';
     pfe->auth_strip_authz = 0;
@@ -7179,6 +7181,10 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
     pfe->last_header_name[length] = '\0';
   }
 
+  // A new header name ends any in-progress Authorization value
+  // accumulation (handle_header_val appends across value fragments).
+  pfe->bearer_capturing = 0;
+
   if (strncasecmp("Host", str, length) == 0) {
     pfe->http_hok = 1;
   }
@@ -7394,26 +7400,36 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
     }
   }
 
-  // AI Gateway: capture Authorization: Bearer for the JWT admission arm.
-  // Only the Bearer scheme is taken — Basic stays with the session-affinity
-  // extractor, which tells the two apart by the same prefix. The scheme tag
-  // (plus any extra RFC 7235 SP) is stripped so the gate hands the bare
-  // compact JWS to the verifier. A value over the 4 KB cap is NOT stored
-  // truncated: a truncated JWT would fail verification anyway, but as an
-  // indistinguishable bad_signature — the oversize flag keeps the 401
-  // reason honest. Lifetime mirrors x_api_key_raw (overwritten per capture).
+  // AI Gateway: accumulate the Authorization value for the JWT admission
+  // arm. llhttp is fed per read and keeps state across llhttp_execute
+  // calls, so one header value may arrive as SEVERAL fragments — and a
+  // 2-4 KB JWT is long enough that a fragment boundary inside it is an
+  // expected event, not a corner case. This capture therefore APPENDS,
+  // unlike the short single-shot captures above, and stores the value RAW
+  // (scheme tag included): the admission gate strips the Bearer prefix
+  // after reassembly, so a boundary can never split the tag the dispatch
+  // keys on. A new header name resets the accumulator (bearer_capturing
+  // is cleared in handle_header_name), which also gives a repeated
+  // Authorization header last-one-wins semantics, matching the captures
+  // above. A value over the 4 KB cap is NOT stored truncated: a truncated
+  // JWT would fail verification anyway, but as an indistinguishable
+  // bad_signature — the oversize flag keeps the 401 reason honest.
   if (!strncasecmp("Authorization", pfe->last_header_name, 13)) {
-    if (length > 7 && !strncasecmp(at, "Bearer ", 7)) {
-      const char *tok = at + 7;
-      size_t tok_len = length - 7;
-      while (tok_len > 0 && *tok == ' ') { tok++; tok_len--; }
-      if (tok_len > 0 && tok_len < sizeof(pfe->bearer_raw)) {
-        memcpy(pfe->bearer_raw, tok, tok_len);
-        pfe->bearer_raw[tok_len] = '\0';
-        pfe->bearer_oversize = 0;
-      } else if (tok_len >= sizeof(pfe->bearer_raw)) {
-        pfe->bearer_raw[0] = '\0';
+    if (!pfe->bearer_capturing) {
+      pfe->bearer_capturing = 1;
+      pfe->bearer_len = 0;
+      pfe->bearer_oversize = 0;
+      pfe->bearer_raw[0] = '\0';
+    }
+    if (!pfe->bearer_oversize && length > 0) {
+      if ((size_t)pfe->bearer_len + length >= sizeof(pfe->bearer_raw)) {
         pfe->bearer_oversize = 1;
+        pfe->bearer_raw[0] = '\0';
+        pfe->bearer_len = 0;
+      } else {
+        memcpy(pfe->bearer_raw + pfe->bearer_len, at, length);
+        pfe->bearer_len += (uint16_t)length;
+        pfe->bearer_raw[pfe->bearer_len] = '\0';
       }
     }
   }

@@ -67,8 +67,9 @@ typedef enum {
  * NUL-terminated. body may be NULL when the request carried none. */
 typedef struct ai_gw_req_ctx {
   const char *api_key;       /* captured X-Api-Key value ("" when absent) */
-  const char *bearer;        /* captured Authorization Bearer token, scheme
-                              * stripped ("" when absent) */
+  const char *bearer;        /* RAW Authorization header value, scheme tag
+                              * included ("" when absent); the gate strips
+                              * the Bearer prefix itself after reassembly */
   int         bearer_oversize; /* 1 = capture exceeded its cap; token dropped */
   const char *jwt_profile;   /* rule jwt_auth_profile ("" when none) */
   const char *body;          /* request body bytes, or NULL */

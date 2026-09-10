@@ -1047,17 +1047,26 @@ struct proxy_fd_ent {
 
   // AI Gateway per-connection state
   char     x_api_key_raw[256];        // Raw value of X-Api-Key request header (extracted by handle_header_val)
-  // Raw Authorization: Bearer token (scheme prefix stripped) captured by
-  // handle_header_val. JWTs run bigger than API keys — real-world Keycloak
-  // access tokens with role-stuffed payloads clear 2 KB — so the cap is
-  // 4 KB. A value that does not fit sets bearer_oversize instead of storing
-  // a truncated token: a truncated JWT would fail signature verification
+  // Raw Authorization header VALUE (scheme tag included) accumulated by
+  // handle_header_val. Unlike the short single-shot captures around it,
+  // this one APPENDS: llhttp is fed per read and may deliver one value in
+  // several fragments, and JWTs run bigger than API keys — real-world
+  // Keycloak access tokens with role-stuffed payloads clear 2 KB, so a
+  // fragment boundary inside the value is an expected event. The Bearer
+  // prefix is stripped by the admission gate AFTER reassembly, so a
+  // boundary can never split the tag the dispatch keys on. Cap is 4 KB; a
+  // value that does not fit sets bearer_oversize instead of storing a
+  // truncated token: a truncated JWT would fail signature verification
   // anyway, but as an indistinguishable bad_signature — the flag keeps the
   // denial reason honest (401 invalid_token, counted as oversize).
   // Lifetime mirrors x_api_key_raw: cleared per request at message-begin.
   char     bearer_raw[4096];
-  uint8_t  bearer_oversize;           // 1 = Authorization Bearer value exceeded the 4 KB cap
-  char     tenant_id[64];             // Tenant ID from llb_ai_validate_key decision
+  uint16_t bearer_len;                // accumulated value bytes (< sizeof(bearer_raw))
+  uint8_t  bearer_capturing;          // 1 = mid-value; cleared by every new header name
+  uint8_t  bearer_oversize;           // 1 = Authorization value exceeded the 4 KB cap
+  char     tenant_id[128];            // Tenant ID from the deciding credential arm; sized to
+                                      // ai_gw_decision_t.tenant_id — JWT tenants come from IdP
+                                      // claims whose length the operator does not control
   char     auth_user_id[128];         // Per-user identity from the deciding credential arm ("" = none);
                                       // distinct from user_id below, which is a BODY field capture
   // Upstream hygiene, stamped by the admission gate per request:
