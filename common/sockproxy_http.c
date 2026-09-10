@@ -54,6 +54,7 @@
 #include "sockproxy_metrics.h"
 #include "sockproxy_routing.h"
 #include "sockproxy_json.h"
+#include "sockproxy_ai_admit.h"
 #include "sockproxy_trace.h"
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_catalog.h"
@@ -6371,6 +6372,7 @@ handle_on_message_begin(llhttp_t* parser)
   if (pfe->odir == 0) {
     pfe->x_api_key_raw[0] = '\0';
     pfe->x_model_header[0] = '\0';
+    pfe->effective_model[0] = '\0';
     pfe->json_stream_route_pending = 0;
     pfe->json_stream_continue_sent = 0;
     /* Token-accounting state is per-response: without this reset, request
@@ -6428,18 +6430,12 @@ handle_on_message_complete(llhttp_t* parser)
   if (pfe->odir == 0 && pfe->head) {
     proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
     if (hent->val.ephash && hent->val.ephash->ai_gw_mode) {
-      ai_gw_decision_t ai_dec = {0};
-      char body_model[MAX_MODEL_LEN] = {0};
       const char *gate_body = NULL;
       size_t gate_body_len = 0;
 
-      /* allowed_models must bind to the model the backend will actually
-       * serve, which is the one in the JSON body — an X-Model header that
-       * differs from the body is at best a stale hint and at worst a spoof.
-       * The message is complete here, so the body is present in rcvbuf;
-       * parse it and fall back to the header only when the body carries no
-       * model field. The located body also feeds the pre-admission token
-       * reservation below. */
+      /* Locate the body in rcvbuf (the message is complete here); it feeds
+       * the gate's body-first model resolution and the pre-admission token
+       * reservation. */
       if (pfe->http_content_length > 0 && pfe->rcv_off > 4) {
         for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
           if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
@@ -6449,212 +6445,114 @@ handle_on_message_complete(llhttp_t* parser)
             break;
           }
         }
-        if (gate_body && gate_body_len > 0) {
-          extract_model_field(gate_body, gate_body_len, body_model, sizeof(body_model));
-        }
       }
-      char *model = body_model[0] ? body_model
-                  : (pfe->prefix_key.model[0] ? pfe->prefix_key.model
-                  : (pfe->x_model_header[0] ? pfe->x_model_header : ""));
 
-      /* Step 1: validate X-Api-Key → 401 (missing/invalid) or 403 (model denied).
-       *
-       * Gated on the service's OWN policy, not on ai_gw_mode. The two are
-       * different questions: ai_gw_mode says this connection does AI
-       * accounting, apikey_auth says this service enforces a credential.
-       * Enforcement used to ride on whether the service streamed, which meant
-       * an operator could not turn on SSE without also turning on auth, or
-       * authenticate a non-streaming service at all.
-       *
-       * Read from the rule (ephash) rather than the accept-time copy on the
-       * pfe: this block runs once per request, and a keep-alive connection
-       * opened before the operator enabled enforcement must not keep skipping
-       * the gate for the life of that connection.
-       *
-       * With the policy disabled, ai_dec stays zeroed, so the rate-limit and
-       * token-quota stages below see an empty tenant and no-op — they are
-       * already written to skip on an empty tenant, so no second branch is
-       * needed here. */
-      /* Skip enforcement only for the two DECLARED non-enforcing values.
-       * 1 enforces, and so does anything out of range: a wire value this
-       * code does not recognise is a corrupted policy, and a corrupted
-       * policy that admits keyless traffic fails open on exactly the
-       * services an operator tried to protect. */
-      if (hent->val.ephash->apikey_auth == 0 ||
-          hent->val.ephash->apikey_auth == 2) {
+      /* One gate, shared across protocol parsers: every policy decision --
+       * enforcement mode, credential validation, the body-first effective
+       * model and its conflict rule, RPS, token reservation -- lives in
+       * ai_gw_admit (sockproxy_ai_admit.c). This caller owns only the H1
+       * response emission and the pfe wiring. */
+      ai_gw_req_ctx_t adm_req = {
+        .api_key = pfe->x_api_key_raw,
+        .body = gate_body,
+        .body_len = gate_body_len,
+        .prefix_model = pfe->prefix_key.model,
+        .hdr_model = pfe->x_model_header,
+        .auth_mode = hent->val.ephash->apikey_auth,
+      };
+      ai_gw_admit_result_t adm;
+      ai_gw_admit(&adm_req, &adm);
+
+      if (adm.verdict == AI_GW_ADMIT_UNMETERED) {
         /* Served, but neither authenticated nor attributable to a tenant.
          * Report it so the operator can see the consequence of the default
-         * rather than infer it from a bill. */
+         * rather than infer it from a bill. The legacy model derivation
+         * also stays in force: pfe->effective_model is deliberately not
+         * written on non-enforcing services. */
         char um_vip[INET6_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &hent->key.xip, um_vip, sizeof(um_vip));
         llb_ai_record_unmetered(um_vip);
-        goto ai_gate_done;
-      }
-
-      int ai_rc = llb_ai_validate_key(pfe->x_api_key_raw, model, &ai_dec);
-      if (ai_rc != 0) {
-        if (ai_dec.decision == 4) {
-          /* The policy requires a key and the store cannot answer. This is
-           * the gateway's fault, not the client's, and it is transient --
-           * so it must NOT be reported as 401. A client that retries a 503
-           * is behaving correctly; a client that retries a 401 is just
-           * replaying a credential that will never work.
-           *
-           * Retry-After is deliberately short: the store may be seconds
-           * from coming back, and this is the failing-closed path, so the
-           * cost of an early retry is one more cheap refusal. */
-          static const char resp_503[] =
-            "HTTP/1.1 503 Service Unavailable\r\n"
+      } else if (adm.verdict == AI_GW_ADMIT_DENY) {
+        char resp_buf[512];
+        int n;
+        const char *status_line =
+          adm.http_status == 400 ? "400 Bad Request" :
+          adm.http_status == 401 ? "401 Unauthorized" :
+          adm.http_status == 403 ? "403 Forbidden" :
+          adm.http_status == 429 ? "429 Too Many Requests" :
+                                   "503 Service Unavailable";
+        if (adm.retry_body) {
+          n = snprintf(resp_buf, sizeof(resp_buf),
+            "HTTP/1.1 %s\r\n"
             "Content-Type: application/json\r\n"
-            "Retry-After: 5\r\n"
+            "Retry-After: %d\r\n"
             "Connection: close\r\n"
             "\r\n"
-            "{\"error\":\"policy_store_unavailable\","
-            "\"message\":\"API-key policy store is unavailable; request refused\"}\r\n";
-          send(pfe->fd, resp_503, sizeof(resp_503) - 1, 0);
-        } else if (ai_dec.decision == 2) {
-          static const char resp_403[] =
-            "HTTP/1.1 403 Forbidden\r\n"
+            "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+            status_line, adm.retry_after, adm.error_code, adm.retry_after);
+        } else if (adm.retry_after > 0) {
+          n = snprintf(resp_buf, sizeof(resp_buf),
+            "HTTP/1.1 %s\r\n"
             "Content-Type: application/json\r\n"
+            "Retry-After: %d\r\n"
             "Connection: close\r\n"
             "\r\n"
-            "{\"error\":\"model_not_allowed\","
-            "\"message\":\"Model not permitted for this API key\"}\r\n";
-          send(pfe->fd, resp_403, sizeof(resp_403) - 1, 0);
+            "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+            status_line, adm.retry_after, adm.error_code, adm.error_msg);
         } else {
-          static const char resp_401[] =
-            "HTTP/1.1 401 Unauthorized\r\n"
+          n = snprintf(resp_buf, sizeof(resp_buf),
+            "HTTP/1.1 %s\r\n"
             "Content-Type: application/json\r\n"
             "Connection: close\r\n"
             "\r\n"
-            "{\"error\":\"invalid_api_key\","
-            "\"message\":\"Missing or invalid X-Api-Key header\"}\r\n";
-          send(pfe->fd, resp_401, sizeof(resp_401) - 1, 0);
+            "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+            status_line, adm.error_code, adm.error_msg);
         }
+        if (n > 0 && n < (int)sizeof(resp_buf))
+          send(pfe->fd, resp_buf, (size_t)n, 0);
         shutdown(pfe->fd, SHUT_RDWR);
-        log_info("[AIGateway] fd=%d rejected: decision=%d key=%.8s...",
-                 pfe->fd, ai_dec.decision, pfe->x_api_key_raw);
-        /* Deny: stop the parser. A bare `return` here left an INDETERMINATE
-         * int as llhttp_execute's errno, and the relay path downstream runs
-         * only when that comes back HPE_OK — so whenever the garbage value
-         * happened to be 0, a request this gate had just rejected went on to
-         * the backend anyway. -1 is the documented callback error value.
-         *
-         * The flag is the second half of that fix. -1 surfaces to the read
-         * loop as a PARSE error, and the parse-error branch there is the
-         * not-actually-HTTP fallback: it resets the parser and still runs
-         * setup_proxy_path, after which the same iteration relays the buffer
-         * raw — the refused request, body and all, arriving at the backend
-         * with the client already holding its 401. The flag lets the read
-         * loop tell a policy denial from malformed traffic, because from
-         * llhttp's point of view they are the same errno. */
+        switch (adm.stage) {
+        case AI_GW_STAGE_CONFLICT:
+          log_info("[AIGateway] fd=%d model conflict: tenant=%s X-Model=%s",
+                   pfe->fd, adm.tenant_id, pfe->x_model_header);
+          break;
+        case AI_GW_STAGE_RATELIMIT:
+          log_info("[AIGateway] fd=%d rate-limited: key=%s tenant=%s error=%s retry=%d",
+                   pfe->fd, adm.key_id, adm.tenant_id, adm.error_code, adm.retry_after);
+          break;
+        case AI_GW_STAGE_RESERVE:
+          log_info("[AIGateway] fd=%d pre-admission denied: tenant=%s want=%u error=%s retry=%d",
+                   pfe->fd, adm.tenant_id, adm.reserved_toks, adm.error_code, adm.retry_after);
+          break;
+        default:
+          log_info("[AIGateway] fd=%d rejected: status=%d key=%.8s...",
+                   pfe->fd, adm.http_status, pfe->x_api_key_raw);
+          break;
+        }
+        /* Deny: stop the parser. A bare `return` here once left an
+         * INDETERMINATE errno for llhttp_execute, and whenever the garbage
+         * value happened to be 0 a rejected request went to the backend
+         * anyway; -1 is the documented callback error value. The flag is
+         * the second half of that fix: -1 surfaces as a PARSE error, whose
+         * fallback branch relays the buffer raw -- the flag lets the read
+         * loop tell a policy denial from malformed traffic. */
         pfe->ai_gw_denied = 1;
         return -1;
-      }
-
-      /* Persist tenant_id for SSE token accounting and metrics */
-      strncpy(pfe->tenant_id, ai_dec.tenant_id, sizeof(pfe->tenant_id) - 1);
-      pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
-
-      /* Step 2: per-key then per-tenant RPS check → 429. The body-bound
-       * model rides along so the token-quota stage can consult the
-       * tenant|model bucket next to the tenant aggregate. */
-      ai_gw_decision_t rl_dec = {0};
-      int rl_rc = llb_ai_ratelimit_check(ai_dec.key_id, ai_dec.tenant_id, model, &rl_dec);
-      if (rl_rc != 0) {
-        char resp_429[320];
-        /* Report the reason this stage actually returned. Two different
-         * denials arrive here: the per-key/per-tenant request-rate limit,
-         * and the token-quota latch when an earlier response drove the
-         * bucket into debt. Hardcoding rate_limit_exceeded told a tenant
-         * who had exhausted its TOKEN budget that it was sending requests
-         * too fast — the log carried the true code while the body the
-         * client parses contradicted it. The reservation stage below has
-         * always reported its own code; this one now matches.
-         *
-         * decision 4 is a third arrival, and not a rate: the stage found a
-         * keyed identity with no store behind it (its own invariant guard).
-         * That is the gateway's outage, so it carries the 503 status the
-         * validate arm uses, never a 429 that reads as "slow down". */
-        const char *rl_err =
-          rl_dec.error_code[0] ? rl_dec.error_code : "rate_limit_exceeded";
-        int n;
-        if (rl_dec.decision == 4) {
-          n = snprintf(resp_429, sizeof(resp_429),
-            "HTTP/1.1 503 Service Unavailable\r\n"
-            "Content-Type: application/json\r\n"
-            "Retry-After: %d\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-            rl_dec.retry_after, rl_err, rl_dec.retry_after);
-        } else {
-          n = snprintf(resp_429, sizeof(resp_429),
-            "HTTP/1.1 429 Too Many Requests\r\n"
-            "Content-Type: application/json\r\n"
-            "Retry-After: %d\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-            rl_dec.retry_after, rl_err, rl_dec.retry_after);
-        }
-        if (n > 0 && n < (int)sizeof(resp_429))
-          send(pfe->fd, resp_429, (size_t)n, 0);
-        shutdown(pfe->fd, SHUT_RDWR);
-        log_info("[AIGateway] fd=%d rate-limited: key=%s tenant=%s error=%s retry=%d",
-                 pfe->fd, ai_dec.key_id, ai_dec.tenant_id,
-                 rl_dec.error_code, rl_dec.retry_after);
-        pfe->ai_gw_denied = 1;
-        return -1;   /* deny: stop the parser (see the 401/403 arm above) */
-      }
-
-      /* Step 3: pre-admission token reservation → 429 BEFORE dispatch.
-       * Claim the request's worst case (prompt estimated from the body's
-       * messages/prompt extent + its declared max_tokens ceiling) against
-       * the tenant quota now, while denial costs one cheap response — not
-       * a backend prefill whose tokens the latch only bills afterwards.
-       * The claim and its window tag ride the pfe to the consume call,
-       * which credits the ceiling back and charges the real usage. */
-      if (gate_body && gate_body_len > 0) {
-        int resv_prompt = estimate_prompt_tokens(gate_body, gate_body_len);
-        int resv_max = extract_max_tokens(gate_body, gate_body_len);
-        if (resv_prompt > 0 || resv_max > 0) {
-          ai_gw_decision_t rs_dec = {0};
-          int64_t rs_epoch = 0;
-          if (llb_ai_token_quota_reserve(ai_dec.tenant_id, model,
-                                         resv_prompt, resv_max,
-                                         &rs_epoch, &rs_dec) != 0) {
-            char resp_429r[320];
-            int rn = snprintf(resp_429r, sizeof(resp_429r),
-              "HTTP/1.1 429 Too Many Requests\r\n"
-              "Content-Type: application/json\r\n"
-              "Retry-After: %d\r\n"
-              "Connection: close\r\n"
-              "\r\n"
-              "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-              rs_dec.retry_after, rs_dec.error_code, rs_dec.retry_after);
-            if (rn > 0 && rn < (int)sizeof(resp_429r))
-              send(pfe->fd, resp_429r, (size_t)rn, 0);
-            shutdown(pfe->fd, SHUT_RDWR);
-            log_info("[AIGateway] fd=%d pre-admission denied: tenant=%s "
-                     "want=%d+%d error=%s retry=%d",
-                     pfe->fd, ai_dec.tenant_id, resv_prompt, resv_max,
-                     rs_dec.error_code, rs_dec.retry_after);
-            pfe->ai_gw_denied = 1;
-            return -1;   /* deny: stop the parser (see the 401/403 arm above) */
-          }
-          if (rs_epoch != 0) {
-            pfe->usage_reserved_toks = (uint32_t)(resv_prompt + resv_max);
-            pfe->usage_res_epoch = rs_epoch;
-          }
+      } else {
+        /* Admitted. Persist the identity for SSE token accounting and
+         * metrics, the gate's model resolution for routing and
+         * response-phase consumers, and the token reservation for the
+         * settle call. */
+        strncpy(pfe->tenant_id, adm.tenant_id, sizeof(pfe->tenant_id) - 1);
+        pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
+        strncpy(pfe->effective_model, adm.effective_model,
+                sizeof(pfe->effective_model) - 1);
+        pfe->effective_model[sizeof(pfe->effective_model) - 1] = '\0';
+        if (adm.res_epoch != 0) {
+          pfe->usage_reserved_toks = adm.reserved_toks;
+          pfe->usage_res_epoch = adm.res_epoch;
         }
       }
-ai_gate_done:
-      /* Reached directly when the service's api_key_auth policy is disabled:
-       * no key was validated, no tenant established, and the rate-limit and
-       * token-quota stages above were therefore skipped rather than run
-       * against an empty tenant they would have no-opped on anyway. */
-      ;
     }
   }
 
@@ -7767,6 +7665,8 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->sse_mode = 0;
   npfe1->ai_gw_mode = 0;           // AI-gateway connection marker (drives request accounting)
   npfe1->apikey_auth = 0;          // per-service X-Api-Key policy (drives the auth gate)
+  npfe1->effective_model[0] = '\0'; // gate model resolution (pfe shells are pool-recycled)
+  npfe1->resp_model[0] = '\0';
   npfe1->metric_ai_recorded = 0;   // per-request request-accounting dedup guard
   npfe1->max_stream_duration_sec = 0;
   npfe1->backend_keepalive_sec = 0;
@@ -8250,12 +8150,15 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * the backend response has not arrived yet, and its consumers (SSE
      * activation/[DONE] metrics, stream cap/reaper, P/D completion records)
      * resolve the model via proxy_effective_model() → resp_model. */
-    if (pfe->x_model_header[0] != '\0') {
+    if (pfe->effective_model[0] != '\0') {
+      strncpy(pfe->resp_model, pfe->effective_model, sizeof(pfe->resp_model) - 1);
+    } else if (pfe->x_model_header[0] != '\0') {
       strncpy(pfe->resp_model, pfe->x_model_header, sizeof(pfe->resp_model) - 1);
     } else {
       strncpy(pfe->resp_model, pfe->prefix_key.model, sizeof(pfe->resp_model) - 1);
     }
     pfe->resp_model[sizeof(pfe->resp_model) - 1] = '\0';
+    pfe->effective_model[0] = '\0';  // per-request, like the captures below
 
     memset(&pfe->prefix_key, 0, sizeof(pfe->prefix_key));  // P0.2: Reset prefix
     pfe->has_conv_id = 0;  // P0.3: Reset conversation ID flag

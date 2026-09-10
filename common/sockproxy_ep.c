@@ -393,7 +393,13 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           // Criterion C: same effective_model is the value that llb_ai_validate_key
           // ( CGO bridge) would receive for AllowedModels checking.
           const char *effective_model = "";
-          if (pfe && pfe->x_model_header[0] != '\0') {
+          if (pfe && pfe->effective_model[0] != '\0') {
+            // Priority 0: the admission gate's body-first resolution. On
+            // enforcing services this is the model authorization was
+            // checked against; routing by anything else re-opens the
+            // authorize-A-serve-B split the gate's conflict rule closes.
+            effective_model = pfe->effective_model;
+          } else if (pfe && pfe->x_model_header[0] != '\0') {
             effective_model = pfe->x_model_header;       // Priority 1: X-Model header
           } else if (pfe && pfe->prefix_key.model[0] != '\0') {
             effective_model = pfe->prefix_key.model;     // Priority 2: JSON body "model"

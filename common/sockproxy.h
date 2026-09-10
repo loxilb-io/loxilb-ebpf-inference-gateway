@@ -1191,6 +1191,18 @@ struct proxy_fd_ent {
                                       // response arrives, so response-phase consumers (SSE
                                       // activation/[DONE] metrics, stream cap/reaper, P/D
                                       // completion records) must read the model here.
+
+  char     effective_model[MAX_MODEL_LEN]; // The admission gate's single body-first model
+                                      // resolution (ai_gw_admit), written only on ENFORCING
+                                      // services after the body/header conflict check. When
+                                      // set, routing and response-phase consumers use it
+                                      // verbatim -- one resolver, every consumer. Empty on
+                                      // non-enforcing services, which keep the legacy
+                                      // header-first derivation (no silent behavior change
+                                      // for unauthenticated consumers). Cleared with the
+                                      // other per-request captures in handle_on_message_begin
+                                      // and snapshotted into resp_model at the keep-alive
+                                      // reset boundary like the fields it supersedes.
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 
@@ -1200,6 +1212,12 @@ typedef struct proxy_fd_ent proxy_fd_ent_t;
 static inline const char *
 proxy_effective_model(const proxy_fd_ent_t *pfe)
 {
+  /* The admission gate's resolution is authoritative when present: it is
+   * the model authorization was checked against, so routing and accounting
+   * following anything else would re-open the authorize-A-serve-B split. */
+  if (pfe->effective_model[0] != '\0') {
+    return pfe->effective_model;
+  }
   if (pfe->x_model_header[0] != '\0') {
     return pfe->x_model_header;
   }
