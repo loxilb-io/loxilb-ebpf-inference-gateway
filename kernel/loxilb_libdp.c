@@ -79,6 +79,16 @@ typedef struct llb_dp_map {
   pthread_rwlock_t stat_lock;
 } llb_dp_map_t;
 
+/* Per-rule sockmap portset record (see llb_sockmap_rule_ports_op). Indexed by
+ * LB rule number (dp_cmn_act.cidx, 1..LLB_MAX_LB_RULES), so the table is sized
+ * LLB_MAX_LB_RULES + 1 with index 0 unused. Ports are net-order. */
+typedef struct llb_sockmap_rule_rec {
+  uint8_t in_use;
+  uint8_t n_eps;
+  uint16_t vip_port;
+  uint16_t ep_ports[LLB_MAX_NXFRMS];
+} llb_sockmap_rule_rec_t;
+
 typedef struct llb_dp_struct
 {
   pthread_rwlock_t lock;
@@ -102,11 +112,18 @@ typedef struct llb_dp_struct
   const char *cgroup_dfl_path;
   int cgfd;
   int smfd;
+  int smpeerfd;
+  int smstatsfd;
+  int smvipportfd;
+  int smepportfd;
   int egr_hooks;
   int nodenum;
   llb_dp_map_t maps[LL_DP_MAX_MAP];
   llb_dp_link_t links[LLB_INTERFACES];
   llb_dp_sect_t psecs[LLB_PSECS];
+  uint32_t sm_vip_ref[65536];
+  uint32_t sm_ep_ref[65536];
+  llb_sockmap_rule_rec_t sm_rule_rec[LLB_MAX_LB_RULES + 1];
   struct pdi_map *ufw4;
   struct pdi_map *ufw6;
   FILE *logfp;
@@ -845,15 +862,31 @@ llb_unload_kern_sockmap(void)
       bpf_prog_detach(xh->cgfd, BPF_CGROUP_SOCK_OPS);
       log_debug("deattached sockops");
     }
+    xh->smfd = -1;
+    xh->smpeerfd = -1;
+    xh->smstatsfd = -1;
+    xh->smvipportfd = -1;
+    xh->smepportfd = -1;
+    xh->maps[LL_DP_SOCK_PROXY_MAP].map_fd = -1;
+    /* refcounts and per-rule records describe map contents that are gone now;
+     * clear both together so a later re-setup never releases stale state. */
+    memset(xh->sm_vip_ref, 0, sizeof(xh->sm_vip_ref));
+    memset(xh->sm_ep_ref, 0, sizeof(xh->sm_ep_ref));
+    memset(xh->sm_rule_rec, 0, sizeof(xh->sm_rule_rec));
   }
 }
 
 #ifdef HAVE_SOCKMAP_SKMSG
 static int
-llb_setup_kern_sockmap_skmsg_helper(int map_fd)
+llb_setup_kern_sockmap_skmsg_helper(int map_fd, int peer_map_fd, int stats_map_fd,
+                                    int vip_map_fd, int ep_map_fd)
 {
   struct bpf_program *prog;
   struct bpf_map *map2;
+  struct bpf_map *stats_map2;
+  struct bpf_map *peer_map2;
+  struct bpf_map *vip_map2;
+  struct bpf_map *ep_map2;
   struct bpf_object *bpf_obj2;
   int pfd2;
 
@@ -863,13 +896,21 @@ llb_setup_kern_sockmap_skmsg_helper(int map_fd)
 
   bpf_obj2 = bpf_object__open(LLB_SOCK_DIR_IMG_BPF);
   map2 = bpf_object__find_map_by_name(bpf_obj2, "sock_proxy_map");
-  if (map2 == NULL) {
-    log_error("sockdir: find map failed");
+  peer_map2 = bpf_object__find_map_by_name(bpf_obj2, "peer_map");
+  stats_map2 = bpf_object__find_map_by_name(bpf_obj2, "sockmap_stats");
+  vip_map2 = bpf_object__find_map_by_name(bpf_obj2, "sockmap_vip_portset");
+  ep_map2 = bpf_object__find_map_by_name(bpf_obj2, "sockmap_ep_portset");
+  if (map2 == NULL || peer_map2 == NULL || stats_map2 == NULL || vip_map2 == NULL || ep_map2 == NULL) {
+    log_error("sockdir: portset find map failed");
     goto err;
   }
 
-  if (bpf_map__reuse_fd(map2, map_fd)) {
-    log_error("sockdir: reusefd failed");
+  if (bpf_map__reuse_fd(map2, map_fd) ||
+      bpf_map__reuse_fd(peer_map2, peer_map_fd) ||
+      bpf_map__reuse_fd(stats_map2, stats_map_fd) ||
+      bpf_map__reuse_fd(vip_map2, vip_map_fd) ||
+      bpf_map__reuse_fd(ep_map2, ep_map_fd)) {
+    log_error("sockdir: portset reusefd failed");
     goto err;
   }
 
@@ -912,7 +953,8 @@ err:
 #else
 
 static int
-llb_setup_kern_sockmap_strparser_helper(int sockmap_fd)
+llb_setup_kern_sockmap_strparser_helper(int sockmap_fd, int peer_map_fd, int stats_map_fd,
+                                        int vip_map_fd, int ep_map_fd)
 {
   struct bpf_program *prog;
   struct bpf_map *map2;
@@ -926,7 +968,16 @@ llb_setup_kern_sockmap_strparser_helper(int sockmap_fd)
 
   bpf_obj2 = bpf_object__open(LLB_SOCK_SP_IMG_BPF);
 #ifdef HAVE_SOCKOPS
+  struct bpf_map *peer_map2;
+  struct bpf_map *stats_map2;
+  struct bpf_map *vip_map2;
+  struct bpf_map *ep_map2;
+
   map2 = bpf_object__find_map_by_name(bpf_obj2, "sock_proxy_map");
+  peer_map2 = bpf_object__find_map_by_name(bpf_obj2, "peer_map");
+  stats_map2 = bpf_object__find_map_by_name(bpf_obj2, "sockmap_stats");
+  vip_map2 = bpf_object__find_map_by_name(bpf_obj2, "sockmap_vip_portset");
+  ep_map2 = bpf_object__find_map_by_name(bpf_obj2, "sockmap_ep_portset");
 #else
   map2 = bpf_object__find_map_by_name(bpf_obj2, "sock_proxy_map2");
 #endif
@@ -936,8 +987,17 @@ llb_setup_kern_sockmap_strparser_helper(int sockmap_fd)
   }
 
 #ifdef HAVE_SOCKOPS
-  if (bpf_map__reuse_fd(map2, sockmap_fd)) {
-    log_error("sockdir: reusefd failed");
+  if (peer_map2 == NULL || stats_map2 == NULL || vip_map2 == NULL || ep_map2 == NULL) {
+    log_error("sockstream: portset find map failed");
+    goto err;
+  }
+
+  if (bpf_map__reuse_fd(map2, sockmap_fd) ||
+      bpf_map__reuse_fd(peer_map2, peer_map_fd) ||
+      bpf_map__reuse_fd(stats_map2, stats_map_fd) ||
+      bpf_map__reuse_fd(vip_map2, vip_map_fd) ||
+      bpf_map__reuse_fd(ep_map2, ep_map_fd)) {
+    log_error("sockstream: portset reusefd failed");
     goto err;
   }
 #endif
@@ -1011,39 +1071,275 @@ llb_sockmap_op(struct llb_sockmap_key *key, int fd, int doadd)
 }
 
 static int
+llb_peer_map_op(const struct llb_sockmap_key *self,
+                const struct llb_sockmap_key *peer,
+                int doadd)
+{
+  if (xh->have_noebpf) {
+    return 0;
+  }
+
+  if (xh->smpeerfd <= 0) {
+    assert(0);
+  }
+
+  if (doadd) {
+    return bpf_map_update_elem(xh->smpeerfd, self, peer, BPF_ANY);
+  }
+
+  return bpf_map_delete_elem(xh->smpeerfd, self);
+}
+
+static int
+llb_sockmap_portset_op(int map_fd, uint32_t *refs, uint16_t port, int doadd,
+                       const char *map_name)
+{
+  uint16_t port_idx;
+  uint8_t enabled = 1;
+
+  if (xh->have_noebpf || !xh->have_sockmap || map_fd <= 0 || refs == NULL || port == 0) {
+    return 0;
+  }
+
+  port_idx = ntohs(port);
+
+  if (doadd) {
+    refs[port_idx]++;
+    if (refs[port_idx] > 1) {
+      return 0;
+    }
+
+    if (bpf_map_update_elem(map_fd, &port, &enabled, BPF_ANY) != 0) {
+      refs[port_idx]--;
+      log_error("sockmap: failed to add %s port %u", map_name, port_idx);
+      return -1;
+    }
+
+    return 0;
+  }
+
+  if (refs[port_idx] == 0) {
+    return 0;
+  }
+
+  refs[port_idx]--;
+  if (refs[port_idx] > 0) {
+    return 0;
+  }
+
+  if (bpf_map_delete_elem(map_fd, &port) != 0) {
+    if (errno == ENOENT) {
+      return 0;
+    }
+
+    refs[port_idx]++;
+    log_error("sockmap: failed to delete %s port %u", map_name, port_idx);
+    return -1;
+  }
+
+  return 0;
+}
+
+static int
+llb_sockmap_rule_gate(struct dp_nat_key *nk, struct dp_proxy_tacts *nv)
+{
+  return nv->ca.act_type == DP_SET_FULLPROXY && nk->l4proto == IPPROTO_TCP &&
+         nk->v6 == 0 && nv->sockmap_en != 0 && nv->sec_mode == 0;
+}
+
+static void
+llb_sockmap_rule_rec_release(llb_sockmap_rule_rec_t *rec, uint32_t cidx)
+{
+  int i;
+
+  if (rec->vip_port != 0 &&
+      llb_sockmap_portset_op(xh->smvipportfd, xh->sm_vip_ref, rec->vip_port, 0, "vip") != 0) {
+    log_error("sockmap: rule %u: failed to release vip port %u", cidx, ntohs(rec->vip_port));
+  }
+  for (i = 0; i < rec->n_eps && i < LLB_MAX_NXFRMS; i++) {
+    if (llb_sockmap_portset_op(xh->smepportfd, xh->sm_ep_ref, rec->ep_ports[i], 0, "endpoint") != 0) {
+      log_error("sockmap: rule %u: failed to release endpoint port %u", cidx, ntohs(rec->ep_ports[i]));
+    }
+  }
+}
+
+/* Rule-level, idempotent portset maintenance.
+ *
+ * The Go control plane re-issues DpCreate on an EXISTING fullproxy rule without
+ * a preceding DpRemove (CHWBL selector reconcile, QoS policy attach, fold/unfold),
+ * and proxy_add_entry() refreshes an existing pool in place and returns 0. A
+ * plain "+1 on every add / -1 on every delete" would therefore leak refcounts.
+ * Instead each rule number (nv->ca.cidx, the same value handed to sockproxy as
+ * pval->_id) owns a record of the ports it currently holds:
+ *   doadd=1: build the NEW set (only when the gate passes), add it (+1), then
+ *            release the OLD record (-1), then store the new record. Adding
+ *            before releasing keeps unchanged ports at 1->2->1 so they never
+ *            drop out of the map (sockops on other CPUs keeps seeing them).
+ *   doadd=0: release the OLD record and drop it; nv only supplies cidx.
+ * A closed gate (sockMapMode off, sec_mode, ...) on doadd=1 is an empty new set,
+ * so the old record is released - this is how an in-place both->off update
+ * is honoured. If adding the new set fails, only what this call added is rolled
+ * back and the old record is kept (fail-open, previous state preserved). If
+ * releasing an old port fails the record is still replaced (otherwise the new
+ * ports would never be released later); the leftover port is harmless (verdict
+ * misses peer_map -> SK_PASS). */
+static int
+llb_sockmap_rule_ports_op(struct dp_nat_key *nk, struct dp_proxy_tacts *nv, int doadd)
+{
+  llb_sockmap_rule_rec_t new_rec;
+  llb_sockmap_rule_rec_t *rec;
+  uint32_t cidx;
+  int i;
+
+  if (nk == NULL || nv == NULL) {
+    return -EINVAL;
+  }
+
+  if (xh->have_noebpf || !xh->have_sockmap) {
+    return 0;
+  }
+
+  cidx = nv->ca.cidx;
+  if (cidx < 1 || cidx > LLB_MAX_LB_RULES) {
+    log_error("sockmap: rule id %u out of range (1..%d), portset not updated",
+              cidx, LLB_MAX_LB_RULES);
+    return 0;
+  }
+  rec = &xh->sm_rule_rec[cidx];
+  memset(&new_rec, 0, sizeof(new_rec));
+
+  if (doadd && llb_sockmap_rule_gate(nk, nv)) {
+    if (nk->dport != 0) {
+      if (llb_sockmap_portset_op(xh->smvipportfd, xh->sm_vip_ref, nk->dport, 1, "vip") != 0) {
+        return -1;
+      }
+      new_rec.vip_port = nk->dport;
+    }
+
+    for (i = 0; i < nv->nxfrm && i < LLB_MAX_NXFRMS; i++) {
+      struct mf_xfrm_inf *xf = &nv->nxfrms[i];
+
+      if (xf->inactive || xf->nv6 != 0 || xf->nat_xport == 0) {
+        continue;
+      }
+
+      if (llb_sockmap_portset_op(xh->smepportfd, xh->sm_ep_ref, xf->nat_xport, 1, "endpoint") != 0) {
+        /* roll back only what THIS call added; the old record stays intact */
+        while (new_rec.n_eps > 0) {
+          new_rec.n_eps--;
+          llb_sockmap_portset_op(xh->smepportfd, xh->sm_ep_ref,
+                                 new_rec.ep_ports[new_rec.n_eps], 0, "endpoint");
+        }
+        if (new_rec.vip_port != 0) {
+          llb_sockmap_portset_op(xh->smvipportfd, xh->sm_vip_ref, new_rec.vip_port, 0, "vip");
+        }
+        return -1;
+      }
+
+      new_rec.ep_ports[new_rec.n_eps++] = xf->nat_xport;
+    }
+    new_rec.in_use = 1;
+  }
+
+  if (rec->in_use) {
+    llb_sockmap_rule_rec_release(rec, cidx);
+  }
+  *rec = new_rec;
+
+  return 0;
+}
+
+static int
 llb_setup_kern_sockmap(const char *cgroup_path)
 {
 #ifdef HAVE_SOCKOPS
   struct bpf_map *map;
-  struct bpf_object *bpf_obj;
-  int pfd;
+  struct bpf_map *peer_map;
+  struct bpf_map *stats_map;
+  struct bpf_map *vip_map;
+  struct bpf_map *ep_map;
+  struct bpf_object *bpf_obj = NULL;
+  struct bpf_program *prog;
+  int pfd = -1;
 #endif
   int cgfd = -1;
   int map_fd = -1;
   int map_fd2 = -1;
+  int peer_map_fd = -1;
+  int stats_map_fd = -1;
+  int vip_map_fd = -1;
+  int ep_map_fd = -1;
 
   if (xh->have_noebpf) {
     return 0;
   }
 
+#ifndef HAVE_SOCKOPS
+  /* Explicit failure instead of the legacy path.
+   *
+   * Historically a build without -DHAVE_SOCKOPS still "worked": this function
+   * loaded the sk_skb stream object with its own private sockhash
+   * (sock_proxy_map2) and setup_proxy_path() registered both ends of every
+   * proxied connection into it from userspace, with the verdict program
+   * redirecting on its own 4-tuple. That manual-registration path was
+   * deliberately retired when the sockops/portset/peer_map design was ported:
+   * keeping both alive would make the key encoding convention and the owner of
+   * sockhash entries depend on a compile flag, which is impossible to diagnose
+   * in the field. sockmap acceleration therefore requires the sockops build
+   * (make EXTRA_CFLAGS="-DHAVE_SOCKOPS"). Fail loudly at startup rather than
+   * silently running a different design. */
+  (void)cgroup_path;
+  log_error("sockmap: --sockmapsupport requires a build with -DHAVE_SOCKOPS "
+            "(EXTRA_CFLAGS); the legacy userspace-registration path is disabled");
+  return -1;
+#endif
+
 #ifdef HAVE_SOCKOPS 
   if (xh->cgfd <= 0) {
+    if (cgroup_path == NULL) {
+      log_error("sockmap: cgroup path not configured");
+      goto err;
+    }
+
     cgfd = cgroup_create_get(cgroup_path);
     if (cgfd < 0) {
+      log_error("sockmap: cgroup create/get failed for '%s'", cgroup_path);
       goto err;
     }
 
     if (cgroup_join(cgroup_path)) {
+      log_error("sockmap: cgroup join failed for '%s'", cgroup_path);
       goto err;
     }
-
-    if (bpf_prog_load(LLB_SOCK_MAP_IMG_BPF, BPF_PROG_TYPE_SOCK_OPS, &bpf_obj, &pfd)) {
-      log_error("sockmap: load failed");
-      goto err;
-    }
-
   } else {
     cgfd = xh->cgfd;
+  }
+
+  bpf_obj = bpf_object__open_file(LLB_SOCK_MAP_IMG_BPF, NULL);
+  if (!bpf_obj) {
+    log_error("sockmap: open failed");
+    goto err;
+  }
+
+  prog = bpf_object__find_program_by_name(bpf_obj, "llb_setup_sockmap");
+  if (!prog) {
+    log_error("sockmap: program not found");
+    goto err;
+  }
+
+  bpf_program__set_type(prog, BPF_PROG_TYPE_SOCK_OPS);
+  bpf_program__set_expected_attach_type(prog, BPF_CGROUP_SOCK_OPS);
+  bpf_program__set_flags(prog, BPF_F_TEST_RND_HI32);
+
+  if (bpf_object__load(bpf_obj)) {
+    log_error("sockmap: load failed");
+    goto err;
+  }
+
+  pfd = bpf_program__fd(prog);
+  if (pfd < 0) {
+    log_error("sockmap: failed to get program fd");
+    goto err;
   }
 
   if (bpf_prog_attach(pfd, cgfd, BPF_CGROUP_SOCK_OPS, 0)) {
@@ -1061,27 +1357,55 @@ llb_setup_kern_sockmap(const char *cgroup_path)
     log_error("sock_proxy_map get failed\n");
     goto err1;
   }
+
+  peer_map = bpf_object__find_map_by_name(bpf_obj, "peer_map");
+  stats_map = bpf_object__find_map_by_name(bpf_obj, "sockmap_stats");
+  vip_map = bpf_object__find_map_by_name(bpf_obj, "sockmap_vip_portset");
+  ep_map = bpf_object__find_map_by_name(bpf_obj, "sockmap_ep_portset");
+  if (!peer_map || !stats_map || !vip_map || !ep_map) {
+    log_error("sockmap: portset map get failed\n");
+    goto err1;
+  }
+
+  peer_map_fd = bpf_map__fd(peer_map);
+  stats_map_fd = bpf_map__fd(stats_map);
+  vip_map_fd = bpf_map__fd(vip_map);
+  ep_map_fd = bpf_map__fd(ep_map);
+  if (peer_map_fd < 0 || stats_map_fd < 0 || vip_map_fd < 0 || ep_map_fd < 0) {
+    log_error("sockmap: portset fd get failed\n");
+    goto err1;
+  }
 #endif
 
 #ifdef HAVE_SOCKMAP_SKMSG
-  map_fd2 = llb_setup_kern_sockmap_skmsg_helper(map_fd);
+  map_fd2 = llb_setup_kern_sockmap_skmsg_helper(map_fd, peer_map_fd, stats_map_fd,
+                                                vip_map_fd, ep_map_fd);
   if (map_fd2 < 0) {
     log_error("sockmap: skmsg helper load failed");
     goto err1;
   }
 #else
-  map_fd2 = llb_setup_kern_sockmap_strparser_helper(map_fd);
+  map_fd2 = llb_setup_kern_sockmap_strparser_helper(map_fd, peer_map_fd, stats_map_fd,
+                                                    vip_map_fd, ep_map_fd);
   if (map_fd2 < 0) {
     log_error("sockmap: skstream helper load failed");
     goto err1;
   }
 #endif
 
+  memset(xh->sm_vip_ref, 0, sizeof(xh->sm_vip_ref));
+  memset(xh->sm_ep_ref, 0, sizeof(xh->sm_ep_ref));
+  memset(xh->sm_rule_rec, 0, sizeof(xh->sm_rule_rec));
+
   xh->maps[LL_DP_SOCK_PROXY_MAP].map_fd = map_fd2;
   if (xh->cgfd <= 0) {
     xh->cgfd = cgfd;
   }
   xh->smfd = map_fd2;
+  xh->smpeerfd = peer_map_fd;
+  xh->smstatsfd = stats_map_fd;
+  xh->smvipportfd = vip_map_fd;
+  xh->smepportfd = ep_map_fd;
 
   log_info("loxilb kern-sock-map attached (%d)", map_fd2);
   return 0;
@@ -1734,7 +2058,8 @@ llb_xh_init(llb_dp_struct_t *xh)
 
   init_throttler(&xh->cpt, 50);
 
-  if (proxy_main(xh->have_sockmap ? llb_sockmap_op : NULL, xh->have_ktls)) {
+  if (proxy_main(xh->have_sockmap ? llb_sockmap_op : NULL,
+                 xh->have_sockmap ? llb_peer_map_op : NULL, xh->have_ktls)) {
     LLB_INIT_FATAL("proxy_main");
   }
 
@@ -2427,6 +2752,10 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // Backend protocol capability (0=http1, 1=http2, 2=both)
   pval->backend_protocol_cap = dat->backend_protocol_cap;
 
+  // sockmap acceleration mode (0=off,1=both,2=request,3=response). Gates the
+  // per-connection peer_map pairing in setup_proxy_path (sockproxy_http.c).
+  pval->sockmap_en = dat->sockmap_en;
+
   // PROXY protocol v2 emission on backend connections (L7 fullproxy). Sourced from
   // the rule's dp_proxy_tacts.ppv2, same flag the fullnat eBPF path consumes.
   pval->ppv2 = dat->ppv2;
@@ -2748,6 +3077,16 @@ llb_add_map_elem(int tbl, void *k, void *v)
       llb_conv_nat2proxy(k, v, &pk, pv);
       // FIXME
       ret = proxy_add_entry(&pk, pv);
+      /* sockmap portsets, fail-open: proxy_add_entry() returns 0 for both a
+       * new pool and an in-place refresh of a live one, so the loader cannot
+       * tell whether a rollback via proxy_delete_entry() would tear down a
+       * rule the control plane still owns. A portset failure therefore only
+       * leaves this rule without acceleration (verdict -> SK_PASS). */
+      if (ret == 0 && llb_sockmap_rule_ports_op(nk, nv, 1) != 0) {
+        log_error("sockmap: portset update failed for vip port %u (rule %u) - "
+                  "rule kept without sockmap acceleration",
+                  ntohs(nk->dport), nv->ca.cidx);
+      }
       
       // Note: pv is intentionally NOT freed here!
       // - mTLS mode: SSL_CTX stores pointer, OpenSSL auto-frees when SSL_CTX destroyed
@@ -2939,6 +3278,9 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
 
     if (nv->ca.act_type == DP_SET_FULLPROXY &&
         (nk->l4proto == IPPROTO_TCP || nk->l4proto == IPPROTO_SCTP) && nk->v6 == 0) {
+      if (llb_sockmap_rule_ports_op(nk, nv, 0) != 0) {
+        log_error("sockmap: failed to remove rule ports for vip %u", ntohs(nk->dport));
+      }
       llb_conv_nat2proxy(nk, nv, &pk, &pa);
       proxy_delete_entry(&pk, &pa);
     }
@@ -4209,7 +4551,10 @@ loxilb_main(struct ebpfcfg *cfg)
     xh->have_ktls = cfg->have_ktls;
 
     xh->egr_hooks = cfg->egr_hooks;
-    if (xh->have_sockrwr != 0) {
+    /* sockmap (sockops attach) needs the cgroup bootstrap as much as the
+     * local socket policy does; without this the sockmap-only boot passed a
+     * NULL path into cgroup_create_get/cgroup_join. */
+    if (xh->have_sockrwr != 0 || xh->have_sockmap != 0) {
       xh->cgroup_dfl_path = CGROUP_PATH;
     }
 

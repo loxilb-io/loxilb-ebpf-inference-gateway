@@ -72,6 +72,18 @@
 #define LLB_MAX_SCTP_CHUNKS_INIT (8)
 #define LLB_RWR_MAP_ENTRIES   (1024)
 #define LLB_SOCK_MAP_SZ       (17*1024)
+/* sockmap acceleration portsets (keyed by net-order L4 port). The sockops
+ * program consults these to decide whether a newly established socket belongs
+ * to a sockmap-enabled FullProxy service (VIP side) or one of its endpoints. */
+#define LLB_SOCK_VIP_PORTSET_SZ (64)
+#define LLB_SOCK_EP_PORTSET_SZ  (256)
+/* Upper bound of LB rule numbers handed out by the Go control plane
+ * (pkg/loxinet/rules.go: RtMaximumLbs = 2*1024, NewMarker(1, RtMaximumLbs)).
+ * NewMarker(begin, len) returns begin..begin+len-1 INCLUSIVE, so valid rule
+ * numbers (dp_cmn_act.cidx for LB rules) are 1..LLB_MAX_LB_RULES. Tables indexed
+ * directly by rule number must be sized [LLB_MAX_LB_RULES + 1] (index 0 unused).
+ * Keep in sync with RtMaximumLbs. */
+#define LLB_MAX_LB_RULES      (2048)
 #define LLB_SOCKID_MAP_SZ     (17*1024)
 #define LLB_MAX_HOSTURL_LEN   (256)
 #define MAX_MODEL_LEN         (128)  /* AI model name max length (e.g. "llama-70b") */
@@ -1061,7 +1073,12 @@ struct dp_proxy_tacts {
   // byte of the former pad3c(4) — offsets and total size unchanged, so the
   // _Static_asserts below stay as-is (same idiom as kv_engine_type/pad3b).
   uint8_t  cb_enable;
-  uint8_t  pad3c;                  // Alignment padding (keeps struct 8-byte aligned)
+  // sockmap acceleration mode for this FullProxy service (Go sockMapMode):
+  // 0=off, 1=both, 2=request-only (client->backend), 3=response-only
+  // (backend->client). Takes the former pad3c(1) byte next to cb_enable —
+  // offsets and total size unchanged, the _Static_asserts below stay as-is
+  // (same replaces-padding idiom as cb_enable/kv_engine_type).
+  uint8_t  sockmap_en;
   // SGLang P/D disaggregation bootstrap port on every prefill EP (0 ⇒ SGLang's
   // default 8998, applied at proxy_add). Meaningful only when pd_disagg_mode=1
   // and kv_engine_type=1 (sglang) — the Go control plane rejects every other

@@ -20,36 +20,33 @@
 SEC("sockops")
 int llb_setup_sockmap(struct bpf_sock_ops *bpf_sops)
 {
-	int etype, err;
+	int etype;
+  __u16 vip_port;
+  __u16 ep_port;
+  __u8 *enabled;
   struct llb_sockmap_key key = { .dip = bpf_sops->remote_ip4,
                                  .sip = bpf_sops->local_ip4,
-                                 .dport = bpf_sops->remote_port >> 16,
-                                 .sport = bpf_htonl(bpf_sops->local_port) >> 16,
+	                                 .dport = bpf_sops->remote_port >> 16,
+	                                 .sport = bpf_htonl(bpf_sops->local_port) >> 16,
                                };
 
   etype = bpf_sops->op;
 
 	switch (etype) {
 	case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB: {
-    bpf_printk("passive:lport %lu ", bpf_ntohs(key.sport));
+    vip_port = key.sport;
+    enabled = bpf_map_lookup_elem(&sockmap_vip_portset, &vip_port);
 
-		if (key.sport == bpf_htons(9090)) {
-      key.dip = 0;
-      key.sip = 0;
-      key.dport = 0;
-
+		if (enabled) {
 			bpf_sock_hash_update(bpf_sops, &sock_proxy_map, &key, BPF_NOEXIST);
 		}
 		break;
   }
 	case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB: {
-      key.dip = 0;
-      key.sip = 0;
-      key.sport = 0;
+    ep_port = key.dport;
+    enabled = bpf_map_lookup_elem(&sockmap_ep_portset, &ep_port);
 
-    bpf_printk("active:dport %lu ", bpf_ntohs(key.dport));
-
-    if (key.dport == bpf_htons(9090)) {
+    if (enabled) {
       bpf_sock_hash_update(bpf_sops, &sock_proxy_map, &key, BPF_NOEXIST);
     }
     break;

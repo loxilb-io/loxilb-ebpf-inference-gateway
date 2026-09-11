@@ -693,6 +693,9 @@ typedef struct proxy_val {
   // 1 = HTTP/2 only
   // 2 = Both HTTP/1.1 and HTTP/2 (backend auto-negotiates)
   uint8_t backend_protocol_cap;
+  // sockmap acceleration mode (dp_proxy_tacts.sockmap_en):
+  // 0=off, 1=both, 2=request-only, 3=response-only
+  uint8_t sockmap_en;
 } proxy_val_t;
 
 // Proxy map entry - combines key and value
@@ -830,6 +833,16 @@ typedef enum {
                                   // slot (dequeue+resume is not wired yet). NOT connected.
 } pd_phase_t;
 
+/* Plain copy of the sockmap key a backend pfe installed into peer_map, kept so
+ * teardown can delete exactly the entries it owns without re-deriving the
+ * tuple from a possibly already-closed fd. */
+typedef struct proxy_skmap_key_snapshot {
+  uint32_t dip;
+  uint32_t sip;
+  uint32_t dport;
+  uint32_t sport;
+} proxy_skmap_key_snapshot_t;
+
 struct proxy_fd_ent {
   pthread_rwlock_t lock;
   /* D2 root fix (pfe pool + generation). The pfe STRUCT (this shell) is never
@@ -894,6 +907,14 @@ struct proxy_fd_ent {
   int is_chunked_response;       // 1 if Transfer-Encoding: chunked detected (persists for connection)
   int peer_eof;                  // 1 if peer closed, waiting for our cache to drain
   time_t eof_timestamp;          // When peer EOF detected (for timeout enforcement)
+
+  // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
+  // setup_proxy_path once the client<->backend pairing is decided.
+  int peer_map_pair_installed;   // 1 if this backend pfe owns any peer_map entry
+  int peer_map_req_installed;    // 1 if the request-direction entry ([client]=backend) is installed
+  int peer_map_resp_installed;   // 1 if the response-direction entry ([backend]=client) is installed
+  proxy_skmap_key_snapshot_t peer_map_client_key;
+  proxy_skmap_key_snapshot_t peer_map_backend_key;
 
   struct proxy_fd_ent *next;
   void *head;
@@ -1333,6 +1354,10 @@ struct proxy_arg {
   // 2 = Both - advertise both h2 and http/1.1 (backend supports both)
   uint8_t backend_protocol_cap;
 
+  // sockmap acceleration mode (0=off,1=both,2=request,3=response), copied
+  // from dp_proxy_tacts.sockmap_en by llb_conv_nat2proxy.
+  uint8_t sockmap_en;
+
   // ==========================================================================
   // TLS-hardening scalars ( version pinning / HSTS).
   // All additive + default-off: 0/empty ⇒ today's hardcoded behaviour (-COMPAT,
@@ -1457,6 +1482,12 @@ _Static_assert(sizeof(struct proxy_arg) <= 4096,
               "proxy_arg_t exceeds eBPF map value size limit");
 
 typedef int (*sockmap_cb_t)(struct llb_sockmap_key *key, int fd, int doadd);
+/* peer_map pairing callback: self-tuple -> peer-tuple (doadd=1) or delete
+ * self-tuple (doadd=0, peer ignored). Installed by the loader when sockmap
+ * support is enabled. */
+typedef int (*peer_map_cb_t)(const struct llb_sockmap_key *self,
+                             const struct llb_sockmap_key *peer,
+                             int doadd);
 typedef void (*proxy_info_cb_t)(struct dp_proxy_ct_ent *pct);
 int proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,
                   uint32_t *epip, uint16_t *epport, uint8_t *epprotocol);
@@ -1536,7 +1567,7 @@ int proxy_set_chwbl_prefix_config(struct proxy_ent *key,
 void proxy_dump_entry(proxy_info_cb_t);
 void proxy_get_entry_stats(uint32_t id, int epid, uint64_t *p, uint64_t *b);
 void pfe_ent_accouting(proxy_fd_ent_t *pfe, uint64_t bc, int txdir);
-int proxy_main(sockmap_cb_t cb, int ktls_enabled);
+int proxy_main(sockmap_cb_t cb, peer_map_cb_t peer_map_cb, int ktls_enabled);
 
 // SNI Certificate Management API (Global Certificate Store)
 // These manage certificates independently of loadbalancer rules

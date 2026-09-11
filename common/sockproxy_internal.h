@@ -111,6 +111,7 @@ typedef struct proxy_struct {
   int run;                              /* Control flag for cleanup threads */
   proxy_map_ent_t *head;
   sockmap_cb_t sockmap_cb;
+  peer_map_cb_t peer_map_cb;
   void *ns;
   proxy_mapfd_t mapfd[PROXY_MAX_THREADS];
   time_t last_session_cleanup;          /* Last time session cleanup ran */

@@ -196,7 +196,7 @@ proxy_log(const char *str, smap_key_t *key)
   inet_ntop(AF_INET, (struct in_addr *)&key->dip, ab1, INET_ADDRSTRLEN);
   inet_ntop(AF_INET, (struct in_addr *)&key->sip, ab2, INET_ADDRSTRLEN);
   log_trace("%s %s:%u -> %s:%u", str,
-            ab1, ntohs((key->dport >> 16)), ab2, ntohs(key->sport >> 16));
+            ab1, ntohs(key->dport), ab2, ntohs(key->sport));
 }
 #else
 #define proxy_log(arg1, arg2)
@@ -212,7 +212,7 @@ proxy_log_always(const char *str, smap_key_t *key)
   inet_ntop(AF_INET, (struct in_addr *)&key->sip, ab2, INET_ADDRSTRLEN);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
   log_debug("%s %s:%u -> %s:%u", str,
-            ab1, ntohs((key->dport >> 16)), ab2, ntohs(key->sport >> 16));
+            ab1, ntohs(key->dport), ab2, ntohs(key->sport));
 #endif
 }
 

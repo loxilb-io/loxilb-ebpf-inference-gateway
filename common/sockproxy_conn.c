@@ -153,16 +153,77 @@ proxy_skmap_key_from_fd(int fd, smap_key_t *skmap_key, int *protocol)
     return -1;
   }
   skmap_key->sip = sin_addr.sin_addr.s_addr;
-  skmap_key->sport = sin_addr.sin_port << 16;
+  /* low-half convention: net-order port in the low 16 bits of the __be32.
+   * Must match llb_kern_sockmap.c / llb_kern_sockstream.c key construction
+   * (remote_port >> 16, bpf_htonl(local_port) >> 16). Consumers read the port
+   * back with a plain (uint16_t) truncation, never >> 16. */
+  skmap_key->sport = sin_addr.sin_port;
 
   if (getpeername(fd, (struct sockaddr*)&sin_addr, &sin_len)) {
     log_error("getpeername failed %s\n", strerror(errno));
     return -1;
   }
   skmap_key->dip = sin_addr.sin_addr.s_addr;
-  skmap_key->dport = sin_addr.sin_port << 16;
+  skmap_key->dport = sin_addr.sin_port;
 
   return 0;
+}
+
+void
+proxy_skmap_snapshot_store(proxy_skmap_key_snapshot_t *dst, const smap_key_t *src)
+{
+  dst->dip = src->dip;
+  dst->sip = src->sip;
+  dst->dport = src->dport;
+  dst->sport = src->sport;
+}
+
+void
+proxy_skmap_snapshot_restore(smap_key_t *dst, const proxy_skmap_key_snapshot_t *src)
+{
+  memset(dst, 0, sizeof(*dst));
+  dst->dip = src->dip;
+  dst->sip = src->sip;
+  dst->dport = src->dport;
+  dst->sport = src->sport;
+}
+
+void
+proxy_peer_map_clear(proxy_fd_ent_t *pfe)
+{
+  pfe->peer_map_pair_installed = 0;
+  pfe->peer_map_req_installed = 0;
+  pfe->peer_map_resp_installed = 0;
+  memset(&pfe->peer_map_client_key, 0, sizeof(pfe->peer_map_client_key));
+  memset(&pfe->peer_map_backend_key, 0, sizeof(pfe->peer_map_backend_key));
+}
+
+void
+proxy_peer_map_delete(proxy_fd_ent_t *pfe)
+{
+  smap_key_t client_key;
+  smap_key_t backend_key;
+
+  if (!pfe->peer_map_pair_installed || proxy_struct->peer_map_cb == NULL) {
+    return;
+  }
+
+  proxy_skmap_snapshot_restore(&client_key, &pfe->peer_map_client_key);
+  proxy_skmap_snapshot_restore(&backend_key, &pfe->peer_map_backend_key);
+
+  /* Delete only the directions that were actually installed (see the directional
+   * sockMapMode gating in setup_proxy_path). */
+  if (pfe->peer_map_req_installed &&
+      proxy_struct->peer_map_cb(&client_key, NULL, 0) != 0) {
+    log_error("Sockmap: peer_map delete failed for client fd=%d", pfe->fd);
+  }
+
+  if (pfe->peer_map_resp_installed &&
+      proxy_struct->peer_map_cb(&backend_key, NULL, 0) != 0) {
+    log_error("Sockmap: peer_map delete failed for backend fd=%d", pfe->fd);
+  }
+
+  proxy_peer_map_clear(pfe);
 }
 
 
