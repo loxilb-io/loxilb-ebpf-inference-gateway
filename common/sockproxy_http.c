@@ -50,6 +50,7 @@
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
+#include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
 #include "sockproxy_metrics.h"
 #include "sockproxy_routing.h"
@@ -599,6 +600,22 @@ l7h1_splice_header(uint8_t *msg, size_t *len, size_t bufsize,
                    const char *name, const char *value)
 {
   char inject_buf[L7_HDR_NAME_MAX + L7_HDR_VALUE_MAX + 8];
+
+  /*
+   * A field carrying CR or LF would not stay one header line: everything
+   * after the break becomes a header line of the receiver's own. Refuse the
+   * splice. Nothing untrusted is logged -- the name is exactly the string
+   * under suspicion, and writing it into a log is the same mistake one layer
+   * down.
+   */
+  if (l7_hdr_pair_unsafe(name, value)) {
+    log_error("l7h1_splice_header: refused a header field carrying a line "
+              "break or an empty name (name_len=%zu value_len=%zu)",
+              name ? strlen(name) : (size_t)0,
+              value ? strlen(value) : (size_t)0);
+    return -1;
+  }
+
   int n = snprintf(inject_buf, sizeof(inject_buf), "%s: %s\r\n", name, value);
   if (n <= 0 || (size_t)n >= sizeof(inject_buf))
     return -1;

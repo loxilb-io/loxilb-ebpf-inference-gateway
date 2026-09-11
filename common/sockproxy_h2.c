@@ -29,6 +29,7 @@
 #include "sockproxy_json.h"
 #include "sockproxy_lb.h"
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
+#include "sockproxy_l7hdr_guard.h" /* same field guard as the H1 splice */
 #include "notify.h"
 #include "log.h"
 
@@ -2279,6 +2280,16 @@ static void
 l7h2_append(l7h2_emit_ctx_t *c, const char *name, const char *value)
 {
   if (c->oom || c->n_out >= c->cap_out || c->n_owned + 2 > (size_t)(L7_H2_MAX_INJECT * 2))
+    return;
+  /*
+   * H2 carries fields as HPACK pairs rather than CRLF-delimited lines, so a
+   * line break here is not the framing break it is on H1. It is still a field
+   * no HTTP/2 peer is required to accept, and the two paths are meant to make
+   * the same decision about the same header set -- so refuse it on the same
+   * terms rather than leaving the answer to whatever the encoder happens to
+   * do with it.
+   */
+  if (l7_hdr_pair_unsafe(name, value))
     return;
   size_t nl = strlen(name), vl = strlen(value);
   char *ncopy = malloc(nl + 1);

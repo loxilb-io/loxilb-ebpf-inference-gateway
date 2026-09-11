@@ -327,6 +327,16 @@ test_cookie: sockproxy_cookie_test.c sockproxy_cookie.h
 test_cook: test_cookie
 	./test_cookie
 
+# Header-field guard: the last check before a name/value is written into a
+# request. Standalone — includes only the pure sockproxy_l7hdr_guard.h, which
+# is why it needs neither the proxy object graph nor a link library.
+test_l7hdr_guard: sockproxy_l7hdr_guard_test.c sockproxy_l7hdr_guard.h
+	$(CC) -Wall -Wextra -o $@ $< -I.
+
+.PHONY: test_l7hdr
+test_l7hdr: test_l7hdr_guard
+	./test_l7hdr_guard
+
 # Phase 87-01 (FIX-1/2/3/4): P/D streaming-completion connection-leak unit.
 # Standalone — includes only the pure sockproxy_pd_leak.h helpers (no sockproxy.c
 # machinery). -fsanitize=address detects over-reads in the bounded detector and
