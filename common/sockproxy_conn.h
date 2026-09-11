@@ -22,8 +22,16 @@
 /* FD mapping */
 int get_mapped_proxy_fd(int fd, int check_slot);
 
-/* FD key extraction (sockmap) */
+/* FD key extraction (sockmap). Ports use the low-half convention: the
+ * net-order port sits in the low 16 bits of the __be32 field (matches the
+ * sockops / sk_skb verdict programs). */
 int proxy_skmap_key_from_fd(int fd, smap_key_t *skmap_key, int *protocol);
+
+/* peer_map pairing bookkeeping (backend pfe owns the entries) */
+void proxy_skmap_snapshot_store(proxy_skmap_key_snapshot_t *dst, const smap_key_t *src);
+void proxy_skmap_snapshot_restore(smap_key_t *dst, const proxy_skmap_key_snapshot_t *src);
+void proxy_peer_map_clear(proxy_fd_ent_t *pfe);
+void proxy_peer_map_delete(proxy_fd_ent_t *pfe);
 
 /* Socket setup utilities */
 void proxy_sock_set_opts(int fd, uint8_t protocol);

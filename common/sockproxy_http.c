@@ -10,7 +10,11 @@
  * Extracted from sockproxy.c — see sockproxy_refactoring_plan.md.
  */
 #define _GNU_SOURCE
+/* Verbose datapath debug logging. Compile it out for performance or CPU
+ * measurement with: make EXTRA_CFLAGS="-DHAVE_SOCKOPS -DHAVE_PROXY_NO_EXTRA_DEBUG" */
+#ifndef HAVE_PROXY_NO_EXTRA_DEBUG
 #define HAVE_PROXY_EXTRA_DEBUG
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2376,6 +2380,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
             if (arg->ep_role[i] == 2) tepval->n_decode_eps++;
           }
         }
+        /* Per-VIP scalars that must follow a rule update. sockMapMode changes
+         * arrive through this in-place path (no -EEXIST / re-create), so the
+         * peer_map gate in setup_proxy_path would otherwise keep the old mode. */
+        ent->val.sockmap_en = arg->sockmap_en;
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
@@ -2773,6 +2781,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   
   // Initialize backend protocol capability (default: HTTP/1.1 only for safety)
   node->val.backend_protocol_cap = arg->backend_protocol_cap;
+  node->val.sockmap_en = arg->sockmap_en;
   
   // Configure ALPN callback with backend protocol capability
   if (ssl_ctx) {
@@ -4462,6 +4471,7 @@ proxy_pdestroy(void *priv)
   PROXY_LOCK();
   if (pfe) {
     PROXY_ENT_LOCK(pfe);
+    proxy_peer_map_delete(pfe);
     ent = pfe->head;
     if (!ent) {
       assert(0);
@@ -6159,11 +6169,16 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
   int pp2len = 0;
   if (ent->val.ppv2 && protocol == IPPROTO_TCP) {
     pp2len = proxy_build_ppv2_v4(pp2buf, sizeof(pp2buf),
-                                 key->dip, (uint16_t)(key->dport >> 16),   /* src = client */
-                                 key->sip, (uint16_t)(key->sport >> 16));  /* dst = VIP */
+                                 key->dip, (uint16_t)key->dport,   /* src = client */
+                                 key->sip, (uint16_t)key->sport);  /* dst = VIP */
   }
 
-  int psep_rc = proxy_setup_ep__(key->sip, key->sport >> 16, (uint8_t)(protocol),
+  /* key->sport carries the net-order VIP port in its low 16 bits (low-half
+   * convention, see proxy_skmap_key_from_fd); the catalog xport is net-order
+   * too (llb_conv_nat2proxy: pent->xport = nat_key->dport), so pass it as-is.
+   * NEVER reintroduce `>> 16` here: it yields xport=0 and every fullproxy
+   * connection gets an empty response. */
+  int psep_rc = proxy_setup_ep__(key->sip, (uint16_t)key->sport, (uint8_t)(protocol),
                        flt_url,
                        pfe->http_path_ok ? pfe->request_path : "/",  // P6: Pass request path
                        pfe->has_conv_id ? pfe->conversation_id : NULL,  // P0.3: Pass conversation ID
@@ -6320,14 +6335,26 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         }
       }
 
-      // Register to sockmap ONLY for HTTP→HTTP plaintext
-      if (sockmap_eligible && proxy_struct->sockmap_cb) {
+      // Register to sockmap ONLY for HTTP→HTTP plaintext.
+      // HAVE_SOCKOPS builds populate the sockhash from the kernel sockops
+      // callbacks; userspace must not re-register the same sockets into the
+      // shared map (BPF_NOEXIST collisions). Pairing is expressed via peer_map
+      // below instead.
+#if !defined(HAVE_SOCKOPS)
+      if (sockmap_eligible && proxy_struct->sockmap_cb && ent->val.sockmap_en) {
         int ret1 = proxy_struct->sockmap_cb(rkey, pfe->fd, 1);
         int ret2 = proxy_struct->sockmap_cb(key, ep_cfd, 1);
         if (ret1 != 0 || ret2 != 0) {
+          if (ret1 == 0) {
+            proxy_struct->sockmap_cb(rkey, pfe->fd, 0);
+          }
+          if (ret2 == 0) {
+            proxy_struct->sockmap_cb(key, ep_cfd, 0);
+          }
           log_error("Sockmap: Registration failed! client_ret=%d, backend_ret=%d", ret1, ret2);
         }
       }
+#endif
     }
 
     npfe2 = pfe_alloc();   /* D2 root fix: pooled pfe shell */
@@ -6411,6 +6438,46 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->qos_was_parked = 0;
     npfe2->qos_park_seen_ts = 0;
 
+#if defined(HAVE_SOCKOPS)
+    if (sockmap_eligible && proxy_struct->peer_map_cb && ent->val.sockmap_en) {
+      /* sockmap_en is a directional mode:
+       *   1 = both, 2 = request-only, 3 = response-only.
+       * The request direction ([client]=backend) lets the sk_skb verdict
+       * redirect client ingress straight to the backend; the response
+       * direction ([backend]=client) redirects backend ingress to the client.
+       * Install only the entries that the mode asks for; the other direction
+       * misses peer_map -> SK_PASS -> stays on the userspace proxy path.
+       * key  = backend socket tuple as seen from the client side (self=client)
+       * rkey = client socket tuple as seen from the backend side (self=backend) */
+      uint8_t dir = ent->val.sockmap_en;
+      int do_req = (dir == 1 || dir == 2);
+      int do_resp = (dir == 1 || dir == 3);
+      int ret1 = do_req ? proxy_struct->peer_map_cb(key, rkey, 1) : 0;
+      int ret2 = do_resp ? proxy_struct->peer_map_cb(rkey, key, 1) : 0;
+
+      if (ret1 != 0 || ret2 != 0) {
+        if (do_req && ret1 == 0) {
+          proxy_struct->peer_map_cb(key, NULL, 0);
+        }
+        if (do_resp && ret2 == 0) {
+          proxy_struct->peer_map_cb(rkey, NULL, 0);
+        }
+        log_error("Sockmap: peer_map registration failed! mode=%u client_ret=%d, backend_ret=%d",
+                  dir, ret1, ret2);
+      } else {
+        if (do_req) {
+          proxy_skmap_snapshot_store(&npfe2->peer_map_client_key, key);
+          npfe2->peer_map_req_installed = 1;
+        }
+        if (do_resp) {
+          proxy_skmap_snapshot_store(&npfe2->peer_map_backend_key, rkey);
+          npfe2->peer_map_resp_installed = 1;
+        }
+        npfe2->peer_map_pair_installed = (do_req || do_resp) ? 1 : 0;
+      }
+    }
+#endif
+
     PROXY_LOCK();
     npfe2->next = ent->val.fdlist;
     ent->val.fdlist = npfe2;
@@ -6444,6 +6511,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     if (retry >= PROXY_MAPFD_RETRIES) {
       proxy_destroy_eps(pfe->fd, &ep_sel);
       proxy_release_fd_ctx(npfe2, 0);
+      proxy_peer_map_delete(npfe2);
       if (npfe2->ssl) {
         SSL_shutdown(npfe2->ssl);
         SSL_free(npfe2->ssl);

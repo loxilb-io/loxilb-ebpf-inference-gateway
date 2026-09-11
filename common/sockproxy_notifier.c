@@ -10,7 +10,11 @@
  * initialization entry-point (proxy_main).  Extracted from sockproxy.c.
  */
 #define _GNU_SOURCE
+/* Verbose datapath debug logging. Compile it out for performance or CPU
+ * measurement with: make EXTRA_CFLAGS="-DHAVE_SOCKOPS -DHAVE_PROXY_NO_EXTRA_DEBUG" */
+#ifndef HAVE_PROXY_NO_EXTRA_DEBUG
 #define HAVE_PROXY_EXTRA_DEBUG
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -602,7 +606,7 @@ proxy_liveness_watchdog_thread(void *arg)
 }
 
 int
-proxy_main(sockmap_cb_t sockmap_cb, int ktls_enabled)
+proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb, int ktls_enabled)
 {
   int startfd = PROXY_START_MAPFD;
   notify_cbs_t cbs = { 0 };
@@ -622,6 +626,7 @@ proxy_main(sockmap_cb_t sockmap_cb, int ktls_enabled)
     assert(0);
   }
   proxy_struct->sockmap_cb = sockmap_cb;
+  proxy_struct->peer_map_cb = peer_map_cb;
   proxy_struct->ns = notify_ctx_new(&cbs, PROXY_MAX_THREADS);
   assert(proxy_struct->ns);
 

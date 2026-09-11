@@ -17,7 +17,7 @@
  * Functions defined in sockproxy_notifier.c:
  *   int  proxy_notify_add_fd(int fd, int type, void *priv);
  *   int  proxy_notify_delete_fd(int fd, int evict);
- *   int  proxy_main(sockmap_cb_t cb, int ktls_enabled);
+ *   int  proxy_main(sockmap_cb_t cb, peer_map_cb_t peer_map_cb, int ktls_enabled);
  *
  * (proxy_notifier is file-local static — not exported)
  */

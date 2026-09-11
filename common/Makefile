@@ -34,7 +34,11 @@ endif
 
 all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
-CFLAGS := -g -Wall -I../libbpf/src/ -DHAVE_DP_GPU_ROUTING=1 -DHAVE_LLM_SYSTEM_PROMPT_HASH=1 $(CFLAGS_TRACE) $(CFLAGS_PII) $(CFLAGS_MTLS)
+# EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
+# reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
+# only in HAVE_SOCKOPS builds, and sockproxy_http.c fills peer_map only when
+# compiled with the same flag.
+CFLAGS := -g -Wall -I../libbpf/src/ -DHAVE_DP_GPU_ROUTING=1 -DHAVE_LLM_SYSTEM_PROMPT_HASH=1 $(CFLAGS_TRACE) $(CFLAGS_PII) $(CFLAGS_MTLS) $(EXTRA_CFLAGS)
 
 # Falling off a non-void function leaves an INDETERMINATE return value, and in
 # the HTTP callbacks that value IS the parser's errno — a deny path that
