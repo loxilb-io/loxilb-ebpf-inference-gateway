@@ -138,8 +138,7 @@ CFLAGS_ALL := -DHAVE_DP_DPU_BF3=1 \
               -DHAVE_DP_RSS=1 -DHAVE_DP_PERSIST_TFC=1 -DHAVE_DP_FW=1 \
               -DHAVE_DP_GPU_ROUTING=1 -DHAVE_DP_IP_FILTER=1 \
               -DHAVE_DP_SECURITY_RATE_LIMIT=1 \
-              -DHAVE_DP_SECURITY_RATE_RUNTIME_CONFIG=1 \
-              -DHAVE_PROXY_EXTRA_DEBUG=1
+              -DHAVE_DP_SECURITY_RATE_RUNTIME_CONFIG=1
 export HAVE_DP_DPU_BF3
 export DPU_CPUS
 endif
@@ -147,7 +146,7 @@ endif
 # Combining gpu-security features with main's base flags
 # Note: -DHAVE_DP_LOG_LVL_DBG=1 removed for kernel 5.15 compatibility (bpf_printk unavailable)
 # CFLAGS_ALL ?= -DHAVE_DP_FC=1 -DHAVE_DP_EXTCT=1 -DHAVE_DP_SCTP_SUM=1 -DHAVE_DP_CT_SYNC=1 -DMAX_REAL_CPUS=16 -DHAVE_DP_RSS=1 -DHAVE_DP_PERSIST_TFC=1 -DHAVE_DP_FW=1 -DHAVE_DP_GPU_ROUTING=1 -DHAVE_DP_IP_FILTER=1 -DHAVE_DP_SECURITY_RATE_LIMIT=1 -DHAVE_DP_SECURITY_RATE_RUNTIME_CONFIG=1
-CFLAGS_ALL ?= -DHAVE_DP_FC=1 -DHAVE_DP_EXTCT=1 -DHAVE_DP_SCTP_SUM=1 -DHAVE_DP_CT_SYNC=1 -DMAX_REAL_CPUS=16 -DHAVE_DP_RSS=1 -DHAVE_DP_PERSIST_TFC=1 -DHAVE_DP_FW=1 -DHAVE_DP_GPU_ROUTING=1 -DHAVE_DP_IP_FILTER=1 -DHAVE_DP_SECURITY_RATE_LIMIT=1 -DHAVE_DP_SECURITY_RATE_RUNTIME_CONFIG=1 -DHAVE_PROXY_EXTRA_DEBUG=1
+CFLAGS_ALL ?= -DHAVE_DP_FC=1 -DHAVE_DP_EXTCT=1 -DHAVE_DP_SCTP_SUM=1 -DHAVE_DP_CT_SYNC=1 -DMAX_REAL_CPUS=16 -DHAVE_DP_RSS=1 -DHAVE_DP_PERSIST_TFC=1 -DHAVE_DP_FW=1 -DHAVE_DP_GPU_ROUTING=1 -DHAVE_DP_IP_FILTER=1 -DHAVE_DP_SECURITY_RATE_LIMIT=1 -DHAVE_DP_SECURITY_RATE_RUNTIME_CONFIG=1
 
 # Allow EXTRA_CFLAGS from command line (e.g., make EXTRA_CFLAGS="-DHAVE_L4_TRACE")
 ifdef EXTRA_CFLAGS
@@ -159,6 +158,17 @@ ifneq (,$(findstring -DHAVE_L4_TRACE,$(EXTRA_CFLAGS)))
 HAVE_L4_TRACE := 1
 export HAVE_L4_TRACE
 endif
+endif
+
+# HAVE_PROXY_EXTRA_DEBUG: verbose per-recv()/per-event debug logging in the proxy
+# datapath. The sockproxy sources define the macro themselves (guarded by
+# HAVE_PROXY_NO_EXTRA_DEBUG); this keeps the kernel-side user of the same macro
+# (llb_kern_ct.c) on the same switch. Turn both off with one EXTRA_CFLAGS entry:
+#   make EXTRA_CFLAGS="-DHAVE_SOCKOPS -DHAVE_PROXY_NO_EXTRA_DEBUG"
+# Images built for performance or CPU measurement must use that: the logging
+# lands only on the userspace relay path and biases any sockmap on/off comparison.
+ifeq (,$(findstring -DHAVE_PROXY_NO_EXTRA_DEBUG,$(EXTRA_CFLAGS)))
+CFLAGS_ALL += -DHAVE_PROXY_EXTRA_DEBUG=1
 endif
 
 # HTTP/HTTPS Tracing Support: Add -DHAVE_HTTP_TRACE=1 if enabled

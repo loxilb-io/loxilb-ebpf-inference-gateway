@@ -10,7 +10,11 @@
  * initialization entry-point (proxy_main).  Extracted from sockproxy.c.
  */
 #define _GNU_SOURCE
+/* Verbose datapath debug logging. Compile it out for performance or CPU
+ * measurement with: make EXTRA_CFLAGS="-DHAVE_SOCKOPS -DHAVE_PROXY_NO_EXTRA_DEBUG" */
+#ifndef HAVE_PROXY_NO_EXTRA_DEBUG
 #define HAVE_PROXY_EXTRA_DEBUG
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
