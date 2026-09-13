@@ -49,6 +49,7 @@ ai_security_admit(uint8_t policy, char *raw_key, char *model,
     return ai_security_status(result, 401);
 
   if (llb_ai_ratelimit_check(result->key_id, result->tenant_id,
+                             result->user_id, "",
                              model ? model : "", &rate) != 0) {
     *result = rate;
     return ai_security_status(result, 429);

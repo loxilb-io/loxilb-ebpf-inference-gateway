@@ -26,12 +26,17 @@ llb_ai_validate_key(char *raw_key, char *model, ai_gw_decision_t *result)
 }
 
 int
-llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
-                       ai_gw_decision_t *result)
+llb_ai_ratelimit_check(char *key_id, char *tenant_id,
+                       char *user_id, char *svc_ident,
+                       char *model, ai_gw_decision_t *result)
 {
   rate_calls++;
   assert(strcmp(key_id, "key-1") == 0);
   assert(strcmp(tenant_id, "tenant-1") == 0);
+  /* The H2 interim gate has no user/service identity to forward — the
+   * identity-forwarding ABI reaches it only through ai_gw_admit. */
+  assert(user_id != NULL);
+  assert(strcmp(svc_ident, "") == 0);
   (void)model;
   result->decision = rate_decision;
   return rate_rc;

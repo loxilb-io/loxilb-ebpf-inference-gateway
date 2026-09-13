@@ -126,6 +126,21 @@ void llamafirewall_set_initialized(int initialized) { atomic_store(&g_llamafirew
 #include "sockproxy_http.h"  /* own header — after all deps; provides PROXY_SESSION_* */
 
 /* Portable strnstr (needed by inject_forwarded_headers and url-matching) */
+/* Service identity "VIP:port" for the QoS ladder, from the connection's
+ * rule head. "" when the head is gone (teardown races) — the ladder treats
+ * an empty ident as "no rule-scope state". */
+static void
+proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len)
+{
+  proxy_map_ent_t *hent = pfe ? (proxy_map_ent_t *)pfe->head : NULL;
+
+  if (!buf || len == 0)
+    return;
+  buf[0] = '\0';
+  if (hent)
+    ai_gw_svc_ident(hent->key.xip, hent->key.xport, buf, len);
+}
+
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
     size_t needle_len = strlen(needle);
     if (needle_len == 0) return haystack;
@@ -1669,8 +1684,13 @@ skip_deferred_masking:
                                 rfd_ent->usage_tail_len, &up, &uc) == 0) {
           rfd_ent->usage_prompt_toks = up;
           rfd_ent->usage_complet_toks = uc;
+          char ns_svc_ident[64];
+          proxy_pfe_svc_ident(rfd_ent, ns_svc_ident, sizeof(ns_svc_ident));
           llb_ai_token_quota_consume((char *)rfd_ent->tenant_id,
                                      (char *)proxy_effective_model(rfd_ent),
+                                     (char *)rfd_ent->auth_user_id,
+                                     (char *)rfd_ent->auth_key_id,
+                                     ns_svc_ident,
                                      up, uc, 0,
                                      (int)rfd_ent->usage_reserved_toks,
                                      rfd_ent->usage_res_epoch, NULL);
@@ -1848,7 +1868,12 @@ skip_deferred_masking:
           }
           rfd_ent->usage_consumed = 1;
         }
+        char sse_svc_ident[64];
+        proxy_pfe_svc_ident(rfd_ent, sse_svc_ident, sizeof(sse_svc_ident));
         llb_ai_token_quota_consume((char *)sse_tenant, (char *)sse_model,
+                                   (char *)rfd_ent->auth_user_id,
+                                   (char *)rfd_ent->auth_key_id,
+                                   sse_svc_ident,
                                    sse_tok_p, sse_tok_c, sse_estimated,
                                    (int)rfd_ent->usage_reserved_toks,
                                    rfd_ent->usage_res_epoch, NULL);
@@ -4456,9 +4481,12 @@ proxy_pdestroy(void *priv)
     int      pending;
     char     tenant[128];
     char     model[MAX_MODEL_LEN];
+    char     user[128];
+    char     key[64];
+    char     svc_ident[64];
     int      reserved;
     int64_t  res_epoch;
-  } resv_rel = { 0, {0}, {0}, 0, 0 };
+  } resv_rel = { 0, {0}, {0}, {0}, {0}, {0}, 0, 0 };
 
   assert(pfe);
 
@@ -4850,6 +4878,9 @@ proxy_pdestroy(void *priv)
       resv_rel.res_epoch = pfe->usage_res_epoch;
       snprintf(resv_rel.tenant, sizeof(resv_rel.tenant), "%s", pfe->tenant_id);
       snprintf(resv_rel.model, sizeof(resv_rel.model), "%s", m ? m : "");
+      snprintf(resv_rel.user, sizeof(resv_rel.user), "%s", pfe->auth_user_id);
+      snprintf(resv_rel.key, sizeof(resv_rel.key), "%s", pfe->auth_key_id);
+      proxy_pfe_svc_ident(pfe, resv_rel.svc_ident, sizeof(resv_rel.svc_ident));
       /* Zero under the lock: nothing may release this claim twice. */
       pfe->usage_reserved_toks = 0;
       pfe->usage_res_epoch = 0;
@@ -4933,7 +4964,9 @@ proxy_pdestroy(void *priv)
   /* Deferred reservation release (collected above under PROXY_LOCK). A zero
    * count charges nothing and releases the claim. */
   if (resv_rel.pending) {
-    llb_ai_token_quota_consume(resv_rel.tenant, resv_rel.model, 0, 0, 0,
+    llb_ai_token_quota_consume(resv_rel.tenant, resv_rel.model,
+                               resv_rel.user, resv_rel.key,
+                               resv_rel.svc_ident, 0, 0, 0,
                                resv_rel.reserved, resv_rel.res_epoch, NULL);
     log_info("[AI_TOKENS] released %d unspent reserved tokens on teardown "
              "tenant=%s", resv_rel.reserved, resv_rel.tenant);
@@ -6567,12 +6600,36 @@ handle_on_message_begin(llhttp_t* parser)
    * the header is present, so without this reset a keyless request N+1 on a
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
+    /* Request N may have left an unsettled claim (no countable usage came
+     * back, or its response was cut). Zeroing it here would strand it in the
+     * quota store until the window rolls; release it so request N+1 on this
+     * same connection is admitted against real headroom. Releasing before
+     * response N settles is safe: the claim is zeroed with it, so a later
+     * settle simply charges the actual tokens with nothing to give back.
+     * The release runs BEFORE the identity clears below — the claim is
+     * request N's and must be handed back to request N's user/key buckets,
+     * not to whatever request N+1 later authenticates as. */
+    if (pfe->ai_gw_mode && pfe->usage_reserved_toks &&
+        pfe->tenant_id[0] != '\0') {
+      char rel_svc_ident[64];
+      proxy_pfe_svc_ident(pfe, rel_svc_ident, sizeof(rel_svc_ident));
+      llb_ai_token_quota_consume((char *)pfe->tenant_id,
+                                 (char *)proxy_effective_model(pfe),
+                                 (char *)pfe->auth_user_id,
+                                 (char *)pfe->auth_key_id,
+                                 rel_svc_ident,
+                                 0, 0, 0, (int)pfe->usage_reserved_toks,
+                                 pfe->usage_res_epoch, NULL);
+    }
+    pfe->usage_reserved_toks = 0;
+    pfe->usage_res_epoch = 0;
     pfe->x_api_key_raw[0] = '\0';
     pfe->bearer_raw[0] = '\0';
     pfe->bearer_len = 0;
     pfe->bearer_capturing = 0;
     pfe->bearer_oversize = 0;
     pfe->auth_user_id[0] = '\0';
+    pfe->auth_key_id[0] = '\0';
     pfe->auth_strip_authz = 0;
     pfe->auth_fwd_identity = 0;
     pfe->auth_jwt_capable = 0;
@@ -6589,21 +6646,6 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->usage_complet_toks = 0;
     pfe->usage_est_prompt = 0;
     pfe->usage_sse_events = 0;
-    /* Request N may have left an unsettled claim (no countable usage came
-     * back, or its response was cut). Zeroing it here would strand it in the
-     * quota store until the window rolls; release it so request N+1 on this
-     * same connection is admitted against real headroom. Releasing before
-     * response N settles is safe: the claim is zeroed with it, so a later
-     * settle simply charges the actual tokens with nothing to give back. */
-    if (pfe->ai_gw_mode && pfe->usage_reserved_toks &&
-        pfe->tenant_id[0] != '\0') {
-      llb_ai_token_quota_consume((char *)pfe->tenant_id,
-                                 (char *)proxy_effective_model(pfe),
-                                 0, 0, 0, (int)pfe->usage_reserved_toks,
-                                 pfe->usage_res_epoch, NULL);
-    }
-    pfe->usage_reserved_toks = 0;
-    pfe->usage_res_epoch = 0;
   }
   return 0;
 }
@@ -6657,6 +6699,9 @@ handle_on_message_complete(llhttp_t* parser)
        * model and its conflict rule, RPS, token reservation -- lives in
        * ai_gw_admit (sockproxy_ai_admit.c). This caller owns only the H1
        * response emission and the pfe wiring. */
+      char adm_svc_ident[64];
+      ai_gw_svc_ident(hent->key.xip, hent->key.xport,
+                      adm_svc_ident, sizeof(adm_svc_ident));
       ai_gw_req_ctx_t adm_req = {
         .api_key = pfe->x_api_key_raw,
         .bearer = pfe->bearer_raw,
@@ -6667,6 +6712,7 @@ handle_on_message_complete(llhttp_t* parser)
         .prefix_model = pfe->prefix_key.model,
         .hdr_model = pfe->x_model_header,
         .auth_mode = hent->val.ephash->apikey_auth,
+        .svc_ident = adm_svc_ident,
       };
       ai_gw_admit_result_t adm;
       ai_gw_admit(&adm_req, &adm);
@@ -6756,6 +6802,8 @@ handle_on_message_complete(llhttp_t* parser)
         pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
         strncpy(pfe->auth_user_id, adm.user_id, sizeof(pfe->auth_user_id) - 1);
         pfe->auth_user_id[sizeof(pfe->auth_user_id) - 1] = '\0';
+        strncpy(pfe->auth_key_id, adm.key_id, sizeof(pfe->auth_key_id) - 1);
+        pfe->auth_key_id[sizeof(pfe->auth_key_id) - 1] = '\0';
         pfe->auth_strip_authz = (adm.auth_flags & AI_GW_AUTHF_STRIP_AUTHZ) ? 1 : 0;
         pfe->auth_fwd_identity = (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
         pfe->auth_jwt_capable =

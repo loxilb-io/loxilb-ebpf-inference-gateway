@@ -321,6 +321,17 @@ test_ai_security: test_ai_security.c sockproxy_ai_security.c sockproxy_ai_securi
 test_aisec: test_ai_security
 	./test_ai_security
 
+# Identity-forwarding ABI: the admission gate must transport user/key/service
+# into every ladder call, and keyless traffic must probe the per-VIP shared
+# bucket exactly when the service identity is known. Stubs both the Go
+# exports and the JSON helpers — no proxy object graph, no link library.
+test_ai_admit_identity: test_ai_admit_identity.c sockproxy_ai_admit.c sockproxy_ai_admit.h
+	$(CC) -Wall -Wextra -o $@ test_ai_admit_identity.c sockproxy_ai_admit.c -I.
+
+.PHONY: test_aiident
+test_aiident: test_ai_admit_identity
+	./test_ai_admit_identity
+
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
 # sockproxy_cookie.h primitives, links -lssl -lcrypto (the already-linked HMAC).
