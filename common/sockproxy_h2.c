@@ -26,6 +26,9 @@
 #include "sockproxy_h2.h"
 #include "sockproxy.h"
 #include "sockproxy_ai_security.h"
+#include "sockproxy_ai_admit.h"   /* the shared H1/H2 admission gate */
+#include "sockproxy_ai_gw.h"      /* settle-path ladder calls */
+#include "sockproxy_pd.h"         /* dialect ops for usage extraction */
 #include "sockproxy_json.h"
 #include "sockproxy_lb.h"
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
@@ -168,6 +171,91 @@ create_stream(proxy_h2_session_t *session, int32_t stream_id)
   return stream;
 }
 
+/* ==========================================================================
+ * AI settle twins — the H1 parser charges token usage at body-complete /
+ * SSE [DONE] and releases orphaned admission claims at teardown
+ * (sockproxy_http.c). HTTP/2 responses flow through the backend-session
+ * callbacks instead, so the same three obligations live here, per stream:
+ * a response-tail window for usage extraction, a settle at backend stream
+ * close, and a claim release when a stream dies before it settled.
+ * ========================================================================== */
+
+/* Sliding response-tail window: the usage object rides the final bytes of
+ * a JSON body or the final SSE chunk (stream_options.include_usage). */
+static void
+proxy_h2_stream_tail_update(proxy_h2_stream_t *stream,
+                            const uint8_t *data, size_t len)
+{
+  size_t keep = sizeof(stream->usage_tail);
+
+  if (len >= keep) {
+    memcpy(stream->usage_tail, data + (len - keep), keep);
+    stream->usage_tail_len = (uint16_t)keep;
+    return;
+  }
+  if ((size_t)stream->usage_tail_len + len > keep) {
+    size_t drop = (size_t)stream->usage_tail_len + len - keep;
+    memmove(stream->usage_tail, stream->usage_tail + drop,
+            stream->usage_tail_len - drop);
+    stream->usage_tail_len -= (uint16_t)drop;
+  }
+  memcpy(stream->usage_tail + stream->usage_tail_len, data, len);
+  stream->usage_tail_len += (uint16_t)len;
+}
+
+/* Settle an admitted stream: extract usage from the tail window, charge the
+ * ladder (releasing the admission claim in the same call) and record the
+ * request. result stays NULL on the consume call — a completed response is
+ * never interrupted; an exceeded quota denies the NEXT request at the gate. */
+static void
+proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
+{
+  proxy_fd_ent_t *pfe = session ? (proxy_fd_ent_t *)session->pfe : NULL;
+  int up = 0, uc = 0;
+
+  if (!stream || !(stream->ai_admitted || stream->ai_unmetered) ||
+      stream->usage_consumed)
+    return;
+  stream->usage_consumed = 1;
+
+  if (pfe && stream->usage_tail_len > 0) {
+    /* Same dialect resolution as the H1 proxy_usage_ops: P/D rules carry
+     * their engine dialect on the epval; plain AI-gateway rules fall back
+     * to the plain-LB profile. The pool is the STREAM's resolved pool —
+     * pfe->epv is connection-scoped and holds whichever pool the LATEST
+     * stream resolved, which on a multi-model connection is not this one. */
+    proxy_epval_t *epv = stream->route_epv
+                             ? (proxy_epval_t *)stream->route_epv
+                             : (proxy_epval_t *)pfe->epv;
+    const pd_dialect_ops_t *uops =
+      (epv && epv->pd_ops) ? epv->pd_ops : &pd_dialect_plain;
+    if (uops->extract_usage)
+      (void)uops->extract_usage(pfe, stream->usage_tail,
+                                stream->usage_tail_len, &up, &uc);
+  }
+
+  llb_ai_token_quota_consume(stream->tenant_id, stream->effective_model,
+                             stream->auth_user_id, stream->auth_key_id,
+                             stream->svc_ident, up, uc, 0,
+                             (int)stream->usage_reserved_toks,
+                             stream->usage_res_epoch, NULL);
+  stream->usage_reserved_toks = 0;
+  stream->usage_res_epoch = 0;
+
+  int64_t latency_ms = 0;
+  if (stream->admit_mono_ns) {
+    uint64_t now = get_timestamp_ns();
+    if (now > stream->admit_mono_ns)
+      latency_ms = (int64_t)((now - stream->admit_mono_ns) / 1000000ULL);
+  }
+  int status = stream->metric_response_status > 0
+                   ? stream->metric_response_status : 200;
+  llb_ai_record_request(stream->tenant_id, stream->effective_model, status,
+                        latency_ms, up, uc, 0, 0, "");
+  log_info("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
+           stream->stream_id, up, uc, status);
+}
+
 /**
  * Destroy stream and remove from session
  */
@@ -177,7 +265,23 @@ destroy_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   if (!session || !stream) {
     return;
   }
-  
+
+  /* AI settle on teardown: the CLIENT stream is the settle unit and this
+   * is the one close that always fires for it. The backend-side stream
+   * close (proxy_h2_backend_on_stream_close_callback) also settles, but it
+   * races the client close — nghttp2 destroys the client stream as soon as
+   * the client's END_STREAM is acknowledged, which for a complete exchange
+   * beats the backend close, and once find_stream() can no longer reach the
+   * client stream the backend-side settle silently no-ops. Settling here
+   * makes metering happen exactly once (usage_consumed guards the double)
+   * for every admitted OR keyless stream, no matter which close wins:
+   *   - a completed response has its usage in the tail window → charged;
+   *   - a genuine abort has whatever arrived (usually nothing) charged and,
+   *     for admitted streams, the admission reservation released — the same
+   *     hand-back the previous abort-only block did, now never skipped. */
+  proxy_h2_settle_stream(session, stream);
+
+
   // Free data buffer if allocated
   if (stream->data_buf) {
     free(stream->data_buf);
@@ -393,6 +497,23 @@ proxy_h2_on_header_callback(nghttp2_session *session,
      * a required policy treats it exactly like a missing credential. */
     ai_security_copy_api_key(stream->x_api_key_raw,
                              sizeof(stream->x_api_key_raw), value, valuelen);
+  } else if (HEADER_MATCHES("authorization")) {
+    /* The JWT arm's credential, stream state for the same reason as the
+     * API key above. nghttp2 delivers the HPACK-decoded value whole, so no
+     * fragment reassembly is needed here — but the H1 oversize contract is
+     * kept: a value beyond the cap is dropped and flagged, so the JWT arm
+     * refuses it as an invalid token instead of validating a prefix. */
+    if (valuelen < sizeof(stream->bearer_raw)) {
+      memcpy(stream->bearer_raw, value, valuelen);
+      stream->bearer_raw[valuelen] = '\0';
+      stream->bearer_oversize = 0;
+    } else {
+      stream->bearer_raw[0] = '\0';
+      stream->bearer_oversize = 1;
+    }
+  } else if (HEADER_MATCHES("x-model")) {
+    snprintf(stream->x_model_header, sizeof(stream->x_model_header),
+             "%.*s", (int)valuelen, value);
   }
 
   // append into the bounded generic L7 header/cookie store on
@@ -787,6 +908,20 @@ proxy_h2_backend_on_header_callback(nghttp2_session *session,
     return 0;
   }
 
+  /* AI settle: capture the backend :status for the request record — the
+   * same role the H1 response status-line capture plays. */
+  if (namelen == 7 && memcmp(name, ":status", 7) == 0 &&
+      backend_session->client_session) {
+    proxy_h2_stream_t *ai_stream =
+      find_stream(backend_session->client_session, mapping->client_stream_id);
+    if (ai_stream && (ai_stream->ai_admitted || ai_stream->ai_unmetered) &&
+        valuelen > 0 && valuelen < 4) {
+      char st[4] = {0};
+      memcpy(st, value, valuelen);
+      ai_stream->metric_response_status = atoi(st);
+    }
+  }
+
   // Allocate header storage if needed
   if (!mapping->response_headers) {
     mapping->response_headers_capacity = 16;  // Initial capacity
@@ -907,7 +1042,10 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       proxy_map_ent_t *node = (proxy_map_ent_t *)client_pfe->head;
       if (node && node->has_l7_policy &&
           l7_cookie_persist_active(client_pfe, node)) {
-        proxy_epval_t *tepval = (proxy_epval_t *)client_pfe->epv;
+        /* The pool must be the one THIS backend session belongs to —
+         * client_pfe->epv is connection-scoped and a concurrent stream
+         * routed through another pool may have overwritten it. */
+        proxy_epval_t *tepval = (proxy_epval_t *)backend_session->epv;
         int ep_idx = backend_session->ep_idx;   /* the backend this stream uses */
         char token[LB_COOKIE_TOKEN_MAX];
         if (tepval && ep_idx >= 0 && ep_idx < tepval->n_eps &&
@@ -1059,7 +1197,18 @@ proxy_h2_backend_on_data_chunk_recv_callback(nghttp2_session *session,
   }
   
   int32_t client_stream_id = mapping->client_stream_id;
-  
+
+  /* AI settle: maintain the response-tail window for admitted streams —
+   * the usage object rides the final bytes (JSON body or final SSE chunk),
+   * exactly what the H1 proxy_usage_tail_update keeps. */
+  if (len > 0) {
+    proxy_h2_stream_t *ai_stream =
+      find_stream(client_session, client_stream_id);
+    if (ai_stream && (ai_stream->ai_admitted || ai_stream->ai_unmetered) &&
+        !ai_stream->usage_consumed)
+      proxy_h2_stream_tail_update(ai_stream, data, len);
+  }
+
   // ============================================================================
   // HTTP/2 BACKPRESSURE: Apply watermark-based flow control (same as HTTP/1.1)
   // ============================================================================
@@ -1159,6 +1308,18 @@ proxy_h2_backend_on_stream_close_callback(nghttp2_session *session,
   stream_mapping_t *tmp;
   HASH_ITER(hh, backend_session->stream_map, mapping, tmp) {
     if (mapping->backend_stream_id == stream_id) {
+      /* AI settle twin: the backend closed the response stream, so the
+       * tail window holds the final bytes. Charge usage, release the
+       * admission claim, record the request — H1 does this at body
+       * complete / SSE [DONE]; a backend-side abort still settles here
+       * with whatever arrived (settle also covers the claim release). */
+      if (backend_session->client_session) {
+        proxy_h2_stream_t *ai_stream =
+          find_stream(backend_session->client_session,
+                      mapping->client_stream_id);
+        if (ai_stream)
+          proxy_h2_settle_stream(backend_session->client_session, ai_stream);
+      }
       HASH_DEL(backend_session->stream_map, mapping);
 
       // Free allocated header storage
@@ -1189,34 +1350,42 @@ proxy_h2_backend_on_stream_close_callback(nghttp2_session *session,
 backend_h2_session_t *
 proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
                                proxy_fd_ent_t *pfe,
+                               int slot,
                                int ep_idx,
+                               void *epv,
                                int backend_fd,
                                void *ssl)
 {
   backend_h2_session_t *backend_session = NULL;
   nghttp2_session_callbacks *callbacks = NULL;
   int rv;
-  
-  if (!client_session || !pfe || ep_idx < 0 || backend_fd <= 0) {
+
+  if (!client_session || !pfe || slot < 0 || ep_idx < 0 || backend_fd <= 0) {
     log_error("[HTTP/2 Backend] Invalid parameters for backend session creation");
     return NULL;
   }
-  
-  // Check if backend session already exists for this endpoint
-  HASH_FIND_INT(client_session->backend_sessions, &ep_idx, backend_session);
+
+  /* Sessions are keyed by the per-connection SLOT, never by ep_idx: two
+   * model pools on one rule both contain an endpoint 0, and a stream of
+   * pool B must not be submitted into pool A's session because the
+   * indexes happen to match. The slot was allocated against (epv, ep_idx)
+   * by the forwarder, so a hit here is a same-pool, same-endpoint reuse. */
+  HASH_FIND_INT(client_session->backend_sessions, &slot, backend_session);
   if (backend_session) {
     return backend_session;
   }
-  
+
   // Create new backend session
   backend_session = calloc(1, sizeof(backend_h2_session_t));
   if (!backend_session) {
     log_error("[HTTP/2 Backend] ep[%d]: Failed to allocate backend session", ep_idx);
     return NULL;
   }
-  
+
   backend_session->backend_fd = backend_fd;
+  backend_session->slot = slot;
   backend_session->ep_idx = ep_idx;
+  backend_session->epv = epv;
   backend_session->client_session = client_session;
   backend_session->ssl = ssl;
   backend_session->connected = 1;
@@ -1280,7 +1449,7 @@ proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
   pthread_mutex_unlock(&backend_session->send_lock);
   
   // Add to client session's backend sessions hash
-  HASH_ADD_INT(client_session->backend_sessions, ep_idx, backend_session);
+  HASH_ADD_INT(client_session->backend_sessions, slot, backend_session);
   
   return backend_session;
 }
@@ -1978,6 +2147,152 @@ proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
   return 0;
 }
 
+/*
+ * proxy_h2_send_ai_deny — terminal AI-gate refusal on ONE stream.
+ *
+ * The L7 synthetic above answers policy REJECT/REDIRECTs and carries only
+ * :status/location; a gate denial owes the client the FULL H1 response
+ * contract: the status, the Retry-After hint on the rate arms, and the
+ * machine-readable JSON error body — the error code is how a client (and
+ * the cicd oracle) tells WHICH arm refused, e.g. missing_token (the JWT
+ * arm decided) vs invalid_api_key. Body shapes mirror the H1 responder
+ * byte-for-byte: {"error","retry_after"} when retry_body, else
+ * {"error","message"}. HEADERS + DATA(END_STREAM); the connection stays
+ * open — h2 multiplexes, only this stream ends.
+ */
+typedef struct {
+  uint8_t *data;
+  size_t len;
+  size_t offset;
+} h2_deny_body_ctx_t;
+
+static ssize_t
+proxy_h2_deny_body_read_callback(nghttp2_session *session, int32_t stream_id,
+                                 uint8_t *buf, size_t length,
+                                 uint32_t *data_flags,
+                                 nghttp2_data_source *source, void *user_data)
+{
+  h2_deny_body_ctx_t *ctx = (h2_deny_body_ctx_t *)source->ptr;
+  size_t remaining = ctx->len - ctx->offset;
+  size_t to_copy = (remaining < length) ? remaining : length;
+
+  (void)session; (void)stream_id; (void)user_data;
+  if (to_copy > 0) {
+    memcpy(buf, ctx->data + ctx->offset, to_copy);
+    ctx->offset += to_copy;
+  }
+  if (ctx->offset >= ctx->len) {
+    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    free(ctx->data);
+    free(ctx);
+  }
+  return (ssize_t)to_copy;
+}
+
+static int
+proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, int32_t stream_id,
+                      int status_code, int retry_after, int retry_body,
+                      const char *error_code, const char *error_msg)
+{
+  if (!pfe || !pfe->h2_session || !pfe->h2_session->session)
+    return -1;
+
+  char status_str[8];
+  char retry_str[16];
+  char clen_str[16];
+  char body[512];
+  int blen;
+
+  snprintf(status_str, sizeof(status_str), "%d", status_code);
+  if (!error_code || !error_code[0])
+    error_code = "denied";
+  if (retry_body) {
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+                    error_code, retry_after);
+  } else {
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+                    error_code, error_msg ? error_msg : "");
+  }
+  if (blen < 0 || blen >= (int)sizeof(body))
+    blen = 0;
+
+  /* The body must outlive this frame: nghttp2 pulls it from the read
+   * callback asynchronously. On allocation failure the refusal still
+   * stands, just body-less — denying is the part that may not fail. */
+  h2_deny_body_ctx_t *ctx = NULL;
+  if (blen > 0) {
+    ctx = calloc(1, sizeof(*ctx));
+    if (ctx) {
+      ctx->data = malloc((size_t)blen);
+      if (!ctx->data) {
+        free(ctx);
+        ctx = NULL;
+      } else {
+        memcpy(ctx->data, body, (size_t)blen);
+        ctx->len = (size_t)blen;
+      }
+    }
+  }
+
+  snprintf(clen_str, sizeof(clen_str), "%d", ctx ? blen : 0);
+
+  nghttp2_nv hdrs[4];
+  size_t nvlen = 0;
+  hdrs[nvlen].name = (uint8_t *)":status";
+  hdrs[nvlen].value = (uint8_t *)status_str;
+  hdrs[nvlen].namelen = 7;
+  hdrs[nvlen].valuelen = strlen(status_str);
+  hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+  nvlen++;
+  hdrs[nvlen].name = (uint8_t *)"content-type";
+  hdrs[nvlen].value = (uint8_t *)"application/json";
+  hdrs[nvlen].namelen = 12;
+  hdrs[nvlen].valuelen = 16;
+  hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+  nvlen++;
+  if (retry_after > 0) {
+    snprintf(retry_str, sizeof(retry_str), "%d", retry_after);
+    hdrs[nvlen].name = (uint8_t *)"retry-after";
+    hdrs[nvlen].value = (uint8_t *)retry_str;
+    hdrs[nvlen].namelen = 11;
+    hdrs[nvlen].valuelen = strlen(retry_str);
+    hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+    nvlen++;
+  }
+  hdrs[nvlen].name = (uint8_t *)"content-length";
+  hdrs[nvlen].value = (uint8_t *)clen_str;
+  hdrs[nvlen].namelen = 14;
+  hdrs[nvlen].valuelen = strlen(clen_str);
+  hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+  nvlen++;
+
+  nghttp2_data_provider data_prd;
+  nghttp2_data_provider *prd = NULL;
+  if (ctx) {
+    data_prd.source.ptr = ctx;
+    data_prd.read_callback = proxy_h2_deny_body_read_callback;
+    prd = &data_prd;
+  }
+
+  int rv = nghttp2_submit_response(pfe->h2_session->session, stream_id,
+                                   hdrs, nvlen, prd);
+  if (rv != 0) {
+    log_error("[AIGateway][HTTP/2] deny submit failed (stream %d status %d): %s",
+              stream_id, status_code, nghttp2_strerror(rv));
+    if (ctx) {
+      free(ctx->data);
+      free(ctx);
+    }
+    /* Still an h2 stream: refuse it outright rather than leaving it open. */
+    nghttp2_submit_rst_stream(pfe->h2_session->session, NGHTTP2_FLAG_NONE,
+                              stream_id, NGHTTP2_INTERNAL_ERROR);
+  }
+  nghttp2_session_send(pfe->h2_session->session);
+  return 0;
+}
+
 /**
  * Cleanup HTTP/2 session and all streams
  */
@@ -2428,32 +2743,105 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
    * this stream.  It MUST precede L7 dispatch, model lookup, all Tier 0/1/1.5/2
    * selectors, conversation/CHWBL fallback and backend connection creation.
    * HTTP/1 performs the same validation from llhttp's message-complete
-   * callback; HTTP/2 bypasses llhttp and therefore needs this stream gate. */
+   * callback; HTTP/2 bypasses llhttp and therefore needs this stream gate.
+   *
+   * ONE gate, shared with the H1 parser: ai_gw_admit() owns arm dispatch on
+   * the declared mode, JWT verification, the body-first effective model and
+   * its conflict rule, the rate/quota ladder and the pre-admission token
+   * reservation. The previous H2-only gate consulted the API-key arm no
+   * matter what the service declared, so the two protocol paths could
+   * disagree about the declared authentication mode of the same service.
+   * This caller owns only the refusal framing and the stream wiring. */
+  char body_model[MAX_MODEL_LEN] = {0};
+  if (stream->data_buf && stream->data_len > 0)
+    extract_model_field((const char *)stream->data_buf, stream->data_len,
+                        body_model, sizeof(body_model));
+
   if (ent->val.ephash) {
-    ai_gw_decision_t decision = {0};
-    char body_model[MAX_MODEL_LEN] = {0};
-    char *model = "";
+    /* The service identity feeds the QoS ladder (rule-scope defaults and
+     * the keyless per-VIP bucket) — an AI-gateway concern. Withhold it on
+     * non-AI rules so a plain H2 service with an undeclared policy never
+     * pays a per-request ladder probe it paid nothing for before (H1 runs
+     * its whole gate only on ai_gw_mode connections). */
+    char adm_svc_ident[64] = "";
+    if (ent->val.ephash->ai_gw_mode)
+      ai_gw_svc_ident(ent->key.xip, ent->key.xport,
+                      adm_svc_ident, sizeof(adm_svc_ident));
 
-    if (stream->data_buf && stream->data_len > 0)
-      extract_model_field((const char *)stream->data_buf, stream->data_len,
-                          body_model, sizeof(body_model));
-    if (body_model[0])
-      model = body_model;
+    ai_gw_req_ctx_t adm_req = {
+      .api_key = stream->x_api_key_raw,
+      .bearer = stream->bearer_raw,
+      .bearer_oversize = stream->bearer_oversize,
+      .jwt_profile = ent->val.ephash->jwt_auth_profile,
+      .body = (const char *)stream->data_buf,
+      .body_len = stream->data_len,
+      .prefix_model = body_model,
+      .hdr_model = stream->x_model_header,
+      .auth_mode = ent->val.ephash->apikey_auth,
+      .svc_ident = adm_svc_ident,
+    };
+    ai_gw_admit_result_t adm;
+    ai_gw_admit(&adm_req, &adm);
 
-    int deny_status = ai_security_admit(ent->val.ephash->apikey_auth,
-                                        stream->x_api_key_raw, model, &decision);
-    if (deny_status != 0) {
-      /* The existing synthetic responder frames a terminal response on one
-       * stream and leaves the multiplexed connection alive.  Return success
-       * so the caller marks this stream response_sent and never redispatches. */
-      pfe->h2_session->l7_active_stream_id = stream->stream_id;
-      proxy_h2_send_l7_synthetic(pfe, deny_status, NULL, NULL);
-      pfe->h2_session->l7_active_stream_id = 0;
+    if (adm.verdict == AI_GW_ADMIT_UNMETERED) {
+      /* Served, but neither authenticated nor attributable to a tenant —
+       * report it exactly as the H1 gate does, and only for AI-gateway
+       * rules (H1 runs its gate only on ai_gw_mode connections). */
+      if (ent->val.ephash->ai_gw_mode) {
+        char um_vip[INET6_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &ent->key.xip, um_vip, sizeof(um_vip));
+        llb_ai_record_unmetered(um_vip);
+        /* Keyless still settles: the response's usage charges the per-VIP
+         * shared bucket keyed by svc_ident (tenant stays ""), the same
+         * exact-usage/deny-next contract the H1 relay applies — its settle
+         * gate is ai_gw_mode, not "admitted with an identity". Without
+         * this a service with only keyless traffic can never trip its own
+         * vip_shared_tpm on HTTP/2 while tripping it fine on HTTP/1. */
+        stream->ai_unmetered = 1;
+        snprintf(stream->svc_ident, sizeof(stream->svc_ident), "%s",
+                 adm_svc_ident);
+        stream->admit_mono_ns = get_timestamp_ns();
+      }
+    } else if (adm.verdict == AI_GW_ADMIT_DENY) {
+      /* Terminal response on THIS stream; the multiplexed connection
+       * stays alive. Return success so the caller marks the stream
+       * response_sent and never redispatches. */
+      proxy_h2_send_ai_deny(pfe, stream->stream_id,
+                            adm.http_status, adm.retry_after,
+                            adm.retry_body, adm.error_code, adm.error_msg);
       log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
-               "status=%d decision=%d credential_present=%d",
-               stream->stream_id, deny_status, decision.decision,
-               stream->x_api_key_raw[0] != '\0');
+               "status=%d stage=%d error=%s key=%s tenant=%s",
+               stream->stream_id, adm.http_status, adm.stage,
+               adm.error_code, adm.key_id, adm.tenant_id);
       return 0;
+    } else {
+      /* Admitted. Persist the identity, the gate's model resolution, the
+       * token reservation and the upstream-hygiene switches on the STREAM
+       * — the settle/abort paths and the dispatch-time strip/inject read
+       * them there, per stream, never from connection state. */
+      stream->ai_admitted = 1;
+      snprintf(stream->tenant_id, sizeof(stream->tenant_id), "%s",
+               adm.tenant_id);
+      snprintf(stream->auth_user_id, sizeof(stream->auth_user_id), "%s",
+               adm.user_id);
+      snprintf(stream->auth_key_id, sizeof(stream->auth_key_id), "%s",
+               adm.key_id);
+      snprintf(stream->effective_model, sizeof(stream->effective_model), "%s",
+               adm.effective_model);
+      snprintf(stream->svc_ident, sizeof(stream->svc_ident), "%s",
+               adm_svc_ident);
+      stream->auth_strip_authz =
+        (adm.auth_flags & AI_GW_AUTHF_STRIP_AUTHZ) ? 1 : 0;
+      stream->auth_fwd_identity =
+        (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
+      stream->auth_jwt_capable =
+        (ent->val.ephash->apikey_auth == 3 ||
+         ent->val.ephash->apikey_auth == 4) ? 1 : 0;
+      if (adm.res_epoch != 0) {
+        stream->usage_reserved_toks = adm.reserved_toks;
+        stream->usage_res_epoch = adm.res_epoch;
+      }
+      stream->admit_mono_ns = get_timestamp_ns();
     }
   }
   
@@ -2468,6 +2856,26 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   
   // P6: Extract path (already available in stream->path, line 331)
   const char *request_path = stream->path[0] ? stream->path : "/";
+
+  // Model for endpoint selection, H1 parity (sockproxy_ep.c Criterion B/C):
+  // the gate's resolution wins on enforcing services; non-enforcing services
+  // keep the legacy header-first derivation. Derived HERE, before the L7
+  // block, so the goto into h2_have_tepval below can never skip it.
+  const char *lookup_model = "";
+  if (stream->effective_model[0])
+    lookup_model = stream->effective_model;
+  else if (stream->x_model_header[0])
+    lookup_model = stream->x_model_header;
+  else if (body_model[0])
+    lookup_model = body_model;
+
+  /* Keyless streams settle and are recorded too; give those calls the
+   * H1-parity model label (the derived one — non-enforcing services get
+   * no gate-resolved model on purpose). Written AFTER the derivation
+   * above, so routing semantics are untouched. */
+  if (stream->ai_unmetered && !stream->effective_model[0] && lookup_model[0])
+    snprintf(stream->effective_model, sizeof(stream->effective_model), "%s",
+             lookup_model);
   
   // L7 content-routing discriminator + dispatch — the H2 seam.
   // IDENTICAL shared helper to the H1 seam (sockproxy_ep.c) so the two paths
@@ -2535,8 +2943,11 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     // L7_DISPATCH_FALLTHROUGH: no L7 policy — fall through to the AI/LPM path.
   }
 
-  // P6: Use LPM for endpoint selection (same as HTTP/1.1); "" = wildcard (no model filter)
-  tepval = find_endpoint_lpm(ent, lookup_host, request_path, "");
+  // Model-aware endpoint selection: find_endpoint_lpm itself tries the
+  // model-specific pool first and falls back to the wildcard, so a
+  // model-keyed rule — the normal AI shape — finally resolves on HTTP/2
+  // (the old hardwired "" could only ever hit rules stored without a model).
+  tepval = find_endpoint_lpm(ent, lookup_host, request_path, lookup_model);
 
 h2_have_tepval:
   if (!tepval) {
@@ -2563,13 +2974,25 @@ h2_have_tepval:
     }
 #endif
     
+    /* H1 parity (sockproxy_ep.c Criterion B): a request that NAMED a model
+     * for which no pool exists gets a clean 503, not a bare RST — the
+     * client can tell "model unavailable" from a transport failure. */
+    if (lookup_model[0] && pfe && pfe->h2_session && pfe->h2_session->session) {
+      proxy_h2_send_ai_deny(pfe, stream->stream_id, 503, 0, 0,
+                            "model_unavailable",
+                            "no backend pool for this model");
+      log_info("[MODEL_ROUTING][HTTP/2] 503 sent for model='%s' stream=%d",
+               lookup_model, stream->stream_id);
+      return 0;
+    }
+
     // Send RST_STREAM to client - no backends available
     if (pfe && pfe->h2_session && pfe->h2_session->session) {
       nghttp2_submit_rst_stream(pfe->h2_session->session, NGHTTP2_FLAG_NONE,
                                 stream->stream_id, NGHTTP2_REFUSED_STREAM);
       nghttp2_session_send(pfe->h2_session->session);
     }
-    
+
     return -1;
   }
   
@@ -2760,10 +3183,14 @@ h2_have_tepval:
   // ============================================================================
   // CRITICAL: Set endpoint context for statistics accounting
   // HTTP/2 forwards per-stream, so we set the client pfe's endpoint info
-  // to track stats for the selected backend endpoint
+  // to track stats for the selected backend endpoint. These two fields are
+  // connection-scoped last-write state kept for the byte accounting only —
+  // no per-stream decision may read them back (the settle dialect reads
+  // stream->route_epv, the cookie path reads the backend session's epv).
   // ============================================================================
   pfe->epv = tepval;
   pfe->ep_num = ep_idx;
+  stream->route_epv = tepval;
 
   // Store conversation mapping if this is first request
   if (stream->has_conv_id && stream->conversation_id[0] != '\0') {
@@ -2774,19 +3201,50 @@ h2_have_tepval:
       }
     }
   }
-  
+
   // ============================================================================
   // BACKEND CONNECTION & FORWARDING
   // ============================================================================
-  
+
   // Backend SSL connection handle (for end-to-end HTTPS mode)
   void *backend_ssl = NULL;
-  
-  // Get or create backend connection
-  if (ep_idx >= 0 && ep_idx < pfe->n_rfd) {
-    backend_fd = pfe->rfd[ep_idx];
+
+  /* Backend-connection identity is (pool, endpoint-in-pool), NEVER the
+   * endpoint index alone: with model-keyed rules one connection carries
+   * streams of several pools and every pool's eps[] starts at 0, so an
+   * index-keyed cache hands pool B's stream the connection dialed for
+   * pool A. rfd[]/rfd_ent[] therefore hold SLOTS: reuse requires the
+   * registered backend pfe to match BOTH the pool (epv) and the
+   * pool-relative endpoint index; a miss allocates the first free slot. */
+  int slot = -1;
+  for (int i = 0; i < pfe->n_rfd && i < MAX_PROXY_EP; i++) {
+    proxy_fd_ent_t *bpfe = pfe->rfd_ent[i];
+    if (bpfe && bpfe->epv == (void *)tepval && bpfe->ep_num == ep_idx &&
+        pfe->rfd[i] > 0) {
+      slot = i;
+      backend_fd = pfe->rfd[i];
+      break;
+    }
   }
-  
+  if (slot < 0) {
+    for (int i = 0; i < MAX_PROXY_EP; i++) {
+      if (pfe->rfd_ent[i] == NULL) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot < 0) {
+      log_error("[HTTP/2] stream %d: no free backend slot (all %d in use)",
+                stream->stream_id, MAX_PROXY_EP);
+      if (pfe->h2_session && pfe->h2_session->session) {
+        nghttp2_submit_rst_stream(pfe->h2_session->session, NGHTTP2_FLAG_NONE,
+                                  stream->stream_id, NGHTTP2_REFUSED_STREAM);
+        nghttp2_session_send(pfe->h2_session->session);
+      }
+      return -1;
+    }
+  }
+
   if (backend_fd <= 0) {
     if (!tepval) {
       log_error("[HTTP/2] CRITICAL: tepval is NULL!");
@@ -2890,9 +3348,9 @@ h2_have_tepval:
       return -1;
     }
     
-    pfe->rfd[ep_idx] = backend_fd;
-    pfe->n_rfd = (ep_idx + 1 > pfe->n_rfd) ? ep_idx + 1 : pfe->n_rfd;
-    
+    pfe->rfd[slot] = backend_fd;
+    pfe->n_rfd = (slot + 1 > pfe->n_rfd) ? slot + 1 : pfe->n_rfd;
+
     // P2 Task 2.3: Record circuit breaker success
     circuit_breaker_record_success(tepval, ep_idx);
   }
@@ -2904,7 +3362,7 @@ h2_have_tepval:
   // Get or create backend HTTP/2 session
   // Pass backend_ssl (actual SSL connection) not ssl_epctx (SSL context)
   backend_h2_session_t *backend_session = proxy_h2_get_backend_session(
-    pfe->h2_session, pfe, ep_idx, backend_fd, backend_ssl);
+    pfe->h2_session, pfe, slot, ep_idx, tepval, backend_fd, backend_ssl);
   
   if (!backend_session) {
     log_error("[HTTP/2] stream %d: Failed to create backend HTTP/2 session for ep[%d]",
@@ -2935,7 +3393,7 @@ h2_have_tepval:
   //                           → proxy_notifier() sees backend pfe → processes response
   //
   // Only register if this is a NEW backend connection (not reused)
-  if (pfe->rfd_ent[ep_idx] == NULL) {
+  if (pfe->rfd_ent[slot] == NULL) {
     // Create proxy_fd_ent_t for backend connection
     proxy_fd_ent_t *backend_pfe = pfe_alloc();   /* D2 root fix: pooled pfe shell */
     if (!backend_pfe) {
@@ -2951,27 +3409,30 @@ h2_have_tepval:
     backend_pfe->odir = 1;                    // Backend direction (outbound from proxy)
     backend_pfe->head = ent;                  // Link to proxy_map_ent_t
     backend_pfe->protocol_version = 2;        // HTTP/2
-    backend_pfe->ep_num = ep_idx;             // Endpoint index
-    backend_pfe->epv = tepval;                // Endpoint value
+    backend_pfe->ep_num = ep_idx;             // Endpoint index INSIDE its pool —
+    backend_pfe->epv = tepval;                // with epv this pair IS the slot's
+                                              // reuse identity (see slot search)
     backend_pfe->stype = PROXY_SOCK_ACTIVE;   // Active connection
     backend_pfe->used = 1;                    // Mark as in use
     backend_pfe->backend_h2_session = backend_session;  // For event handler lookup
     
     // Link backend pfe to client pfe (bidirectional)
-    pfe->rfd_ent[ep_idx] = backend_pfe;
+    pfe->rfd_ent[slot] = backend_pfe;
     backend_pfe->rfd_ent[0] = pfe;            // Back-link to client pfe
     backend_pfe->n_rfd = 1;
-    
+
     // ✅ CRITICAL: Register with event loop - enables backend response handling
     if (proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, backend_pfe) != 0) {
       log_error("[HTTP/2] stream %d: Failed to register backend fd=%d with event loop",
                 stream->stream_id, backend_fd);
-      pfe->rfd_ent[ep_idx] = NULL;   /* D2 root fix: unlink before recycling the shell */
+      pfe->rfd_ent[slot] = NULL;   /* D2 root fix: unlink before recycling the shell */
+      pfe->rfd[slot] = -1;         /* the fd closes below; a stale positive here
+                                    * would satisfy the reuse probe forever */
       pfe_recycle(backend_pfe);      /* pool the shell (frees rcvbuf, bumps gen) */
       close(backend_fd);
       return -1;
     }
-  } 
+  }
   
   // ============================================================================
   // GENERIC HEADER FORWARDING: Use all collected headers for protocol transparency
@@ -3011,24 +3472,31 @@ h2_have_tepval:
      * the unmodified request rather than dropping it. */
   }
 
-  /* Strip the gateway credential AFTER optional L7 mutation (so a header rule
-   * cannot re-add it) and BEFORE nghttp2_submit_request.  Allocation failure
-   * fails closed for services that claimed this namespace; forwarding the
-   * secret is never an acceptable fallback. */
+  /* Upstream hygiene AFTER optional L7 mutation (so a header rule cannot
+   * re-add a stripped credential) and BEFORE nghttp2_submit_request: the
+   * gateway credential strip, plus — parity with the H1 splice — the
+   * client X-Auth-* spoof strip, the consumed-Authorization strip and the
+   * verified-identity injection on JWT-capable rules. Allocation failure
+   * fails closed for services that claimed a credential namespace;
+   * forwarding the secret is never an acceptable fallback. */
   nghttp2_nv *security_headers_nv = NULL;
   int security_headers_built = 0;
   uint8_t security_policy = ent->val.ephash ? ent->val.ephash->apikey_auth : 0;
-  if (ai_security_should_strip_api_key(security_policy)) {
-    security_headers_nv = calloc(nheaders, sizeof(*security_headers_nv));
+  int hygiene_jwt = stream->ai_admitted && stream->auth_jwt_capable;
+  if (ai_security_should_strip_api_key(security_policy) || hygiene_jwt) {
+    size_t hygiene_cap = nheaders + 2;   /* + injected X-Auth-Tenant/User */
+    security_headers_nv = calloc(hygiene_cap, sizeof(*security_headers_nv));
     if (!security_headers_nv) {
       if (l7_hdr_built)
         proxy_h2_free_l7_req_headers(l7_headers_nv, &l7_hdr_ctx);
       log_error("[AIGateway][HTTP/2] cannot allocate credential-safe header set");
       return -1;
     }
-    nheaders = ai_security_filter_h2_headers(headers, nheaders,
-                                             security_headers_nv, nheaders,
-                                             security_policy);
+    nheaders = ai_security_h2_upstream_hygiene(
+        headers, nheaders, security_headers_nv, hygiene_cap,
+        security_policy, hygiene_jwt,
+        stream->auth_strip_authz, stream->auth_fwd_identity,
+        stream->tenant_id, stream->auth_user_id);
     headers = security_headers_nv;
     security_headers_built = 1;
   }
@@ -3149,7 +3617,7 @@ h2_have_tepval:
           }
 
           // Get backend pfe for EPOLLOUT registration
-          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[ep_idx];
+          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[slot];
           if (backend_pfe) {
             // Register EPOLLOUT for retry when socket becomes writable
             proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
@@ -3194,7 +3662,7 @@ h2_have_tepval:
           }
 
           // Get backend pfe for EPOLLOUT registration
-          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[ep_idx];
+          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[slot];
           if (backend_pfe) {
             // Register EPOLLOUT for retry when socket becomes writable
             proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);

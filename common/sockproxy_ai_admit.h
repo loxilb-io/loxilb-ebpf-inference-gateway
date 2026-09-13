@@ -79,6 +79,10 @@ typedef struct ai_gw_req_ctx {
   int         auth_mode;     /* rule api_key_auth wire value (0 unset / 1 apikey
                               * required / 2 disabled / 3 jwt / 4 apikey-or-jwt;
                               * anything else enforces the API-key arm, fail-closed) */
+  const char *svc_ident;     /* service identity "VIP:port" ("" when unknown);
+                              * selects the rule-scope QoS defaults row, and on
+                              * non-enforcing services the opt-in per-VIP shared
+                              * bucket (the only ladder arm keyless traffic has) */
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {
@@ -113,5 +117,12 @@ typedef struct ai_gw_admit_result {
 } ai_gw_admit_result_t;
 
 int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);
+
+/* Format the service identity the QoS ladder keys rule-scope state on:
+ * "VIP:port" from the rule key's network-order IPv4 address and port —
+ * the same derivation llb_ai_record_unmetered has always used for its
+ * vip label, plus the listener port. buf is always NUL-terminated; a
+ * zero-length buf is left untouched. */
+void ai_gw_svc_ident(uint32_t xip_be, uint16_t xport_be, char *buf, size_t len);
 
 #endif /* __SOCKPROXY_AI_ADMIT_H__ */

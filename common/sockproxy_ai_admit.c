@@ -38,6 +38,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <arpa/inet.h>
 
 #include "xxhash.h"
 #include "uthash.h"
@@ -50,6 +51,19 @@
  * world; hold the mirror to the original. */
 _Static_assert(AI_GW_MODEL_LEN == MAX_MODEL_LEN,
                "AI_GW_MODEL_LEN must mirror MAX_MODEL_LEN");
+
+void
+ai_gw_svc_ident(uint32_t xip_be, uint16_t xport_be, char *buf, size_t len)
+{
+  char vip[INET_ADDRSTRLEN] = {0};
+
+  if (!buf || len == 0)
+    return;
+  buf[0] = '\0';
+  if (!inet_ntop(AF_INET, &xip_be, vip, sizeof(vip)))
+    return;
+  snprintf(buf, len, "%s:%u", vip, (unsigned)ntohs(xport_be));
+}
 
 static void
 set_deny(ai_gw_admit_result_t *res, ai_gw_admit_stage_t stage, int status,
@@ -73,12 +87,30 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
   const char *prefix_model = req->prefix_model ? req->prefix_model : "";
   const char *hdr_model = req->hdr_model ? req->hdr_model : "";
 
+  const char *svc_ident = req->svc_ident ? req->svc_ident : "";
+
   /* Skip enforcement only for the two DECLARED non-enforcing values.
    * 1 enforces, and so does anything out of range: a wire value this code
    * does not recognise is a corrupted policy, and a corrupted policy that
    * admits keyless traffic fails open on exactly the services an operator
    * tried to protect. */
   if (req->auth_mode == 0 || req->auth_mode == 2) {
+    /* The one ladder arm keyless traffic has: the opt-in per-VIP shared
+     * bucket. A fully-empty identity makes this the keyless probe on the
+     * Go side — no bucket configured (or defaults unknowable) admits, so
+     * services that never opted in keep their exact legacy behaviour. */
+    if (svc_ident[0]) {
+      ai_gw_decision_t vs_dec = {0};
+      if (llb_ai_ratelimit_check("", "", "", (char *)svc_ident, "",
+                                 &vs_dec) != 0) {
+        set_deny(res, AI_GW_STAGE_RATELIMIT,
+                 vs_dec.decision == 4 ? 503 : 429,
+                 vs_dec.retry_after, 1,
+                 vs_dec.error_code[0] ? vs_dec.error_code
+                                      : "rate_limit_exceeded", "");
+        return -1;
+      }
+    }
     res->verdict = AI_GW_ADMIT_UNMETERED;
     return 0;
   }
@@ -195,6 +227,7 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
    * that reads as "slow down". */
   ai_gw_decision_t rl_dec = {0};
   int rl_rc = llb_ai_ratelimit_check(key_dec.key_id, key_dec.tenant_id,
+                                     key_dec.user_id, (char *)svc_ident,
                                      (char *)model, &rl_dec);
   if (rl_rc != 0) {
     const char *rl_err =
@@ -218,6 +251,8 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
       ai_gw_decision_t rs_dec = {0};
       int64_t rs_epoch = 0;
       if (llb_ai_token_quota_reserve(key_dec.tenant_id, (char *)model,
+                                     key_dec.user_id, key_dec.key_id,
+                                     (char *)svc_ident,
                                      resv_prompt, resv_max,
                                      &rs_epoch, &rs_dec) != 0) {
         set_deny(res, AI_GW_STAGE_RESERVE, 429, rs_dec.retry_after, 1,

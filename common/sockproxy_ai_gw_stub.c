@@ -81,12 +81,15 @@ llb_ai_validate_bearer(char *bearer, char *model_name, char *profile_name,
 }
 
 __attribute__((weak)) int
-llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
-                       ai_gw_decision_t *result)
+llb_ai_ratelimit_check(char *key_id, char *tenant_id,
+                       char *user_id, char *svc_ident,
+                       char *model, ai_gw_decision_t *result)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)key_id;
     (void)tenant_id;
+    (void)user_id;
+    (void)svc_ident;
     (void)model;
     (void)result;
     return 0;  /* allow */
@@ -140,6 +143,7 @@ llb_ai_stream_end(char *tenant_id, char *model_name)
 
 __attribute__((weak)) int
 llb_ai_token_quota_consume(char *tenant_id, char *model_name,
+                           char *user_id, char *key_id, char *svc_ident,
                            int prompt_tokens, int complet_tokens,
                            int estimated, int reserved_toks,
                            int64_t res_epoch, ai_gw_decision_t *result)
@@ -147,6 +151,9 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
+    (void)user_id;
+    (void)key_id;
+    (void)svc_ident;
     (void)prompt_tokens;
     (void)complet_tokens;
     (void)estimated;
@@ -158,12 +165,16 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
 
 __attribute__((weak)) int
 llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
+                           char *user_id, char *key_id, char *svc_ident,
                            int prompt_est, int max_tokens,
                            int64_t *res_epoch, ai_gw_decision_t *result)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
+    (void)user_id;
+    (void)key_id;
+    (void)svc_ident;
     (void)prompt_est;
     (void)max_tokens;
     (void)result;

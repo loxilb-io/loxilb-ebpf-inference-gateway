@@ -113,19 +113,35 @@ extern int llb_ai_validate_bearer(char *bearer, char *model_name,
  * then the per-tenant shared bucket. Either stage can deny the request.
  *
  * Parameters:
- *   key_id    the validated API key's key_id string
- *   tenant_id the validated API key's tenant_id string
+ *   key_id    the validated API key's key_id string ("" on the JWT arm and on
+ *             keyless calls)
+ *   tenant_id the deciding credential arm's tenant_id string ("" on keyless
+ *             calls)
+ *   user_id   the deciding credential arm's per-user identity ("" when the
+ *             arm mapped none — API keys do not map to users today)
+ *   svc_ident the service identity the request arrived on, formatted
+ *             "VIP:port" ("" when unknown); selects the rule-scope defaults
+ *             row and, on keyless calls, the opt-in per-VIP shared bucket
  *   model     the request's body-bound model name (may be empty); selects the
  *             tenant|model token bucket for the token-quota stage
  *   result    output structure; on denial, decision is set to 3 (429),
  *             retry_after is set in seconds, and error_code is populated
  *
+ * A fully-empty identity (key_id, tenant_id and user_id all "") is the
+ * keyless probe: with a svc_ident it consults only the per-VIP shared
+ * bucket (absent bucket or unknowable defaults admit — the bucket is
+ * opt-in), and with no svc_ident it always admits.
+ *
+ * Parameter order mirrors the Go-side rateLimitCheckInternal so the CGO
+ * export is a position-for-position pass-through.
+ *
  * Returns:
  *    0  request is within rate limits; proceed
  *   -1  request is rate-limited; inspect result->decision and result->retry_after
  */
-extern int llb_ai_ratelimit_check(char *key_id, char *tenant_id, char *model,
-                                  ai_gw_decision_t *result);
+extern int llb_ai_ratelimit_check(char *key_id, char *tenant_id,
+                                  char *user_id, char *svc_ident,
+                                  char *model, ai_gw_decision_t *result);
 
 /*
  * llb_ai_ratelimit_update – synchronously refresh in-memory rate-limit buckets.
@@ -221,6 +237,13 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  * Parameters:
  *   tenant_id      tenant identifier from the validated API key (NUL-terminated)
  *   model_name     effective model name (NUL-terminated; pass "" if unknown)
+ *   user_id        per-user identity established at admission ("" when none);
+ *                  charges the user and user|model buckets next to the
+ *                  tenant aggregate
+ *   key_id         the admitting key's key_id ("" on the JWT arm); charges
+ *                  the key's own tokens-per-minute bucket
+ *   svc_ident      service identity "VIP:port" ("" when unknown); selects
+ *                  rule-scope defaults and the per-VIP shared bucket
  *   prompt_tokens  token count from the request body; 0 when absent
  *   complet_tokens token count from the response body; 0 when absent
  *   estimated      1 when the counts come from the estimate net (request-size
@@ -243,6 +266,8 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  *   -1  quota exceeded; result->decision == 3 and result->retry_after is set
  */
 extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
+                                      char *user_id, char *key_id,
+                                      char *svc_ident,
                                       int prompt_tokens, int complet_tokens,
                                       int estimated, int reserved_toks,
                                       int64_t res_epoch,
@@ -271,6 +296,12 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
  * Parameters:
  *   tenant_id   tenant identifier from the validated API key (NUL-terminated)
  *   model_name  effective model name (NUL-terminated; pass "" if unknown)
+ *   user_id     per-user identity established at admission ("" when none);
+ *               reserves against the user and user|model buckets too
+ *   key_id      the admitting key's key_id ("" on the JWT arm); reserves
+ *               against the key's tokens-per-minute bucket
+ *   svc_ident   service identity "VIP:port" ("" when unknown); selects
+ *               rule-scope defaults and the per-VIP shared bucket
  *   prompt_est  prompt-token estimate from the request body; 0 when unknown
  *   max_tokens  declared completion ceiling from the request body; 0 when
  *               the client did not declare one (only the prompt estimate is
@@ -286,6 +317,8 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
  *   -1  denied; respond 429 and do NOT dispatch
  */
 extern int llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
+                                      char *user_id, char *key_id,
+                                      char *svc_ident,
                                       int prompt_est, int max_tokens,
                                       int64_t *res_epoch,
                                       ai_gw_decision_t *result);

@@ -1090,6 +1090,10 @@ struct proxy_fd_ent {
                                       // claims whose length the operator does not control
   char     auth_user_id[128];         // Per-user identity from the deciding credential arm ("" = none);
                                       // distinct from user_id below, which is a BODY field capture
+  char     auth_key_id[64];           // key_id of the admitting API key ("" on the JWT arm); sized to
+                                      // ai_gw_decision_t.key_id. Settle-path twin of tenant/user above:
+                                      // the key's own tokens-per-minute bucket charges at consume time,
+                                      // which runs long after key_dec has gone out of scope
   // Upstream hygiene, stamped by the admission gate per request:
   uint8_t  auth_strip_authz;          // 1 = strip Authorization before dispatch (JWT arm decided, no passthrough)
   uint8_t  auth_fwd_identity;         // 1 = inject X-Auth-Tenant/X-Auth-User upstream (verified values)

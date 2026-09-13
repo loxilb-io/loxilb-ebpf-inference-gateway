@@ -9,53 +9,10 @@
 
 #include "sockproxy_ai_security.h"
 
-static int
-ai_security_status(const ai_gw_decision_t *result, int default_status)
-{
-  if (!result)
-    return default_status;
-
-  switch (result->decision) {
-  case 2:
-    return 403;
-  case 3:
-    return 429;
-  case 4:
-    return 503;
-  case 1:
-    return 401;
-  default:
-    return default_status;
-  }
-}
-
-int
-ai_security_admit(uint8_t policy, char *raw_key, char *model,
-                  ai_gw_decision_t *result)
-{
-  ai_gw_decision_t local = {0};
-  ai_gw_decision_t rate = {0};
-
-  if (!result)
-    result = &local;
-  memset(result, 0, sizeof(*result));
-
-  /* Only the two declared non-enforcing values bypass authentication.
-   * Unknown wire values fail closed. */
-  if (policy == 0 || policy == 2)
-    return 0;
-
-  if (llb_ai_validate_key(raw_key ? raw_key : "", model ? model : "", result) != 0)
-    return ai_security_status(result, 401);
-
-  if (llb_ai_ratelimit_check(result->key_id, result->tenant_id,
-                             model ? model : "", &rate) != 0) {
-    *result = rate;
-    return ai_security_status(result, 429);
-  }
-
-  return 0;
-}
+/* ai_security_admit is gone: the HTTP/2 stream gate calls ai_gw_admit()
+ * (sockproxy_ai_admit.c), the same admission gate the HTTP/1 parser runs.
+ * The H2-only arm it implemented ran the API-key check no matter what the
+ * service declared, which admitted a valid API key on a jwt-only service. */
 
 int
 ai_security_copy_api_key(char *dst, size_t cap,
@@ -81,28 +38,81 @@ ai_security_should_strip_api_key(uint8_t policy)
   return policy != 0;
 }
 
+static int
+nv_name_is(const nghttp2_nv *nv, const char *name, size_t namelen)
+{
+  return nv->namelen == namelen &&
+         strncasecmp((const char *)nv->name, name, namelen) == 0;
+}
+
 size_t
-ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
-                              nghttp2_nv *output, size_t output_cap,
-                              uint8_t policy)
+ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
+                                nghttp2_nv *output, size_t output_cap,
+                                uint8_t policy, int jwt_capable,
+                                int strip_authz, int fwd_identity,
+                                const char *tenant, const char *user)
 {
   size_t written = 0;
-  int strip = ai_security_should_strip_api_key(policy);
+  int strip_key = ai_security_should_strip_api_key(policy);
 
   if (!input || !output)
     return 0;
 
   for (size_t i = 0; i < input_len; i++) {
     const nghttp2_nv *nv = &input[i];
-    int is_api_key = nv->namelen == sizeof("x-api-key") - 1 &&
-                     strncasecmp((const char *)nv->name, "x-api-key",
-                                 sizeof("x-api-key") - 1) == 0;
-    if (strip && is_api_key)
+    if (strip_key && nv_name_is(nv, "x-api-key", sizeof("x-api-key") - 1))
+      continue;
+    /* Client-sent X-Auth-* carries gateway-verified identity upstream, so
+     * a client copy is a spoof whether or not this request's profile
+     * forwards identity — stripped ALWAYS on JWT-capable rules, exactly
+     * like the H1 splice (sockproxy_http.c). */
+    if (jwt_capable &&
+        (nv_name_is(nv, "x-auth-tenant", sizeof("x-auth-tenant") - 1) ||
+         nv_name_is(nv, "x-auth-user", sizeof("x-auth-user") - 1)))
+      continue;
+    /* Authorization is stripped only when the JWT arm decided this request
+     * and the profile did not opt into passthrough: the gateway consumed
+     * that credential, and replaying an access token hands every backend
+     * operator a bearer credential they never needed. */
+    if (jwt_capable && strip_authz &&
+        nv_name_is(nv, "authorization", sizeof("authorization") - 1))
       continue;
     if (written >= output_cap)
       break;
     output[written++] = *nv;
   }
 
+  /* Inject the VERIFIED identity (forward_identity profiles). The values
+   * point at caller-owned storage — the stream's identity fields — which
+   * outlives the submit; nghttp2 copies at submit time. */
+  if (jwt_capable && fwd_identity && tenant && tenant[0]) {
+    if (written < output_cap) {
+      output[written].name = (uint8_t *)"x-auth-tenant";
+      output[written].value = (uint8_t *)tenant;
+      output[written].namelen = sizeof("x-auth-tenant") - 1;
+      output[written].valuelen = strlen(tenant);
+      output[written].flags = NGHTTP2_NV_FLAG_NONE;
+      written++;
+    }
+    if (user && user[0] && written < output_cap) {
+      output[written].name = (uint8_t *)"x-auth-user";
+      output[written].value = (uint8_t *)user;
+      output[written].namelen = sizeof("x-auth-user") - 1;
+      output[written].valuelen = strlen(user);
+      output[written].flags = NGHTTP2_NV_FLAG_NONE;
+      written++;
+    }
+  }
+
   return written;
+}
+
+size_t
+ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
+                              nghttp2_nv *output, size_t output_cap,
+                              uint8_t policy)
+{
+  /* Legacy shape: the credential strip alone, no JWT hygiene. */
+  return ai_security_h2_upstream_hygiene(input, input_len, output, output_cap,
+                                         policy, 0, 0, 0, NULL, NULL);
 }

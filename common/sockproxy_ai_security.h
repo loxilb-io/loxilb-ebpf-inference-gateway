@@ -13,19 +13,8 @@
 
 #include "sockproxy_ai_gw.h"
 
-/*
- * Protocol-neutral API-key and request-rate admission.
- *
- * policy uses the data-plane wire values:
- *   0 = undeclared, 1 = required, 2 = explicitly disabled.
- * Unknown non-zero values fail closed and therefore enforce.
- *
- * Returns 0 when the request may enter routing.  Otherwise returns the HTTP
- * status that the protocol adapter must send (401/403/429/503).  result is
- * populated by the underlying policy callbacks on both allow and deny paths.
- */
-int ai_security_admit(uint8_t policy, char *raw_key, char *model,
-                      ai_gw_decision_t *result);
+/* Admission lives in ai_gw_admit (sockproxy_ai_admit.h) — ONE gate for both
+ * protocol parsers. This header keeps the HTTP/2 header-hygiene helpers. */
 
 /* Copy one length-delimited HTTP/2 value into a bounded C credential buffer. */
 int ai_security_copy_api_key(char *dst, size_t cap,
@@ -41,9 +30,29 @@ int ai_security_copy_api_key(char *dst, size_t cap,
 int ai_security_should_strip_api_key(uint8_t policy);
 
 /*
+ * Full upstream header hygiene for one admitted HTTP/2 stream, the parity
+ * twin of the H1 splice block (sockproxy_http.c):
+ *   - X-Api-Key stripped when the service claimed the namespace (policy!=0);
+ *   - on JWT-capable rules (jwt_capable), CLIENT-sent X-Auth-Tenant/User are
+ *     stripped ALWAYS (verified-identity spoof), and Authorization is
+ *     stripped when the deciding profile said so (strip_authz);
+ *   - when the profile forwards identity (fwd_identity), the VERIFIED
+ *     tenant/user are appended as X-Auth-Tenant/X-Auth-User. The injected
+ *     values point at CALLER-owned storage (the stream identity fields);
+ *     nghttp2_submit_request copies the bytes before they can go stale.
+ * The output is a shallow copy; size output_cap for input_len + 2.
+ */
+size_t ai_security_h2_upstream_hygiene(const nghttp2_nv *input, size_t input_len,
+                                       nghttp2_nv *output, size_t output_cap,
+                                       uint8_t policy, int jwt_capable,
+                                       int strip_authz, int fwd_identity,
+                                       const char *tenant, const char *user);
+
+/*
  * Remove X-Api-Key from an HTTP/2 name/value array when the service has
  * claimed the gateway credential namespace.  The output is a shallow copy;
  * nghttp2_submit_request copies the bytes before either source array is freed.
+ * (Thin wrapper over the hygiene filter above with the JWT arms off.)
  */
 size_t ai_security_filter_h2_headers(const nghttp2_nv *input, size_t input_len,
                                      nghttp2_nv *output, size_t output_cap,

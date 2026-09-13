@@ -61,6 +61,44 @@ typedef struct proxy_h2_stream {
   char authority[256];               // :authority pseudo-header (Host)
   char content_type[128];            // Content-Type header
   char x_api_key_raw[256];           // Per-stream gateway credential (never forwarded upstream)
+  char x_model_header[128];          // X-Model header (per-stream; H1 keeps it on the pfe,
+                                     // but concurrent H2 streams may name different models)
+  char bearer_raw[4096];             // RAW Authorization value, scheme tag included ("" when
+                                     // absent); the shared admission gate strips the Bearer
+                                     // prefix itself. Stream state for the same reason as
+                                     // x_api_key_raw: streams may carry different tenants.
+  uint8_t bearer_oversize;           // 1 = Authorization exceeded the capture cap; the value
+                                     // is dropped so the JWT arm refuses it as invalid
+
+  // AI admission identity + settle state, stamped by ai_gw_admit() at the
+  // stream gate. Stream-scoped twins of the pfe fields the H1 parser uses:
+  // the reservation made at admission must be settled (or released) for
+  // THIS stream no matter what the multiplexed neighbours do.
+  uint8_t  ai_admitted;              // 1 = gate ALLOWed (identity fields below valid)
+  uint8_t  ai_unmetered;             // 1 = keyless on an AI-gateway rule: no identity, but
+                                     // the response still settles into the per-VIP shared
+                                     // bucket (svc_ident below is valid; tenant stays "")
+  void    *route_epv;                // the pool THIS stream resolved (proxy_epval_t*).
+                                     // Settle reads its usage dialect from here — pfe->epv
+                                     // is connection-scoped and a later stream of another
+                                     // model overwrites it before an earlier stream settles
+  char     tenant_id[128];
+  char     auth_user_id[128];
+  char     auth_key_id[64];
+  char     effective_model[128];     // the gate's body-first model resolution
+  char     svc_ident[64];            // "VIP:port" captured at admission — teardown paths
+                                     // must not chase the rule head after it may be gone
+  uint8_t  auth_strip_authz;         // upstream hygiene switches, parity with the H1 splice
+  uint8_t  auth_fwd_identity;
+  uint8_t  auth_jwt_capable;
+  uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
+  int64_t  usage_res_epoch;          // reservation window tag
+  uint8_t  usage_consumed;           // 1 = settle ran (no double charge/release)
+  uint8_t  usage_tail[1024];         // response-tail window for usage extraction
+                                     // (mirrors PROXY_USAGE_TAIL_KEEP)
+  uint16_t usage_tail_len;
+  uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
+  int      metric_response_status;   // backend :status relayed to the client (0 = unseen)
 
   // Generic request header storage (for gRPC and protocol transparency)
   nghttp2_nv *request_headers;       // All request headers (malloc'd)
@@ -144,8 +182,13 @@ typedef struct backend_h2_session {
   int goaway_sent;                   // 1 = GOAWAY sent to backend
   int goaway_received;               // 1 = GOAWAY received from backend
 
-  // Backend endpoint info
-  int ep_idx;                        // Which backend endpoint (index into tepval->eps)
+  // Backend endpoint info. The hash key is `slot`, the per-connection
+  // backend-connection slot — NOT ep_idx: two model pools on one rule both
+  // have an endpoint 0, so (pool, ep_idx) is the identity a session reuse
+  // must match and ep_idx alone aliases across pools.
+  int slot;                          // Per-connection slot (pfe->rfd[]/rfd_ent[] index)
+  int ep_idx;                        // Endpoint index INSIDE epv->eps (stats/cookie/logs)
+  void *epv;                         // The pool (proxy_epval_t*) this session belongs to
   char backend_addr[64];             // Backend IP address (for logging)
   int backend_port;                  // Backend port
 
@@ -321,14 +364,19 @@ int proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
  * 
  * @param client_session Client-side HTTP/2 session
  * @param pfe Proxy file descriptor entry
- * @param ep_idx Backend endpoint index
+ * @param slot Per-connection backend slot (the session hash key; two model
+ *             pools both have an endpoint 0, so ep_idx alone is not identity)
+ * @param ep_idx Endpoint index inside epv->eps (stats/cookie/logs)
+ * @param epv The pool (proxy_epval_t*) the endpoint belongs to
  * @param backend_fd Backend socket FD (already connected)
  * @param ssl Backend SSL connection (NULL if plain HTTP/2)
  * @return backend_h2_session_t* on success, NULL on error
  */
 backend_h2_session_t *proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
                                                      proxy_fd_ent_t *pfe,
+                                                     int slot,
                                                      int ep_idx,
+                                                     void *epv,
                                                      int backend_fd,
                                                      void *ssl);
 

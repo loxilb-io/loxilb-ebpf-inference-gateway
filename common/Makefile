@@ -152,7 +152,8 @@ sockproxy_notifier.o: sockproxy_notifier.c sockproxy_notifier.h sockproxy_intern
 sockproxy_ktls.o: sockproxy_ktls.c sockproxy_ktls.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-sockproxy_h2.o: sockproxy_h2.c sockproxy_h2.h sockproxy_ai_security.h sockproxy_json.h
+sockproxy_h2.o: sockproxy_h2.c sockproxy_h2.h sockproxy_ai_security.h \
+	sockproxy_ai_admit.h sockproxy_ai_gw.h sockproxy_pd.h sockproxy_json.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_ai_security.o: sockproxy_ai_security.c sockproxy_ai_security.h sockproxy_ai_gw.h
@@ -320,6 +321,17 @@ test_ai_security: test_ai_security.c sockproxy_ai_security.c sockproxy_ai_securi
 .PHONY: test_aisec
 test_aisec: test_ai_security
 	./test_ai_security
+
+# Identity-forwarding ABI: the admission gate must transport user/key/service
+# into every ladder call, and keyless traffic must probe the per-VIP shared
+# bucket exactly when the service identity is known. Stubs both the Go
+# exports and the JSON helpers — no proxy object graph, no link library.
+test_ai_admit_identity: test_ai_admit_identity.c sockproxy_ai_admit.c sockproxy_ai_admit.h
+	$(CC) -Wall -Wextra -o $@ test_ai_admit_identity.c sockproxy_ai_admit.c -I.
+
+.PHONY: test_aiident
+test_aiident: test_ai_admit_identity
+	./test_ai_admit_identity
 
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure

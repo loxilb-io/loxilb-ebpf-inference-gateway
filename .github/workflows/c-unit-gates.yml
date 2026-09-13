@@ -1,0 +1,46 @@
+name: C-Unit-Gates
+
+# The standalone C units for the sockproxy auth plane, gated where the code
+# lives. Until now these targets ran only from the gateway repo's CI against
+# its PINNED submodule revision, so a unit added or changed HERE was not
+# exercised anywhere until the pin moved — a test that exists but is run by
+# nobody. This workflow closes that gap: every push and PR to this repo runs
+# the units at the revision under review, no gateway checkout involved.
+#
+# Scope: the self-contained targets only (compile from common/ sources plus
+# system libraries; no datapath build, no kernel objects). Heavier units that
+# need the full proxy object graph stay with the gateway repo's build.
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - 'common/**'
+      - '.github/workflows/c-unit-gates.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - 'common/**'
+      - '.github/workflows/c-unit-gates.yml'
+  workflow_dispatch:
+
+jobs:
+  c-units:
+    name: c-units
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain and unit dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install build-essential libnghttp2-dev
+
+      - name: Header-field guard (bytes between a header value and the wire)
+        run: make -C common test_l7hdr
+
+      - name: HTTP/2 upstream header hygiene
+        run: make -C common test_aisec
+
+      - name: Admission-gate identity transport and the keyless shared bucket
+        run: make -C common test_aiident
