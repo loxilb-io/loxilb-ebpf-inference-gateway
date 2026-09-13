@@ -9407,7 +9407,41 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->ai_gw_denied = 0;
           return -1; // Restart
         } else {
-          // Parse error
+          // Parse error.
+          //
+          // The branch below is the not-actually-HTTP fallback: it resets
+          // the parser and relays the buffer raw to the backend, which is
+          // correct for a plain L7 service fronting a non-HTTP protocol.
+          // But on an AI-gateway ENFORCING service (ai_gw_mode set) every
+          // request must pass ai_gw_admit in on_message_complete, and a
+          // request that never parses to completion never reaches that
+          // callback — so relaying it raw hands the backend a request the
+          // admission gate never saw. That is an authentication bypass and
+          // an HTTP request-smuggling primitive: a client sending
+          // Content-Length together with Transfer-Encoding (llhttp refuses
+          // the pair, HPE error) took exactly this door to a JWT-only
+          // backend, credential-free. Fail closed instead: answer 400 and
+          // tear the connection down. Scoped to ai_gw_mode services, so
+          // non-AI L7/L4 passthrough keeps the raw-relay fallback.
+          {
+            proxy_map_ent_t *perr_head = (proxy_map_ent_t *)pfe->head;
+            if (pfe->odir == 0 && perr_head && perr_head->val.ephash &&
+                perr_head->val.ephash->ai_gw_mode) {
+              static const char smuggle_400[] =
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"bad_request\",\"message\":\"unparseable or "
+                "ambiguously framed request refused before admission\"}\r\n";
+              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, 0);
+              shutdown(pfe->fd, SHUT_RDWR);
+              log_info("[AIGateway] fd=%d parse error on an enforcing "
+                       "service — refused before admission (no raw relay)",
+                       pfe->fd);
+              return -1; // Restart — never relay an ungated request
+            }
+          }
           pfe->rcv_off = 0;
           pfe->parsed_off = 0;
           pfe->http_pok = 0;
