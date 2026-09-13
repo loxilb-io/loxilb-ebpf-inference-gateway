@@ -141,6 +141,26 @@ proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len)
     ai_gw_svc_ident(hent->key.xip, hent->key.xport, buf, len);
 }
 
+/* True when this connection's most recent AI response finished and no dialect
+ * ever read a usage object out of it — the condition
+ * loxilb_ai_tokens_missing_total exists to report, which for a non-streamed
+ * response nothing used to report at all.
+ *
+ * metric_ai_recorded is the "a response completed and was counted" marker, so
+ * the pair is already exact and needs no sse_active test (which would be
+ * fragile here — the keep-alive boundary clears that flag at a different point
+ * in the request cycle): a completed SSE response has set usage_consumed on
+ * its [DONE], and an SSE stream that was cut never set metric_ai_recorded.
+ *
+ * Answering yes says nothing about whether the response SHOULD have been
+ * charged; this is an accounting observation, not a quota decision. */
+static int
+proxy_usage_went_unreported(const proxy_fd_ent_t *pfe)
+{
+  return pfe && pfe->odir == 0 && pfe->ai_gw_mode &&
+         pfe->metric_ai_recorded && !pfe->usage_consumed;
+}
+
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
     size_t needle_len = strlen(needle);
     if (needle_len == 0) return haystack;
@@ -4497,6 +4517,19 @@ proxy_pdestroy(void *priv)
   h2_inflight_settle_t *h2_settle = NULL;
   int n_h2_settle = 0;
 
+  /* The connection's LAST response may also have completed without a readable
+   * usage object. The per-request boundary in handle_on_headers_complete
+   * reports that for every response that a request N+1 follows; the last one
+   * is followed by nothing, so without this twin a connection serving a single
+   * request — the common shape — would never report at all. Collected under
+   * PROXY_LOCK and emitted after the unlock, like resv_rel, because the
+   * recorder crosses into the control plane. */
+  struct {
+    int  pending;
+    char tenant[128];
+    char model[MAX_MODEL_LEN];
+  } usage_missing = { 0, {0}, {0} };
+
   assert(pfe);
 
   // Log sticky session cleanup
@@ -4895,6 +4928,19 @@ proxy_pdestroy(void *priv)
       pfe->usage_res_epoch = 0;
     }
 
+    /* Last response on this connection, finished with no readable usage
+     * object (see the declaration above). Identity is copied here because the
+     * pfe may be recycled by the time this is emitted. */
+    if (!is_listener && proxy_usage_went_unreported(pfe)) {
+      const char *um_model = proxy_effective_model(pfe);
+      usage_missing.pending = 1;
+      snprintf(usage_missing.tenant, sizeof(usage_missing.tenant), "%s",
+               pfe->tenant_id);
+      snprintf(usage_missing.model, sizeof(usage_missing.model), "%s",
+               um_model ? um_model : "");
+      pfe->metric_ai_recorded = 0;   /* reported once */
+    }
+
     /* HTTP/2 client connection: settle every stream still in flight. On an
      * abrupt teardown nghttp2 never runs each stream's close, so those admitted
      * or keyless streams never released their admission reservation nor recorded
@@ -4989,6 +5035,17 @@ proxy_pdestroy(void *priv)
                                resv_rel.reserved, resv_rel.res_epoch, NULL);
     log_info("[AI_TOKENS] released %d unspent reserved tokens on teardown "
              "tenant=%s", resv_rel.reserved, resv_rel.tenant);
+  }
+
+  /* Deferred missing-usage report (collected above under PROXY_LOCK). Charges
+   * nothing — it records that a response completed with no usage object to
+   * read, which is the counter's stated contract for every completed
+   * response, streamed or not. */
+  if (usage_missing.pending) {
+    llb_ai_record_usage_missing(usage_missing.tenant, usage_missing.model);
+    log_info("[AI_TOKENS] response completed with no usage object "
+             "tenant=%s model=%s (reported, not charged)",
+             usage_missing.tenant, usage_missing.model);
   }
 
   /* Deferred HTTP/2 in-flight settles (collected above under PROXY_LOCK).
@@ -6664,6 +6721,16 @@ handle_on_message_begin(llhttp_t* parser)
     }
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
+    /* Request N's response completed without a readable usage object. Report
+     * it before the identity and the accounting flags below are cleared —
+     * the counter is labelled with request N's tenant and model, not with
+     * whatever request N+1 turns out to be. Reporting only; nothing is
+     * charged, exactly as on the connection-teardown twin in proxy_pdestroy. */
+    if (proxy_usage_went_unreported(pfe)) {
+      llb_ai_record_usage_missing((char *)pfe->tenant_id,
+                                  (char *)proxy_effective_model(pfe));
+      pfe->metric_ai_recorded = 0;   /* reported once */
+    }
     pfe->x_api_key_raw[0] = '\0';
     pfe->bearer_raw[0] = '\0';
     pfe->bearer_len = 0;
