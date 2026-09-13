@@ -4488,6 +4488,15 @@ proxy_pdestroy(void *priv)
     int64_t  res_epoch;
   } resv_rel = { 0, {0}, {0}, {0}, {0}, {0}, 0, 0 };
 
+  /* HTTP/2 in-flight per-stream settles. The resv_rel above hands back the
+   * single pfe-level reservation the H1 parser holds; an H2 connection can
+   * carry many admitted/keyless streams that never reached their own close.
+   * Collected (usage extracted, identity copied) under PROXY_LOCK and emitted
+   * to the control plane after the final PROXY_UNLOCK — same deferral reason
+   * as resv_rel: the settle re-enters the non-recursive PROXY_LOCK. */
+  h2_inflight_settle_t *h2_settle = NULL;
+  int n_h2_settle = 0;
+
   assert(pfe);
 
   // Log sticky session cleanup
@@ -4886,6 +4895,16 @@ proxy_pdestroy(void *priv)
       pfe->usage_res_epoch = 0;
     }
 
+    /* HTTP/2 client connection: settle every stream still in flight. On an
+     * abrupt teardown nghttp2 never runs each stream's close, so those admitted
+     * or keyless streams never released their admission reservation nor recorded
+     * their request. Collected here under the lock (usage extracted while the
+     * pool is still guaranteed alive); the control-plane charge/record is
+     * emitted after PROXY_UNLOCK below, exactly as resv_rel is. */
+    if (!is_listener && pfe->odir == 0 && pfe->h2_session) {
+      n_h2_settle = proxy_h2_collect_inflight_settles(pfe, &h2_settle);
+    }
+
     /* A backend teardown must not discard a client's undelivered payload.
      * A fast backend can be fully read (or hard-reset) while the slow client
      * it fed still owes up to a full cache high-water mark from its xmit
@@ -4971,6 +4990,28 @@ proxy_pdestroy(void *priv)
     log_info("[AI_TOKENS] released %d unspent reserved tokens on teardown "
              "tenant=%s", resv_rel.reserved, resv_rel.tenant);
   }
+
+  /* Deferred HTTP/2 in-flight settles (collected above under PROXY_LOCK).
+   * The consume call charges whatever usage was extracted and releases the
+   * admission reservation in the same call — a zero-usage stream is a pure
+   * release, matching resv_rel. A request record is emitted ONLY when the
+   * response actually progressed (a backend status was seen); an aborted
+   * stream releases its reservation without fabricating a completed-request
+   * record, exactly as the H1 teardown does. */
+  for (int hi = 0; hi < n_h2_settle; hi++) {
+    h2_inflight_settle_t *e = &h2_settle[hi];
+    llb_ai_token_quota_consume(e->tenant, e->model, e->user, e->key,
+                               e->svc_ident, e->prompt_toks, e->complet_toks,
+                               0, e->reserved_toks, e->res_epoch, NULL);
+    if (e->status > 0) {
+      llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
+                            e->prompt_toks, e->complet_toks, 0, 0, "");
+    }
+    log_info("[AI_TOKENS][HTTP/2] teardown settle tenant=%s prompt=%d "
+             "completion=%d reserved=%d status=%d", e->tenant, e->prompt_toks,
+             e->complet_toks, e->reserved_toks, e->status);
+  }
+  free(h2_settle);
 
   /* Deferred prefill mid-request failovers (collected above under
    * PROXY_LOCK). Same-thread with the dying leg's teardown — the client pfe
