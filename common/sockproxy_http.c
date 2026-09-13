@@ -4518,7 +4518,7 @@ proxy_pdestroy(void *priv)
   int n_h2_settle = 0;
 
   /* The connection's LAST response may also have completed without a readable
-   * usage object. The per-request boundary in handle_on_headers_complete
+   * usage object. The per-request boundary in handle_on_message_begin
    * reports that for every response that a request N+1 follows; the last one
    * is followed by nothing, so without this twin a connection serving a single
    * request — the common shape — would never report at all. Collected under
@@ -5063,6 +5063,16 @@ proxy_pdestroy(void *priv)
     if (e->status > 0) {
       llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
                             e->prompt_toks, e->complet_toks, 0, 0, "");
+      /* Recorded as completed with no usage object to read — the H2 twin of
+       * the H1 report above. Inside the status guard on purpose: a stream
+       * with no backend status never completed a response, so it is a
+       * release, not an accounting hole. Reports, charges nothing. */
+      if (e->usage_missing) {
+        llb_ai_record_usage_missing(e->tenant, e->model);
+        log_info("[AI_TOKENS][HTTP/2] teardown settle: response completed with "
+                 "no usage object tenant=%s model=%s (reported, not charged)",
+                 e->tenant, e->model);
+      }
     }
     log_info("[AI_TOKENS][HTTP/2] teardown settle tenant=%s prompt=%d "
              "completion=%d reserved=%d status=%d", e->tenant, e->prompt_toks,

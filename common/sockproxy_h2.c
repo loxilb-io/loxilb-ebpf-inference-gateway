@@ -213,15 +213,21 @@ proxy_h2_stream_tail_update(proxy_h2_stream_t *stream,
  * the STREAM's resolved-pool dialect. Pure C (no control-plane entry), so it
  * is safe under PROXY_LOCK — the teardown collector relies on that. The pool
  * pointer is read here, never after the lock is dropped: a concurrent rule
- * delete can free it the instant the lock is released. */
-static void
+ * delete can free it the instant the lock is released.
+ *
+ * Returns 1 when a dialect actually read a usage object, 0 when none was
+ * readable. The distinction is NOT recoverable from *up/*uc: a usage object
+ * reporting zero tokens and no usage object at all both leave them 0, and
+ * only the latter is the accounting hole loxilb_ai_tokens_missing_total
+ * reports. This is the H2 equivalent of H1's usage_consumed flag. */
+static int
 proxy_h2_stream_extract_usage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                               int *up, int *uc)
 {
   *up = 0;
   *uc = 0;
   if (!pfe || !stream || stream->usage_tail_len == 0)
-    return;
+    return 0;
   /* Same dialect resolution as the H1 proxy_usage_ops: P/D rules carry
    * their engine dialect on the epval; plain AI-gateway rules fall back
    * to the plain-LB profile. The pool is the STREAM's resolved pool —
@@ -233,8 +239,9 @@ proxy_h2_stream_extract_usage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   const pd_dialect_ops_t *uops =
     (epv && epv->pd_ops) ? epv->pd_ops : &pd_dialect_plain;
   if (uops->extract_usage)
-    (void)uops->extract_usage(pfe, stream->usage_tail,
-                              stream->usage_tail_len, up, uc);
+    return uops->extract_usage(pfe, stream->usage_tail,
+                               stream->usage_tail_len, up, uc) == 0;
+  return 0;
 }
 
 /* Settle an admitted stream: extract usage from the tail window, charge the
@@ -252,7 +259,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
     return;
   stream->usage_consumed = 1;
 
-  proxy_h2_stream_extract_usage(pfe, stream, &up, &uc);
+  int usage_read = proxy_h2_stream_extract_usage(pfe, stream, &up, &uc);
 
   llb_ai_token_quota_consume(stream->tenant_id, stream->effective_model,
                              stream->auth_user_id, stream->auth_key_id,
@@ -272,6 +279,22 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                    ? stream->metric_response_status : 200;
   llb_ai_record_request(stream->tenant_id, stream->effective_model, status,
                         latency_ms, up, uc, 0, 0, "");
+
+  /* The same accounting hole the H1 paths report: this response was recorded
+   * as completed and no dialect read a usage object out of it, so it was
+   * charged nothing and — without this — reported nothing either. Gated on a
+   * backend status actually having been seen, so an aborted stream (which
+   * settles here too, only to release its reservation) is not counted as a
+   * completed response with missing usage. Charges nothing; whether such a
+   * response should be billed an estimate stays the open quota-policy
+   * question it is on H1. */
+  if (!usage_read && stream->metric_response_status > 0) {
+    llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model);
+    log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
+             "object tenant=%s model=%s (reported, not charged)",
+             stream->stream_id, stream->tenant_id, stream->effective_model);
+  }
+
   log_info("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
            stream->stream_id, up, uc, status);
 }
@@ -316,9 +339,13 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
       break;
     stream->usage_consumed = 1;
 
-    proxy_h2_stream_extract_usage(pfe, stream, &up, &uc);
+    int usage_read = proxy_h2_stream_extract_usage(pfe, stream, &up, &uc);
 
     e = &list[n++];
+    /* Reported by the caller after PROXY_LOCK drops, like the charge: the
+     * recorder crosses into the control plane. Paired with e->status below,
+     * which is what decides whether a response completed at all. */
+    e->usage_missing = !usage_read;
     snprintf(e->tenant, sizeof(e->tenant), "%s", stream->tenant_id);
     snprintf(e->model, sizeof(e->model), "%s", stream->effective_model);
     snprintf(e->user, sizeof(e->user), "%s", stream->auth_user_id);
