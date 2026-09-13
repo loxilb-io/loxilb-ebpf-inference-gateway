@@ -1,103 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
+/*
+ * HTTP/2 credential-handling unit. Admission itself lives in ai_gw_admit
+ * (covered by test_ai_admit_identity); this unit pins the header-hygiene
+ * half: the bounded credential copy, the X-Api-Key namespace rules, and
+ * the upstream hygiene (client X-Auth-* strip, consumed-Authorization
+ * strip, verified-identity injection).
+ */
+
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include "sockproxy_ai_security.h"
-
-static int validate_calls;
-static int rate_calls;
-static int validate_rc;
-static int validate_decision;
-static int rate_rc;
-static int rate_decision;
-
-int
-llb_ai_validate_key(char *raw_key, char *model, ai_gw_decision_t *result)
-{
-  validate_calls++;
-  (void)raw_key;
-  (void)model;
-  result->decision = validate_decision;
-  strcpy(result->key_id, "key-1");
-  strcpy(result->tenant_id, "tenant-1");
-  return validate_rc;
-}
-
-int
-llb_ai_ratelimit_check(char *key_id, char *tenant_id,
-                       char *user_id, char *svc_ident,
-                       char *model, ai_gw_decision_t *result)
-{
-  rate_calls++;
-  assert(strcmp(key_id, "key-1") == 0);
-  assert(strcmp(tenant_id, "tenant-1") == 0);
-  /* The H2 interim gate has no user/service identity to forward — the
-   * identity-forwarding ABI reaches it only through ai_gw_admit. */
-  assert(user_id != NULL);
-  assert(strcmp(svc_ident, "") == 0);
-  (void)model;
-  result->decision = rate_decision;
-  return rate_rc;
-}
-
-static void
-reset_stubs(void)
-{
-  validate_calls = 0;
-  rate_calls = 0;
-  validate_rc = 0;
-  validate_decision = 0;
-  rate_rc = 0;
-  rate_decision = 0;
-}
-
-static void
-test_admission_matrix(void)
-{
-  ai_gw_decision_t result;
-
-  reset_stubs();
-  assert(ai_security_admit(0, "", "model-a", &result) == 0);
-  assert(validate_calls == 0 && rate_calls == 0);
-
-  reset_stubs();
-  assert(ai_security_admit(2, "client-owned", "model-a", &result) == 0);
-  assert(validate_calls == 0 && rate_calls == 0);
-
-  reset_stubs();
-  validate_rc = -1;
-  validate_decision = 1;
-  assert(ai_security_admit(1, "", "model-a", &result) == 401);
-  assert(validate_calls == 1 && rate_calls == 0);
-
-  reset_stubs();
-  validate_rc = -1;
-  validate_decision = 2;
-  assert(ai_security_admit(1, "key", "model-b", &result) == 403);
-
-  reset_stubs();
-  validate_rc = -1;
-  validate_decision = 4;
-  assert(ai_security_admit(1, "key", "model-a", &result) == 503);
-
-  reset_stubs();
-  rate_rc = -1;
-  rate_decision = 3;
-  assert(ai_security_admit(1, "key", "model-a", &result) == 429);
-  assert(validate_calls == 1 && rate_calls == 1);
-
-  reset_stubs();
-  assert(ai_security_admit(1, "key", "model-a", &result) == 0);
-  assert(validate_calls == 1 && rate_calls == 1);
-
-  reset_stubs();
-  validate_rc = -1;
-  validate_decision = 1;
-  assert(ai_security_admit(99, "", "model-a", &result) == 401);
-  assert(validate_calls == 1); /* unknown policy fails closed */
-}
 
 static void
 test_bounded_copy(void)
@@ -128,6 +44,22 @@ nv(char *name, char *value)
     .flags = NGHTTP2_NV_FLAG_NONE,
   };
   return item;
+}
+
+static int
+has_header(const nghttp2_nv *set, size_t n, const char *name,
+           const char *value /* NULL = any */)
+{
+  for (size_t i = 0; i < n; i++) {
+    if (set[i].namelen == strlen(name) &&
+        strncasecmp((const char *)set[i].name, name, set[i].namelen) == 0) {
+      if (!value)
+        return 1;
+      return set[i].valuelen == strlen(value) &&
+             memcmp(set[i].value, value, set[i].valuelen) == 0;
+    }
+  }
+  return 0;
 }
 
 static void
@@ -168,12 +100,68 @@ test_header_filter(void)
   }
 }
 
+static void
+test_upstream_hygiene(void)
+{
+  nghttp2_nv input[] = {
+    nv(":method", "POST"),
+    nv("authorization", "Bearer tok"),
+    nv("x-auth-tenant", "spoofed-t"),
+    nv("x-auth-user", "spoofed-u"),
+    nv("content-type", "application/json"),
+  };
+  nghttp2_nv output[7];
+  size_t n;
+
+  /* JWT-capable + strip_authz + forward_identity: client X-Auth-* gone,
+   * Authorization gone, VERIFIED identity injected. */
+  n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
+                                      3 /* jwt */, 1, 1, 1,
+                                      "tenant-1", "alice");
+  assert(n == 4); /* :method + content-type + 2 injected */
+  assert(!has_header(output, n, "authorization", NULL));
+  assert(has_header(output, n, "x-auth-tenant", "tenant-1"));
+  assert(has_header(output, n, "x-auth-user", "alice"));
+  assert(!has_header(output, n, "x-auth-tenant", "spoofed-t"));
+  assert(!has_header(output, n, "x-auth-user", "spoofed-u"));
+
+  /* Passthrough profile (strip_authz=0): Authorization rides through, the
+   * spoofed X-Auth-* still never does. */
+  n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
+                                      3, 1, 0, 0, "", "");
+  assert(n == 3);
+  assert(has_header(output, n, "authorization", "Bearer tok"));
+  assert(!has_header(output, n, "x-auth-tenant", NULL));
+  assert(!has_header(output, n, "x-auth-user", NULL));
+
+  /* Not JWT-capable (plain API-key service): none of the JWT hygiene runs —
+   * exact legacy behaviour, headers untouched apart from the key strip. */
+  n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
+                                      1, 0, 0, 0, NULL, NULL);
+  assert(n == 5);
+  assert(has_header(output, n, "authorization", "Bearer tok"));
+  assert(has_header(output, n, "x-auth-tenant", "spoofed-t"));
+
+  /* forward_identity with no user: only the tenant is injected. */
+  n = ai_security_h2_upstream_hygiene(input, 5, output, 7,
+                                      3, 1, 1, 1, "tenant-1", "");
+  assert(n == 3);
+  assert(has_header(output, n, "x-auth-tenant", "tenant-1"));
+  assert(!has_header(output, n, "x-auth-user", NULL));
+
+  /* Injection respects the output cap: no room, no write past the end. */
+  nghttp2_nv tight[2];
+  n = ai_security_h2_upstream_hygiene(input, 5, tight, 2,
+                                      3, 1, 1, 1, "tenant-1", "alice");
+  assert(n == 2);
+}
+
 int
 main(void)
 {
-  test_admission_matrix();
   test_bounded_copy();
   test_header_filter();
-  puts("PASS: AI security admission and policy-owned credential handling");
+  test_upstream_hygiene();
+  puts("PASS: AI credential handling and upstream header hygiene");
   return 0;
 }

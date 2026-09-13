@@ -152,7 +152,8 @@ sockproxy_notifier.o: sockproxy_notifier.c sockproxy_notifier.h sockproxy_intern
 sockproxy_ktls.o: sockproxy_ktls.c sockproxy_ktls.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-sockproxy_h2.o: sockproxy_h2.c sockproxy_h2.h sockproxy_ai_security.h sockproxy_json.h
+sockproxy_h2.o: sockproxy_h2.c sockproxy_h2.h sockproxy_ai_security.h \
+	sockproxy_ai_admit.h sockproxy_ai_gw.h sockproxy_pd.h sockproxy_json.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_ai_security.o: sockproxy_ai_security.c sockproxy_ai_security.h sockproxy_ai_gw.h

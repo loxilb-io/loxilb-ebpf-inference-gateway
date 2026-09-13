@@ -61,6 +61,37 @@ typedef struct proxy_h2_stream {
   char authority[256];               // :authority pseudo-header (Host)
   char content_type[128];            // Content-Type header
   char x_api_key_raw[256];           // Per-stream gateway credential (never forwarded upstream)
+  char x_model_header[128];          // X-Model header (per-stream; H1 keeps it on the pfe,
+                                     // but concurrent H2 streams may name different models)
+  char bearer_raw[4096];             // RAW Authorization value, scheme tag included ("" when
+                                     // absent); the shared admission gate strips the Bearer
+                                     // prefix itself. Stream state for the same reason as
+                                     // x_api_key_raw: streams may carry different tenants.
+  uint8_t bearer_oversize;           // 1 = Authorization exceeded the capture cap; the value
+                                     // is dropped so the JWT arm refuses it as invalid
+
+  // AI admission identity + settle state, stamped by ai_gw_admit() at the
+  // stream gate. Stream-scoped twins of the pfe fields the H1 parser uses:
+  // the reservation made at admission must be settled (or released) for
+  // THIS stream no matter what the multiplexed neighbours do.
+  uint8_t  ai_admitted;              // 1 = gate ALLOWed (identity fields below valid)
+  char     tenant_id[128];
+  char     auth_user_id[128];
+  char     auth_key_id[64];
+  char     effective_model[128];     // the gate's body-first model resolution
+  char     svc_ident[64];            // "VIP:port" captured at admission — teardown paths
+                                     // must not chase the rule head after it may be gone
+  uint8_t  auth_strip_authz;         // upstream hygiene switches, parity with the H1 splice
+  uint8_t  auth_fwd_identity;
+  uint8_t  auth_jwt_capable;
+  uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
+  int64_t  usage_res_epoch;          // reservation window tag
+  uint8_t  usage_consumed;           // 1 = settle ran (no double charge/release)
+  uint8_t  usage_tail[1024];         // response-tail window for usage extraction
+                                     // (mirrors PROXY_USAGE_TAIL_KEEP)
+  uint16_t usage_tail_len;
+  uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
+  int      metric_response_status;   // backend :status relayed to the client (0 = unseen)
 
   // Generic request header storage (for gRPC and protocol transparency)
   nghttp2_nv *request_headers;       // All request headers (malloc'd)
