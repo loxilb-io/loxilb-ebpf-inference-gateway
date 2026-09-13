@@ -180,6 +180,12 @@ create_stream(proxy_h2_session_t *session, int32_t stream_id)
  * close, and a claim release when a stream dies before it settled.
  * ========================================================================== */
 
+/* Release a stream's pending AI-deny response body, if any. The stream owns
+ * the buffer nghttp2 reads asynchronously (see proxy_h2_send_ai_deny), so this
+ * is the one place it is freed — covering both the normal drain and a client
+ * that resets the denied stream before the read callback reaches EOF. */
+static void proxy_h2_free_deny_body(proxy_h2_stream_t *stream);
+
 /* Sliding response-tail window: the usage object rides the final bytes of
  * a JSON body or the final SSE chunk (stream_options.include_usage). */
 static void
@@ -203,6 +209,34 @@ proxy_h2_stream_tail_update(proxy_h2_stream_t *stream,
   stream->usage_tail_len += (uint16_t)len;
 }
 
+/* Extract prompt/completion tokens from a stream's response-tail window using
+ * the STREAM's resolved-pool dialect. Pure C (no control-plane entry), so it
+ * is safe under PROXY_LOCK — the teardown collector relies on that. The pool
+ * pointer is read here, never after the lock is dropped: a concurrent rule
+ * delete can free it the instant the lock is released. */
+static void
+proxy_h2_stream_extract_usage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                              int *up, int *uc)
+{
+  *up = 0;
+  *uc = 0;
+  if (!pfe || !stream || stream->usage_tail_len == 0)
+    return;
+  /* Same dialect resolution as the H1 proxy_usage_ops: P/D rules carry
+   * their engine dialect on the epval; plain AI-gateway rules fall back
+   * to the plain-LB profile. The pool is the STREAM's resolved pool —
+   * pfe->epv is connection-scoped and holds whichever pool the LATEST
+   * stream resolved, which on a multi-model connection is not this one. */
+  proxy_epval_t *epv = stream->route_epv
+                           ? (proxy_epval_t *)stream->route_epv
+                           : (proxy_epval_t *)pfe->epv;
+  const pd_dialect_ops_t *uops =
+    (epv && epv->pd_ops) ? epv->pd_ops : &pd_dialect_plain;
+  if (uops->extract_usage)
+    (void)uops->extract_usage(pfe, stream->usage_tail,
+                              stream->usage_tail_len, up, uc);
+}
+
 /* Settle an admitted stream: extract usage from the tail window, charge the
  * ladder (releasing the admission claim in the same call) and record the
  * request. result stays NULL on the consume call — a completed response is
@@ -218,21 +252,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
     return;
   stream->usage_consumed = 1;
 
-  if (pfe && stream->usage_tail_len > 0) {
-    /* Same dialect resolution as the H1 proxy_usage_ops: P/D rules carry
-     * their engine dialect on the epval; plain AI-gateway rules fall back
-     * to the plain-LB profile. The pool is the STREAM's resolved pool —
-     * pfe->epv is connection-scoped and holds whichever pool the LATEST
-     * stream resolved, which on a multi-model connection is not this one. */
-    proxy_epval_t *epv = stream->route_epv
-                             ? (proxy_epval_t *)stream->route_epv
-                             : (proxy_epval_t *)pfe->epv;
-    const pd_dialect_ops_t *uops =
-      (epv && epv->pd_ops) ? epv->pd_ops : &pd_dialect_plain;
-    if (uops->extract_usage)
-      (void)uops->extract_usage(pfe, stream->usage_tail,
-                                stream->usage_tail_len, &up, &uc);
-  }
+  proxy_h2_stream_extract_usage(pfe, stream, &up, &uc);
 
   llb_ai_token_quota_consume(stream->tenant_id, stream->effective_model,
                              stream->auth_user_id, stream->auth_key_id,
@@ -254,6 +274,78 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                         latency_ms, up, uc, 0, 0, "");
   log_info("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
            stream->stream_id, up, uc, status);
+}
+
+/* Collect the connection's un-settled admitted/keyless streams for a deferred
+ * settle at teardown (see the header contract on h2_inflight_settle_t). Usage
+ * is extracted here — under the caller's PROXY_LOCK, because the stream's pool
+ * is only guaranteed alive while the lock is held — and the identity is copied
+ * out so the caller can emit the control-plane charge/record after unlocking.
+ * Each collected stream is marked settled so a later close cannot double it. */
+int
+proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
+                                   h2_inflight_settle_t **out)
+{
+  proxy_h2_session_t *sess = pfe ? pfe->h2_session : NULL;
+  proxy_h2_stream_t *stream, *tmp;
+  h2_inflight_settle_t *list;
+  int cap, n = 0;
+
+  *out = NULL;
+  if (!sess || sess->active_stream_count <= 0)
+    return 0;
+
+  cap = sess->active_stream_count;
+  list = calloc((size_t)cap, sizeof(*list));
+  if (!list) {
+    /* Never silently drop: the reservations these streams hold will strand
+     * until the quota window rolls, which the operator should be able to see. */
+    log_error("[AI_TOKENS][HTTP/2] teardown settle: OOM for %d stream(s) — "
+              "their reservations will self-heal only at window roll", cap);
+    return 0;
+  }
+
+  HASH_ITER(hh, sess->streams, stream, tmp) {
+    int up = 0, uc = 0;
+    h2_inflight_settle_t *e;
+
+    if (!(stream->ai_admitted || stream->ai_unmetered) ||
+        stream->usage_consumed)
+      continue;
+    if (n >= cap)   /* active_stream_count is authoritative; guard regardless */
+      break;
+    stream->usage_consumed = 1;
+
+    proxy_h2_stream_extract_usage(pfe, stream, &up, &uc);
+
+    e = &list[n++];
+    snprintf(e->tenant, sizeof(e->tenant), "%s", stream->tenant_id);
+    snprintf(e->model, sizeof(e->model), "%s", stream->effective_model);
+    snprintf(e->user, sizeof(e->user), "%s", stream->auth_user_id);
+    snprintf(e->key, sizeof(e->key), "%s", stream->auth_key_id);
+    snprintf(e->svc_ident, sizeof(e->svc_ident), "%s", stream->svc_ident);
+    e->prompt_toks = up;
+    e->complet_toks = uc;
+    e->reserved_toks = (int)stream->usage_reserved_toks;
+    e->res_epoch = stream->usage_res_epoch;
+    e->status = stream->metric_response_status > 0
+                    ? stream->metric_response_status : 0;
+    e->latency_ms = 0;
+    if (stream->admit_mono_ns) {
+      uint64_t now = get_timestamp_ns();
+      if (now > stream->admit_mono_ns)
+        e->latency_ms = (int64_t)((now - stream->admit_mono_ns) / 1000000ULL);
+    }
+    stream->usage_reserved_toks = 0;
+    stream->usage_res_epoch = 0;
+  }
+
+  if (n == 0) {
+    free(list);
+    return 0;
+  }
+  *out = list;
+  return n;
 }
 
 /**
@@ -281,6 +373,9 @@ destroy_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
    *     hand-back the previous abort-only block did, now never skipped. */
   proxy_h2_settle_stream(session, stream);
 
+  /* Release the AI-deny response body if the stream still owns one (a client
+   * reset before nghttp2 drained it never reached the read callback's EOF). */
+  proxy_h2_free_deny_body(stream);
 
   // Free data buffer if allocated
   if (stream->data_buf) {
@@ -2166,6 +2261,19 @@ typedef struct {
   size_t offset;
 } h2_deny_body_ctx_t;
 
+static void
+proxy_h2_free_deny_body(proxy_h2_stream_t *stream)
+{
+  h2_deny_body_ctx_t *ctx;
+
+  if (!stream || !stream->deny_body_ctx)
+    return;
+  ctx = (h2_deny_body_ctx_t *)stream->deny_body_ctx;
+  free(ctx->data);
+  free(ctx);
+  stream->deny_body_ctx = NULL;
+}
+
 static ssize_t
 proxy_h2_deny_body_read_callback(nghttp2_session *session, int32_t stream_id,
                                  uint8_t *buf, size_t length,
@@ -2181,21 +2289,24 @@ proxy_h2_deny_body_read_callback(nghttp2_session *session, int32_t stream_id,
     memcpy(buf, ctx->data + ctx->offset, to_copy);
     ctx->offset += to_copy;
   }
-  if (ctx->offset >= ctx->len) {
+  /* Signal EOF at end-of-body but do NOT free here: the STREAM owns the ctx
+   * and destroy_stream frees it. Freeing on EOF would leak whenever the client
+   * resets the stream before this callback drains the body (the callback then
+   * never runs), and would risk a double free against destroy_stream. */
+  if (ctx->offset >= ctx->len)
     *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    free(ctx->data);
-    free(ctx);
-  }
   return (ssize_t)to_copy;
 }
 
 static int
-proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, int32_t stream_id,
+proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                       int status_code, int retry_after, int retry_body,
                       const char *error_code, const char *error_msg)
 {
-  if (!pfe || !pfe->h2_session || !pfe->h2_session->session)
+  if (!pfe || !stream || !pfe->h2_session || !pfe->h2_session->session)
     return -1;
+
+  int32_t stream_id = stream->stream_id;
 
   char status_str[8];
   char retry_str[16];
@@ -2235,6 +2346,11 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, int32_t stream_id,
       }
     }
   }
+
+  /* The stream owns the body from here: destroy_stream frees it even if the
+   * client resets the stream before nghttp2 drains it. A denied stream sends
+   * exactly one response, so this never overwrites a live ctx. */
+  stream->deny_body_ctx = ctx;
 
   snprintf(clen_str, sizeof(clen_str), "%d", ctx ? blen : 0);
 
@@ -2281,10 +2397,9 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, int32_t stream_id,
   if (rv != 0) {
     log_error("[AIGateway][HTTP/2] deny submit failed (stream %d status %d): %s",
               stream_id, status_code, nghttp2_strerror(rv));
-    if (ctx) {
-      free(ctx->data);
-      free(ctx);
-    }
+    /* nghttp2 never took the data provider, so free the body now (clears the
+     * stream's pointer so destroy_stream does not double free). */
+    proxy_h2_free_deny_body(stream);
     /* Still an h2 stream: refuse it outright rather than leaving it open. */
     nghttp2_submit_rst_stream(pfe->h2_session->session, NGHTTP2_FLAG_NONE,
                               stream_id, NGHTTP2_INTERNAL_ERROR);
@@ -2806,7 +2921,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       /* Terminal response on THIS stream; the multiplexed connection
        * stays alive. Return success so the caller marks the stream
        * response_sent and never redispatches. */
-      proxy_h2_send_ai_deny(pfe, stream->stream_id,
+      proxy_h2_send_ai_deny(pfe, stream,
                             adm.http_status, adm.retry_after,
                             adm.retry_body, adm.error_code, adm.error_msg);
       log_info("[AIGateway][HTTP/2] stream=%d rejected before routing: "
@@ -2978,7 +3093,7 @@ h2_have_tepval:
      * for which no pool exists gets a clean 503, not a bare RST — the
      * client can tell "model unavailable" from a transport failure. */
     if (lookup_model[0] && pfe && pfe->h2_session && pfe->h2_session->session) {
-      proxy_h2_send_ai_deny(pfe, stream->stream_id, 503, 0, 0,
+      proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0,
                             "model_unavailable",
                             "no backend pool for this model");
       log_info("[MODEL_ROUTING][HTTP/2] 503 sent for model='%s' stream=%d",

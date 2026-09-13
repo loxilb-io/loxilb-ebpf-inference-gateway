@@ -114,7 +114,14 @@ typedef struct proxy_h2_stream {
   
   // Response tracking
   int response_sent;                 // 1 = response headers/data sent
-  
+
+  // Terminal AI-gate refusal body (h2_deny_body_ctx_t*). nghttp2 pulls the
+  // JSON error body from a read callback asynchronously, so it must outlive
+  // the submit; the STREAM owns it and destroy_stream frees it. This closes
+  // the leak on a client that RSTs the denied stream before nghttp2 drains
+  // the body — the read callback then never reaches EOF to free it itself.
+  void *deny_body_ctx;
+
   // LLM-specific fields (for CHWBL/GPU routing)
   void *prefix_key;                  // llm_prefix_key_t* - extracted from request
   char conversation_id[128];         // X-Conversation-ID header
@@ -188,7 +195,13 @@ typedef struct backend_h2_session {
   // must match and ep_idx alone aliases across pools.
   int slot;                          // Per-connection slot (pfe->rfd[]/rfd_ent[] index)
   int ep_idx;                        // Endpoint index INSIDE epv->eps (stats/cookie/logs)
-  void *epv;                         // The pool (proxy_epval_t*) this session belongs to
+  void *epv;                         // The pool (proxy_epval_t*) this session belongs to.
+                                     // Ownership contract: pools are mutated in place on a
+                                     // rule update and freed only on rule delete, which tears
+                                     // down these sessions first — so this raw pointer (and the
+                                     // pointer-equality slot-reuse probe in the forwarder) stay
+                                     // valid for the session's life. A future free-on-delete of
+                                     // live pools would need a refcount or generation here.
   char backend_addr[64];             // Backend IP address (for logging)
   int backend_port;                  // Backend port
 
@@ -321,6 +334,50 @@ int proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream);
  * @param pfe Proxy file descriptor entry
  */
 void proxy_h2_cleanup_session(proxy_fd_ent_t *pfe);
+
+/*
+ * One deferred HTTP/2 stream settle, collected on connection teardown.
+ *
+ * A completed stream settles at its own close (destroy_stream), but a client
+ * that resets the connection — or a fatal session error — tears the whole
+ * connection down without nghttp2 closing each stream, so any admitted or
+ * keyless stream still in flight never settles: its admission reservation
+ * strands in the quota store until the window rolls, and its request record is
+ * never emitted. proxy_pdestroy collects those here and settles them.
+ *
+ * The charge/record re-enters the control plane (CGO), which must not run under
+ * PROXY_LOCK (non-recursive; the callee re-takes it). But the usage extraction
+ * reads the stream's resolved pool, which a concurrent rule delete may free the
+ * moment PROXY_LOCK is dropped. So the split mirrors the H1 resv_rel deferral:
+ * proxy_h2_collect_inflight_settles() extracts usage + copies identity UNDER
+ * the lock, and the caller emits llb_ai_token_quota_consume + llb_ai_record_request
+ * from this array AFTER unlocking.
+ */
+typedef struct h2_inflight_settle {
+  char    tenant[128];
+  char    model[128];
+  char    user[128];
+  char    key[64];
+  char    svc_ident[64];
+  int     prompt_toks;
+  int     complet_toks;
+  int     reserved_toks;
+  int     status;
+  int64_t res_epoch;
+  int64_t latency_ms;
+} h2_inflight_settle_t;
+
+/*
+ * Collect the client connection's not-yet-settled admitted/keyless streams
+ * into a freshly malloc'd array (*out; the caller frees it). Each collected
+ * stream is marked settled (usage_consumed) so a later close cannot double
+ * charge or double release. Pure C — no control-plane entry — so it is safe to
+ * call while PROXY_LOCK is held, which the caller MUST be. Returns the count
+ * (0 with *out left NULL when there is nothing to settle or on allocation
+ * failure; a failure is logged, never silently dropped).
+ */
+int proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
+                                      h2_inflight_settle_t **out);
 
 /**
  * proxy_h2_inject_resp_headers —: the ONE net-new C
