@@ -363,6 +363,12 @@ typedef struct h2_inflight_settle {
   int     complet_toks;
   int     reserved_toks;
   int     status;
+  /* 1 = no dialect read a usage object for this stream. Read together with
+   * status: status > 0 && usage_missing is a response that completed with
+   * nothing to charge, which llb_ai_record_usage_missing reports. It cannot
+   * be inferred from prompt_toks/complet_toks, because a usage object
+   * reporting zero tokens leaves those 0 as well. */
+  int     usage_missing;
   int64_t res_epoch;
   int64_t latency_ms;
 } h2_inflight_settle_t;

@@ -1257,6 +1257,26 @@ struct proxy_fd_ent {
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 
+/* True for a response status that was supposed to carry a usage object: a
+ * successful completion, and nothing else.
+ *
+ * loxilb_ai_tokens_missing_total reports an ACCOUNTING HOLE — a response that
+ * should have been charged and could not be. An error body is not that: a
+ * backend answering 4xx/5xx produced no completion, so carrying no usage is
+ * correct rather than missing, and counting it would let a backend outage
+ * dominate the series with responses nobody ever expected to charge.
+ *
+ * Deliberately 2xx rather than "not 4xx/5xx". 1xx and 3xx did not complete a
+ * response either, and 1xx specifically must not slip through: the H/1.1
+ * status parser latches the FIRST status line it sees and never overwrites
+ * it, so a 100-Continue exchange leaves metric_response_status at 100 with
+ * the real status never recorded. */
+static inline int
+proxy_status_is_2xx(unsigned int status)
+{
+  return status >= 200 && status < 300;
+}
+
 /* Effective model for response-phase consumers: live request fields first
  * (pre-reset paths), then the resp_model snapshot. Returns "" when no model
  * was supplied at all. */

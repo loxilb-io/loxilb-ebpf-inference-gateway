@@ -393,6 +393,28 @@ extern void llb_ai_normal_session_hit(char *model_name);
  */
 extern void llb_ai_record_unmetered(char *vip);
 
+/*
+ * llb_ai_record_usage_missing – record a completed response that carried no
+ * readable usage object. Charges nothing.
+ *
+ * The SSE path reaches the missing-usage counter through the quota charge's
+ * estimated arm. A non-streamed response has no such route: its accounting
+ * runs only when a dialect extracts a usage object, so a body without one
+ * charged nothing AND reported nothing, leaving the condition the counter
+ * exists to expose invisible for that shape. This reports it.
+ *
+ * Accounting-only on purpose, and these responses stay free by decision
+ * rather than by omission: charging an estimate was considered and rejected,
+ * because it can deny a tenant's next request for traffic that is free today
+ * and a non-streamed response carries no completion-side signal to estimate
+ * from. The counter is what would reopen that with data.
+ *
+ * Parameters:
+ *   tenant_id   verified tenant the response belonged to (NUL-terminated)
+ *   model_name  effective model of the request (NUL-terminated)
+ */
+extern void llb_ai_record_usage_missing(char *tenant_id, char *model_name);
+
 /**
  * llb_ai_pd_record_ep – record per-endpoint P/D latency for Prometheus histogram.
  * New export — does NOT replace llb_ai_pd_record.
