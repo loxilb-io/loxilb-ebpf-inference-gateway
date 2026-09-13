@@ -153,12 +153,19 @@ proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len)
  * its [DONE], and an SSE stream that was cut never set metric_ai_recorded.
  *
  * Answering yes says nothing about whether the response SHOULD have been
- * charged; this is an accounting observation, not a quota decision. */
+ * charged; this is an accounting observation, not a quota decision.
+ *
+ * Restricted to 2xx (see proxy_status_is_2xx): metric_ai_recorded is set for
+ * every non-SSE response that carried a status, error shapes included — an
+ * OpenAI-compatible backend answers errors as JSON — and an error body has no
+ * usage object by design. Without this test a backend outage would drive the
+ * counter harder than the condition it exists to report. */
 static int
 proxy_usage_went_unreported(const proxy_fd_ent_t *pfe)
 {
   return pfe && pfe->odir == 0 && pfe->ai_gw_mode &&
-         pfe->metric_ai_recorded && !pfe->usage_consumed;
+         pfe->metric_ai_recorded && !pfe->usage_consumed &&
+         proxy_status_is_2xx(pfe->metric_response_status);
 }
 
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {

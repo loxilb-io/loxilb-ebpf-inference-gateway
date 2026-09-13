@@ -283,12 +283,11 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   /* The same accounting hole the H1 paths report: this response was recorded
    * as completed and no dialect read a usage object out of it, so it was
    * charged nothing and — without this — reported nothing either. Gated on a
-   * backend status actually having been seen, so an aborted stream (which
-   * settles here too, only to release its reservation) is not counted as a
-   * completed response with missing usage. Charges nothing; whether such a
-   * response should be billed an estimate stays the open quota-policy
-   * question it is on H1. */
-  if (!usage_read && stream->metric_response_status > 0) {
+   * 2xx (see proxy_status_is_2xx), which also excludes the aborted stream
+   * that settles here only to release its reservation and never saw a status
+   * at all. Charges nothing; whether such a response should be billed an
+   * estimate stays the open quota-policy question it is on H1. */
+  if (!usage_read && proxy_status_is_2xx(stream->metric_response_status)) {
     llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model);
     log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
              "object tenant=%s model=%s (reported, not charged)",
@@ -343,9 +342,11 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
 
     e = &list[n++];
     /* Reported by the caller after PROXY_LOCK drops, like the charge: the
-     * recorder crosses into the control plane. Paired with e->status below,
-     * which is what decides whether a response completed at all. */
-    e->usage_missing = !usage_read;
+     * recorder crosses into the control plane. 2xx-gated here rather than at
+     * the emit, so the decision is made once, beside the extraction it
+     * depends on. */
+    e->usage_missing = !usage_read &&
+                       proxy_status_is_2xx(stream->metric_response_status);
     snprintf(e->tenant, sizeof(e->tenant), "%s", stream->tenant_id);
     snprintf(e->model, sizeof(e->model), "%s", stream->effective_model);
     snprintf(e->user, sizeof(e->user), "%s", stream->auth_user_id);
