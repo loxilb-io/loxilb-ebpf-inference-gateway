@@ -4523,6 +4523,15 @@ proxy_pdestroy(void *priv)
       fd_ent = ent->val.fdlist;
       while (fd_ent) {
         if (fd_ent->odir == 0) {
+          /* Same per-connection HTTP/2 session leak as the single-connection
+           * path below, reached when the whole rule goes away. Streams are
+           * freed without settling here, matching what this path already does
+           * with the HTTP/1.1 reservation: the deferred settle belongs to the
+           * per-connection teardown, and a rule delete is taking the pools
+           * with it regardless. */
+          if (fd_ent->h2_session) {
+            proxy_h2_cleanup_session(fd_ent);
+          }
           proxy_release_rfd_ctx(fd_ent);
           if (fd_ent->fd != ent->val.main_fd) {
             proxy_release_fd_ctx(fd_ent, 0);
@@ -4954,6 +4963,20 @@ proxy_pdestroy(void *priv)
         }
         PROXY_ENT_UNLOCK(cpfe);
       }
+    }
+
+    /* Free the HTTP/2 session itself. Nothing did until now — the cleanup had
+     * no caller at all — so every H2 client connection leaked its session, its
+     * nghttp2 state and every stream struct still attached to it, and each of
+     * those streams carries the bearer + usage-tail windows.
+     *
+     * It runs HERE, before proxy_release_rfd_ctx, because it needs the
+     * rfd_ent[] links to clear each backend pfe's view of the session it is
+     * about to free. It does not touch the backend fds: those belong to the
+     * backend pfes and are closed exactly once, by each pfe's own teardown.
+     * The streams it frees were settled by the collector above. */
+    if (!is_listener && pfe->odir == 0 && pfe->h2_session) {
+      proxy_h2_cleanup_session(pfe);
     }
 
     if (!is_listener) {

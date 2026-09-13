@@ -348,30 +348,18 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
   return n;
 }
 
-/**
- * Destroy stream and remove from session
- */
+/* Release a stream's memory and unlink it from the session. Pure C — no
+ * control-plane entry — so it is safe with PROXY_LOCK held. Settling is the
+ * CALLER's business: destroy_stream() settles first (nghttp2's stream-close
+ * path), while the teardown path in proxy_h2_cleanup_session() must NOT,
+ * because proxy_pdestroy has already collected those settles for deferred
+ * emission and the charge call would re-enter the non-recursive lock. */
 static void
-destroy_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
+h2_stream_free(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
 {
   if (!session || !stream) {
     return;
   }
-
-  /* AI settle on teardown: the CLIENT stream is the settle unit and this
-   * is the one close that always fires for it. The backend-side stream
-   * close (proxy_h2_backend_on_stream_close_callback) also settles, but it
-   * races the client close — nghttp2 destroys the client stream as soon as
-   * the client's END_STREAM is acknowledged, which for a complete exchange
-   * beats the backend close, and once find_stream() can no longer reach the
-   * client stream the backend-side settle silently no-ops. Settling here
-   * makes metering happen exactly once (usage_consumed guards the double)
-   * for every admitted OR keyless stream, no matter which close wins:
-   *   - a completed response has its usage in the tail window → charged;
-   *   - a genuine abort has whatever arrived (usually nothing) charged and,
-   *     for admitted streams, the admission reservation released — the same
-   *     hand-back the previous abort-only block did, now never skipped. */
-  proxy_h2_settle_stream(session, stream);
 
   /* Release the AI-deny response body if the stream still owns one (a client
    * reset before nghttp2 drained it never reached the read callback's EOF). */
@@ -405,6 +393,34 @@ destroy_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
 
   // Free stream structure
   free(stream);
+}
+
+/**
+ * Destroy stream and remove from session
+ */
+static void
+destroy_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
+{
+  if (!session || !stream) {
+    return;
+  }
+
+  /* AI settle on teardown: the CLIENT stream is the settle unit and this
+   * is the one close that always fires for it. The backend-side stream
+   * close (proxy_h2_backend_on_stream_close_callback) also settles, but it
+   * races the client close — nghttp2 destroys the client stream as soon as
+   * the client's END_STREAM is acknowledged, which for a complete exchange
+   * beats the backend close, and once find_stream() can no longer reach the
+   * client stream the backend-side settle silently no-ops. Settling here
+   * makes metering happen exactly once (usage_consumed guards the double)
+   * for every admitted OR keyless stream, no matter which close wins:
+   *   - a completed response has its usage in the tail window → charged;
+   *   - a genuine abort has whatever arrived (usually nothing) charged and,
+   *     for admitted streams, the admission reservation released — the same
+   *     hand-back the previous abort-only block did, now never skipped. */
+  proxy_h2_settle_stream(session, stream);
+
+  h2_stream_free(session, stream);
 }
 
 /**
@@ -1882,21 +1898,14 @@ proxy_h2_backend_session_destroy(backend_h2_session_t *backend_session)
     backend_session->session = NULL;
   }
 
-  // ============================================================================
-  // CRITICAL CLEANUP: Remove backend fd from event loop before closing
-  // Prevents event loop from trying to access freed backend_pfe
-  // ============================================================================
-  if (backend_session->backend_fd > 0) {
-    // Remove from event loop
-    proxy_notify_delete_fd(backend_session->backend_fd, 1);
-
-    // Close socket
-    close(backend_session->backend_fd);
-
-    log_debug("[HTTP/2 Backend] ep[%d]: Closed and unregistered backend fd=%d",
-              backend_session->ep_idx, backend_session->backend_fd);
-  }
-
+  /* The fd is NOT closed here. It belongs to the backend proxy_fd_ent_t that
+   * was created around it, exactly as an HTTP/1.1 backend leg does: that pfe
+   * is deregistered by proxy_release_rfd_ctx and closed by its own
+   * proxy_release_fd_ctx(.., 1). Closing it here as well would hand the same
+   * descriptor number back to the kernel twice — the second close landing on
+   * whatever connection has since been handed that number. The two creation
+   * failure paths in proxy_h2_forward_to_backend are the only places where no
+   * pfe ever took ownership, and each closes the fd itself. */
   pthread_mutex_destroy(&backend_session->send_lock);
   free(backend_session);
 }
@@ -2410,6 +2419,10 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 
 /**
  * Cleanup HTTP/2 session and all streams
+ *
+ * Teardown-only, and it never enters the control plane — see the contract on
+ * the streams below. Call it from proxy_pdestroy for the client pfe while the
+ * backend links are still intact, i.e. BEFORE proxy_release_rfd_ctx.
  */
 void
 proxy_h2_cleanup_session(proxy_fd_ent_t *pfe)
@@ -2417,28 +2430,47 @@ proxy_h2_cleanup_session(proxy_fd_ent_t *pfe)
   if (!pfe || !pfe->h2_session) {
     return;
   }
-  
+
   proxy_h2_session_t *h2_sess = pfe->h2_session;
-  
+
+  /* Streams go FIRST, and without settling. Two reasons, both load-bearing:
+   *   - The settle charges the control plane, which re-enters the
+   *     non-recursive PROXY_LOCK this runs under. proxy_pdestroy has already
+   *     collected these streams' settles for emission after it unlocks.
+   *   - Emptying the stream hash now makes the backend-side close callback
+   *     harmless: it settles whatever find_stream() hands back, and with the
+   *     hash empty that is NULL. So a callback fired from any
+   *     nghttp2_session_del below cannot reach a freed stream or the
+   *     control plane. */
+  proxy_h2_stream_t *stream, *tmp;
+  HASH_ITER(hh, h2_sess->streams, stream, tmp) {
+    h2_stream_free(h2_sess, stream);
+  }
+
   // Destroy all backend sessions
   backend_h2_session_t *backend_session, *backend_tmp;
   HASH_ITER(hh, h2_sess->backend_sessions, backend_session, backend_tmp) {
     HASH_DEL(h2_sess->backend_sessions, backend_session);
+    /* Drop the owning backend pfe's view of this session before freeing it.
+     * That pfe outlives this call — proxy_release_rfd_ctx only MARKS it for
+     * eviction, so its own teardown (and any EPOLLOUT that beats the evict)
+     * runs afterwards and would otherwise read freed memory through
+     * pfe->backend_h2_session. */
+    if (backend_session->slot >= 0 && backend_session->slot < MAX_PROXY_EP) {
+      proxy_fd_ent_t *bpfe = pfe->rfd_ent[backend_session->slot];
+      if (bpfe && bpfe->backend_h2_session == backend_session) {
+        bpfe->backend_h2_session = NULL;
+      }
+    }
     proxy_h2_backend_session_destroy(backend_session);
   }
-  
-  // Destroy all streams
-  proxy_h2_stream_t *stream, *tmp;
-  HASH_ITER(hh, h2_sess->streams, stream, tmp) {
-    destroy_stream(h2_sess, stream);
-  }
-  
+
   // Delete nghttp2 session
   if (h2_sess->session) {
     nghttp2_session_del(h2_sess->session);
     h2_sess->session = NULL;
   }
-  
+
   // Free session structure
   free(h2_sess);
   pfe->h2_session = NULL;
@@ -3514,6 +3546,11 @@ h2_have_tepval:
     if (!backend_pfe) {
       log_error("[HTTP/2] stream %d: Failed to allocate backend pfe for fd=%d",
                 stream->stream_id, backend_fd);
+      /* No pfe ever took the fd, so this path owns the close — and the
+       * session, already in the reuse hash, must go with it or a later slot
+       * probe submits streams into a closed descriptor. */
+      HASH_DEL(pfe->h2_session->backend_sessions, backend_session);
+      proxy_h2_backend_session_destroy(backend_session);
       close(backend_fd);
       return -1;
     }
@@ -3537,13 +3574,26 @@ h2_have_tepval:
     backend_pfe->n_rfd = 1;
 
     // ✅ CRITICAL: Register with event loop - enables backend response handling
-    if (proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, backend_pfe) != 0) {
+    /* Pinned to the CLIENT fd's notify worker: every handler touching the
+     * client's h2_session (proxy_h2_handle_backend_data walks its hashes with
+     * no client lock held) then serializes with proxy_pdestroy freeing that
+     * session — the same single-worker guarantee the HTTP/1.1 backend path
+     * has relied on since the conc=128 wedge fix. */
+    if (proxy_notify_add_fd_pinned(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_HUP,
+                                   backend_pfe, pfe->fd) != 0) {
       log_error("[HTTP/2] stream %d: Failed to register backend fd=%d with event loop",
                 stream->stream_id, backend_fd);
       pfe->rfd_ent[slot] = NULL;   /* D2 root fix: unlink before recycling the shell */
       pfe->rfd[slot] = -1;         /* the fd closes below; a stale positive here
                                     * would satisfy the reuse probe forever */
       pfe_recycle(backend_pfe);      /* pool the shell (frees rcvbuf, bumps gen) */
+      /* The registration failed, so nothing will ever evict this fd and the
+       * recycled shell no longer owns it: close it here. The session was
+       * created around that fd and is already in the reuse hash, so it must
+       * leave NOW or a later slot probe adopts a dead (possibly
+       * kernel-recycled) descriptor number. */
+      HASH_DEL(pfe->h2_session->backend_sessions, backend_session);
+      proxy_h2_backend_session_destroy(backend_session);
       close(backend_fd);
       return -1;
     }

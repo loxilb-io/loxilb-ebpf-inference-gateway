@@ -1740,6 +1740,7 @@ proxy_epval_t* find_endpoint_lpm(proxy_map_ent_t *ent,
 
 // Event loop management wrappers (for HTTP/2 backend registration)
 int proxy_notify_add_fd(int fd, int type, void *priv);
+int proxy_notify_add_fd_pinned(int fd, int type, void *priv, int pin_fd);
 int proxy_notify_delete_fd(int fd, int evict);
 
 
