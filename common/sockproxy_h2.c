@@ -285,8 +285,8 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
    * charged nothing and — without this — reported nothing either. Gated on a
    * 2xx (see proxy_status_is_2xx), which also excludes the aborted stream
    * that settles here only to release its reservation and never saw a status
-   * at all. Charges nothing; whether such a response should be billed an
-   * estimate stays the open quota-policy question it is on H1. */
+   * at all. Charges nothing, by decision and not by omission — the same
+   * settled answer the H1 reporters carry. */
   if (!usage_read && proxy_status_is_2xx(stream->metric_response_status)) {
     llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model);
     log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "

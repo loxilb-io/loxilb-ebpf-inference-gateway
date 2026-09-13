@@ -403,8 +403,11 @@ extern void llb_ai_record_unmetered(char *vip);
  * charged nothing AND reported nothing, leaving the condition the counter
  * exists to expose invisible for that shape. This reports it.
  *
- * Accounting-only on purpose. Whether such a response should also be charged
- * an estimated amount is a quota-policy decision, not this call's business.
+ * Accounting-only on purpose, and these responses stay free by decision
+ * rather than by omission: charging an estimate was considered and rejected,
+ * because it can deny a tenant's next request for traffic that is free today
+ * and a non-streamed response carries no completion-side signal to estimate
+ * from. The counter is what would reopen that with data.
  *
  * Parameters:
  *   tenant_id   verified tenant the response belonged to (NUL-terminated)
