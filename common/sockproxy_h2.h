@@ -75,6 +75,13 @@ typedef struct proxy_h2_stream {
   // the reservation made at admission must be settled (or released) for
   // THIS stream no matter what the multiplexed neighbours do.
   uint8_t  ai_admitted;              // 1 = gate ALLOWed (identity fields below valid)
+  uint8_t  ai_unmetered;             // 1 = keyless on an AI-gateway rule: no identity, but
+                                     // the response still settles into the per-VIP shared
+                                     // bucket (svc_ident below is valid; tenant stays "")
+  void    *route_epv;                // the pool THIS stream resolved (proxy_epval_t*).
+                                     // Settle reads its usage dialect from here — pfe->epv
+                                     // is connection-scoped and a later stream of another
+                                     // model overwrites it before an earlier stream settles
   char     tenant_id[128];
   char     auth_user_id[128];
   char     auth_key_id[64];
@@ -175,8 +182,13 @@ typedef struct backend_h2_session {
   int goaway_sent;                   // 1 = GOAWAY sent to backend
   int goaway_received;               // 1 = GOAWAY received from backend
 
-  // Backend endpoint info
-  int ep_idx;                        // Which backend endpoint (index into tepval->eps)
+  // Backend endpoint info. The hash key is `slot`, the per-connection
+  // backend-connection slot — NOT ep_idx: two model pools on one rule both
+  // have an endpoint 0, so (pool, ep_idx) is the identity a session reuse
+  // must match and ep_idx alone aliases across pools.
+  int slot;                          // Per-connection slot (pfe->rfd[]/rfd_ent[] index)
+  int ep_idx;                        // Endpoint index INSIDE epv->eps (stats/cookie/logs)
+  void *epv;                         // The pool (proxy_epval_t*) this session belongs to
   char backend_addr[64];             // Backend IP address (for logging)
   int backend_port;                  // Backend port
 
@@ -352,14 +364,19 @@ int proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
  * 
  * @param client_session Client-side HTTP/2 session
  * @param pfe Proxy file descriptor entry
- * @param ep_idx Backend endpoint index
+ * @param slot Per-connection backend slot (the session hash key; two model
+ *             pools both have an endpoint 0, so ep_idx alone is not identity)
+ * @param ep_idx Endpoint index inside epv->eps (stats/cookie/logs)
+ * @param epv The pool (proxy_epval_t*) the endpoint belongs to
  * @param backend_fd Backend socket FD (already connected)
  * @param ssl Backend SSL connection (NULL if plain HTTP/2)
  * @return backend_h2_session_t* on success, NULL on error
  */
 backend_h2_session_t *proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
                                                      proxy_fd_ent_t *pfe,
+                                                     int slot,
                                                      int ep_idx,
+                                                     void *epv,
                                                      int backend_fd,
                                                      void *ssl);
 

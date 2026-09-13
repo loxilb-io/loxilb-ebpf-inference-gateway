@@ -213,15 +213,20 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   proxy_fd_ent_t *pfe = session ? (proxy_fd_ent_t *)session->pfe : NULL;
   int up = 0, uc = 0;
 
-  if (!stream || !stream->ai_admitted || stream->usage_consumed)
+  if (!stream || !(stream->ai_admitted || stream->ai_unmetered) ||
+      stream->usage_consumed)
     return;
   stream->usage_consumed = 1;
 
   if (pfe && stream->usage_tail_len > 0) {
     /* Same dialect resolution as the H1 proxy_usage_ops: P/D rules carry
      * their engine dialect on the epval; plain AI-gateway rules fall back
-     * to the plain-LB profile. */
-    proxy_epval_t *epv = (proxy_epval_t *)pfe->epv;
+     * to the plain-LB profile. The pool is the STREAM's resolved pool —
+     * pfe->epv is connection-scoped and holds whichever pool the LATEST
+     * stream resolved, which on a multi-model connection is not this one. */
+    proxy_epval_t *epv = stream->route_epv
+                             ? (proxy_epval_t *)stream->route_epv
+                             : (proxy_epval_t *)pfe->epv;
     const pd_dialect_ops_t *uops =
       (epv && epv->pd_ops) ? epv->pd_ops : &pd_dialect_plain;
     if (uops->extract_usage)
@@ -261,25 +266,20 @@ destroy_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
     return;
   }
 
-  /* AI abort twin: a stream torn down before its response settled still
-   * holds an admission-time claim. The claim is epoch-tagged and would
-   * self-heal at the window rollover, but until then it denies admissions
-   * for a request that burned nothing — hand it back now (H1: the
-   * teardown resv_rel release in sockproxy_http.c). */
-  if (stream->ai_admitted && !stream->usage_consumed &&
-      stream->usage_reserved_toks) {
-    llb_ai_token_quota_consume(stream->tenant_id, stream->effective_model,
-                               stream->auth_user_id, stream->auth_key_id,
-                               stream->svc_ident, 0, 0, 0,
-                               (int)stream->usage_reserved_toks,
-                               stream->usage_res_epoch, NULL);
-    log_info("[AI_TOKENS][HTTP/2] released %u orphaned reserved tokens "
-             "tenant=%s stream=%d", stream->usage_reserved_toks,
-             stream->tenant_id, stream->stream_id);
-    stream->usage_reserved_toks = 0;
-    stream->usage_res_epoch = 0;
-    stream->usage_consumed = 1;
-  }
+  /* AI settle on teardown: the CLIENT stream is the settle unit and this
+   * is the one close that always fires for it. The backend-side stream
+   * close (proxy_h2_backend_on_stream_close_callback) also settles, but it
+   * races the client close — nghttp2 destroys the client stream as soon as
+   * the client's END_STREAM is acknowledged, which for a complete exchange
+   * beats the backend close, and once find_stream() can no longer reach the
+   * client stream the backend-side settle silently no-ops. Settling here
+   * makes metering happen exactly once (usage_consumed guards the double)
+   * for every admitted OR keyless stream, no matter which close wins:
+   *   - a completed response has its usage in the tail window → charged;
+   *   - a genuine abort has whatever arrived (usually nothing) charged and,
+   *     for admitted streams, the admission reservation released — the same
+   *     hand-back the previous abort-only block did, now never skipped. */
+  proxy_h2_settle_stream(session, stream);
 
 
   // Free data buffer if allocated
@@ -914,7 +914,8 @@ proxy_h2_backend_on_header_callback(nghttp2_session *session,
       backend_session->client_session) {
     proxy_h2_stream_t *ai_stream =
       find_stream(backend_session->client_session, mapping->client_stream_id);
-    if (ai_stream && ai_stream->ai_admitted && valuelen > 0 && valuelen < 4) {
+    if (ai_stream && (ai_stream->ai_admitted || ai_stream->ai_unmetered) &&
+        valuelen > 0 && valuelen < 4) {
       char st[4] = {0};
       memcpy(st, value, valuelen);
       ai_stream->metric_response_status = atoi(st);
@@ -1041,7 +1042,10 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       proxy_map_ent_t *node = (proxy_map_ent_t *)client_pfe->head;
       if (node && node->has_l7_policy &&
           l7_cookie_persist_active(client_pfe, node)) {
-        proxy_epval_t *tepval = (proxy_epval_t *)client_pfe->epv;
+        /* The pool must be the one THIS backend session belongs to —
+         * client_pfe->epv is connection-scoped and a concurrent stream
+         * routed through another pool may have overwritten it. */
+        proxy_epval_t *tepval = (proxy_epval_t *)backend_session->epv;
         int ep_idx = backend_session->ep_idx;   /* the backend this stream uses */
         char token[LB_COOKIE_TOKEN_MAX];
         if (tepval && ep_idx >= 0 && ep_idx < tepval->n_eps &&
@@ -1200,7 +1204,8 @@ proxy_h2_backend_on_data_chunk_recv_callback(nghttp2_session *session,
   if (len > 0) {
     proxy_h2_stream_t *ai_stream =
       find_stream(client_session, client_stream_id);
-    if (ai_stream && ai_stream->ai_admitted && !ai_stream->usage_consumed)
+    if (ai_stream && (ai_stream->ai_admitted || ai_stream->ai_unmetered) &&
+        !ai_stream->usage_consumed)
       proxy_h2_stream_tail_update(ai_stream, data, len);
   }
 
@@ -1345,34 +1350,42 @@ proxy_h2_backend_on_stream_close_callback(nghttp2_session *session,
 backend_h2_session_t *
 proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
                                proxy_fd_ent_t *pfe,
+                               int slot,
                                int ep_idx,
+                               void *epv,
                                int backend_fd,
                                void *ssl)
 {
   backend_h2_session_t *backend_session = NULL;
   nghttp2_session_callbacks *callbacks = NULL;
   int rv;
-  
-  if (!client_session || !pfe || ep_idx < 0 || backend_fd <= 0) {
+
+  if (!client_session || !pfe || slot < 0 || ep_idx < 0 || backend_fd <= 0) {
     log_error("[HTTP/2 Backend] Invalid parameters for backend session creation");
     return NULL;
   }
-  
-  // Check if backend session already exists for this endpoint
-  HASH_FIND_INT(client_session->backend_sessions, &ep_idx, backend_session);
+
+  /* Sessions are keyed by the per-connection SLOT, never by ep_idx: two
+   * model pools on one rule both contain an endpoint 0, and a stream of
+   * pool B must not be submitted into pool A's session because the
+   * indexes happen to match. The slot was allocated against (epv, ep_idx)
+   * by the forwarder, so a hit here is a same-pool, same-endpoint reuse. */
+  HASH_FIND_INT(client_session->backend_sessions, &slot, backend_session);
   if (backend_session) {
     return backend_session;
   }
-  
+
   // Create new backend session
   backend_session = calloc(1, sizeof(backend_h2_session_t));
   if (!backend_session) {
     log_error("[HTTP/2 Backend] ep[%d]: Failed to allocate backend session", ep_idx);
     return NULL;
   }
-  
+
   backend_session->backend_fd = backend_fd;
+  backend_session->slot = slot;
   backend_session->ep_idx = ep_idx;
+  backend_session->epv = epv;
   backend_session->client_session = client_session;
   backend_session->ssl = ssl;
   backend_session->connected = 1;
@@ -1436,7 +1449,7 @@ proxy_h2_get_backend_session(proxy_h2_session_t *client_session,
   pthread_mutex_unlock(&backend_session->send_lock);
   
   // Add to client session's backend sessions hash
-  HASH_ADD_INT(client_session->backend_sessions, ep_idx, backend_session);
+  HASH_ADD_INT(client_session->backend_sessions, slot, backend_session);
   
   return backend_session;
 }
@@ -2778,6 +2791,16 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
         char um_vip[INET6_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &ent->key.xip, um_vip, sizeof(um_vip));
         llb_ai_record_unmetered(um_vip);
+        /* Keyless still settles: the response's usage charges the per-VIP
+         * shared bucket keyed by svc_ident (tenant stays ""), the same
+         * exact-usage/deny-next contract the H1 relay applies — its settle
+         * gate is ai_gw_mode, not "admitted with an identity". Without
+         * this a service with only keyless traffic can never trip its own
+         * vip_shared_tpm on HTTP/2 while tripping it fine on HTTP/1. */
+        stream->ai_unmetered = 1;
+        snprintf(stream->svc_ident, sizeof(stream->svc_ident), "%s",
+                 adm_svc_ident);
+        stream->admit_mono_ns = get_timestamp_ns();
       }
     } else if (adm.verdict == AI_GW_ADMIT_DENY) {
       /* Terminal response on THIS stream; the multiplexed connection
@@ -2845,6 +2868,14 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     lookup_model = stream->x_model_header;
   else if (body_model[0])
     lookup_model = body_model;
+
+  /* Keyless streams settle and are recorded too; give those calls the
+   * H1-parity model label (the derived one — non-enforcing services get
+   * no gate-resolved model on purpose). Written AFTER the derivation
+   * above, so routing semantics are untouched. */
+  if (stream->ai_unmetered && !stream->effective_model[0] && lookup_model[0])
+    snprintf(stream->effective_model, sizeof(stream->effective_model), "%s",
+             lookup_model);
   
   // L7 content-routing discriminator + dispatch — the H2 seam.
   // IDENTICAL shared helper to the H1 seam (sockproxy_ep.c) so the two paths
@@ -3152,10 +3183,14 @@ h2_have_tepval:
   // ============================================================================
   // CRITICAL: Set endpoint context for statistics accounting
   // HTTP/2 forwards per-stream, so we set the client pfe's endpoint info
-  // to track stats for the selected backend endpoint
+  // to track stats for the selected backend endpoint. These two fields are
+  // connection-scoped last-write state kept for the byte accounting only —
+  // no per-stream decision may read them back (the settle dialect reads
+  // stream->route_epv, the cookie path reads the backend session's epv).
   // ============================================================================
   pfe->epv = tepval;
   pfe->ep_num = ep_idx;
+  stream->route_epv = tepval;
 
   // Store conversation mapping if this is first request
   if (stream->has_conv_id && stream->conversation_id[0] != '\0') {
@@ -3166,19 +3201,50 @@ h2_have_tepval:
       }
     }
   }
-  
+
   // ============================================================================
   // BACKEND CONNECTION & FORWARDING
   // ============================================================================
-  
+
   // Backend SSL connection handle (for end-to-end HTTPS mode)
   void *backend_ssl = NULL;
-  
-  // Get or create backend connection
-  if (ep_idx >= 0 && ep_idx < pfe->n_rfd) {
-    backend_fd = pfe->rfd[ep_idx];
+
+  /* Backend-connection identity is (pool, endpoint-in-pool), NEVER the
+   * endpoint index alone: with model-keyed rules one connection carries
+   * streams of several pools and every pool's eps[] starts at 0, so an
+   * index-keyed cache hands pool B's stream the connection dialed for
+   * pool A. rfd[]/rfd_ent[] therefore hold SLOTS: reuse requires the
+   * registered backend pfe to match BOTH the pool (epv) and the
+   * pool-relative endpoint index; a miss allocates the first free slot. */
+  int slot = -1;
+  for (int i = 0; i < pfe->n_rfd && i < MAX_PROXY_EP; i++) {
+    proxy_fd_ent_t *bpfe = pfe->rfd_ent[i];
+    if (bpfe && bpfe->epv == (void *)tepval && bpfe->ep_num == ep_idx &&
+        pfe->rfd[i] > 0) {
+      slot = i;
+      backend_fd = pfe->rfd[i];
+      break;
+    }
   }
-  
+  if (slot < 0) {
+    for (int i = 0; i < MAX_PROXY_EP; i++) {
+      if (pfe->rfd_ent[i] == NULL) {
+        slot = i;
+        break;
+      }
+    }
+    if (slot < 0) {
+      log_error("[HTTP/2] stream %d: no free backend slot (all %d in use)",
+                stream->stream_id, MAX_PROXY_EP);
+      if (pfe->h2_session && pfe->h2_session->session) {
+        nghttp2_submit_rst_stream(pfe->h2_session->session, NGHTTP2_FLAG_NONE,
+                                  stream->stream_id, NGHTTP2_REFUSED_STREAM);
+        nghttp2_session_send(pfe->h2_session->session);
+      }
+      return -1;
+    }
+  }
+
   if (backend_fd <= 0) {
     if (!tepval) {
       log_error("[HTTP/2] CRITICAL: tepval is NULL!");
@@ -3282,9 +3348,9 @@ h2_have_tepval:
       return -1;
     }
     
-    pfe->rfd[ep_idx] = backend_fd;
-    pfe->n_rfd = (ep_idx + 1 > pfe->n_rfd) ? ep_idx + 1 : pfe->n_rfd;
-    
+    pfe->rfd[slot] = backend_fd;
+    pfe->n_rfd = (slot + 1 > pfe->n_rfd) ? slot + 1 : pfe->n_rfd;
+
     // P2 Task 2.3: Record circuit breaker success
     circuit_breaker_record_success(tepval, ep_idx);
   }
@@ -3296,7 +3362,7 @@ h2_have_tepval:
   // Get or create backend HTTP/2 session
   // Pass backend_ssl (actual SSL connection) not ssl_epctx (SSL context)
   backend_h2_session_t *backend_session = proxy_h2_get_backend_session(
-    pfe->h2_session, pfe, ep_idx, backend_fd, backend_ssl);
+    pfe->h2_session, pfe, slot, ep_idx, tepval, backend_fd, backend_ssl);
   
   if (!backend_session) {
     log_error("[HTTP/2] stream %d: Failed to create backend HTTP/2 session for ep[%d]",
@@ -3327,7 +3393,7 @@ h2_have_tepval:
   //                           → proxy_notifier() sees backend pfe → processes response
   //
   // Only register if this is a NEW backend connection (not reused)
-  if (pfe->rfd_ent[ep_idx] == NULL) {
+  if (pfe->rfd_ent[slot] == NULL) {
     // Create proxy_fd_ent_t for backend connection
     proxy_fd_ent_t *backend_pfe = pfe_alloc();   /* D2 root fix: pooled pfe shell */
     if (!backend_pfe) {
@@ -3343,27 +3409,30 @@ h2_have_tepval:
     backend_pfe->odir = 1;                    // Backend direction (outbound from proxy)
     backend_pfe->head = ent;                  // Link to proxy_map_ent_t
     backend_pfe->protocol_version = 2;        // HTTP/2
-    backend_pfe->ep_num = ep_idx;             // Endpoint index
-    backend_pfe->epv = tepval;                // Endpoint value
+    backend_pfe->ep_num = ep_idx;             // Endpoint index INSIDE its pool —
+    backend_pfe->epv = tepval;                // with epv this pair IS the slot's
+                                              // reuse identity (see slot search)
     backend_pfe->stype = PROXY_SOCK_ACTIVE;   // Active connection
     backend_pfe->used = 1;                    // Mark as in use
     backend_pfe->backend_h2_session = backend_session;  // For event handler lookup
     
     // Link backend pfe to client pfe (bidirectional)
-    pfe->rfd_ent[ep_idx] = backend_pfe;
+    pfe->rfd_ent[slot] = backend_pfe;
     backend_pfe->rfd_ent[0] = pfe;            // Back-link to client pfe
     backend_pfe->n_rfd = 1;
-    
+
     // ✅ CRITICAL: Register with event loop - enables backend response handling
     if (proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, backend_pfe) != 0) {
       log_error("[HTTP/2] stream %d: Failed to register backend fd=%d with event loop",
                 stream->stream_id, backend_fd);
-      pfe->rfd_ent[ep_idx] = NULL;   /* D2 root fix: unlink before recycling the shell */
+      pfe->rfd_ent[slot] = NULL;   /* D2 root fix: unlink before recycling the shell */
+      pfe->rfd[slot] = -1;         /* the fd closes below; a stale positive here
+                                    * would satisfy the reuse probe forever */
       pfe_recycle(backend_pfe);      /* pool the shell (frees rcvbuf, bumps gen) */
       close(backend_fd);
       return -1;
     }
-  } 
+  }
   
   // ============================================================================
   // GENERIC HEADER FORWARDING: Use all collected headers for protocol transparency
@@ -3548,7 +3617,7 @@ h2_have_tepval:
           }
 
           // Get backend pfe for EPOLLOUT registration
-          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[ep_idx];
+          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[slot];
           if (backend_pfe) {
             // Register EPOLLOUT for retry when socket becomes writable
             proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
@@ -3593,7 +3662,7 @@ h2_have_tepval:
           }
 
           // Get backend pfe for EPOLLOUT registration
-          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[ep_idx];
+          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[slot];
           if (backend_pfe) {
             // Register EPOLLOUT for retry when socket becomes writable
             proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
