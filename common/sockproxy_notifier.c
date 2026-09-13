@@ -80,6 +80,21 @@ int proxy_notify_add_fd(int fd, int type, void *priv)
                         priv ? ((proxy_fd_ent_t *)priv)->gen : 0);
 }
 
+/* Pinned variant: the new fd inherits pin_fd's notify worker, so both legs of
+ * one logical connection serialize on a single thread — the same guarantee the
+ * HTTP/1.1 backend path gets from notify_add_ent_pinned. Without it a backend
+ * fd shards by fd number and its relay handler can run concurrently with the
+ * client fd's proxy_pdestroy on another worker. */
+int proxy_notify_add_fd_pinned(int fd, int type, void *priv, int pin_fd)
+{
+  if (!proxy_struct || !proxy_struct->ns) {
+    return -1;
+  }
+  return notify_add_ent_pinned(proxy_struct->ns, fd, type, priv,
+                               priv ? ((proxy_fd_ent_t *)priv)->gen : 0,
+                               pin_fd);
+}
+
 int proxy_notify_delete_fd(int fd, int evict)
 {
   if (!proxy_struct || !proxy_struct->ns) {
