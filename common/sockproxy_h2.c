@@ -290,10 +290,16 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
    * at all. Charges nothing, by decision and not by omission — the same
    * settled answer the H1 reporters carry. */
   if (!usage_read && proxy_status_is_2xx(stream->metric_response_status)) {
-    llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model);
+    /* H2_STREAM_CLOSE rather than RESPONSE_COMPLETE: destroy_stream runs the
+     * same close for a response that finished and for one aborted after its
+     * 2xx headers, and nghttp2's error code is not plumbed this far, so the
+     * boundary is all this site can honestly claim. */
+    llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model,
+                                LLB_AI_UMISS_H2_STREAM_CLOSE);
     log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
-             "object tenant=%s model=%s (reported, not charged)",
-             stream->stream_id, stream->tenant_id, stream->effective_model);
+             "object tenant=%s model=%s reason=%s (reported, not charged)",
+             stream->stream_id, stream->tenant_id, stream->effective_model,
+             LLB_AI_UMISS_H2_STREAM_CLOSE);
   }
 
   log_info("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",

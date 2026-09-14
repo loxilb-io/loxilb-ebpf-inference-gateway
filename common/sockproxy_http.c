@@ -5148,10 +5148,17 @@ proxy_pdestroy(void *priv)
    * read, which is the counter's stated contract for every completed
    * response, streamed or not. */
   if (usage_missing.pending) {
-    llb_ai_record_usage_missing(usage_missing.tenant, usage_missing.model);
+    /* CONNECTION_CLOSE, not RESPONSE_COMPLETE: this fired because the
+     * connection went away. The 2xx status was seen, but nothing here proves
+     * the exchange finished — a client that took the headers and cut lands on
+     * exactly this path. Naming the boundary keeps that ambiguity in the
+     * label instead of hiding it behind a guess. */
+    llb_ai_record_usage_missing(usage_missing.tenant, usage_missing.model,
+                                LLB_AI_UMISS_CONNECTION_CLOSE);
     log_info("[AI_TOKENS] response completed with no usage object "
-             "tenant=%s model=%s (reported, not charged)",
-             usage_missing.tenant, usage_missing.model);
+             "tenant=%s model=%s reason=%s (reported, not charged)",
+             usage_missing.tenant, usage_missing.model,
+             LLB_AI_UMISS_CONNECTION_CLOSE);
   }
 
   /* Deferred HTTP/2 in-flight settles (collected above under PROXY_LOCK).
@@ -5174,10 +5181,15 @@ proxy_pdestroy(void *priv)
        * with no backend status never completed a response, so it is a
        * release, not an accounting hole. Reports, charges nothing. */
       if (e->usage_missing) {
-        llb_ai_record_usage_missing(e->tenant, e->model);
+        /* Collected by the teardown sweep, so the boundary is the connection
+         * dying with this stream still in flight — the H2 twin of the H1
+         * report above, and the same ambiguity. */
+        llb_ai_record_usage_missing(e->tenant, e->model,
+                                    LLB_AI_UMISS_CONNECTION_CLOSE);
         log_info("[AI_TOKENS][HTTP/2] teardown settle: response completed with "
-                 "no usage object tenant=%s model=%s (reported, not charged)",
-                 e->tenant, e->model);
+                 "no usage object tenant=%s model=%s reason=%s "
+                 "(reported, not charged)", e->tenant, e->model,
+                 LLB_AI_UMISS_CONNECTION_CLOSE);
       }
     }
     log_info("[AI_TOKENS][HTTP/2] teardown settle tenant=%s prompt=%d "
@@ -6849,8 +6861,13 @@ handle_on_message_begin(llhttp_t* parser)
      * whatever request N+1 turns out to be. Reporting only; nothing is
      * charged, exactly as on the connection-teardown twin in proxy_pdestroy. */
     if (proxy_usage_went_unreported(pfe)) {
+      /* RESPONSE_COMPLETE — the strongest of the three boundaries. Reaching
+       * this reset means the client sent request N+1 on this connection, so
+       * response N demonstrably finished and the backend simply did not put a
+       * usage object in it. No teardown race, no possible client cut. */
       llb_ai_record_usage_missing((char *)pfe->tenant_id,
-                                  (char *)proxy_effective_model(pfe));
+                                  (char *)proxy_effective_model(pfe),
+                                  LLB_AI_UMISS_RESPONSE_COMPLETE);
       pfe->metric_ai_recorded = 0;   /* reported once */
     }
     pfe->x_api_key_raw[0] = '\0';
