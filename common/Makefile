@@ -462,9 +462,16 @@ test_conv_pool_alias_via_sockproxy: test_conv_pool_alias.c sockproxy_conv_pool.h
 # be used for that: test_kv_exact reads a fixture from the GATEWAY repo
 # (../../cicd/common/kv_hash/fixtures), which does not exist in this checkout.
 .PHONY: test_conv
-test_conv: test_conv_pool_alias test_conv_pool_alias_via_sockproxy
+test_conv: test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool
 	./test_conv_pool_alias
 	./test_conv_pool_alias_via_sockproxy
+	./test_ep_health_pool
+
+# A health signal must reach the endpoint it is about. An endpoint index is
+# pool-local; the address is not. Header-only, so it runs here rather than
+# waiting for the gateway repo's pin to move.
+test_ep_health_pool: test_ep_health_pool.c sockproxy_ep_health.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
 
 # Generated engine wire IDs + strict dialect resolution (fail-closed on
 # unknown kv_engine_type). gc-sections keeps only the functions under test.
@@ -549,7 +556,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
+	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

@@ -333,6 +333,9 @@ typedef struct llm_prefix_key {
  * layout in every translation unit whatever order the two headers arrive in;
  * the assert keeps that independence honest rather than accidental. */
 #include "sockproxy_conv_pool.h"
+/* endpoint health identity: which endpoint a health signal is about, and
+ * when a bare index may be resolved at all. */
+#include "sockproxy_ep_health.h"
 _Static_assert(CONV_POOL_KEY_MAX >= 16 + 1 + MAX_CONV_ID_LEN + 1,
                "conv_map key must hold the pool tag and a full-length conv_id");
 
@@ -1597,6 +1600,11 @@ int proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,
 int proxy_add_entry(struct proxy_ent *new_ent, struct proxy_arg *arg);
 int proxy_delete_entry(struct proxy_ent *ent, struct proxy_arg *arg);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);
+/* Health keys on the endpoint ADDRESS, which names the same backend in every
+ * pool, rather than on a pool-local index. ep_port 0 matches any port on the
+ * address (a host-level signal); non-zero matches exactly. */
+int proxy_update_ep_health_by_addr(struct proxy_ent *key, uint32_t ep_ip,
+                                   uint16_t ep_port, uint8_t inactive);
 int proxy_update_ep_health_by_ip(struct proxy_ent *key, uint32_t ep_ip, uint8_t inactive);
 
 /* Synchronous single-writer setter for the per-entry kv_exact_contract
