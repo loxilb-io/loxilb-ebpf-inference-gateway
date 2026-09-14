@@ -443,16 +443,22 @@ test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.
 test_model_routing: test_model_routing.c sockproxy_routing.c sockproxy_routing.h sockproxy_internal.h
 	$(CC) -Wall -Wextra -o $@ test_model_routing.c sockproxy_routing.c -I.
 
+# Conversation stickiness may not cross model pools on one VIP:port -- the
+# (pool, endpoint-in-pool) identity rule for ent->val.conv_map. Header-only.
+test_conv_pool_alias: test_conv_pool_alias.c sockproxy_conv_pool.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
 # Generated engine wire IDs + strict dialect resolution (fail-closed on
 # unknown kv_engine_type). gc-sections keeps only the functions under test.
 test_pd_ids: test_pd_ids.c sockproxy_pd_core.c sockproxy_pd_ids.h sockproxy_pd.h
 	$(CC) -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ $< -I. -DTEST_PD_IDS
 
 .PHONY: test_kv
-test_kv: test_kv_exact test_model_routing test_pd_ids
+test_kv: test_kv_exact test_model_routing test_pd_ids test_conv_pool_alias
 	./test_kv_exact
 	./test_model_routing
 	./test_pd_ids
+	./test_conv_pool_alias
 
 # AI-gateway token accounting: usage-object extraction unit tests
 # (compiles sockproxy_json.c into the test TU; log.c is stubbed inside)
@@ -524,7 +530,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
+	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

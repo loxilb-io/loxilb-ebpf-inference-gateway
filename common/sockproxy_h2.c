@@ -95,8 +95,10 @@ int chwbl_ring_lookup(chwbl_ring_t *ring, uint64_t hash);
 uint64_t compute_prefix_hash(llm_prefix_key_t *key);
 int extract_llm_prefix(const char *json_str, size_t json_len, llm_prefix_key_t *key);
 #endif
-conversation_mapping_t* get_conversation_mapping(proxy_map_ent_t *ent, const char *conv_id);
-int store_conversation_endpoint(proxy_map_ent_t *ent, const char *conv_id, int ep_idx);
+conversation_mapping_t* get_conversation_mapping(proxy_map_ent_t *ent, const char *conv_id,
+                                                 const proxy_epval_t *epv);
+int store_conversation_endpoint(proxy_map_ent_t *ent, const char *conv_id, int ep_idx,
+                                const proxy_epval_t *epv);
 
 // ============================================================================
 // Stream Management Helpers
@@ -3250,7 +3252,12 @@ h2_have_tepval:
 
   // P0.3: Check conversation tracking first (sticky routing)
   if (ep_idx < 0 && stream->has_conv_id && stream->conversation_id[0] != '\0') {
-    conversation_mapping_t *conv_map = get_conversation_mapping(ent, stream->conversation_id);
+    /* tepval is the pool THIS stream resolved to. A row stored by the other
+     * model's pool on this VIP must not answer here: it would both hand us an
+     * index chosen for a different endpoint list and suppress the store of our
+     * own binding just below. */
+    conversation_mapping_t *conv_map =
+        get_conversation_mapping(ent, stream->conversation_id, tepval);
     if (conv_map) {
       ep_idx = conv_map->ep_idx;
       
@@ -3369,8 +3376,9 @@ h2_have_tepval:
 
   // Store conversation mapping if this is first request
   if (stream->has_conv_id && stream->conversation_id[0] != '\0') {
-    if (!get_conversation_mapping(ent, stream->conversation_id)) {
-      if (store_conversation_endpoint(ent, stream->conversation_id, ep_idx) == 0) {
+    if (!get_conversation_mapping(ent, stream->conversation_id, tepval)) {
+      if (store_conversation_endpoint(ent, stream->conversation_id, ep_idx,
+                                      tepval) == 0) {
         log_debug("[HTTP/2] stream %d: Stored conversation mapping: %s → ep[%d]",
                   stream->stream_id, stream->conversation_id, ep_idx);
       }

@@ -41,6 +41,7 @@
 #include "sockproxy_lb.h"       /* wrr_select_endpoint, chwbl_select_endpoint, chwbl_dec_load */
 #include "sockproxy_health.h"   /* is_endpoint_healthy, circuit_breaker_record_failure/success */
 #include "sockproxy_kv_exact.h" /* pd_kv_exact_select (single-role Tier-1.5 branch) */
+#include "sockproxy_conv_pool.h" /* conv_pool_tag_of_key, conv_pool_tag_matches */
 #include "sockproxy_ep.h"       /* own header */
 #include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
 
@@ -119,19 +120,31 @@ session_key_hash(const char *session_key)
 static int __attribute__((unused))
 lookup_conversation_endpoint(proxy_map_ent_t *ent, 
                               const char *conv_id,
-                              int *ep_idx)
+                              int *ep_idx,
+                              const proxy_epval_t *epv)
 {
   conversation_mapping_t *mapping = NULL;
   time_t now = time(NULL);
+  uint64_t want_tag;
+  char hkey[CONV_POOL_KEY_MAX];
   int found = 0;
   
   if (!conv_id || conv_id[0] == '\0') {
     return -1;
   }
+
+  want_tag = conv_pool_tag_of_key(epv ? epv->ephash_key : NULL);
+  conv_pool_make_key(hkey, sizeof(hkey), want_tag, conv_id);
   
   // CRITICAL-2 FIX: Use WRITE lock since we modify mapping fields
   pthread_rwlock_wrlock(&ent->val.conv_lock);
-  HASH_FIND_STR(ent->val.conv_map, conv_id, mapping);
+  /* Keyed by (pool, conv_id): another pool's binding for the same
+   * conversation id lives in its own row and is invisible here. */
+  HASH_FIND_STR(ent->val.conv_map, hkey, mapping);
+
+  if (mapping && !conv_pool_tag_matches(mapping->pool_tag, want_tag)) {
+    mapping = NULL;
+  }
 
   if (mapping) {
     *ep_idx = mapping->ep_idx;
@@ -152,16 +165,28 @@ lookup_conversation_endpoint(proxy_map_ent_t *ent,
 
 // P0.3: Get conversation mapping with full metadata (for smart validation)
 conversation_mapping_t*
-get_conversation_mapping(proxy_map_ent_t *ent, const char *conv_id)
+get_conversation_mapping(proxy_map_ent_t *ent, const char *conv_id,
+                         const proxy_epval_t *epv)
 {
   conversation_mapping_t *mapping = NULL;
+  uint64_t want_tag;
+  char hkey[CONV_POOL_KEY_MAX];
   
   if (!conv_id || conv_id[0] == '\0') {
     return NULL;
   }
+
+  want_tag = conv_pool_tag_of_key(epv ? epv->ephash_key : NULL);
+  conv_pool_make_key(hkey, sizeof(hkey), want_tag, conv_id);
   
   pthread_rwlock_rdlock(&ent->val.conv_lock);
-  HASH_FIND_STR(ent->val.conv_map, conv_id, mapping);
+  /* Keyed by (pool, conv_id): this pool sees only its OWN binding for the
+   * conversation, so it neither consumes nor evicts another pool's row. The
+   * tag check below is belt-and-braces against a key collision. */
+  HASH_FIND_STR(ent->val.conv_map, hkey, mapping);
+  if (mapping && !conv_pool_tag_matches(mapping->pool_tag, want_tag)) {
+    mapping = NULL;
+  }
   pthread_rwlock_unlock(&ent->val.conv_lock);
   
   return mapping;
@@ -172,17 +197,29 @@ static void __attribute__((unused))
 update_conversation_validation(proxy_map_ent_t *ent,
                                 const char *conv_id,
                                 uint64_t metrics_version,
-                                uint8_t is_healthy)
+                                uint8_t is_healthy,
+                                const proxy_epval_t *epv)
 {
   conversation_mapping_t *mapping = NULL;
+  uint64_t want_tag;
+  char hkey[CONV_POOL_KEY_MAX];
   
   if (!conv_id || conv_id[0] == '\0') {
     return;
   }
+
+  want_tag = conv_pool_tag_of_key(epv ? epv->ephash_key : NULL);
+  conv_pool_make_key(hkey, sizeof(hkey), want_tag, conv_id);
   
   pthread_rwlock_wrlock(&ent->val.conv_lock);
-  HASH_FIND_STR(ent->val.conv_map, conv_id, mapping);
+  HASH_FIND_STR(ent->val.conv_map, hkey, mapping);
   
+  /* Health validated against this pool says nothing about another pool's
+   * endpoint of the same index. */
+  if (mapping && !conv_pool_tag_matches(mapping->pool_tag, want_tag)) {
+    mapping = NULL;
+  }
+
   if (mapping) {
     mapping->cached_metrics_version = metrics_version;
     mapping->validated_healthy = is_healthy;
@@ -196,20 +233,34 @@ update_conversation_validation(proxy_map_ent_t *ent,
 int 
 store_conversation_endpoint(proxy_map_ent_t *ent,
                             const char *conv_id,
-                            int ep_idx)
+                            int ep_idx,
+                            const proxy_epval_t *epv)
 {
   conversation_mapping_t *mapping;
   conversation_mapping_t *existing = NULL;
   time_t now = time(NULL);
+  uint64_t pool_tag;
+  char hkey[CONV_POOL_KEY_MAX];
   
   if (!conv_id || conv_id[0] == '\0') {
     return -1;
   }
+
+  /* An index stored without its pool can never be applied again (every
+   * lookup fails closed), so refuse the store outright rather than filling
+   * the table with dead rows. */
+  pool_tag = conv_pool_tag_of_key(epv ? epv->ephash_key : NULL);
+  if (pool_tag == CONV_POOL_TAG_UNKNOWN) {
+    return -1;
+  }
+  conv_pool_make_key(hkey, sizeof(hkey), pool_tag, conv_id);
   
   pthread_rwlock_wrlock(&ent->val.conv_lock);
   
-  // CRITICAL FIX: Check if mapping already exists (prevents memory leak on duplicate)
-  HASH_FIND_STR(ent->val.conv_map, conv_id, existing);
+  /* Keyed by (pool, conv_id): "already exists" means THIS pool already bound
+   * this conversation. Another pool's row for the same id is a different key
+   * and is left untouched. */
+  HASH_FIND_STR(ent->val.conv_map, hkey, existing);
   
   if (existing) {
     /* capture state under wrlock for emit-after-unlock. */
@@ -219,6 +270,9 @@ store_conversation_endpoint(proxy_map_ent_t *ent,
 
     // Update existing mapping instead of creating duplicate
     existing->ep_idx = ep_idx;
+    /* Re-stamp: this conv_id is being (re-)bound to THIS pool, so the row's
+     * owner changes with the index it carries. The two must move together. */
+    existing->pool_tag = pool_tag;
     existing->last_access_ts = now;
     existing->request_count++;
     existing->cached_metrics_version = 0;  // Reset validation state
@@ -252,7 +306,9 @@ store_conversation_endpoint(proxy_map_ent_t *ent,
 
   strncpy(mapping->conv_id, conv_id, sizeof(mapping->conv_id)-1);
   mapping->conv_id[sizeof(mapping->conv_id)-1] = '\0';
+  memcpy(mapping->hkey, hkey, sizeof(mapping->hkey));
   mapping->ep_idx = ep_idx;
+  mapping->pool_tag = pool_tag;
   mapping->created_ts = now;
   mapping->last_access_ts = now;
   mapping->request_count = 1;
@@ -261,7 +317,7 @@ store_conversation_endpoint(proxy_map_ent_t *ent,
   mapping->cached_metrics_version = 0;  // Will be set on first validation
   mapping->validated_healthy = 0;       // Not yet validated
 
-  HASH_ADD_STR(ent->val.conv_map, conv_id, mapping);
+  HASH_ADD_STR(ent->val.conv_map, hkey, mapping);
   /* capture state under wrlock for emit-after-unlock. */
   {
     uint64_t emit_created_ts    = mapping->created_ts;
@@ -879,7 +935,8 @@ pd_fallback_normal:
             snprintf(ns_session_key, sizeof(ns_session_key), "custom_%s_%s",
                      tepval->session_header_name, custom_session_header);
             int ns_bound = -1;
-            if (lookup_conversation_endpoint(node, ns_session_key, &ns_bound) == 0 &&
+            if (lookup_conversation_endpoint(node, ns_session_key, &ns_bound,
+                                             tepval) == 0 &&
                 ns_bound >= 0 && ns_bound < tepval->n_eps &&
                 tepval->eps[ns_bound].inv == 0 &&
                 is_endpoint_healthy(tepval, ns_bound)) {
@@ -1252,7 +1309,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
                                     tepval->session_header_enabled,
                                     ns_used_learned)) {
           if (ns_session_key[0] != '\0') {
-            store_conversation_endpoint(node, ns_session_key, sel);
+            store_conversation_endpoint(node, ns_session_key, sel, tepval);
           }
           ep_sel->ep_cfds[0].needs_learning = 1;
           strncpy(ep_sel->session_header_name, tepval->session_header_name,
@@ -1352,7 +1409,8 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
                      custom_session_header);
             
             // Try to lookup learned session binding
-            if (lookup_conversation_endpoint(node, session_key, &selected_ep) == 0) {
+            if (lookup_conversation_endpoint(node, session_key, &selected_ep,
+                                             tepval) == 0) {
               // CRITICAL FIX: Validate learned endpoint before using
               if (selected_ep >= 0 && selected_ep < tepval->n_eps) {
                 // Check if endpoint is still active/healthy
@@ -1376,7 +1434,19 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
                            session_key, selected_ep, tepval->eps[selected_ep].inv);
                   pthread_rwlock_wrlock(&node->val.conv_lock);
                   conversation_mapping_t *stale_mapping = NULL;
-                  HASH_FIND_STR(node->val.conv_map, session_key, stale_mapping);
+                  char stale_hkey[CONV_POOL_KEY_MAX];
+                  conv_pool_make_key(stale_hkey, sizeof(stale_hkey),
+                                     conv_pool_tag_of_key(tepval->ephash_key),
+                                     session_key);
+                  HASH_FIND_STR(node->val.conv_map, stale_hkey, stale_mapping);
+                  /* The lock was dropped since the lookup above, so the row may
+                   * have been re-bound to another pool meanwhile. Only this
+                   * pool's own stale row may be deleted. */
+                  if (stale_mapping &&
+                      !conv_pool_tag_matches(stale_mapping->pool_tag,
+                                             conv_pool_tag_of_key(tepval->ephash_key))) {
+                    stale_mapping = NULL;
+                  }
                   /* capture state under wrlock for emit-after-unlock. */
                   int      emit_stale_present = 0;
                   uint64_t emit_stale_created_ts = 0;
@@ -1404,7 +1474,17 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
                 // CRITICAL FIX: Out of bounds - DELETE invalid mapping
                 pthread_rwlock_wrlock(&node->val.conv_lock);
                 conversation_mapping_t *invalid_mapping = NULL;
-                HASH_FIND_STR(node->val.conv_map, session_key, invalid_mapping);
+                char invalid_hkey[CONV_POOL_KEY_MAX];
+                conv_pool_make_key(invalid_hkey, sizeof(invalid_hkey),
+                                 conv_pool_tag_of_key(tepval->ephash_key),
+                                 session_key);
+                HASH_FIND_STR(node->val.conv_map, invalid_hkey, invalid_mapping);
+                /* Same re-bind window as the stale branch above. */
+                if (invalid_mapping &&
+                    !conv_pool_tag_matches(invalid_mapping->pool_tag,
+                                           conv_pool_tag_of_key(tepval->ephash_key))) {
+                  invalid_mapping = NULL;
+                }
                 /* capture state under wrlock for emit-after-unlock. */
                 int      emit_inv_present = 0;
                 uint64_t emit_inv_created_ts = 0;
@@ -1591,7 +1671,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
             char imm_key[256];
             snprintf(imm_key, sizeof(imm_key), "custom_%s_%s",
                      tepval->session_header_name, custom_session_header);
-            if (store_conversation_endpoint(node, imm_key, selected_ep) == 0) {
+            if (store_conversation_endpoint(node, imm_key, selected_ep, tepval) == 0) {
               log_info("[NS_STICKY_STORE] stored '%s' → ep[%d]", imm_key, selected_ep);
             } else {
               log_warn("[NS_STICKY_STORE] FAILED to store '%s' → ep[%d] (calloc/lock failed?)", imm_key, selected_ep);

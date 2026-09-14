@@ -317,20 +317,33 @@ restart:
 
 // P2: Proactive session cleanup - Remove all conversation mappings for inactive endpoint
 // This prevents memory waste and re-learning overhead when endpoints go down
+//
+// Scoped to ONE pool: conv_map is shared by every pool on the VIP and an
+// endpoint index is only meaningful inside its own pool's eps[]. Matching on
+// the index alone evicted every other pool's conversations that happened to
+// sit at the same index - different, still-healthy endpoints.
 uint32_t
-cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index)
+cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index,
+                          const proxy_epval_t *epv)
 {
   conversation_mapping_t *mapping, *tmp;
+  uint64_t pool_tag;
   uint32_t removed = 0;
   
   if (!ent || ep_index < 0) {
+    return 0;
+  }
+
+  pool_tag = conv_pool_tag_of_key(epv ? epv->ephash_key : NULL);
+  if (pool_tag == CONV_POOL_TAG_UNKNOWN) {
     return 0;
   }
   
   pthread_rwlock_wrlock(&ent->val.conv_lock);
   
   HASH_ITER(hh, ent->val.conv_map, mapping, tmp) {
-    if (mapping->ep_idx == ep_index) {
+    if (mapping->ep_idx == ep_index &&
+        conv_pool_tag_matches(mapping->pool_tag, pool_tag)) {
       HASH_DEL(ent->val.conv_map, mapping);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[CONV_EP_DOWN] Removed stale session mapping '%s' → ep[%d] (proactive cleanup)",

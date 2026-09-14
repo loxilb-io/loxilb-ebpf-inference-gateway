@@ -61,7 +61,8 @@ uint32_t count_active_connections_to_endpoint(proxy_map_ent_t *ent, int ep_index
 void force_close_endpoint_connections(proxy_map_ent_t *ent, int ep_index);
 
 /* Remove all conversation/session mappings for an inactive endpoint */
-uint32_t cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index);
+uint32_t cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index,
+                                  const proxy_epval_t *epv);
 
 /* -------------------------------------------------------------------------
  * Background drain checker thread
