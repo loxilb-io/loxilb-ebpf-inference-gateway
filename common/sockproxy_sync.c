@@ -177,13 +177,13 @@ apply_conv_sync_entry(proxy_map_ent_t *ent, proxy_epval_t *tepval,
     memcpy(m->hkey, hkey, sizeof(m->hkey));
     m->ep_idx         = ev->ep_idx;
     /* proxy_sync_event_t carries no pool identity (its service_key is only
-     * xip:xport:proto), so the tag can only name the pool pick_tepval_for_sync
-     * guessed. On a single-pool service that guess is the right pool and
-     * failover stickiness is preserved; on a multi-pool service a later turn
-     * that resolves to a different pool now MISSES and re-selects instead of
-     * being handed this index. Carrying the pool on the wire needs a
-     * proxy_sync_event_t field and its two Go-side cgo mirrors, so it lands
-     * separately. */
+     * xip:xport:proto), so this tag can only name the pool
+     * pick_tepval_for_sync resolved. That is sound ONLY because the caller
+     * refuses multi-pool services outright: with more than one pool the row
+     * would be tagged as belonging to the guessed pool, so that pool would
+     * MATCH it rather than miss, and be handed an index chosen inside a
+     * different eps[]. Here there is exactly one pool, so the guess is the
+     * answer. */
     m->pool_tag       = pool_tag;
     m->created_ts     = ev->created_ts;
     m->last_access_ts = ev->last_access_ts;
@@ -269,8 +269,30 @@ proxy_sync_apply_session_entry(const proxy_sync_event_t *ev)
    * == -1) fall through to the pd_session_map path below. Without this the
    * receiver dropped every conversation entry into pd_session_map and left
    * conv_map empty, so X-Conversation-Id stickiness never survived failover. */
-  if (ev->ep_idx >= 0 && ev->prefill_ep_idx < 0 && ev->decode_ep_idx < 0)
+  if (ev->ep_idx >= 0 && ev->prefill_ep_idx < 0 && ev->decode_ep_idx < 0) {
+    /* proxy_sync_event_t carries no pool identity, so on a service with more
+     * than one pool pick_tepval_for_sync can only GUESS which one the remote
+     * ep_idx belongs to - and the row it writes is then tagged as that pool's
+     * own. A wrong guess is not a miss, it is the cross-pool aliasing this
+     * whole keying exists to prevent, laundered through failover with a tag
+     * that certifies it: an install hands one pool an index chosen inside
+     * another (in range and healthy, so no later check can catch it), and a
+     * DELETE removes a live binding belonging to a pool the event never
+     * named. Refuse instead. The entry is reported as an apply error, which
+     * is metered, rather than silently dropped; single-pool services are
+     * unaffected because there the guess is the only possible answer.
+     *
+     * Carrying the pool on the wire needs a proxy_sync_event_t field and its
+     * Go-side mirrors, and lands separately - at which point this refusal is
+     * replaced by the real identity rather than relaxed. */
+    if (!conv_pool_sync_may_apply(HASH_COUNT(ent->val.ephash))) {
+      log_info("[XSYNC] conv entry for %s refused: %u pools on this service and "
+               "the event names none; stickiness will be re-learned locally",
+               ev->service_key, HASH_COUNT(ent->val.ephash));
+      return SYNC_APPLY_ERROR;
+    }
     return apply_conv_sync_entry(ent, tepval, ev);
+  }
 
   /* HEALTH GATE — SPEC A5. LAST step before wrlock acquire. */
   if (ev->prefill_ep_idx >= 0 &&

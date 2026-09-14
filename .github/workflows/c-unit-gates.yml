@@ -44,3 +44,9 @@ jobs:
 
       - name: Admission-gate identity transport and the keyless shared bucket
         run: make -C common test_aiident
+
+      # Built in both include orders: conversation_mapping_t embeds a
+      # CONV_POOL_KEY_MAX array, so a key size that moved with include order
+      # would give that struct two layouts with no compiler diagnostic.
+      - name: Conversation stickiness names its pool, and its key has one size
+        run: make -C common test_conv
