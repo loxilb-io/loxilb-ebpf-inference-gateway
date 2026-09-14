@@ -3380,11 +3380,23 @@ proxy_update_ep_health_by_addr(proxy_ent_t *key, uint32_t ep_ip,
 
       PROXY_UNLOCK();
       if (matched == 0) {
+        /* inet_ntoa returns ONE static buffer, so two of them in a single
+         * call print the same address twice - here that would name the
+         * service as the missing endpoint. Separate buffers, as elsewhere in
+         * this file. */
+        char ep_str[INET_ADDRSTRLEN], svc_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, (struct in_addr *)&ep_ip, ep_str, sizeof(ep_str));
+        inet_ntop(AF_INET, (struct in_addr *)&key->xip, svc_str, sizeof(svc_str));
         log_error("EP health - %s:%u not found in service %s:%u",
-                  inet_ntoa(*(struct in_addr *)&ep_ip), ntohs(ep_port),
-                  inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
+                  ep_str, ntohs(ep_port), svc_str, ntohs(key->xport));
         return -ENOENT;
       }
+      /* "every pool" is the point of this function, so say how many rows the
+       * signal actually reached - one is the normal single-pool case, more
+       * means the backend is shared. */
+      log_info("EP health - %s:%u -> inactive=%u applied to %d endpoint row(s)",
+               inet_ntoa(*(struct in_addr *)&ep_ip), ntohs(ep_port),
+               inactive, matched);
       return 0;
     }
     ent = ent->next;
@@ -3400,7 +3412,7 @@ int
 proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
 {
   proxy_map_ent_t *ent;
-  proxy_epval_t *tepval, *tmp_epval;
+  proxy_epval_t *tepval;
   time_t now = time(NULL);
   unsigned int n_pools;
 
@@ -3439,31 +3451,32 @@ proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
         return -EINVAL;
       }
 
-      HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-        // Validate endpoint index
-        if (ep_index >= tepval->n_eps) {
-          PROXY_UNLOCK();
-          log_error("P2: proxy_update_ep_health - invalid ep_index %d (max: %d)",
-                    ep_index, tepval->n_eps);
-          return -EINVAL;
-        }
+      /* Exactly one pool by the check above, and uthash's head IS that
+       * element - so take it directly rather than iterating. Returning from
+       * inside a HASH_ITER body is precisely the shape that made this
+       * function only ever touch the first pool; it is not reintroduced here
+       * even in a case where one iteration is all there is. */
+      tepval = ent->val.ephash;
 
-        ep_health_apply(ent, tepval, ep_index, inactive, now);
-
+      // Validate endpoint index
+      if (ep_index >= tepval->n_eps) {
         PROXY_UNLOCK();
-
-        // Note: Existing connections continue (graceful draining by default)
-        // - NEW connections: Will skip this endpoint if inactive=1
-        // - EXISTING connections: Continue using established sockets
-        // - Timed policy: Will force-close after drain_timeout_sec
-        // - Immediate policy: Connections closed immediately
-
-        return 0;
+        log_error("P2: proxy_update_ep_health - invalid ep_index %d (max: %d)",
+                  ep_index, tepval->n_eps);
+        return -EINVAL;
       }
 
+      ep_health_apply(ent, tepval, ep_index, inactive, now);
+
       PROXY_UNLOCK();
-      log_error("P2: proxy_update_ep_health - no ephash entry found");
-      return -ENOENT;
+
+      // Note: Existing connections continue (graceful draining by default)
+      // - NEW connections: Will skip this endpoint if inactive=1
+      // - EXISTING connections: Continue using established sockets
+      // - Timed policy: Will force-close after drain_timeout_sec
+      // - Immediate policy: Connections closed immediately
+
+      return 0;
     }
     ent = ent->next;
   }
@@ -3536,9 +3549,13 @@ int
 proxy_update_ep_health_by_ip(proxy_ent_t *key, uint32_t ep_ip, uint8_t inactive)
 {
   if (key) {
+    /* Separate buffers: inet_ntoa has one static buffer, so calling it twice
+     * in a single log line prints one address in both slots. */
+    char svc_str[INET_ADDRSTRLEN], ep_str[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, (struct in_addr *)&key->xip, svc_str, sizeof(svc_str));
+    inet_ntop(AF_INET, (struct in_addr *)&ep_ip, ep_str, sizeof(ep_str));
     log_info("proxy_update_ep_health_by_ip called - svc=%s:%u ep=%s inactive=%u",
-             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
-             inet_ntoa(*(struct in_addr *)&ep_ip), inactive);
+             svc_str, ntohs(key->xport), ep_str, inactive);
   }
   return proxy_update_ep_health_by_addr(key, ep_ip, 0, inactive);
 }
