@@ -226,11 +226,12 @@ llb_ai_record_unmetered(char *vip)
 }
 
 __attribute__((weak)) void
-llb_ai_record_usage_missing(char *tenant_id, char *model_name)
+llb_ai_record_usage_missing(char *tenant_id, char *model_name, char *reason)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
     (void)model_name;
+    (void)reason;
 }
 
 /* llb_ai_update_ep_queue_depth is defined in sockproxy_metrics.c (C-side),

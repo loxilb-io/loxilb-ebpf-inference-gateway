@@ -394,6 +394,38 @@ extern void llb_ai_normal_session_hit(char *model_name);
 extern void llb_ai_record_unmetered(char *vip);
 
 /*
+ * Reason values for llb_ai_record_usage_missing's reason parameter. Each names
+ * the REPORTING BOUNDARY the report fired at, because that boundary is the only
+ * thing the data plane actually knows — not an interpretation of why the usage
+ * object was absent. The control plane carries these verbatim into the
+ * loxilb_ai_tokens_missing_total reason label and rejects anything else, so a
+ * new value must be added on BOTH sides.
+ *
+ * RESPONSE_COMPLETE  the H1 keep-alive boundary: the client sent the NEXT
+ *                    request on this same connection, which proves the previous
+ *                    exchange finished. A 2xx that completed with no usage
+ *                    object is the backend's omission, nothing else.
+ * H2_STREAM_CLOSE    an HTTP/2 client stream closed. nghttp2 runs the same
+ *                    close for a completed response and for a stream aborted
+ *                    after its 2xx headers, and no error code is plumbed
+ *                    through, so the two are NOT distinguishable here.
+ * CONNECTION_CLOSE   the connection itself was destroyed while the last
+ *                    response (H1) or an in-flight stream (H2) had a 2xx status
+ *                    and no usage read. A non-conforming backend on a
+ *                    "Connection: close" response and a client that took the
+ *                    2xx and cut both land here.
+ *
+ * Operationally the split exists so the two policy cases can be told apart:
+ * RESPONSE_COMPLETE is a backend conformance problem and staying free is
+ * right, while CONNECTION_CLOSE is the bucket where a single tenant running
+ * materially above the fleet baseline would be a behavioural signal. Neither
+ * charges anything today.
+ */
+#define LLB_AI_UMISS_RESPONSE_COMPLETE  "response_complete"
+#define LLB_AI_UMISS_H2_STREAM_CLOSE    "h2_stream_close"
+#define LLB_AI_UMISS_CONNECTION_CLOSE   "connection_close"
+
+/*
  * llb_ai_record_usage_missing – record a completed response that carried no
  * readable usage object. Charges nothing.
  *
@@ -412,8 +444,11 @@ extern void llb_ai_record_unmetered(char *vip);
  * Parameters:
  *   tenant_id   verified tenant the response belonged to (NUL-terminated)
  *   model_name  effective model of the request (NUL-terminated)
+ *   reason      one of the LLB_AI_UMISS_* literals above, naming the boundary
+ *               this report fired at (NUL-terminated; never NULL)
  */
-extern void llb_ai_record_usage_missing(char *tenant_id, char *model_name);
+extern void llb_ai_record_usage_missing(char *tenant_id, char *model_name,
+                                        char *reason);
 
 /**
  * llb_ai_pd_record_ep – record per-endpoint P/D latency for Prometheus histogram.
