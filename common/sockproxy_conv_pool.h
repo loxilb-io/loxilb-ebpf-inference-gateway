@@ -41,12 +41,32 @@
  * empty key is the basis itself. */
 #define CONV_POOL_TAG_UNKNOWN 0ULL
 
-/* 16 hex digits of pool tag + ':' + the conversation id + NUL. */
-#ifndef MAX_CONV_ID_LEN
-#define CONV_POOL_KEY_MAX (16 + 1 + 256 + 1)
-#else
-#define CONV_POOL_KEY_MAX (16 + 1 + MAX_CONV_ID_LEN)
-#endif
+/* Longest conversation id the data path can hand to conv_pool_make_key.
+ * sockproxy_ep.c composes "custom_<session_header_name>_<value>" into
+ * char[CONV_POOL_ID_MAX] (ns_session_key, session_key, imm_key) and the
+ * header value itself arrives in proxy_fd_ent's custom_session_header_value,
+ * so 255 chars + NUL bounds every id that can reach the table. */
+#define CONV_POOL_ID_MAX 256
+
+/* 16 hex digits of pool tag + ':' + the conversation id + NUL.
+ *
+ * Defined UNCONDITIONALLY, and NOT in terms of MAX_CONV_ID_LEN. This value
+ * sizes conversation_mapping_t's hkey[] member, so a definition that changed
+ * with whether MAX_CONV_ID_LEN had been seen yet would give the struct a
+ * different layout in a translation unit that includes this header first than
+ * in every other one - silently, with no compiler diagnostic, and the symptom
+ * would be heap corruption in the conversation table rather than a build
+ * failure. sockproxy.h carries the _Static_assert that this covers a full
+ * MAX_CONV_ID_LEN id.
+ *
+ * It is sized for the callers' buffers rather than for the struct's shorter
+ * conv_id[] field, so no id is truncated on the way into the key: truncation
+ * here is not a lost suffix but a MERGE - two conversations whose keys agree
+ * in a long prefix collapse onto one row and share a single endpoint binding.
+ * That is reachable, not theoretical: session_header_name is documented
+ * in-tree with "authorization", and the key is then
+ * "custom_authorization_Bearer <jwt>", where two tokens share a long prefix. */
+#define CONV_POOL_KEY_MAX (16 + 1 + CONV_POOL_ID_MAX)
 
 static inline uint64_t
 conv_pool_tag_of_key(const char *ephash_key)

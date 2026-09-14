@@ -589,7 +589,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
          * binding takes precedence. Reuses the branch-agnostic conv_map helpers;
          * this is the DFL home for what used to live in PROXY_MODE_ALL. */
         int  ns_used_learned = 0;
-        char ns_session_key[256];
+        char ns_session_key[CONV_POOL_ID_MAX];
         ns_session_key[0] = '\0';
 
 #ifdef HAVE_DP_GPU_ROUTING
@@ -1357,7 +1357,10 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
         if (tepval->select == PROXY_SEL_STICKY ||
             (tepval->select == PROXY_SEL_RR && tepval->session_header_enabled) ||
             (node->has_l7_policy && pfe && l7_cookie_persist_active(pfe, node))) {
-          char session_key[256];  // Increased size for long header values
+          /* Sized by the conv key contract, not by hand: an id longer than
+           * this is not truncated on the way into conv_map, it is MERGED
+           * with whatever else shares its prefix. */
+          char session_key[CONV_POOL_ID_MAX];
           int selected_ep = -1;
           int using_learned_session = 0;
           int cookie_pinned = 0;   // 1 if a valid LB cookie pinned selected_ep
@@ -1668,7 +1671,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
           // instead of falling back to PRIORITY 1 (hash re-computation).
           if (tepval->session_header_enabled && !using_learned_session &&
               custom_session_header && custom_session_header[0] != '\0') {
-            char imm_key[256];
+            char imm_key[CONV_POOL_ID_MAX];
             snprintf(imm_key, sizeof(imm_key), "custom_%s_%s",
                      tepval->session_header_name, custom_session_header);
             if (store_conversation_endpoint(node, imm_key, selected_ep, tepval) == 0) {

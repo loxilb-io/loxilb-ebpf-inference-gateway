@@ -328,9 +328,13 @@ typedef struct llm_prefix_key {
 } llm_prefix_key_t;
 
 #define MAX_CONV_ID_LEN 128
-/* conv_map keying: needs MAX_CONV_ID_LEN above, and defines CONV_POOL_KEY_MAX
- * used by conversation_mapping_t below. */
+/* conv_map keying: defines CONV_POOL_KEY_MAX, used by conversation_mapping_t
+ * below. Deliberately independent of MAX_CONV_ID_LEN so the struct has ONE
+ * layout in every translation unit whatever order the two headers arrive in;
+ * the assert keeps that independence honest rather than accidental. */
 #include "sockproxy_conv_pool.h"
+_Static_assert(CONV_POOL_KEY_MAX >= 16 + 1 + MAX_CONV_ID_LEN + 1,
+               "conv_map key must hold the pool tag and a full-length conv_id");
 
 // P1.2: Virtual node in consistent hash ring
 typedef struct chwbl_vnode {

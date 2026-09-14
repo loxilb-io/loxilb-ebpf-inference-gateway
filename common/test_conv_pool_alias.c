@@ -10,6 +10,12 @@
  * catch it because an in-range index naming a live endpoint passes.
  *
  * Build: cc -Wall -Wextra -Werror -o test_conv_pool_alias test_conv_pool_alias.c -I.
+ *
+ * Built TWICE (see the Makefile): once standalone, once with
+ * -DMAX_CONV_ID_LEN so the header is exercised in both include orders. The
+ * key-size assertions below must hold identically in both, because
+ * conversation_mapping_t embeds a CONV_POOL_KEY_MAX array and a value that
+ * moved with include order would give that struct two layouts.
  */
 
 #include <assert.h>
@@ -102,6 +108,75 @@ test_wildcard_pool_is_a_pool_not_a_wildcard(void)
   assert(row_applies_to(&row, POOL_A_KEY) == 0);
 }
 
+/* The key size may not move with include order. conversation_mapping_t embeds
+ * char hkey[CONV_POOL_KEY_MAX]; when the value depended on whether
+ * MAX_CONV_ID_LEN had been seen first, a TU that included this header first
+ * got 274 and every other TU got 145 - two layouts for one struct, no
+ * compiler diagnostic, heap corruption at run time. Compiled in both include
+ * orders, so this holds only if the definition is unconditional. */
+_Static_assert(CONV_POOL_KEY_MAX == 16 + 1 + 256,
+               "CONV_POOL_KEY_MAX must not depend on include order");
+_Static_assert(CONV_POOL_ID_MAX == 256,
+               "conv ids are bounded by the callers' key buffers");
+#ifdef MAX_CONV_ID_LEN
+_Static_assert(CONV_POOL_KEY_MAX >= 16 + 1 + MAX_CONV_ID_LEN + 1,
+               "conv_map key must hold the pool tag and a full-length conv_id");
+#endif
+
+/* Truncating the id inside the key is not a lost suffix, it is a MERGE: two
+ * conversations that agree in a long prefix land on ONE row and share a single
+ * endpoint binding. Reachable with session_header_name="authorization", where
+ * the key is "custom_authorization_Bearer <jwt>" and two tokens share a long
+ * prefix. The ids here are the longest the callers can build. */
+static void
+test_long_ids_that_share_a_prefix_keep_separate_rows(void)
+{
+  char id_a[CONV_POOL_ID_MAX], id_b[CONV_POOL_ID_MAX];
+  char key_a[CONV_POOL_KEY_MAX], key_b[CONV_POOL_KEY_MAX];
+  uint64_t tag = conv_pool_tag_of_key(POOL_A_KEY);
+  static const char prefix[] =
+    "custom_authorization_Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.";
+
+  memset(id_a, 'x', sizeof(id_a));
+  memcpy(id_a, prefix, sizeof(prefix) - 1);   /* no NUL: the fill stays */
+  id_a[sizeof(id_a) - 1] = '\0';
+  memcpy(id_b, id_a, sizeof(id_b));
+  id_a[200] = 'A';                            /* the two tokens diverge late */
+  id_b[200] = 'B';
+
+  /* Guard the oracle: the inputs must really differ, and really be long. */
+  assert(strlen(id_a) == CONV_POOL_ID_MAX - 1);
+  assert(strcmp(id_a, id_b) != 0);
+
+  conv_pool_make_key(key_a, sizeof(key_a), tag, id_a);
+  conv_pool_make_key(key_b, sizeof(key_b), tag, id_b);
+
+  /* Distinct conversations, distinct rows. */
+  assert(strcmp(key_a, key_b) != 0);
+  /* And nothing was dropped on the way in. */
+  assert(strcmp(key_a + 17, id_a) == 0);
+  assert(strlen(key_a) == 16 + 1 + strlen(id_a));
+}
+
+/* Two pools and one conversation id still differ, at full id length: the pool
+ * tag is fixed-width hex before a ':' that cannot appear in it, so no
+ * (pool, id) pair can spell another pair's key. */
+static void
+test_full_length_id_still_separates_pools(void)
+{
+  char id[CONV_POOL_ID_MAX];
+  char key_a[CONV_POOL_KEY_MAX], key_b[CONV_POOL_KEY_MAX];
+
+  memset(id, 'z', sizeof(id));
+  id[sizeof(id) - 1] = '\0';
+
+  conv_pool_make_key(key_a, sizeof(key_a), conv_pool_tag_of_key(POOL_A_KEY), id);
+  conv_pool_make_key(key_b, sizeof(key_b), conv_pool_tag_of_key(POOL_B_KEY), id);
+
+  assert(strcmp(key_a, key_b) != 0);
+  assert(strcmp(key_a + 17, key_b + 17) == 0);   /* same id, different tag */
+}
+
 int
 main(void)
 {
@@ -110,6 +185,14 @@ main(void)
   test_index_stored_on_pool_a_is_not_applied_to_pool_b();
   test_untagged_row_never_applies();
   test_wildcard_pool_is_a_pool_not_a_wildcard();
-  puts("test_conv_pool_alias: ALL PASS");
+  test_long_ids_that_share_a_prefix_keep_separate_rows();
+  test_full_length_id_still_separates_pools();
+  /* Name the include order: the two legs of this test differ ONLY in it,
+   * so an indistinguishable banner would hide one leg not having run. */
+#ifdef MAX_CONV_ID_LEN
+  puts("test_conv_pool_alias [via sockproxy.h]: ALL PASS");
+#else
+  puts("test_conv_pool_alias [standalone]: ALL PASS");
+#endif
   return 0;
 }
