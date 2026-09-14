@@ -48,5 +48,5 @@ jobs:
       # Built in both include orders: conversation_mapping_t embeds a
       # CONV_POOL_KEY_MAX array, so a key size that moved with include order
       # would give that struct two layouts with no compiler diagnostic.
-      - name: Conversation stickiness names its pool, and its key has one size
+      - name: Conversation stickiness names its pool, and a health signal names its endpoint
         run: make -C common test_conv

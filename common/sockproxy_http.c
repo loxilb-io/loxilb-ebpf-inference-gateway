@@ -3269,97 +3269,198 @@ pd_parked_drain_ep(proxy_epval_t *tepval, int ep_index, const char *why)
 //   2. tepval->chwbl_config->ep_loads[ep_index].ep_available = !inactive (1 byte)
 //
 // No hash ring rebuild, no socket operations, no connection termination.
+/* Apply one health transition to ONE endpoint of ONE pool.
+ *
+ * Split out so the address-keyed entry point below can run it once per pool
+ * with THAT pool's own index. Every side effect here is indexed - the session
+ * sweep, the trie removal, the parked-client drain, the drain state - so
+ * running it with an index resolved in a different pool touches the wrong
+ * rows. Caller holds PROXY_LOCK.
+ */
+static void
+ep_health_apply(proxy_map_ent_t *ent, proxy_epval_t *tepval, int ep_index,
+                uint8_t inactive, time_t now)
+{
+  uint8_t old_state = tepval->eps[ep_index].inv;
+
+  tepval->eps[ep_index].inv = inactive;
+
+  // P2: Proactive session cleanup when endpoint becomes inactive
+  if (inactive && old_state == 0) {
+    // CRITICAL: Remove all stale session mappings for this endpoint
+    // This prevents memory waste and avoids re-learning overhead on every request
+    uint32_t cleaned = cleanup_endpoint_sessions(ent, ep_index, tepval);
+    if (cleaned > 0) {
+      log_info("[EP_HEALTH] Endpoint[%d] marked inactive, cleaned %u session mappings",
+               ep_index, cleaned);
+    }
+
+    /* remove dead EP from trie to prevent stale Tier 1 matches */
+    if (tepval->pd_trie) {
+      pthread_rwlock_wrlock(&tepval->pd_trie_lock);
+      pd_trie_remove_ep(tepval->pd_trie, ep_index);
+      pthread_rwlock_unlock(&tepval->pd_trie_lock);
+    }
+
+    /* Release every client parked on the now-dead EP for
+     * re-selection (see pd_parked_drain_ep). */
+    pd_parked_drain_ep(tepval, ep_index, "ep-down");
+
+    // P2: Handle draining based on policy
+    if (tepval->drain_policy == DRAIN_POLICY_TIMED) {
+      // Count current active connections
+      uint32_t active_conns = count_active_connections_to_endpoint(ent, ep_index);
+
+      tepval->drain_state[ep_index].is_draining = 1;
+      tepval->drain_state[ep_index].drain_start_ts = now;
+      tepval->drain_state[ep_index].active_conns_at_start = active_conns;
+    } else if (tepval->drain_policy == DRAIN_POLICY_IMMEDIATE) {
+      // Force-close immediately
+      force_close_endpoint_connections(ent, ep_index);
+    }
+  } else if (!inactive && old_state == 1) {
+    // Transitioning from inactive -> active (cancel draining)
+    if (tepval->drain_state[ep_index].is_draining) {
+      tepval->drain_state[ep_index].is_draining = 0;
+    }
+  }
+
+  log_info("EP health updated - %s:%u pool='%s' ep[%d] %u->%u",
+           inet_ntoa(*(struct in_addr *)&tepval->eps[ep_index].xip),
+           ntohs(tepval->eps[ep_index].xport),
+           tepval->ephash_key, ep_index, old_state, inactive);
+}
+
+/* Health is a property of the ENDPOINT, not of a pool.
+ *
+ * A service with model-keyed rules holds several proxy_epval_t pools, each
+ * numbering its own eps[] from 0, and one backend address may appear in more
+ * than one of them. An index therefore names an endpoint only inside the pool
+ * that produced it, while an ADDRESS names the same backend everywhere - so
+ * that is what this keys on, and every pool holding it is updated with its
+ * OWN index.
+ *
+ * ep_port == 0 matches any port on the address, which is what a host-level
+ * signal (a GPU node going red) means. A non-zero port matches exactly, so a
+ * per-backend probe cannot mark a sibling listener on the same host down.
+ *
+ * Returns 0 if at least one endpoint matched, -ENOENT if none did.
+ */
+int
+proxy_update_ep_health_by_addr(proxy_ent_t *key, uint32_t ep_ip,
+                               uint16_t ep_port, uint8_t inactive)
+{
+  proxy_map_ent_t *ent;
+  proxy_epval_t *tepval, *tmp_epval;
+  time_t now = time(NULL);
+  int matched = 0;
+
+  if (!key) {
+    log_error("proxy_update_ep_health_by_addr - invalid key");
+    return -EINVAL;
+  }
+
+  PROXY_LOCK();
+
+  ent = proxy_struct->head;
+  while (ent) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      /* EVERY pool, not the first: the loop below must not return from
+       * inside its body. A backend shared by two model pools is one backend,
+       * and a health signal for it applies to both rows. */
+      HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
+        for (int i = 0; i < tepval->n_eps; i++) {
+          if (!ep_health_addr_matches(tepval->eps[i].xip, tepval->eps[i].xport,
+                                      ep_ip, ep_port))
+            continue;
+          ep_health_apply(ent, tepval, i, inactive, now);
+          matched++;
+        }
+      }
+
+      PROXY_UNLOCK();
+      if (matched == 0) {
+        log_error("EP health - %s:%u not found in service %s:%u",
+                  inet_ntoa(*(struct in_addr *)&ep_ip), ntohs(ep_port),
+                  inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
+        return -ENOENT;
+      }
+      return 0;
+    }
+    ent = ent->next;
+  }
+
+  PROXY_UNLOCK();
+  log_error("P2: proxy_update_ep_health_by_addr - entry not found for %s:%u",
+            inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
+  return -ENOENT;
+}
+
 int
 proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
 {
   proxy_map_ent_t *ent;
   proxy_epval_t *tepval, *tmp_epval;
   time_t now = time(NULL);
-  
+  unsigned int n_pools;
+
   if (!key || ep_index < 0) {
     log_error("P2: proxy_update_ep_health - invalid parameters");
     return -EINVAL;
   }
 
   PROXY_LOCK();
-  
+
   // Find existing proxy entry
   ent = proxy_struct->head;
   while (ent) {
     if (cmp_proxy_ent(&ent->key, key)) {
-      // Entry found - update endpoint health
+      n_pools = HASH_COUNT(ent->val.ephash);
+
+      if (n_pools == 0) {
+        PROXY_UNLOCK();
+        log_error("P2: proxy_update_ep_health - no ephash entry found");
+        return -ENOENT;
+      }
+
+      /* An index is pool-local. With several pools on this service the
+       * caller's index names no particular endpoint - it used to be resolved
+       * against whichever pool hashed first, which marked a healthy backend
+       * down and left the failed one taking traffic. Refuse instead, and let
+       * the caller use the address-keyed entry point above; the Go side
+       * treats a non-zero return as "fall back to a full rule sync", which
+       * converges correctly. */
+      if (!ep_health_index_is_resolvable(n_pools)) {
+        PROXY_UNLOCK();
+        log_error("P2: proxy_update_ep_health - %u pools on %s:%u, an endpoint "
+                  "index names none of them; use proxy_update_ep_health_by_addr",
+                  n_pools, inet_ntoa(*(struct in_addr *)&key->xip),
+                  ntohs(key->xport));
+        return -EINVAL;
+      }
+
       HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
         // Validate endpoint index
         if (ep_index >= tepval->n_eps) {
           PROXY_UNLOCK();
-          log_error("P2: proxy_update_ep_health - invalid ep_index %d (max: %d)", 
+          log_error("P2: proxy_update_ep_health - invalid ep_index %d (max: %d)",
                     ep_index, tepval->n_eps);
           return -EINVAL;
         }
 
-        // Update ONLY the inactive flag
-        uint8_t old_state = tepval->eps[ep_index].inv;
-        tepval->eps[ep_index].inv = inactive;
-
-        // P2: Proactive session cleanup when endpoint becomes inactive
-        if (inactive && old_state == 0) {
-          // CRITICAL: Remove all stale session mappings for this endpoint
-          // This prevents memory waste and avoids re-learning overhead on every request
-          uint32_t cleaned = cleanup_endpoint_sessions(ent, ep_index, tepval);
-          if (cleaned > 0) {
-            log_info("[EP_HEALTH] Endpoint[%d] marked inactive, cleaned %u session mappings",
-                     ep_index, cleaned);
-          }
-
-          /* remove dead EP from trie to prevent stale Tier 1 matches */
-          if (tepval->pd_trie) {
-            pthread_rwlock_wrlock(&tepval->pd_trie_lock);
-            pd_trie_remove_ep(tepval->pd_trie, ep_index);
-            pthread_rwlock_unlock(&tepval->pd_trie_lock);
-          }
-
-          /* Release every client parked on the now-dead EP for
-           * re-selection (see pd_parked_drain_ep). */
-          pd_parked_drain_ep(tepval, ep_index, "ep-down");
-        }
-
-        // P2: Handle draining based on policy
-        if (inactive && old_state == 0) {
-          
-          if (tepval->drain_policy == DRAIN_POLICY_TIMED) {
-            // Count current active connections
-            uint32_t active_conns = count_active_connections_to_endpoint(ent, ep_index);
-            
-            tepval->drain_state[ep_index].is_draining = 1;
-            tepval->drain_state[ep_index].drain_start_ts = now;
-            tepval->drain_state[ep_index].active_conns_at_start = active_conns;
-          } else if (tepval->drain_policy == DRAIN_POLICY_IMMEDIATE) {
-            // Force-close immediately
-            force_close_endpoint_connections(ent, ep_index);
-          } 
-        } else if (!inactive && old_state == 1) {
-          // Transitioning from inactive → active (cancel draining)
-          if (tepval->drain_state[ep_index].is_draining) {
-            tepval->drain_state[ep_index].is_draining = 0;
-          }
-        }
-
-        log_info("EP health updated - %s:%u ep[%d] %u→%u",
-                  inet_ntoa(*(struct in_addr *)&tepval->eps[ep_index].xip),
-                  ntohs(tepval->eps[ep_index].xport),
-                  ep_index, old_state, inactive);
+        ep_health_apply(ent, tepval, ep_index, inactive, now);
 
         PROXY_UNLOCK();
-        
+
         // Note: Existing connections continue (graceful draining by default)
         // - NEW connections: Will skip this endpoint if inactive=1
         // - EXISTING connections: Continue using established sockets
         // - Timed policy: Will force-close after drain_timeout_sec
         // - Immediate policy: Connections closed immediately
-        
+
         return 0;
       }
-      
+
       PROXY_UNLOCK();
       log_error("P2: proxy_update_ep_health - no ephash entry found");
       return -ENOENT;
@@ -3428,67 +3529,18 @@ proxy_update_kv_exact_contract(proxy_ent_t *key, uint32_t binding_gen,
   return -ENOENT;
 }
 
-// P2 GPU-Aware: Update endpoint health by IP address lookup
-// This is a helper for GPU-aware load balancing where we have endpoint IP but not index
-// Returns: 0 on success, -1 on error
+// P2 GPU-Aware: Update endpoint health by IP address lookup.
+// A host-level signal (a GPU node turning red) applies to every listener on
+// that address, so this is the any-port case of the address-keyed update.
 int
 proxy_update_ep_health_by_ip(proxy_ent_t *key, uint32_t ep_ip, uint8_t inactive)
 {
-  proxy_map_ent_t *ent;
-  proxy_epval_t *tepval, *tmp_epval;
-  int ep_index = -1;
-  
-  if (!key) {
-    log_error("proxy_update_ep_health_by_ip - invalid key");
-    return -EINVAL;
+  if (key) {
+    log_info("proxy_update_ep_health_by_ip called - svc=%s:%u ep=%s inactive=%u",
+             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+             inet_ntoa(*(struct in_addr *)&ep_ip), inactive);
   }
-
-  log_info("proxy_update_ep_health_by_ip called - svc=%s:%u ep=%s inactive=%u",
-           inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
-           inet_ntoa(*(struct in_addr *)&ep_ip), inactive);
-
-  PROXY_LOCK();
-  
-  // Find existing proxy entry
-  ent = proxy_struct->head;
-  while (ent) {
-    if (cmp_proxy_ent(&ent->key, key)) {
-      // Entry found - find endpoint by IP
-      HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
-        // Search for matching endpoint IP
-        for (int i = 0; i < tepval->n_eps; i++) {
-          if (tepval->eps[i].xip == ep_ip) {
-            ep_index = i;
-            break;
-          }
-        }
-        
-        if (ep_index < 0) {
-          PROXY_UNLOCK();
-          log_error("Endpoint IP %s not found in service %s:%u",
-                    inet_ntoa(*(struct in_addr *)&ep_ip),
-                    inet_ntoa(*(struct in_addr *)&key->xip), 
-                    ntohs(key->xport));
-          return -ENOENT;
-        }
-        
-        PROXY_UNLOCK();
-        
-        // Reuse existing health update function
-        return proxy_update_ep_health(key, ep_index, inactive);
-      }
-      
-      PROXY_UNLOCK();
-      log_error("No ephash entry found");
-      return -ENOENT;
-    }
-    ent = ent->next;
-  }
-
-  PROXY_UNLOCK();
-  log_error("Proxy entry not found for %s:%u",
-            inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
-  return -ENOENT;
+  return proxy_update_ep_health_by_addr(key, ep_ip, 0, inactive);
 }
 
 /* ==========================================================================
