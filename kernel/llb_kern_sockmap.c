@@ -17,42 +17,44 @@
 #include "../common/llb_dpapi.h"
 #include "../common/llb_sockmap.h"
 
+/* Registers a newly established socket that belongs to a sockmap-enabled rule.
+ * Every such socket goes into sock_proxy_map so it can be a redirect target; it
+ * also goes into sock_verdict_map when some rule accelerates the direction in
+ * which it receives (see llb_sockmap.h). The redirect map is filled first, so
+ * the verdict never starts on a socket its peer cannot yet reach.
+ * Ports follow the low-half convention of llb_sockmap_key. */
 SEC("sockops")
 int llb_setup_sockmap(struct bpf_sock_ops *bpf_sops)
 {
-	int etype;
-  __u16 vip_port;
-  __u16 ep_port;
-  __u8 *enabled;
+  struct llb_sockmap_portset_val *pv;
+  __u8 verdict;
   struct llb_sockmap_key key = { .dip = bpf_sops->remote_ip4,
                                  .sip = bpf_sops->local_ip4,
-	                                 .dport = bpf_sops->remote_port >> 16,
-	                                 .sport = bpf_htonl(bpf_sops->local_port) >> 16,
+                                 .dport = bpf_sops->remote_port >> 16,
+                                 .sport = bpf_htonl(bpf_sops->local_port) >> 16,
                                };
 
-  etype = bpf_sops->op;
-
-	switch (etype) {
-	case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB: {
-    vip_port = key.sport;
-    enabled = bpf_map_lookup_elem(&sockmap_vip_portset, &vip_port);
-
-		if (enabled) {
-			bpf_sock_hash_update(bpf_sops, &sock_proxy_map, &key, BPF_NOEXIST);
-		}
-		break;
-  }
-	case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB: {
-    ep_port = key.dport;
-    enabled = bpf_map_lookup_elem(&sockmap_ep_portset, &ep_port);
-
-    if (enabled) {
-      bpf_sock_hash_update(bpf_sops, &sock_proxy_map, &key, BPF_NOEXIST);
-    }
+  switch (bpf_sops->op) {
+  case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
+    /* accepted by a proxy listener: local address and port are the VIP */
+    pv = sockmap_vip_portset_lookup(key.sip, (__u16)key.sport);
     break;
-  }
+  case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:
+    /* connected by the proxy: remote address and port are the endpoint */
+    pv = sockmap_ep_portset_lookup(key.dip, (__u16)key.dport);
+    break;
   default:
-    break;
+    return 0;
+  }
+
+  if (!pv) {
+    return 0;
+  }
+  verdict = pv->verdict_refs != 0;
+
+  bpf_sock_hash_update(bpf_sops, &sock_proxy_map, &key, BPF_NOEXIST);
+  if (verdict) {
+    bpf_sock_hash_update(bpf_sops, &sock_verdict_map, &key, BPF_NOEXIST);
   }
 
   return 0;

@@ -14,7 +14,7 @@
 #define LLB_SOCKMAP_STATS_SZ        8   /* Includes spare slots */
 #define SOCKMAP_STAT_REDIRECT_OK    0   /* Peer hit -> issue bpf_sk_redirect_hash (engage) */
 #define SOCKMAP_STAT_PEER_MISS      1   /* Eligible, but peer_map miss -> SK_PASS */
-#define SOCKMAP_STAT_INELIGIBLE     2   /* Portset mismatch -> SK_PASS */
+#define SOCKMAP_STAT_INELIGIBLE     2   /* Portset miss, or no rule accelerates this direction -> SK_PASS */
 #define SOCKMAP_STAT_REDIRECT_REQ   3   /* REDIRECT_OK in the request direction (client->backend, vip hit) */
 #define SOCKMAP_STAT_REDIRECT_RESP  4   /* REDIRECT_OK in the response direction (backend->client, ep hit) */
 /* Bytes handed to bpf_sk_redirect_hash in the response direction.
@@ -23,12 +23,32 @@
  * further down the kernel's send path (client receives more than we redirected). */
 #define SOCKMAP_STAT_RESP_BYTES     5
 
+/* Two sockhashes, so that only the direction a rule accelerates pays for the
+ * sk_skb verdict:
+ *   sock_proxy_map   - every eligible socket, keyed by its own tuple. No programs
+ *                      are attached; it is the lookup map of bpf_sk_redirect_hash,
+ *                      so any socket that can be a redirect target must be here
+ *                      (a miss is SK_DROP, and the dropped bytes are already ACKed).
+ *   sock_verdict_map - the subset whose ingress direction is accelerated. The
+ *                      stream parser and verdict are attached to this map.
+ * A socket in response-only mode on the client side, for example, is only in
+ * sock_proxy_map: it can receive redirected response bytes, while the requests it
+ * receives stay on the plain TCP path instead of the psock ingress queue.
+ * The value is __u64 so userspace can look an entry up (the kernel returns the
+ * socket cookie only for an 8-byte value). */
 struct sock_proxy_map_d {
   __uint(type,        BPF_MAP_TYPE_SOCKHASH);
   __type(key,         struct llb_sockmap_key);
-  __type(value,       int);
+  __type(value,       __u64);
   __uint(max_entries, LLB_SOCK_MAP_SZ);
 } sock_proxy_map SEC(".maps");
+
+struct sock_verdict_map_d {
+  __uint(type,        BPF_MAP_TYPE_SOCKHASH);
+  __type(key,         struct llb_sockmap_key);
+  __type(value,       __u64);
+  __uint(max_entries, LLB_SOCK_MAP_SZ);
+} sock_verdict_map SEC(".maps");
 
 struct sockmap_stats_map_d {
   __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -68,16 +88,42 @@ struct sockmap_peer_map_d {
 
 struct sockmap_vip_portset_map_d {
   __uint(type,        BPF_MAP_TYPE_HASH);
-  __type(key,         __u16);
-  __type(value,       __u8);
+  __type(key,         struct llb_sockmap_portset_key);
+  __type(value,       struct llb_sockmap_portset_val);
   __uint(max_entries, LLB_SOCK_VIP_PORTSET_SZ);
 } sockmap_vip_portset SEC(".maps");
 
 struct sockmap_ep_portset_map_d {
   __uint(type,        BPF_MAP_TYPE_HASH);
-  __type(key,         __u16);
-  __type(value,       __u8);
+  __type(key,         struct llb_sockmap_portset_key);
+  __type(value,       struct llb_sockmap_portset_val);
   __uint(max_entries, LLB_SOCK_EP_PORTSET_SZ);
 } sockmap_ep_portset SEC(".maps");
+
+/* VIP portset lookup for a socket whose local address and port are ip/port:
+ * the exact address first, then the wildcard entry of a rule bound to 0.0.0.0.
+ * One pointer is live at a time (see the pointer-OR note in the verdict). */
+static __always_inline struct llb_sockmap_portset_val *
+sockmap_vip_portset_lookup(__be32 ip, __u16 port)
+{
+  struct llb_sockmap_portset_key pk = { .ip = ip, .port = port, .res = 0 };
+  struct llb_sockmap_portset_val *pv;
+
+  pv = bpf_map_lookup_elem(&sockmap_vip_portset, &pk);
+  if (pv) {
+    return pv;
+  }
+  pk.ip = 0;
+  return bpf_map_lookup_elem(&sockmap_vip_portset, &pk);
+}
+
+/* Endpoint portset lookup for a socket whose remote address and port are ip/port. */
+static __always_inline struct llb_sockmap_portset_val *
+sockmap_ep_portset_lookup(__be32 ip, __u16 port)
+{
+  struct llb_sockmap_portset_key pk = { .ip = ip, .port = port, .res = 0 };
+
+  return bpf_map_lookup_elem(&sockmap_ep_portset, &pk);
+}
 
 #endif
