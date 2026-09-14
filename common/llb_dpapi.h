@@ -72,11 +72,14 @@
 #define LLB_MAX_SCTP_CHUNKS_INIT (8)
 #define LLB_RWR_MAP_ENTRIES   (1024)
 #define LLB_SOCK_MAP_SZ       (17*1024)
-/* sockmap acceleration portsets (keyed by net-order L4 port). The sockops
- * program consults these to decide whether a newly established socket belongs
- * to a sockmap-enabled FullProxy service (VIP side) or one of its endpoints. */
-#define LLB_SOCK_VIP_PORTSET_SZ (64)
-#define LLB_SOCK_EP_PORTSET_SZ  (256)
+/* sockmap acceleration portsets (keyed by IPv4 address + L4 port, see
+ * struct llb_sockmap_portset_key). The sockops program consults these to decide
+ * whether a newly established socket belongs to a sockmap-enabled FullProxy
+ * service (VIP side) or one of its endpoints. One VIP entry per enabled rule;
+ * endpoint entries are shared by every enabled rule pointing at the same
+ * endpoint address and port. */
+#define LLB_SOCK_VIP_PORTSET_SZ (LLB_MAX_LB_RULES)
+#define LLB_SOCK_EP_PORTSET_SZ  (4*LLB_MAX_LB_RULES)
 /* Upper bound of LB rule numbers handed out by the Go control plane
  * (pkg/loxinet/rules.go: RtMaximumLbs = 2*1024, NewMarker(1, RtMaximumLbs)).
  * NewMarker(begin, len) returns begin..begin+len-1 INCLUSIVE, so valid rule
@@ -1252,6 +1255,28 @@ struct llb_sockmap_key {
   __be32 sip;
   __be32 dport;
   __be32 sport;
+};
+
+/* sockmap portset key. ip and port are net-order. On the VIP portset ip is the
+ * address the proxy listener is bound to, and 0 stands for a wildcard (0.0.0.0)
+ * VIP; on the endpoint portset ip is the endpoint address. */
+struct llb_sockmap_portset_key {
+  __be32 ip;
+  __be16 port;
+  __u16  res;
+};
+
+/* sockmap portset value. Written only by the loader, read by BPF.
+ *   refs         - enabled rules holding this address and port. Any entry means
+ *                  a matching socket is a redirect target (sock_proxy_map).
+ *   verdict_refs - how many of those rules accelerate the direction in which this
+ *                  socket receives: the request direction for a VIP entry, the
+ *                  response direction for an endpoint entry. Non-zero also puts
+ *                  the socket into sock_verdict_map, so its ingress runs the
+ *                  sk_skb verdict. */
+struct llb_sockmap_portset_val {
+  __u32 refs;
+  __u32 verdict_refs;
 };
 
 struct sock_str_key {

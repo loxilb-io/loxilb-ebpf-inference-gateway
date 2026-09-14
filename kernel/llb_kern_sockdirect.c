@@ -23,44 +23,23 @@ int llb_sockmap_dir(struct sk_msg_md *mmd)
 {
   struct llb_sockmap_key redirect_key;
   struct llb_sockmap_key *peer_key;
-  __u16 vip_port;
-  __u16 ep_port;
-  __u8 eligible = 0;
-  __u8 *vip_enabled;
-  __u8 *ep_enabled;
-  /* Use the low-half convention. sk_msg_md.remote_port is also a __u32
-   * "network byte order" field, so the kernel places the net-order port in the
-   * upper 16 bits and it must be normalized with >> 16.
-   * (During the earlier unification, removing >> 16 after misreading
-   * remote_port as already being in the low 16 bits, together with the missing
-   * dport in sk_skb verdict, was the reason sockmap redirect always missed.)
-   * local_port is stored in the host-order low 16 bits, so use
-   * bpf_htonl(...) >> 16. */
+  struct llb_sockmap_portset_val *pv;
   struct llb_sockmap_key key = { .dip = mmd->local_ip4,
                                  .sip = mmd->remote_ip4,
 	                                 .dport = bpf_htonl(mmd->local_port) >> 16,
 	                                 .sport = mmd->remote_port >> 16,
                                };
 
-  vip_port = key.sport;
-  ep_port = key.dport;
-  /* If both portset lookups stay live at the same time, the -O2 compiler can
-   * merge the two NULL checks into
-   *   r0 = vip_ptr | ep_ptr
-   * which triggers the verifier error "pointer |= pointer prohibited".
-   * Only look up ep on a vip miss so that at most one pointer is live at a
-   * time, while preserving the OR semantics of eligibility. */
-  vip_enabled = bpf_map_lookup_elem(&sockmap_vip_portset, &vip_port);
-  if (vip_enabled) {
-    eligible = 1;
-  } else {
-    ep_enabled = bpf_map_lookup_elem(&sockmap_ep_portset, &ep_port);
-    if (ep_enabled) {
-      eligible = 1;
-    }
+  /* This key is the peer's view of the socket (sip/sport are the remote end),
+   * which is what the portset lookups below have always been given. Only one
+   * portset pointer is live at a time, to avoid the verifier's pointer-OR
+   * rejection. */
+  pv = sockmap_vip_portset_lookup(key.sip, (__u16)key.sport);
+  if (!pv) {
+    pv = sockmap_ep_portset_lookup(key.dip, (__u16)key.dport);
   }
 
-  if (!eligible) {
+  if (!pv) {
     sockmap_stat_inc(SOCKMAP_STAT_INELIGIBLE);
     return SK_PASS;
   }

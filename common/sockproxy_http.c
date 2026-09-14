@@ -2436,6 +2436,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * arrive through this in-place path (no -EEXIST / re-create), so the
          * peer_map gate in setup_proxy_path would otherwise keep the old mode. */
         ent->val.sockmap_en = arg->sockmap_en;
+        tepval->sockmap_en = arg->sockmap_en;
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
@@ -2483,6 +2484,11 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
         // SSE streaming configuration 
         tepval->sse_mode = arg->sse_mode;
+        /* A new pool on a live VIP:port, including a rule re-created after the
+         * last one was deleted (the listener survives), must not inherit the
+         * previous rule's sockmap mode. */
+        tepval->sockmap_en = arg->sockmap_en;
+        ent->val.sockmap_en = arg->sockmap_en;
         tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
         tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
         tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
@@ -2935,6 +2941,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   // SSE streaming configuration 
   tepval->sse_mode = arg->sse_mode;
+  tepval->sockmap_en = arg->sockmap_en;
   tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
   tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
   tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
@@ -6614,7 +6621,9 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->qos_park_seen_ts = 0;
 
 #if defined(HAVE_SOCKOPS)
-    if (sockmap_eligible && proxy_struct->peer_map_cb && ent->val.sockmap_en) {
+    uint8_t sockmap_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
+
+    if (sockmap_eligible && proxy_struct->peer_map_cb && sockmap_mode) {
       /* sockmap_en is a directional mode:
        *   1 = both, 2 = request-only, 3 = response-only.
        * The request direction ([client]=backend) lets the sk_skb verdict
@@ -6624,7 +6633,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
        * misses peer_map -> SK_PASS -> stays on the userspace proxy path.
        * key  = backend socket tuple as seen from the client side (self=client)
        * rkey = client socket tuple as seen from the backend side (self=backend) */
-      uint8_t dir = ent->val.sockmap_en;
+      uint8_t dir = sockmap_mode;
       int do_req = (dir == 1 || dir == 2);
       int do_resp = (dir == 1 || dir == 3);
       int ret1 = do_req ? proxy_struct->peer_map_cb(key, rkey, 1) : 0;
