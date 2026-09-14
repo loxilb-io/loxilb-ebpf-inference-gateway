@@ -670,6 +670,14 @@ typedef struct proxy_epval {
    * fences the strict rule across that window (plan-fix I-14 backstop). */
   _Atomic uint64_t kv_exact_contract;
 
+  /* sockmap acceleration mode of the rule that owns this pool
+   * (dp_proxy_tacts.sockmap_en: 0=off, 1=both, 2=request-only, 3=response-only).
+   * setup_proxy_path pairs a connection by the mode of the pool it was routed
+   * to. proxy_val_t.sockmap_en is per VIP:port and outlives its rules (the
+   * listener is kept after the last rule is deleted), so it cannot tell a
+   * re-created rule, or one of several host-based rules, apart. */
+  uint8_t sockmap_en;
+
   UT_hash_handle hh;
 } proxy_epval_t;
 
