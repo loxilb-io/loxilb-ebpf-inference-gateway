@@ -457,6 +457,15 @@ test_conv_pool_alias: test_conv_pool_alias.c sockproxy_conv_pool.h
 test_conv_pool_alias_via_sockproxy: test_conv_pool_alias.c sockproxy_conv_pool.h
 	$(CC) -Wall -Wextra -Werror -DMAX_CONV_ID_LEN=128 -o $@ $< -I.
 
+# Self-contained (common/ sources plus libc only), so C-Unit-Gates can run it
+# here rather than waiting for the gateway repo's pin to move. test_kv cannot
+# be used for that: test_kv_exact reads a fixture from the GATEWAY repo
+# (../../cicd/common/kv_hash/fixtures), which does not exist in this checkout.
+.PHONY: test_conv
+test_conv: test_conv_pool_alias test_conv_pool_alias_via_sockproxy
+	./test_conv_pool_alias
+	./test_conv_pool_alias_via_sockproxy
+
 # Generated engine wire IDs + strict dialect resolution (fail-closed on
 # unknown kv_engine_type). gc-sections keeps only the functions under test.
 test_pd_ids: test_pd_ids.c sockproxy_pd_core.c sockproxy_pd_ids.h sockproxy_pd.h
