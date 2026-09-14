@@ -328,6 +328,9 @@ typedef struct llm_prefix_key {
 } llm_prefix_key_t;
 
 #define MAX_CONV_ID_LEN 128
+/* conv_map keying: needs MAX_CONV_ID_LEN above, and defines CONV_POOL_KEY_MAX
+ * used by conversation_mapping_t below. */
+#include "sockproxy_conv_pool.h"
 
 // P1.2: Virtual node in consistent hash ring
 typedef struct chwbl_vnode {
@@ -383,8 +386,20 @@ typedef struct chwbl_config {
 } chwbl_config_t;
 
 typedef struct conversation_mapping {
+  /* uthash key: "<16 hex pool tag>:<conv_id>" (conv_pool_make_key). conv_map
+   * is shared by every pool on the VIP, so conv_id alone is NOT a key - two
+   * pools using one conversation id would share a row and evict each other's
+   * binding on every turn. Keep conv_id below as the logical id for logs and
+   * the HA sync wire, which address a conversation by id. */
+  char hkey[CONV_POOL_KEY_MAX];
   char conv_id[MAX_CONV_ID_LEN];
   int ep_idx;
+  /* Identity of the pool whose eps[] ep_idx indexes (conv_pool_tag_of_key on
+   * the pool's ephash_key). conv_map is keyed by conv_id alone and is shared
+   * by every pool on the VIP, but an endpoint index is only meaningful inside
+   * the pool that stored it, so a row that does not name its pool may not be
+   * consumed or overwritten. CONV_POOL_TAG_UNKNOWN => never applied. */
+  uint64_t pool_tag;
   uint64_t created_ts;
   uint64_t last_access_ts;
   uint32_t request_count;
@@ -921,6 +936,13 @@ struct proxy_fd_ent {
   void *head;
   void *ssl;
   void *epv;
+  /* Pool that owns ep_num for SESSION LEARNING on the backend leg only.
+   * The backend fd deliberately keeps epv NULL (it must not decrement CHWBL
+   * load), but it does carry ep_num so a session id returned by the backend
+   * can be bound. That binding still has to name the pool the index belongs
+   * to, so the pool is carried separately instead of relaxing the epv rule.
+   * struct proxy_epval *; NULL on the client leg, which uses epv. */
+  void *learn_epv;
   proxy_h2_session_t *h2_session;  // HTTP/2 session context (NULL for HTTP/1.1)
   void *backend_h2_session;        // Backend HTTP/2 session (for backend connections only)
   uint64_t nrb;
@@ -1668,8 +1690,10 @@ void circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index);
 int chwbl_ring_lookup(chwbl_ring_t *ring, uint64_t hash);
 uint64_t compute_prefix_hash(llm_prefix_key_t *key);
 int extract_llm_prefix(const char *json_str, size_t json_len, llm_prefix_key_t *key);
-conversation_mapping_t* get_conversation_mapping(proxy_map_ent_t *ent, const char *conv_id);
-int store_conversation_endpoint(proxy_map_ent_t *ent, const char *conv_id, int ep_idx);
+conversation_mapping_t* get_conversation_mapping(proxy_map_ent_t *ent, const char *conv_id,
+                                                const struct proxy_epval *epv);
+int store_conversation_endpoint(proxy_map_ent_t *ent, const char *conv_id, int ep_idx,
+                                const struct proxy_epval *epv);
 void strip_port_from_hostname(const char *host_with_port, char *host_only, size_t host_only_size);
 
 // P/D Session stickiness functions (Tier 0 cache-aware routing)

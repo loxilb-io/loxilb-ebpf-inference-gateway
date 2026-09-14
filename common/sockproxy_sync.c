@@ -33,6 +33,7 @@
 #include "uthash.h"
 #include "log.h"
 #include "sockproxy.h"
+#include "sockproxy_conv_pool.h"
 #include "sockproxy_internal.h"
 
 /* Forward declaration; real signature reuses sockproxy_health.c. */
@@ -140,6 +141,12 @@ apply_conv_sync_entry(proxy_map_ent_t *ent, proxy_epval_t *tepval,
   conversation_mapping_t *m = NULL;
   int outcome = SYNC_APPLY_ERROR;
   int is_delete = (ev->kind == SYNC_SESSION_DELETE || ev->kind == SYNC_CONV_DELETE);
+  uint64_t pool_tag = conv_pool_tag_of_key(tepval->ephash_key);
+  char hkey[CONV_POOL_KEY_MAX];
+
+  /* conv_map is keyed by (pool, conv_id); the wire carries only the id, so the
+   * row is addressed under the pool pick_tepval_for_sync resolved. */
+  conv_pool_make_key(hkey, sizeof(hkey), pool_tag, ev->conv_id);
 
   /* HEALTH GATE (SPEC A5) — installs only; a DELETE must always apply. */
   if (!is_delete && ev->ep_idx >= 0 && !is_endpoint_healthy(tepval, ev->ep_idx))
@@ -147,7 +154,7 @@ apply_conv_sync_entry(proxy_map_ent_t *ent, proxy_epval_t *tepval,
 
   pthread_rwlock_wrlock(&ent->val.conv_lock);
 
-  HASH_FIND_STR(ent->val.conv_map, ev->conv_id, m);
+  HASH_FIND_STR(ent->val.conv_map, hkey, m);
 
   if (is_delete) {
     if (m) {
@@ -167,11 +174,21 @@ apply_conv_sync_entry(proxy_map_ent_t *ent, proxy_epval_t *tepval,
     }
     strncpy(m->conv_id, ev->conv_id, MAX_CONV_ID_LEN - 1);
     m->conv_id[MAX_CONV_ID_LEN - 1] = '\0';
+    memcpy(m->hkey, hkey, sizeof(m->hkey));
     m->ep_idx         = ev->ep_idx;
+    /* proxy_sync_event_t carries no pool identity (its service_key is only
+     * xip:xport:proto), so the tag can only name the pool pick_tepval_for_sync
+     * guessed. On a single-pool service that guess is the right pool and
+     * failover stickiness is preserved; on a multi-pool service a later turn
+     * that resolves to a different pool now MISSES and re-selects instead of
+     * being handed this index. Carrying the pool on the wire needs a
+     * proxy_sync_event_t field and its two Go-side cgo mirrors, so it lands
+     * separately. */
+    m->pool_tag       = pool_tag;
     m->created_ts     = ev->created_ts;
     m->last_access_ts = ev->last_access_ts;
     m->request_count  = ev->request_count;
-    HASH_ADD_STR(ent->val.conv_map, conv_id, m);
+    HASH_ADD_STR(ent->val.conv_map, hkey, m);
     outcome = SYNC_APPLY_INSTALLED;
     log_info("[XSYNC_CONV_APPLY] INSTALLED conv_id='%s' ep_idx=%d svc=%s",
              ev->conv_id, ev->ep_idx, ev->service_key);
@@ -189,6 +206,8 @@ apply_conv_sync_entry(proxy_map_ent_t *ent, proxy_epval_t *tepval,
   }
   /* m->created_ts > ev->created_ts → remote is older, remote wins. */
   m->ep_idx         = ev->ep_idx;
+  /* The index and the pool that owns it must always move together. */
+  m->pool_tag       = pool_tag;
   m->created_ts     = ev->created_ts;
   m->last_access_ts = ev->last_access_ts;
   m->request_count  = ev->request_count;

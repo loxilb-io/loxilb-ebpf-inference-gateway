@@ -3298,7 +3298,7 @@ proxy_update_ep_health(proxy_ent_t *key, int ep_index, uint8_t inactive)
         if (inactive && old_state == 0) {
           // CRITICAL: Remove all stale session mappings for this endpoint
           // This prevents memory waste and avoids re-learning overhead on every request
-          uint32_t cleaned = cleanup_endpoint_sessions(ent, ep_index);
+          uint32_t cleaned = cleanup_endpoint_sessions(ent, ep_index, tepval);
           if (cleaned > 0) {
             log_info("[EP_HEALTH] Endpoint[%d] marked inactive, cleaned %u session mappings",
                      ep_index, cleaned);
@@ -6581,6 +6581,10 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     if (npfe1->needs_session_learning) {
       npfe2->needs_session_learning = 1;
       npfe2->ep_num = ep_num;  // Store endpoint number for learning (from loop variable)
+      /* ep_num alone cannot be bound: it indexes ONE pool's eps[] and every
+       * model pool on this service starts at 0. Carry the pool that owns it
+       * (epv stays NULL here by the P1.3 load-accounting rule above). */
+      npfe2->learn_epv = tepval;
       strncpy(npfe2->session_header_name, npfe1->session_header_name, 
               sizeof(npfe2->session_header_name) - 1);
       npfe2->session_header_name[sizeof(npfe2->session_header_name) - 1] = '\0';
@@ -9729,7 +9733,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                    pfe->session_header_name, pfe->learned_session_id);
                           
                           // Store mapping: session_id → endpoint_index
-                          if (store_conversation_endpoint(ent, conv_id, pfe->ep_num) == 0) {
+                          /* Backend leg: the pool rides on learn_epv, not epv. */
+                          if (store_conversation_endpoint(ent, conv_id, pfe->ep_num,
+                                                          (const proxy_epval_t *)pfe->learn_epv) == 0) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
                             log_info("[SESSION_LEARNED] Backend returned '%s: %s' → bound to endpoint[%d]",
                                      pfe->session_header_name, pfe->learned_session_id, pfe->ep_num);

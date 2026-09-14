@@ -15,12 +15,19 @@
 /* Session key hash (also used by sockproxy_http.c) */
 uint32_t session_key_hash(const char *session_key);
 
-/* Conversation mapping API */
+/* Conversation mapping API.
+ *
+ * `epv` names the pool the endpoint index belongs to and is REQUIRED: an
+ * index is meaningless outside its own pool's eps[] (sockproxy_conv_pool.h).
+ * get_ returns NULL when the stored mapping belongs to another pool, so the
+ * caller re-selects instead of routing to another model's backend. */
 conversation_mapping_t *get_conversation_mapping(proxy_map_ent_t *ent,
-                                                  const char *conv_id);
+                                                  const char *conv_id,
+                                                  const proxy_epval_t *epv);
 int store_conversation_endpoint(proxy_map_ent_t *ent,
                                 const char *conv_id,
-                                int ep_idx);
+                                int ep_idx,
+                                const proxy_epval_t *epv);
 
 /* Strip port from hostname helper -- e.g. "host:9090" -> "host" */
 void strip_port_from_hostname(const char *host_with_port,
