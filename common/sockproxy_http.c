@@ -7713,15 +7713,21 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
                       pfe->last_header_name, 
                       header_name_len)) {
         
-        // Match found! Extract full header value (original behavior)
-        if (length > 0 && length < sizeof(pfe->custom_session_header_value)) {
-          strncpy(pfe->custom_session_header_value, at, length);
-          pfe->custom_session_header_value[length] = '\0';
+        /* Match found. A value that does not fit is reduced to a digest of
+         * the whole value rather than dropped: the previous "only if it
+         * fits" guard silently disabled stickiness for every long value,
+         * which is exactly the documented session_header_name
+         * "authorization" case, where the value is a bearer token. */
+        if (length > 0 &&
+            conv_pool_store_id(pfe->custom_session_header_value,
+                               sizeof(pfe->custom_session_header_value),
+                               at, length) == 0) {
           pfe->has_custom_session_header = 1;
           
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-          log_debug("[SESSION_HEADER] fd=%d: Extracted header '%s'='%.*s' for session affinity",
-                   pfe->fd, pfe->session_header_name, (int)length, at);
+          log_debug("[SESSION_HEADER] fd=%d: Extracted header '%s'='%.*s' (bound as '%s') for session affinity",
+                   pfe->fd, pfe->session_header_name, (int)length, at,
+                   pfe->custom_session_header_value);
 #endif
         }
       }

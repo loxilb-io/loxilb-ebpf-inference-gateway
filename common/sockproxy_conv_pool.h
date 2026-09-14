@@ -68,6 +68,79 @@
  * "custom_authorization_Bearer <jwt>", where two tokens share a long prefix. */
 #define CONV_POOL_KEY_MAX (16 + 1 + CONV_POOL_ID_MAX)
 
+/* A session id that does not fit is stored as this marker, sixteen hex digits
+ * of FNV-1a over the WHOLE value, '.', and the value's decimal length. Length
+ * is part of the form so two values must collide in the hash AND be the same
+ * size to share a row. 1 + 16 + 1 + 20 + NUL. */
+#define CONV_POOL_DIGEST_MARK '~'
+#define CONV_POOL_DIGEST_MAX  39
+
+/* Store a session id into a bounded buffer without ever merging two of them.
+ *
+ * The obvious two ways to handle a value that does not fit are both wrong for
+ * a routing key. Truncating merges every value sharing a prefix onto one
+ * binding. Dropping the value - which the plain-header extraction path did -
+ * silently disables stickiness altogether, and does it precisely for the
+ * configuration the tree documents, session_header_name "authorization",
+ * where the value is a bearer token far longer than any sane buffer.
+ *
+ * So an over-long value is reduced to a digest of the whole thing instead: the
+ * id stays bounded, distinct conversations keep distinct rows, and the same
+ * conversation keeps mapping to the same row on every turn, which is all a
+ * stickiness key has to do.
+ *
+ * A value that fits is stored verbatim unless it could be read back as a
+ * digest, which is digested instead so the two forms can never be confused.
+ *
+ * `val` need not be NUL-terminated; exactly `vallen` bytes are read. Returns 0
+ * on success, -1 if the arguments cannot be honoured.
+ *
+ * This is an affinity key, not a credential: the cost of a collision is a lost
+ * KV-cache hit on a healthy endpoint of the correct model, which is why a
+ * non-cryptographic hash is the right tool here.
+ */
+static inline int
+conv_pool_store_id(char *out, size_t outlen, const char *val, size_t vallen)
+{
+  static const char hex[] = "0123456789abcdef";
+  uint64_t h = 0xcbf29ce484222325ULL;   /* FNV-1a 64 offset basis */
+  size_t i, n, digits;
+  char dec[20];
+
+  if (!out || !val || outlen < CONV_POOL_DIGEST_MAX + 1)
+    return -1;
+
+  /* Fits, and cannot be mistaken for the digest form. */
+  if (vallen < outlen && val[0] != CONV_POOL_DIGEST_MARK) {
+    for (i = 0; i < vallen; i++)
+      out[i] = val[i];
+    out[vallen] = '\0';
+    return 0;
+  }
+
+  for (i = 0; i < vallen; i++) {
+    h ^= (uint64_t)(unsigned char)val[i];
+    h *= 0x100000001b3ULL;              /* FNV-1a 64 prime */
+  }
+
+  n = 0;
+  out[n++] = CONV_POOL_DIGEST_MARK;
+  for (i = 0; i < 16; i++)
+    out[n++] = hex[(h >> (60 - 4 * i)) & 0xf];
+  out[n++] = '.';
+
+  digits = 0;
+  do {
+    dec[digits++] = (char)('0' + (vallen % 10));
+    vallen /= 10;
+  } while (vallen && digits < sizeof(dec));
+  while (digits)
+    out[n++] = dec[--digits];
+
+  out[n] = '\0';
+  return 0;
+}
+
 static inline uint64_t
 conv_pool_tag_of_key(const char *ephash_key)
 {
@@ -97,6 +170,32 @@ conv_pool_tag_matches(uint64_t stored, uint64_t want)
   if (stored == CONV_POOL_TAG_UNKNOWN || want == CONV_POOL_TAG_UNKNOWN)
     return 0;
   return stored == want;
+}
+
+/*
+ * May a sync event that names no pool be applied to a service holding
+ * `n_pools` pools?
+ *
+ * proxy_sync_event_t carries a service_key ("xip:xport:proto") and nothing
+ * finer, so the receiver can only resolve the pool by guessing. With exactly
+ * one pool the guess is the answer. With more, the guess is a coin toss whose
+ * losing side is not a miss but the cross-pool aliasing this file exists to
+ * prevent - and worse than the original, because the row is written carrying
+ * the guessed pool's tag, so that pool MATCHES it and is handed an index
+ * chosen inside a different eps[]. In range and healthy, so nothing
+ * downstream can catch it. A DELETE under a wrong guess removes a live
+ * binding belonging to a pool the event never named.
+ *
+ * Fail closed: re-learning stickiness locally costs one re-selection, while a
+ * wrong guess silently corrupts a binding until it ages out.
+ *
+ * When the pool rides on the wire this predicate goes away - replaced by the
+ * real identity, not relaxed.
+ */
+static inline int
+conv_pool_sync_may_apply(unsigned int n_pools)
+{
+  return n_pools == 1;
 }
 
 /*

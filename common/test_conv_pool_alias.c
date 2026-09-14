@@ -177,6 +177,104 @@ test_full_length_id_still_separates_pools(void)
   assert(strcmp(key_a + 17, key_b + 17) == 0);   /* same id, different tag */
 }
 
+/* An id that does not fit must still identify ONE conversation. Dropping it
+ * (what the plain-header path did) disables stickiness; truncating it merges
+ * conversations. Neither is acceptable, so it is digested. */
+static void
+test_overlong_ids_are_bound_not_dropped_or_merged(void)
+{
+  char a[CONV_POOL_ID_MAX], b[CONV_POOL_ID_MAX];
+  /* Two bearer tokens: same long prefix, differing far past any buffer. */
+  char raw_a[4096], raw_b[4096];
+  static const char prefix[] = "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.";
+  size_t n = sizeof(raw_a) - 1;
+
+  memset(raw_a, 'q', sizeof(raw_a));
+  memcpy(raw_a, prefix, sizeof(prefix) - 1);
+  memcpy(raw_b, raw_a, sizeof(raw_b));
+  raw_a[3000] = 'A';
+  raw_b[3000] = 'B';
+
+  /* Bound, not dropped. */
+  assert(conv_pool_store_id(a, sizeof(a), raw_a, n) == 0);
+  assert(conv_pool_store_id(b, sizeof(b), raw_b, n) == 0);
+  assert(a[0] == CONV_POOL_DIGEST_MARK);
+  assert(strlen(a) < CONV_POOL_DIGEST_MAX);
+
+  /* Not merged: the two tokens keep separate rows. */
+  assert(strcmp(a, b) != 0);
+
+  /* Stable: the same conversation binds to the same row on every turn. */
+  {
+    char again[CONV_POOL_ID_MAX];
+    assert(conv_pool_store_id(again, sizeof(again), raw_a, n) == 0);
+    assert(strcmp(a, again) == 0);
+  }
+
+  /* Length is part of the form, so a shorter value cannot land on a longer
+   * one's row even if the hashes were to agree. */
+  {
+    char shorter[CONV_POOL_ID_MAX];
+    assert(conv_pool_store_id(shorter, sizeof(shorter), raw_a, n - 1) == 0);
+    assert(strcmp(a, shorter) != 0);
+  }
+}
+
+/* A value that fits is passed through untouched -- the common case must not
+ * become a digest -- unless it could be read back AS a digest, which would
+ * make the two forms ambiguous. */
+static void
+test_short_ids_are_stored_verbatim_without_ambiguity(void)
+{
+  char out[CONV_POOL_ID_MAX];
+  static const char plain[] = "custom_x-session-id_abc123";
+  char lookalike[CONV_POOL_ID_MAX];
+
+  assert(conv_pool_store_id(out, sizeof(out), plain, strlen(plain)) == 0);
+  assert(strcmp(out, plain) == 0);
+
+  /* A short value that merely looks like the digest form is digested, so no
+   * client-supplied value can impersonate another conversation's row. */
+  lookalike[0] = CONV_POOL_DIGEST_MARK;
+  memcpy(lookalike + 1, "0123456789abcdef.9", 19);
+  assert(conv_pool_store_id(out, sizeof(out), lookalike, strlen(lookalike)) == 0);
+  assert(strcmp(out, lookalike) != 0);
+  assert(out[0] == CONV_POOL_DIGEST_MARK);
+
+  /* Refuses a buffer it cannot honour rather than writing a partial id. */
+  assert(conv_pool_store_id(out, CONV_POOL_DIGEST_MAX - 1, plain, strlen(plain)) == -1);
+  assert(conv_pool_store_id(NULL, sizeof(out), plain, strlen(plain)) == -1);
+}
+
+/* An id with no NUL inside `vallen` must not be over-read: the extraction
+ * path passes a pointer into the request buffer plus a length. */
+static void
+test_store_id_reads_exactly_vallen_bytes(void)
+{
+  char out[CONV_POOL_ID_MAX];
+  char unterminated[8];
+
+  memset(unterminated, 'k', sizeof(unterminated));   /* deliberately no NUL */
+  assert(conv_pool_store_id(out, sizeof(out), unterminated,
+                            sizeof(unterminated)) == 0);
+  assert(strlen(out) == sizeof(unterminated));
+  assert(strncmp(out, unterminated, sizeof(unterminated)) == 0);
+}
+
+/* A failover event that names no pool may only be applied where there is
+ * nothing to guess. On a multi-pool service the guessed pool would be written
+ * into the row's tag, so that pool would MATCH the row and take an index
+ * chosen inside another pool's eps[] -- the aliasing this file prevents,
+ * re-entering through HA sync with a tag that certifies it. */
+static void
+test_sync_without_pool_identity_applies_only_to_one_pool(void)
+{
+  assert(conv_pool_sync_may_apply(1) == 1);   /* nothing to guess */
+  assert(conv_pool_sync_may_apply(2) == 0);   /* the exposing topology */
+  assert(conv_pool_sync_may_apply(7) == 0);
+  assert(conv_pool_sync_may_apply(0) == 0);   /* no pool at all: not a wildcard */
+}
+
 int
 main(void)
 {
@@ -187,6 +285,10 @@ main(void)
   test_wildcard_pool_is_a_pool_not_a_wildcard();
   test_long_ids_that_share_a_prefix_keep_separate_rows();
   test_full_length_id_still_separates_pools();
+  test_overlong_ids_are_bound_not_dropped_or_merged();
+  test_short_ids_are_stored_verbatim_without_ambiguity();
+  test_store_id_reads_exactly_vallen_bytes();
+  test_sync_without_pool_identity_applies_only_to_one_pool();
   /* Name the include order: the two legs of this test differ ONLY in it,
    * so an indistinguishable banner would hide one leg not having run. */
 #ifdef MAX_CONV_ID_LEN
