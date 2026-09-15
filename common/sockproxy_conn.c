@@ -194,6 +194,9 @@ proxy_peer_map_clear(proxy_fd_ent_t *pfe)
   pfe->peer_map_pair_installed = 0;
   pfe->peer_map_req_installed = 0;
   pfe->peer_map_resp_installed = 0;
+  pfe->peer_map_req_verdict = 0;
+  pfe->peer_map_resp_verdict = 0;
+  pfe->peer_map_req_pending = 0;
   memset(&pfe->peer_map_client_key, 0, sizeof(pfe->peer_map_client_key));
   memset(&pfe->peer_map_backend_key, 0, sizeof(pfe->peer_map_backend_key));
 }
@@ -211,6 +214,18 @@ proxy_peer_map_delete(proxy_fd_ent_t *pfe)
   proxy_skmap_snapshot_restore(&client_key, &pfe->peer_map_client_key);
   proxy_skmap_snapshot_restore(&backend_key, &pfe->peer_map_backend_key);
 
+  /* sock_verdict_map first: a socket left there without its peer_map entry would
+   * make the verdict SK_PASS, which can stall the reader (llb_kern_sockmap.c). */
+  if (pfe->peer_map_req_verdict && proxy_struct->verdict_map_cb &&
+      proxy_struct->verdict_map_cb(&client_key, -1, 0) != 0) {
+    log_error("Sockmap: sock_verdict_map delete failed for client of fd=%d", pfe->fd);
+  }
+
+  if (pfe->peer_map_resp_verdict && proxy_struct->verdict_map_cb &&
+      proxy_struct->verdict_map_cb(&backend_key, -1, 0) != 0) {
+    log_error("Sockmap: sock_verdict_map delete failed for backend fd=%d", pfe->fd);
+  }
+
   /* Delete only the directions that were actually installed (see the directional
    * sockMapMode gating in setup_proxy_path). */
   if (pfe->peer_map_req_installed &&
@@ -224,6 +239,67 @@ proxy_peer_map_delete(proxy_fd_ent_t *pfe)
   }
 
   proxy_peer_map_clear(pfe);
+}
+
+/* Activates the request direction of a pair installed by setup_proxy_path: puts
+ * the client socket into sock_verdict_map, after which the kernel moves client
+ * bytes straight to the backend. It must wait until userspace holds no client
+ * byte the backend has not received, or the bytes the client sends next would
+ * overtake them: nothing left in rcvbuf, no streamed request body outstanding,
+ * and an empty send cache on the backend. Callers invoke it wherever one of
+ * those conditions can become true; it does nothing until all of them hold.
+ *
+ * Bytes that reach the socket between the last read and the add stay in its
+ * receive queue; the next read of the client fd runs them through the verdict,
+ * so the client fd must stay armed for reads after activation.
+ *
+ * If the add fails, most commonly because the client has half-closed and the
+ * socket is no longer ESTABLISHED, the request entry is removed and the
+ * connection stays on the userspace relay. */
+void
+proxy_peer_map_activate_req(proxy_fd_ent_t *client_pfe)
+{
+  proxy_fd_ent_t *be;
+  smap_key_t client_key;
+  int ret;
+
+  if (!client_pfe || client_pfe->odir != 0 || client_pfe->n_rfd <= 0) {
+    return;
+  }
+
+  be = client_pfe->rfd_ent[0];
+  if (!be || !be->peer_map_req_pending || proxy_struct->verdict_map_cb == NULL ||
+      proxy_struct->peer_map_cb == NULL) {
+    return;
+  }
+
+  if (client_pfe->rcv_off != 0 || client_pfe->stream_body_remaining != 0 ||
+      client_pfe->pd_phase != PD_PHASE_NONE ||
+      be->cache_total_size != 0 || be->cache_head != NULL) {
+    return;
+  }
+
+  be->peer_map_req_pending = 0;
+  proxy_skmap_snapshot_restore(&client_key, &be->peer_map_client_key);
+
+  ret = proxy_struct->verdict_map_cb(&client_key, client_pfe->fd, 1);
+  if (ret == 0) {
+    be->peer_map_req_verdict = 1;
+    return;
+  }
+
+  if (proxy_struct->peer_map_cb(&client_key, NULL, 0) == 0) {
+    be->peer_map_req_installed = 0;
+    be->peer_map_pair_installed = be->peer_map_resp_installed;
+  }
+
+  if (ret == -EOPNOTSUPP) {
+    log_debug("Sockmap: client fd=%d no longer established, request direction stays on the userspace relay",
+              client_pfe->fd);
+  } else {
+    log_error("Sockmap: sock_verdict_map add failed for client fd=%d (%d), request direction stays on the userspace relay",
+              client_pfe->fd, ret);
+  }
 }
 
 

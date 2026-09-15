@@ -32,6 +32,7 @@ void proxy_skmap_snapshot_store(proxy_skmap_key_snapshot_t *dst, const smap_key_
 void proxy_skmap_snapshot_restore(smap_key_t *dst, const proxy_skmap_key_snapshot_t *src);
 void proxy_peer_map_clear(proxy_fd_ent_t *pfe);
 void proxy_peer_map_delete(proxy_fd_ent_t *pfe);
+void proxy_peer_map_activate_req(proxy_fd_ent_t *client_pfe);
 
 /* Socket setup utilities */
 void proxy_sock_set_opts(int fd, uint8_t protocol);

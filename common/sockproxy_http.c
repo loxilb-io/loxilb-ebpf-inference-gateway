@@ -6704,16 +6704,25 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
 #if defined(HAVE_SOCKOPS)
     uint8_t sockmap_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
 
-    if (sockmap_eligible && proxy_struct->peer_map_cb && sockmap_mode) {
+    if (sockmap_eligible && proxy_struct->peer_map_cb && proxy_struct->verdict_map_cb &&
+        sockmap_mode) {
       /* sockmap_en is a directional mode:
        *   1 = both, 2 = request-only, 3 = response-only.
        * The request direction ([client]=backend) lets the sk_skb verdict
        * redirect client ingress straight to the backend; the response
        * direction ([backend]=client) redirects backend ingress to the client.
        * Install only the entries that the mode asks for; the other direction
-       * misses peer_map -> SK_PASS -> stays on the userspace proxy path.
+       * stays on the userspace proxy path.
        * key  = backend socket tuple as seen from the client side (self=client)
-       * rkey = client socket tuple as seen from the backend side (self=backend) */
+       * rkey = client socket tuple as seen from the backend side (self=backend)
+       *
+       * An installed entry does nothing until its socket is also added to
+       * sock_verdict_map (sockops no longer adds it; see llb_kern_sockmap.c).
+       * The backend socket is added right away: the request has not been sent
+       * yet, so no response byte can be in userspace or on the way. The client
+       * socket is added by proxy_peer_map_activate_req once userspace has handed
+       * the backend every client byte it holds, so later client bytes cannot
+       * overtake the request that is still being forwarded. */
       uint8_t dir = sockmap_mode;
       int do_req = (dir == 1 || dir == 2);
       int do_resp = (dir == 1 || dir == 3);
@@ -6733,12 +6742,22 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         if (do_req) {
           proxy_skmap_snapshot_store(&npfe2->peer_map_client_key, key);
           npfe2->peer_map_req_installed = 1;
+          npfe2->peer_map_req_pending = 1;
         }
         if (do_resp) {
           proxy_skmap_snapshot_store(&npfe2->peer_map_backend_key, rkey);
-          npfe2->peer_map_resp_installed = 1;
+          int vret = proxy_struct->verdict_map_cb(rkey, ep_cfd, 1);
+          if (vret == 0) {
+            npfe2->peer_map_resp_installed = 1;
+            npfe2->peer_map_resp_verdict = 1;
+          } else {
+            proxy_struct->peer_map_cb(rkey, NULL, 0);
+            log_error("Sockmap: sock_verdict_map add failed for backend fd=%d (%d), "
+                      "response direction stays on the userspace relay", ep_cfd, vret);
+          }
         }
-        npfe2->peer_map_pair_installed = (do_req || do_resp) ? 1 : 0;
+        npfe2->peer_map_pair_installed =
+            (npfe2->peer_map_req_installed || npfe2->peer_map_resp_installed) ? 1 : 0;
       }
     }
 #endif
@@ -8779,6 +8798,14 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 
     llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
 
+#if defined(HAVE_SOCKOPS)
+    /* The request is handed to the backend and rcvbuf is reset; the request
+     * direction can be activated unless a streamed body is still outstanding
+     * or the backend's send cache is not empty yet (the cache drain and the
+     * body relay retry). */
+    proxy_peer_map_activate_req(pfe);
+#endif
+
     // CRITICAL FIX: Break read loop after forwarding request to backend
     // We must wait for backend response, not continue reading from client
     // The client has sent its full request and is waiting for response
@@ -9156,6 +9183,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           rc = (int)((size_t)rc - sb_take);
           /* fall through: remaining bytes start the next request (parse) */
         } else {
+#if defined(HAVE_SOCKOPS)
+          /* no-op until the body is fully relayed and the backend cache is empty */
+          proxy_peer_map_activate_req(pfe);
+#endif
           continue;   /* body chunk fully consumed — next burst read */
         }
       }
@@ -9989,6 +10020,13 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         log_error("[BURST_MULTIPLEXOR_FAIL] fd=%d: proxy_multiplexor failed, closing connection", fd);
         return -1; // Restart
       }
+
+#if defined(HAVE_SOCKOPS)
+      if (!pfe->odir) {
+        /* client bytes that arrived before activation were just relayed */
+        proxy_peer_map_activate_req(pfe);
+      }
+#endif
 
       // CRITICAL: Check backpressure AFTER forwarding each packet in burst
       // If destination cache just crossed high water mark, stop reading immediately
