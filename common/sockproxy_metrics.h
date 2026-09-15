@@ -133,6 +133,14 @@ typedef struct proxy_metrics_snapshot {
      * above. */
     uint64_t pd_connect_retry_same_ep;
     uint64_t pd_connect_retry_same_ep_ok;
+
+    /* Bounded-admission overflow shed (parked FIFO full on every eligible
+     * EP -> 429). With LLB_PD_QUEUE_DEPTH_PER_EP > 0 the plain-shed branch
+     * is unreachable and this valve is the ONLY shed that can fire, so
+     * without this field every overload drop is invisible to /metrics.
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks
+     * above. */
+    uint64_t pd_admission_overflow_shed;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================
@@ -149,7 +157,8 @@ proxy_metrics_snapshot_t proxy_get_metrics(void);
  * pd_admission_stats_get - read-only accessor for the Phase-93 file-static
  * admission counters in sockproxy_pd.c (OBS-01 export).
  * which==0 -> pd_admission_shed_total, which==1 -> pd_admission_queued_total,
- * any other value -> 0. Called from proxy_get_metrics only.
+ * which==2 -> pd_admission_overflow_shed_total, any other value -> 0.
+ * Called from proxy_get_metrics only.
  */
 uint64_t pd_admission_stats_get(int which);
 
