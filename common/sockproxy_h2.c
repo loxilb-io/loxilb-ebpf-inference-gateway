@@ -187,6 +187,8 @@ create_stream(proxy_h2_session_t *session, int32_t stream_id)
  * is the one place it is freed — covering both the normal drain and a client
  * that resets the denied stream before the read callback reaches EOF. */
 static void proxy_h2_free_deny_body(proxy_h2_stream_t *stream);
+static void h2_resp_relay_free(proxy_h2_session_t *client_session,
+                               h2_resp_relay_t *r);
 
 /* Sliding response-tail window: the usage object rides the final bytes of
  * a JSON body or the final SSE chunk (stream_options.include_usage). */
@@ -400,6 +402,14 @@ h2_stream_free(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   /* Release the AI-deny response body if the stream still owns one (a client
    * reset before nghttp2 drained it never reached the read callback's EOF). */
   proxy_h2_free_deny_body(stream);
+
+  /* Release the backend response relay (queued chunks, stored trailers)
+   * and return its unsent bytes to the session budget. nghttp2 runs the
+   * relay provider only for open streams, so nothing reads it after this
+   * point: the stream close callback runs once nghttp2 has detached the
+   * DATA item, and proxy_h2_cleanup_session frees streams right before
+   * deleting the session. */
+  h2_resp_relay_free(session, &stream->resp);
 
   // Free data buffer if allocated
   if (stream->data_buf) {
@@ -935,82 +945,278 @@ proxy_h2_recv_callback(nghttp2_session *session,
 // Backend HTTP/2 Session Management (Transit Mode)
 // ============================================================================
 
-/**
- * Data provider context for forwarding DATA frames
- * Extended with session context for backpressure management
- */
-typedef struct {
-  uint8_t *data;
-  size_t len;
-  size_t offset;
-  proxy_h2_session_t *client_session;    // For backpressure release logic
-  backend_h2_session_t *backend_session;  // For nghttp2_session_resume_data()
-  int32_t stream_id;                      // Stream ID to resume
-} data_forward_ctx_t;
+/* ==========================================================================
+ * Backend -> client response relay (h2_resp_relay_t, sockproxy_h2.h)
+ *
+ * One data provider per client stream drains a chunk queue filled by the
+ * backend DATA callback. The provider is submitted once with END_STREAM,
+ * resumed as chunks arrive, and defers while the queue is empty. Once the
+ * backend's END_STREAM has been seen and the queue is drained it sets EOF,
+ * which ends the stream, or EOF with NO_END_STREAM plus
+ * nghttp2_submit_trailer when the backend sent trailers.
+ *
+ * Why not one nghttp2_submit_data per chunk (the previous design): nghttp2
+ * keeps one DATA item per stream and refuses a second with
+ * NGHTTP2_ERR_DATA_EXIST until the first reaches EOF, so a chunk that
+ * arrived while the client's window was closed failed the callback. Its
+ * END_STREAM also never reached the client, because every provider ended
+ * at EOF without END_STREAM and an empty END_STREAM DATA frame was never
+ * relayed. Trailers submitted with nghttp2_submit_headers could go out
+ * before still-pending DATA, since nghttp2 sends HEADERS ahead of DATA.
+ * ========================================================================== */
+
+static void
+h2_resp_nv_free(nghttp2_nv *nv, size_t count)
+{
+  if (!nv) {
+    return;
+  }
+  for (size_t i = 0; i < count; i++) {
+    free(nv[i].name);
+    free(nv[i].value);
+  }
+  free(nv);
+}
+
+/* Free the collected header fields of the HEADERS frame just handled. The
+ * header callback appends to this array, so it must be emptied after each
+ * frame, or the next frame (a final response after a 1xx, or the trailers)
+ * would be relayed with the previous frame's fields prepended. */
+static void
+h2_mapping_clear_resp_headers(stream_mapping_t *mapping)
+{
+  if (!mapping->response_headers) {
+    return;
+  }
+  for (size_t i = 0; i < mapping->response_headers_count; i++) {
+    free(mapping->response_headers[i].name);
+    free(mapping->response_headers[i].value);
+  }
+  mapping->response_headers_count = 0;
+}
+
+static void
+h2_resp_account_release(proxy_h2_session_t *client_session, size_t n)
+{
+  if (client_session->total_response_buffer_size > n) {
+    client_session->total_response_buffer_size -= n;
+  } else {
+    client_session->total_response_buffer_size = 0;
+  }
+}
+
+/* Release consumed bytes from the session budget and, at the LOW water
+ * mark, lift backpressure (same logic as HTTP/1.1's
+ * proxy_check_release_backpressure). The backend stream feeding this client
+ * stream is looked up by id rather than kept as a pointer, so a backend
+ * session torn down in the meantime is never touched. */
+static void
+h2_resp_release(proxy_h2_session_t *client_session, int32_t client_stream_id,
+                size_t n)
+{
+  h2_resp_account_release(client_session, n);
+
+  if (!client_session->backpressure_active ||
+      client_session->total_response_buffer_size > H2_SESSION_LOW_WATER) {
+    return;
+  }
+
+  client_session->backpressure_active = 0;
+  log_warn("🟢 HTTP/2 session LOW water mark reached (size=%zu/%d MB), RELEASING BACKPRESSURE",
+           client_session->total_response_buffer_size, H2_SESSION_LOW_WATER/(1024*1024));
+
+  backend_h2_session_t *backend_session, *btmp;
+  HASH_ITER(hh, client_session->backend_sessions, backend_session, btmp) {
+    stream_mapping_t *mapping = NULL;
+    HASH_FIND_INT(backend_session->stream_map, &client_stream_id, mapping);
+    if (!mapping || !backend_session->session) {
+      continue;
+    }
+    int rv = nghttp2_session_resume_data(backend_session->session,
+                                         mapping->backend_stream_id);
+    if (rv == 0) {
+      log_debug("✓ Resumed backend stream %d after backpressure release",
+                mapping->backend_stream_id);
+    } else {
+      log_warn("Failed to resume backend stream %d: %s",
+               mapping->backend_stream_id, nghttp2_strerror(rv));
+    }
+    break;
+  }
+}
+
+/* Drop everything a relay holds and hand its unsent bytes back to the
+ * session budget. Idempotent; safe on a zeroed relay. Called when the client
+ * stream is freed, which is the only point after which nghttp2 can no longer
+ * run the provider. */
+static void
+h2_resp_relay_free(proxy_h2_session_t *client_session, h2_resp_relay_t *r)
+{
+  h2_resp_chunk_t *c = r->head;
+  while (c) {
+    h2_resp_chunk_t *next = c->next;
+    free(c);
+    c = next;
+  }
+  r->head = NULL;
+  r->tail = NULL;
+  if (client_session && r->queued_bytes) {
+    h2_resp_account_release(client_session, r->queued_bytes);
+    /* No backend resume here: this runs on stream close or session
+     * teardown, and the next chunk callback re-checks the watermark. */
+    if (client_session->backpressure_active &&
+        client_session->total_response_buffer_size <= H2_SESSION_LOW_WATER) {
+      client_session->backpressure_active = 0;
+    }
+  }
+  r->queued_bytes = 0;
+  h2_resp_nv_free(r->trailers, r->trailers_count);
+  r->trailers = NULL;
+  r->trailers_count = 0;
+  r->trailers_capacity = 0;
+  r->trailer_pending = 0;
+  r->data_provider_active = 0;
+}
+
+/* Reset the client stream once; the stream close that follows frees the
+ * relay. */
+static void
+h2_resp_relay_reset(proxy_h2_session_t *client_session,
+                    proxy_h2_stream_t *stream, uint32_t error_code)
+{
+  if (stream->resp.reset_submitted || stream->resp.eos_sent) {
+    return;
+  }
+  nghttp2_submit_rst_stream(client_session->session, NGHTTP2_FLAG_NONE,
+                            stream->stream_id, error_code);
+  stream->resp.reset_submitted = 1;
+}
 
 /**
- * Data provider read callback for forwarding DATA frames
+ * Data provider read callback for the backend -> client response body.
  */
 static ssize_t
-data_forward_read_callback(nghttp2_session *session, int32_t stream_id,
+h2_resp_relay_read_callback(nghttp2_session *session, int32_t stream_id,
                             uint8_t *buf, size_t length, uint32_t *data_flags,
                             nghttp2_data_source *source, void *user_data)
 {
-  data_forward_ctx_t *ctx = (data_forward_ctx_t *)source->ptr;
-  size_t remaining = ctx->len - ctx->offset;
-  size_t to_copy = (remaining < length) ? remaining : length;
-  
-  if (to_copy > 0) {
-    memcpy(buf, ctx->data + ctx->offset, to_copy);
-    ctx->offset += to_copy;
+  proxy_fd_ent_t *pfe = (proxy_fd_ent_t *)user_data;
+  proxy_h2_session_t *client_session = pfe ? pfe->h2_session : NULL;
+  proxy_h2_stream_t *stream =
+    client_session ? find_stream(client_session, stream_id) : NULL;
+
+  (void)source;
+
+  if (!stream) {
+    /* nghttp2 reads only open streams and the relay is freed with the
+     * stream, so the two stream tables disagree. Reset the stream rather
+     * than end it as if the body were complete. */
+    log_error("[HTTP/2] stream %d: response relay has no stream", stream_id);
+    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
   }
-  
-  if (ctx->offset >= ctx->len) {
-    *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-    
-    // ============================================================================
-    // HTTP/2 BACKPRESSURE RELEASE: Resume backend reads when cache drains
-    // ============================================================================
-    // Pattern: Identical to HTTP/1.1's proxy_check_release_backpressure() at sockproxy.c:382
-    //
-    // Update total buffer size (subtract freed data)
-    if (ctx->client_session) {
-      ctx->client_session->total_response_buffer_size -= ctx->len;
-      
-      // Check if we should release backpressure (LOW water mark)
-      // Same logic as HTTP/1.1: if (size <= LOW_WATER && backpressure_active)
-      if (ctx->client_session->backpressure_active &&
-          ctx->client_session->total_response_buffer_size <= H2_SESSION_LOW_WATER) {
-        
-        ctx->client_session->backpressure_active = 0;
-        
-        log_warn("🟢 HTTP/2 session LOW water mark reached (size=%zu/%d MB), RELEASING BACKPRESSURE",
-                 ctx->client_session->total_response_buffer_size, H2_SESSION_LOW_WATER/(1024*1024));
-        
-        // ============================================================================
-        // CRITICAL: Resume paused backend stream (prevents deadlock)
-        // ============================================================================
-        // When NGHTTP2_ERR_PAUSE was returned, stream entered paused state
-        // Must explicitly call nghttp2_session_resume_data() to resume stream
-        // Simply calling nghttp2_session_recv() does NOT auto-resume paused streams
-        //
-        if (ctx->backend_session && ctx->backend_session->session) {
-          int rv = nghttp2_session_resume_data(ctx->backend_session->session, ctx->stream_id);
-          if (rv == 0) {
-            log_debug("✓ Resumed backend stream %d after backpressure release", ctx->stream_id);
-          } else {
-            log_warn("Failed to resume backend stream %d: %s", 
-                     ctx->stream_id, nghttp2_strerror(rv));
-          }
-        }
+
+  h2_resp_relay_t *r = &stream->resp;
+  size_t copied = 0;
+
+  while (copied < length && r->head) {
+    h2_resp_chunk_t *c = r->head;
+    size_t avail = c->len - c->off;
+    size_t n = (avail < length - copied) ? avail : length - copied;
+
+    memcpy(buf + copied, c->data + c->off, n);
+    c->off += n;
+    copied += n;
+    if (c->off == c->len) {
+      r->head = c->next;
+      if (!r->head) {
+        r->tail = NULL;
       }
+      free(c);
     }
-    
-    free(ctx->data);
-    free(ctx);
   }
-  
-  return to_copy;
+
+  if (copied > 0) {
+    r->queued_bytes -= copied;
+    h2_resp_release(client_session, stream_id, copied);
+  }
+
+  if (r->head) {
+    return (ssize_t)copied;          // more queued than this frame can carry
+  }
+  if (!r->eos_pending) {
+    /* Queue drained, body not finished: wait for the next backend chunk,
+     * which resumes this provider. */
+    return copied ? (ssize_t)copied : NGHTTP2_ERR_DEFERRED;
+  }
+
+  /* Backend END_STREAM seen and everything relayed. The provider was
+   * submitted with END_STREAM, so EOF alone ends the stream. */
+  *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+  r->data_provider_active = 0;
+  r->eos_sent = 1;
+
+  if (r->trailer_pending) {
+    /* Trailers must follow the last DATA: end the provider without
+     * END_STREAM and submit them from inside this callback, as nghttp2
+     * documents. nghttp2 copies the fields, so free ours now. */
+    *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+    int rv = nghttp2_submit_trailer(session, stream_id, r->trailers,
+                                    r->trailers_count);
+    h2_resp_nv_free(r->trailers, r->trailers_count);
+    r->trailers = NULL;
+    r->trailers_count = 0;
+    r->trailers_capacity = 0;
+    r->trailer_pending = 0;
+    if (rv != 0) {
+      log_error("[HTTP/2] stream %d: nghttp2_submit_trailer failed: %s",
+                stream_id, nghttp2_strerror(rv));
+      /* Without its trailers the stream can never end cleanly; this return
+       * makes nghttp2 reset it. */
+      r->reset_submitted = 1;
+      return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+  }
+
+  return (ssize_t)copied;
+}
+
+/* Make the provider run: submit it once, or resume it if it is deferred.
+ * Returns 0, or a fatal nghttp2 error for the caller to propagate. */
+static int
+h2_resp_relay_kick(proxy_h2_session_t *client_session, proxy_h2_stream_t *stream)
+{
+  h2_resp_relay_t *r = &stream->resp;
+  int rv;
+
+  if (r->eos_sent || r->reset_submitted) {
+    return 0;
+  }
+
+  if (r->data_provider_active) {
+    rv = nghttp2_session_resume_data(client_session->session, stream->stream_id);
+    /* NGHTTP2_ERR_INVALID_ARGUMENT only means the provider is not deferred
+     * by us: it is still queued, or waiting for the client's window, and
+     * will read the new chunk when it runs. */
+    return nghttp2_is_fatal(rv) ? rv : 0;
+  }
+
+  nghttp2_data_provider data_prd;
+  data_prd.source.ptr = NULL;        // the callback looks the stream up by id
+  data_prd.read_callback = h2_resp_relay_read_callback;
+
+  rv = nghttp2_submit_data(client_session->session, NGHTTP2_FLAG_END_STREAM,
+                           stream->stream_id, &data_prd);
+  if (rv != 0) {
+    log_error("[HTTP/2] stream %d: nghttp2_submit_data failed: %s",
+              stream->stream_id, nghttp2_strerror(rv));
+    if (nghttp2_is_fatal(rv)) {
+      return rv;
+    }
+    h2_resp_relay_reset(client_session, stream, NGHTTP2_INTERNAL_ERROR);
+    return 0;
+  }
+  r->data_provider_active = 1;
+  return 0;
 }
 
 /**
@@ -1165,13 +1371,96 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     // When using nghttp2_session_mem_recv(), frame->headers.nva is NOT populated.
     // Headers are only available during the header callback execution.
     // We MUST use the headers collected in mapping->response_headers.
+    //
+    // A backend (client-mode) session reports only the first HEADERS as
+    // NGHTTP2_HCAT_RESPONSE; a later 1xx, the final response and the
+    // trailers all arrive as NGHTTP2_HCAT_HEADERS. So classify by :status
+    // and by whether the final response has already been relayed. nghttp2's
+    // HTTP messaging checks (on by default) reject any other sequence before
+    // this callback runs.
+    size_t nhdrs = mapping->response_headers ? mapping->response_headers_count : 0;
+    int end_stream = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+    proxy_h2_stream_t *cstream = find_stream(client_session, client_stream_id);
+    const nghttp2_nv *status_nv = NULL;
+    int rv;
 
-    if (!mapping->response_headers || mapping->response_headers_count == 0) {
-      log_error("[HTTP/2 Backend] ep[%d]: No headers collected for stream %d (nvlen=%zu)",
-                backend_session->ep_idx, frame->hd.stream_id, frame->headers.nvlen);
-      // This should never happen if header callback worked correctly
-      return NGHTTP2_ERR_CALLBACK_FAILURE;
+    for (size_t i = 0; i < nhdrs; i++) {
+      if (mapping->response_headers[i].namelen == 7 &&
+          memcmp(mapping->response_headers[i].name, ":status", 7) == 0) {
+        status_nv = &mapping->response_headers[i];
+        break;
+      }
     }
+
+    if (!cstream) {
+      /* The client reset the stream: nothing to relay to. */
+      log_debug("[HTTP/2 Backend] ep[%d]: HEADERS for closed client stream %d dropped",
+                backend_session->ep_idx, client_stream_id);
+      h2_mapping_clear_resp_headers(mapping);
+      break;
+    }
+
+    h2_resp_relay_t *relay = &cstream->resp;
+
+    if (!status_nv && relay->final_headers_sent) {
+      /* Trailers. Not submitted here: nghttp2 sends HEADERS ahead of any
+       * DATA still pending for the client, so they could overtake the body.
+       * Hand the fields to the relay, which submits them after the last
+       * DATA. Trailers always carry END_STREAM (nghttp2 enforces it); an
+       * empty trailer block just ends the body. */
+      if (!end_stream) {
+        log_warn("[HTTP/2 Backend] ep[%d]: trailers without END_STREAM on stream %d",
+                 backend_session->ep_idx, frame->hd.stream_id);
+      }
+      if (nhdrs > 0 && !relay->eos_sent && !relay->reset_submitted) {
+        h2_resp_nv_free(relay->trailers, relay->trailers_count);
+        relay->trailers = mapping->response_headers;
+        relay->trailers_count = mapping->response_headers_count;
+        relay->trailers_capacity = mapping->response_headers_capacity;
+        relay->trailer_pending = 1;
+        mapping->response_headers = NULL;
+        mapping->response_headers_count = 0;
+        mapping->response_headers_capacity = 0;
+      }
+      h2_mapping_clear_resp_headers(mapping);
+      relay->eos_pending = 1;
+      rv = h2_resp_relay_kick(client_session, cstream);
+      if (rv != 0) {
+        return rv;
+      }
+      nghttp2_session_send(client_session->session);
+      break;
+    }
+
+    if (!status_nv || relay->final_headers_sent) {
+      log_error("[HTTP/2 Backend] ep[%d]: unexpected HEADERS on stream %d "
+                "(fields=%zu status=%s final_sent=%d)",
+                backend_session->ep_idx, frame->hd.stream_id, nhdrs,
+                status_nv ? "yes" : "no", relay->final_headers_sent);
+      h2_mapping_clear_resp_headers(mapping);
+      h2_resp_relay_reset(client_session, cstream, NGHTTP2_PROTOCOL_ERROR);
+      nghttp2_session_send(client_session->session);
+      break;
+    }
+
+    if (status_nv->valuelen == 3 && status_nv->value[0] == '1') {
+      /* Non-final (1xx, e.g. 100 Continue, 103 Early Hints): relay as is.
+       * The final response follows, so the stream stays open and the
+       * response header injection below waits for it. */
+      rv = nghttp2_submit_headers(client_session->session, NGHTTP2_FLAG_NONE,
+                                  client_stream_id, NULL,
+                                  mapping->response_headers,
+                                  mapping->response_headers_count, NULL);
+      if (rv != 0) {
+        log_error("[HTTP/2 Backend] ep[%d]: nghttp2_submit_headers (1xx) failed: %s",
+                  backend_session->ep_idx, nghttp2_strerror(rv));
+      }
+      h2_mapping_clear_resp_headers(mapping);
+      nghttp2_session_send(client_session->session);
+      break;
+    }
+
+    /* Final response. */
 
     // on the L7_Proxy peer only ( gate),
     // inject a stateless HTTP_COOKIE Set-Cookie into the relayed HEADERS frame
@@ -1259,25 +1548,33 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       }
     }
 
-    // Forward collected headers to client, preserving END_STREAM flag from backend
-    // This is critical for gRPC: trailing HEADERS must have END_STREAM set
-    uint8_t flags = NGHTTP2_FLAG_NONE;
-    if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-      flags = NGHTTP2_FLAG_END_STREAM;
-    }
+    // Forward collected headers to client, preserving END_STREAM from the
+    // backend: a response without a body (204, HEAD, a gRPC trailers-only
+    // response) ends here. A body is relayed by the response relay, and
+    // trailers are handled above.
+    uint8_t flags = end_stream ? NGHTTP2_FLAG_END_STREAM : NGHTTP2_FLAG_NONE;
 
-    int rv = nghttp2_submit_headers(client_session->session,
-                                     flags,  // Preserve END_STREAM from backend
-                                     client_stream_id,
-                                     NULL,  // No priority
-                                     mapping->response_headers,      // Use COLLECTED headers
-                                     mapping->response_headers_count, // Use COLLECTED count
-                                     NULL);  // No stream user data
+    rv = nghttp2_submit_headers(client_session->session,
+                                flags,  // Preserve END_STREAM from backend
+                                client_stream_id,
+                                NULL,  // No priority
+                                mapping->response_headers,      // Use COLLECTED headers
+                                mapping->response_headers_count, // Use COLLECTED count
+                                NULL);  // No stream user data
+
+    h2_mapping_clear_resp_headers(mapping);
 
     if (rv != 0) {
       log_error("[HTTP/2 Backend] ep[%d]: nghttp2_submit_headers failed: %s",
                 backend_session->ep_idx, nghttp2_strerror(rv));
-    } 
+      h2_resp_relay_reset(client_session, cstream, NGHTTP2_INTERNAL_ERROR);
+    } else {
+      relay->final_headers_sent = 1;
+      if (end_stream) {
+        relay->eos_pending = 1;
+        relay->eos_sent = 1;
+      }
+    }
 
     // Trigger immediate send to client
     nghttp2_session_send(client_session->session);
@@ -1286,14 +1583,34 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
   }
   
   case NGHTTP2_DATA:
-    // DATA frames forwarded via data_chunk callback
+    // DATA payload is queued by the data_chunk callback. END_STREAM arrives
+    // here, including on an empty DATA frame, which never reaches the chunk
+    // callback: mark the body complete and let the relay end the stream
+    // once the queue drains (submitting an empty provider if no chunk ever
+    // came).
+    if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+      proxy_h2_stream_t *cstream = find_stream(client_session, client_stream_id);
+      if (cstream && !cstream->resp.eos_sent && !cstream->resp.reset_submitted) {
+        cstream->resp.eos_pending = 1;
+        int rv = h2_resp_relay_kick(client_session, cstream);
+        if (rv != 0) {
+          return rv;
+        }
+        nghttp2_session_send(client_session->session);
+      }
+    }
     break;
     
-  case NGHTTP2_RST_STREAM:
+  case NGHTTP2_RST_STREAM: {
     // Forward stream reset to client
+    proxy_h2_stream_t *cstream = find_stream(client_session, client_stream_id);
+    if (cstream) {
+      cstream->resp.reset_submitted = 1;
+    }
     nghttp2_submit_rst_stream(client_session->session, NGHTTP2_FLAG_NONE,
                                client_stream_id, frame->rst_stream.error_code);
     break;
+  }
     
   case NGHTTP2_GOAWAY:
     log_warn("[HTTP/2 Backend] ep[%d]: GOAWAY received: last_stream=%d, error=0x%x",
@@ -1345,51 +1662,76 @@ proxy_h2_backend_on_data_chunk_recv_callback(nghttp2_session *session,
   
   int32_t client_stream_id = mapping->client_stream_id;
 
+  proxy_h2_stream_t *cstream = find_stream(client_session, client_stream_id);
+
+  (void)flags;  // END_STREAM is seen in the frame recv callback, not here
+
   /* AI settle: maintain the response-tail window for admitted streams —
    * the usage object rides the final bytes (JSON body or final SSE chunk),
    * exactly what the H1 proxy_usage_tail_update keeps. */
-  if (len > 0) {
-    proxy_h2_stream_t *ai_stream =
-      find_stream(client_session, client_stream_id);
-    if (ai_stream && (ai_stream->ai_admitted || ai_stream->ai_unmetered) &&
-        !ai_stream->usage_consumed)
-      proxy_h2_stream_tail_update(ai_stream, data, len);
+  if (len > 0 && cstream &&
+      (cstream->ai_admitted || cstream->ai_unmetered) &&
+      !cstream->usage_consumed)
+    proxy_h2_stream_tail_update(cstream, data, len);
+
+  if (!cstream) {
+    /* The client reset the stream: nothing to relay to. Drop the chunk
+     * instead of failing the whole connection. */
+    log_debug("[HTTP/2 Backend] ep[%d]: DATA for closed client stream %d dropped",
+              backend_session->ep_idx, client_stream_id);
+    return 0;
+  }
+
+  h2_resp_relay_t *relay = &cstream->resp;
+  if (len == 0 || relay->eos_sent || relay->reset_submitted) {
+    return 0;
   }
 
   // ============================================================================
   // HTTP/2 BACKPRESSURE: Apply watermark-based flow control (same as HTTP/1.1)
   // ============================================================================
-  // Check total buffered data BEFORE malloc (prevents memory exhaustion)
   // Pattern: Identical to HTTP/1.1's cache limit check at sockproxy.c:302
   //
   // Why this works:
   //   - nghttp2 protocol-level flow control (64KB window) already running
   //   - BUT proxy buffers data AFTER nghttp2 receives it (double buffering)
-  //   - Must apply SESSION-LEVEL limit on proxy's data_copy allocations
+  //   - Must apply SESSION-LEVEL limit on the relay queues
   //   - Return NGHTTP2_ERR_PAUSE to stop backend reads (nghttp2 API contract)
   //
+  // nghttp2 does not deliver a chunk again after NGHTTP2_ERR_PAUSE (it
+  // counts it as consumed), so the chunk is still queued below; the
+  // overshoot is bounded by one frame.
+  int pause = 0;
   if (client_session->total_response_buffer_size + len > H2_SESSION_HIGH_WATER) {
     if (!client_session->backpressure_active) {
       client_session->backpressure_active = 1;
       log_warn("🔴 HTTP/2 session HIGH water mark reached (size=%zu/%d MB), APPLYING BACKPRESSURE",
                client_session->total_response_buffer_size, H2_SESSION_HIGH_WATER/(1024*1024));
     }
-    
-    // Pause backend data reception (nghttp2 will stop reading from backend socket)
-    // This allows client to drain buffered data before accepting more from backend
-    return NGHTTP2_ERR_PAUSE;
+    pause = 1;
   }
-  
+
   // Copy data to avoid lifetime issues (nghttp2 might reuse the buffer)
-  uint8_t *data_copy = malloc(len);
-  if (!data_copy) {
+  h2_resp_chunk_t *chunk = malloc(sizeof(*chunk) + len);
+  if (!chunk) {
     log_error("[HTTP/2 Backend] ep[%d]: Failed to allocate memory for DATA forwarding",
               backend_session->ep_idx);
     return NGHTTP2_ERR_NOMEM;
   }
-  memcpy(data_copy, data, len);
+  chunk->next = NULL;
+  chunk->len = len;
+  chunk->off = 0;
+  memcpy(chunk->data, data, len);
+  if (relay->tail) {
+    relay->tail->next = chunk;
+  } else {
+    relay->head = chunk;
+  }
+  relay->tail = chunk;
+  relay->queued_bytes += len;
 
-  // Track allocation (same pattern as HTTP/1.1 cache accounting)
+  // Track allocation (same pattern as HTTP/1.1 cache accounting); released
+  // as the relay provider hands bytes to nghttp2, or when the stream is freed
   client_session->total_response_buffer_size += len;
   
   // Diagnostic: Warn if buffer is unusually large (shouldn't happen with backpressure)
@@ -1400,39 +1742,17 @@ proxy_h2_backend_on_data_chunk_recv_callback(nghttp2_session *session,
              client_session->total_response_buffer_size / (1024.0 * 1024.0),
              client_session->backpressure_active);
   }
-  
-  // Create data provider context
-  data_forward_ctx_t *ctx = malloc(sizeof(data_forward_ctx_t));
-  if (!ctx) {
-    free(data_copy);
-    return NGHTTP2_ERR_NOMEM;
-  }
-  ctx->data = data_copy;
-  ctx->len = len;
-  ctx->offset = 0;
-  ctx->client_session = client_session;    // For backpressure release
-  ctx->backend_session = backend_session;  // For nghttp2_session_resume_data()
-  ctx->stream_id = stream_id;              // Stream ID to resume
-  
-  // Set up data provider
-  nghttp2_data_provider data_prd;
-  data_prd.source.ptr = ctx;
-  data_prd.read_callback = data_forward_read_callback;
-  
-  // Submit DATA frame to client
-  int rv = nghttp2_submit_data(client_session->session, flags, client_stream_id, &data_prd);
+
+  int rv = h2_resp_relay_kick(client_session, cstream);
   if (rv != 0) {
-    log_error("[HTTP/2 Backend] ep[%d]: nghttp2_submit_data failed: %s",
-              backend_session->ep_idx, nghttp2_strerror(rv));
-    free(data_copy);
-    free(ctx);
     return rv;
   }
 
-  // Send DATA frame to client immediately (same pattern as HEADERS forwarding)
+  // Send DATA frame to client immediately (same pattern as HEADERS forwarding).
+  // This may end and free the client stream; do not touch cstream after it.
   nghttp2_session_send(client_session->session);
 
-  return 0;
+  return pause ? NGHTTP2_ERR_PAUSE : 0;
 }
 
 /**
@@ -1466,6 +1786,22 @@ proxy_h2_backend_on_stream_close_callback(nghttp2_session *session,
                       mapping->client_stream_id);
         if (ai_stream)
           proxy_h2_settle_stream(backend_session->client_session, ai_stream);
+
+        /* The response relay lives on the client stream and outlives this
+         * mapping: a normal close comes right after the backend's
+         * END_STREAM, while the relay may still be waiting for the
+         * client's window. A close WITHOUT END_STREAM (a reset nghttp2
+         * raised itself, a GOAWAY refusal) leaves nothing that would ever
+         * end the client stream, so reset it. Submit only: the send runs
+         * from the caller (this callback can fire inside the backend send
+         * of proxy_h2_forward_to_backend while the client streams are
+         * being iterated, and a send here could free one of them). */
+        if (ai_stream && !ai_stream->resp.eos_pending &&
+            backend_session->client_session->session) {
+          h2_resp_relay_reset(backend_session->client_session, ai_stream,
+                              error_code != NGHTTP2_NO_ERROR ?
+                              error_code : NGHTTP2_INTERNAL_ERROR);
+        }
       }
       HASH_DEL(backend_session->stream_map, mapping);
 

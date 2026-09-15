@@ -48,6 +48,51 @@ typedef enum {
 } h2_stream_state_t;
 
 /**
+ * One backend DATA chunk waiting to be relayed to the client.
+ */
+typedef struct h2_resp_chunk {
+  struct h2_resp_chunk *next;
+  size_t len;                        // Bytes in data[]
+  size_t off;                        // Bytes already handed to nghttp2
+  uint8_t data[];
+} h2_resp_chunk_t;
+
+/**
+ * Backend -> client response relay state for one client stream.
+ *
+ * nghttp2 allows one DATA item per stream at a time (a second
+ * nghttp2_submit_data fails with NGHTTP2_ERR_DATA_EXIST while the first is
+ * still pending), and it sends HEADERS before any pending DATA. So the
+ * response body is relayed through ONE data provider per client stream that
+ * drains a chunk queue: it is submitted once with END_STREAM, resumed as
+ * chunks arrive, defers while the queue is empty, and ends the stream (or
+ * hands off to nghttp2_submit_trailer) once the backend's END_STREAM has been
+ * seen and the queue is drained.
+ *
+ * This lives on the client stream, not on stream_mapping_t: the mapping is
+ * freed when the BACKEND stream closes, which happens as soon as the
+ * backend's END_STREAM arrives, while the queue may still be waiting for the
+ * client's flow-control window. The client stream is closed by nghttp2 only
+ * after our END_STREAM or RST_STREAM goes out, and nghttp2 never calls a data
+ * provider of a closed stream, so the relay lives exactly as long as the
+ * provider can run. The provider finds it by stream id (no raw pointer).
+ */
+typedef struct h2_resp_relay {
+  h2_resp_chunk_t *head;             // Chunk queue (FIFO)
+  h2_resp_chunk_t *tail;
+  size_t queued_bytes;               // Unsent bytes, counted in total_response_buffer_size
+  uint8_t data_provider_active;      // 1 = provider submitted and not yet at EOF
+  uint8_t eos_pending;               // 1 = backend END_STREAM seen (DATA or trailers)
+  uint8_t eos_sent;                  // 1 = provider reached EOF (or HEADERS carried END_STREAM)
+  uint8_t final_headers_sent;        // 1 = final (non-1xx) response HEADERS relayed
+  uint8_t trailer_pending;           // 1 = trailers stored, sent at provider EOF
+  uint8_t reset_submitted;           // 1 = RST_STREAM already submitted to the client
+  nghttp2_nv *trailers;              // Stored trailer fields (owned, malloc'd name/value)
+  size_t trailers_count;
+  size_t trailers_capacity;
+} h2_resp_relay_t;
+
+/**
  * HTTP/2 stream context
  * Represents a single HTTP request/response within a connection
  */
@@ -115,6 +160,10 @@ typedef struct proxy_h2_stream {
   // Response tracking
   int response_sent;                 // 1 = response headers/data sent
 
+  // Backend response relay (chunk queue, END_STREAM and trailer state).
+  // Freed with the stream; see h2_resp_relay_t for why it lives here.
+  h2_resp_relay_t resp;
+
   // Terminal AI-gate refusal body (h2_deny_body_ctx_t*). nghttp2 pulls the
   // JSON error body from a read callback asynchronously, so it must outlive
   // the submit; the STREAM owns it and destroy_stream frees it. This closes
@@ -148,7 +197,9 @@ typedef struct stream_mapping {
   int ep_idx;                        // Backend endpoint index
   time_t created_ts;                 // Mapping creation time
 
-  // Response header collection (for backend → client forwarding)
+  // Response header collection (for backend → client forwarding). Holds the
+  // fields of the backend HEADERS frame being received; emptied once that
+  // frame is relayed (1xx, final response) or handed to the relay (trailers).
   nghttp2_nv *response_headers;      // Collected response headers
   size_t response_headers_count;     // Number of headers
   size_t response_headers_capacity;  // Allocated capacity
