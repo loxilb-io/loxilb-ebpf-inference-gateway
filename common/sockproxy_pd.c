@@ -1523,14 +1523,23 @@ static _Atomic uint64_t pd_ctrl_fold_transitions_total = 0;
  * The accessor route is deliberate — the Phase-93 comments above explicitly
  * avoided global_stats struct churn, so the counters stay file-static and are
  * exported through this one seam (migration to global_stats noted as debt in
- * -SUMMARY). which==0 -> shed_total, which==1 -> queued_total, any other
- * value -> 0. Prototype lives next to proxy_get_metrics in sockproxy_metrics.h. */
+ * -SUMMARY). which==0 -> shed_total, which==1 -> queued_total, which==2 ->
+ * overflow_shed_total, any other value -> 0. Prototype lives next to
+ * proxy_get_metrics in sockproxy_metrics.h.
+ *
+ * which==2 was missing until a live run measured the consequence: with
+ * queueing enabled (LLB_PD_QUEUE_DEPTH_PER_EP > 0) the plain shed branch is
+ * unreachable and the overflow valve is the ONLY shed that can fire — so
+ * every overload drop was invisible to /metrics (clients held 429s while
+ * pd_admission_shed_total sat at 0 and the overflow count never left this
+ * file). */
 uint64_t
 pd_admission_stats_get(int which)
 {
   switch (which) {
   case 0:  return atomic_load(&pd_admission_shed_total);
   case 1:  return atomic_load(&pd_admission_queued_total);
+  case 2:  return atomic_load(&pd_admission_overflow_shed_total);
   default: return 0;
   }
 }

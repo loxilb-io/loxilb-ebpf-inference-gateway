@@ -267,6 +267,9 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_cb_proactive_heal = atomic_load(&global_stats.pd_cb_proactive_heal);
     snapshot.pd_admission_shed    = pd_admission_stats_get(0);
     snapshot.pd_admission_queued  = pd_admission_stats_get(1);
+    /* Struct position differs from these two (tail-append contract) but the
+     * source is the same accessor seam. */
+    snapshot.pd_admission_overflow_shed = pd_admission_stats_get(2);
 
     return snapshot;
 }
