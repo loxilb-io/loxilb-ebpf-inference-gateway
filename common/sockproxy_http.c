@@ -9278,8 +9278,29 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           if (memcmp(pfe->rcvbuf, preface, 24) == 0) {                  
             // Initialize HTTP/2 session
             if (proxy_check_and_setup_h2(pfe) == 0) {
-              // Session created successfully - let HTTP/2 handler take over
-              // The data (including preface) will be consumed by nghttp2
+              /* Hand rcvbuf to nghttp2 now, as the h2 branch above does.
+               * The read that completed the preface may also hold the
+               * client SETTINGS and the first HEADERS. A client that writes
+               * them together and then waits (no SETTINGS ACK, no
+               * WINDOW_UPDATE) sends nothing more to wake this loop, so
+               * leaving them for the next read left the first stream
+               * unanswered until the client gave up.
+               *
+               * A preface split across reads has already been fed to llhttp
+               * in part (it knows PRI and waits mid-preface with HPE_OK).
+               * The h2 branch owns the connection from here, so that parser
+               * state is dead; reset it with parsed_off anyway so nothing
+               * later reads a half-parsed request. The slowloris anchor set
+               * above stays: nghttp2 clears it on the first complete
+               * HEADERS, and until then the h2 branch times from the first
+               * byte. */
+              pfe->parsed_off = 0;
+              llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
+              if (proxy_h2_handle_client_data(pfe) < 0) {
+                log_error("[HTTP/2] fd=%d: Failed to handle client data", fd);
+                return -1; // Restart
+              }
+              pfe->rcv_off = 0;
               continue;
             } else {
               log_error("[HTTP/2] Failed to initialize HTTP/2 session for plaintext connection");
