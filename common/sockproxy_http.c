@@ -4741,7 +4741,7 @@ proxy_pdestroy(void *priv)
               const char *pd_model = proxy_effective_model(client_pfe);
               int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
               llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv,
-                               1 /*prefill error*/);
+                               4 /*prefill error*/);
             }
             if (client_pfe->fd > 0) {
               send(client_pfe->fd, pd_prefill_err, sizeof(pd_prefill_err) - 1,

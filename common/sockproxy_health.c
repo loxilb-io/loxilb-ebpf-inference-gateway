@@ -721,7 +721,28 @@ check_draining_endpoints(void)
               } else if (pfe->prefix_key.model[0] != '\0') {
                 dec_model = pfe->prefix_key.model;
               }
-              llb_ai_pd_record(dec_model, 0, 0, 0, 1 /*prefill error*/);
+              if (pfe->pd_sg_active) {
+                /* The SG rendezvous wedge is a PAIR failure, and the leg
+                 * actually parked is the PREFILL one: it sits at the engine's
+                 * disaggregation bootstrap timeout waiting for a decode worker
+                 * that never arrived, while decode idles in WaitingForInput.
+                 * Naming prefill here is the honest read of this branch, not
+                 * an inherited default. SGLang never populates
+                 * pd_kv_params_len (its KV handoff is engine-internal), so 0
+                 * is the true kv answer here. */
+                llb_ai_pd_record(dec_model, 0, 0, 0, 1 /*prefill timeout*/);
+              } else {
+                /* The sequential machines wedged on the DECODE leg: prefill
+                 * completed (we are in DECODE_SENDING and its response was
+                 * parsed), then the decode EP accepted and produced nothing.
+                 * Record the leg that actually timed out -- mirroring what
+                 * this block already does for the response body -- and read kv
+                 * off the completed prefill as every other post-prefill site
+                 * does. Hardcoding 0 would report a kv result the proxy
+                 * already holds as "missing". */
+                int dec_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
+                llb_ai_pd_record(dec_model, 0, 0, dec_kv, 3 /*decode timeout*/);
+              }
             }
             if (pfe->fd > 0) {
               /* SG keeps its historical body; the sequential machines name

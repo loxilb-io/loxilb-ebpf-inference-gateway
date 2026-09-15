@@ -163,8 +163,12 @@ pd_sg_abort_pair(proxy_fd_ent_t *client_pfe, const char *reason,
             (unsigned long long)client_pfe->pd_sg_room,
             client_pfe->pd_prefill_ep_idx, client_pfe->pd_decode_ep_idx);
   {
+    /* Every caller of this abort reaches it through a PREFILL-side failure:
+     * the drain (prefill) leg died before it completed, the prefill origin
+     * answered 5xx, or the pair retry was exhausted. None of them is a
+     * timeout, so they must not land on the prefill timeout series. */
     const char *pd_model = proxy_effective_model(client_pfe);
-    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 1 /*prefill error*/);
+    llb_ai_pd_record((char *)pd_model, 0, 0, 0, 4 /*prefill error*/);
   }
   if (client_pfe->fd > 0) {
     if (client_pfe->ssl) {
@@ -335,8 +339,13 @@ pd_sg_drain_consume(proxy_fd_ent_t *ent, proxy_fd_ent_t *client_pfe,
                  ent->parser.status_code, client_pfe->fd, ent->fd,
                  (unsigned long long)client_pfe->pd_sg_room);
         {
+          /* The origin computed a 4xx and the client is being handed that
+           * response verbatim. Nothing in the gateway failed and nothing
+           * timed out; the request was REJECTED upstream. Recording it as a
+           * prefill timeout made a burst of malformed client requests read as
+           * a wedged prefill fleet. */
           const char *pd_model = proxy_effective_model(client_pfe);
-          llb_ai_pd_record((char *)pd_model, 0, 0, 0, 1 /*prefill error*/);
+          llb_ai_pd_record((char *)pd_model, 0, 0, 0, 5 /*prefill rejected*/);
         }
         pd_sg_relay_bytes(client_pfe, msg, len);
         if (ent->pd_sg_drain_done) {
