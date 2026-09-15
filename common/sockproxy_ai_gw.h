@@ -334,7 +334,17 @@ extern int llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
  *   prefill_latency_ms prefill phase duration in milliseconds; 0 when unknown
  *   decode_latency_ms  decode phase TTFT in milliseconds; 0 when unknown
  *   kv_params_found    1 when kv_transfer_params found, 0 otherwise
- *   error_phase        0=success, 1=prefill_timeout, 2=decode_error
+ *   error_phase        the lifecycle outcome, naming the leg that failed
+ *                      AND how it failed. The pair is exported verbatim
+ *                      as {phase,status} on loxilb_ai_pd_requests_total,
+ *                      so a value naming the wrong leg or the wrong
+ *                      failure mode is an operator-visible lie:
+ *                        0 = complete / success
+ *                        1 = prefill  / timeout   (prefill leg ran out of time)
+ *                        2 = decode   / error     (decode leg failed or died)
+ *                        3 = decode   / timeout   (decode leg produced no byte)
+ *                        4 = prefill  / error     (prefill leg failed or died)
+ *                        5 = prefill  / rejected  (origin refused; relayed verbatim)
  *
  * Returns void.
  */
@@ -459,7 +469,17 @@ extern void llb_ai_record_usage_missing(char *tenant_id, char *model_name,
  *   prefill_latency_ms prefill phase duration in milliseconds; 0 when unknown
  *   decode_latency_ms  decode phase TTFT in milliseconds; 0 when unknown
  *   kv_params_found    1 when kv_transfer_params found, 0 otherwise
- *   error_phase        0=success, 1=prefill_timeout, 2=decode_error
+ *   error_phase        the lifecycle outcome, naming the leg that failed
+ *                      AND how it failed. The pair is exported verbatim
+ *                      as {phase,status} on loxilb_ai_pd_requests_total,
+ *                      so a value naming the wrong leg or the wrong
+ *                      failure mode is an operator-visible lie:
+ *                        0 = complete / success
+ *                        1 = prefill  / timeout   (prefill leg ran out of time)
+ *                        2 = decode   / error     (decode leg failed or died)
+ *                        3 = decode   / timeout   (decode leg produced no byte)
+ *                        4 = prefill  / error     (prefill leg failed or died)
+ *                        5 = prefill  / rejected  (origin refused; relayed verbatim)
  *   prefill_ep_ip      prefill endpoint IP (network byte order uint32)
  *   decode_ep_ip       decode endpoint IP (network byte order uint32)
  */
