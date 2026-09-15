@@ -279,31 +279,52 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
     if (now > stream->admit_mono_ns)
       latency_ms = (int64_t)((now - stream->admit_mono_ns) / 1000000ULL);
   }
-  int status = stream->metric_response_status > 0
-                   ? stream->metric_response_status : 200;
-  llb_ai_record_request(stream->tenant_id, stream->effective_model, status,
-                        latency_ms, up, uc, 0, 0, "");
+  /* A request record is emitted ONLY when the response actually progressed,
+   * which here means a backend :status was captured for this stream. A
+   * stream torn down before that — a client RST_STREAM mid-flight, a backend
+   * that died before answering — releases its reservation and is charged
+   * whatever arrived, but it never completed a response and must not be
+   * counted as one.
+   *
+   * This is the same rule its three siblings already keep, and it is the
+   * reason none of them carries a status fallback: the H1 non-SSE recorder
+   * is gated on `metric_response_status != 0`, the H1 SSE recorder only runs
+   * once headers have been seen, and the connection-teardown sweep over
+   * these very streams emits its record under `if (e->status > 0)`. A
+   * fabricated 200 here would add a phantom served request to
+   * loxilb_ai_requests_total{outcome="completed"} and pull the served-latency
+   * histogram toward the abort interval — precisely the distortion the
+   * denial recorder keeps out of that histogram by design. */
+  int status = stream->metric_response_status;
+  if (status > 0) {
+    llb_ai_record_request(stream->tenant_id, stream->effective_model, status,
+                          latency_ms, up, uc, 0, 0, "");
 
-  /* The same accounting hole the H1 paths report: this response was recorded
-   * as completed and no dialect read a usage object out of it, so it was
-   * charged nothing and — without this — reported nothing either. Gated on a
-   * 2xx (see proxy_status_is_2xx), which also excludes the aborted stream
-   * that settles here only to release its reservation and never saw a status
-   * at all. Charges nothing, by decision and not by omission — the same
-   * settled answer the H1 reporters carry. */
-  if (!usage_read && proxy_status_is_2xx(stream->metric_response_status)) {
-    /* H2_STREAM_CLOSE rather than RESPONSE_COMPLETE: destroy_stream runs the
-     * same close for a response that finished and for one aborted after its
-     * 2xx headers, and nghttp2's error code is not plumbed this far, so the
-     * boundary is all this site can honestly claim. */
-    llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model,
-                                LLB_AI_UMISS_H2_STREAM_CLOSE);
-    log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
-             "object tenant=%s model=%s reason=%s (reported, not charged)",
-             stream->stream_id, stream->tenant_id, stream->effective_model,
-             LLB_AI_UMISS_H2_STREAM_CLOSE);
+    /* The same accounting hole the H1 paths report: this response was recorded
+     * as completed and no dialect read a usage object out of it, so it was
+     * charged nothing and — without this — reported nothing either. Gated on a
+     * 2xx (see proxy_status_is_2xx). Inside the status guard for the same
+     * reason the sweep keeps it there: a stream with no backend status never
+     * completed a response, so it is a release, not an accounting hole.
+     * Charges nothing, by decision and not by omission — the same settled
+     * answer the H1 reporters carry. */
+    if (!usage_read && proxy_status_is_2xx(status)) {
+      /* H2_STREAM_CLOSE rather than RESPONSE_COMPLETE: destroy_stream runs the
+       * same close for a response that finished and for one aborted after its
+       * 2xx headers, and nghttp2's error code is not plumbed this far, so the
+       * boundary is all this site can honestly claim. */
+      llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model,
+                                  LLB_AI_UMISS_H2_STREAM_CLOSE);
+      log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
+               "object tenant=%s model=%s reason=%s (reported, not charged)",
+               stream->stream_id, stream->tenant_id, stream->effective_model,
+               LLB_AI_UMISS_H2_STREAM_CLOSE);
+    }
   }
 
+  /* status=0 names the release-only settle explicitly, so the log says which
+   * of the two shapes ran instead of leaving it to be inferred from a 200
+   * that no backend ever sent. */
   log_info("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
            stream->stream_id, up, uc, status);
 }
