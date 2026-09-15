@@ -1115,6 +1115,36 @@ llb_peer_map_op(const struct llb_sockmap_key *self,
   return bpf_map_delete_elem(xh->smpeerfd, self);
 }
 
+/* Adds a socket to sock_verdict_map (doadd=1) or removes it (doadd=0). The
+ * stream parser and verdict run only on sockets in this map, and sockops never
+ * adds to it: the proxy adds a socket once its peer_map entry is installed and
+ * removes it before that entry goes, so the verdict never has to SK_PASS (see
+ * llb_kern_sockmap.c for the kernel defect that makes SK_PASS stall a reader).
+ * An add of a socket that is not ESTABLISHED fails with -EOPNOTSUPP; the proxy
+ * then keeps the connection on the userspace relay. */
+static int
+llb_verdict_map_op(const struct llb_sockmap_key *self, int fd, int doadd)
+{
+  int ret;
+
+  if (xh->have_noebpf) {
+    return 0;
+  }
+
+  if (xh->smverdictfd <= 0) {
+    assert(0);
+  }
+
+  if (doadd) {
+    __u64 ufd = (__u64)fd;   /* sock_verdict_map has an 8-byte value */
+    return bpf_map_update_elem(xh->smverdictfd, self, &ufd, BPF_NOEXIST);
+  }
+
+  /* A closed socket has already left the sockhash on its own. */
+  ret = bpf_map_delete_elem(xh->smverdictfd, self);
+  return ret == -ENOENT ? 0 : ret;
+}
+
 /* Adds (doadd=1) or releases (doadd=0) one reference to a portset entry.
  * verdict says whether the reference also counts in verdict_refs. Refcounts live
  * in the map value itself; the loader is the only writer and runs under XH_LOCK,
@@ -2118,7 +2148,8 @@ llb_xh_init(llb_dp_struct_t *xh)
   init_throttler(&xh->cpt, 50);
 
   if (proxy_main(xh->have_sockmap ? llb_sockmap_op : NULL,
-                 xh->have_sockmap ? llb_peer_map_op : NULL, xh->have_ktls)) {
+                 xh->have_sockmap ? llb_peer_map_op : NULL,
+                 xh->have_sockmap ? llb_verdict_map_op : NULL, xh->have_ktls)) {
     LLB_INIT_FATAL("proxy_main");
   }
 

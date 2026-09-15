@@ -946,6 +946,11 @@ struct proxy_fd_ent {
   int peer_map_resp_installed;   // 1 if the response-direction entry ([backend]=client) is installed
   proxy_skmap_key_snapshot_t peer_map_client_key;
   proxy_skmap_key_snapshot_t peer_map_backend_key;
+  // sock_verdict_map membership (HAVE_SOCKOPS), also on the BACKEND pfe. A
+  // direction is active only once its socket is in sock_verdict_map.
+  int peer_map_req_verdict;      // 1 if the client socket is in sock_verdict_map
+  int peer_map_resp_verdict;     // 1 if the backend socket is in sock_verdict_map
+  int peer_map_req_pending;      // request entry installed, client socket not added yet (proxy_peer_map_activate_req)
 
   struct proxy_fd_ent *next;
   void *head;
@@ -1594,6 +1599,13 @@ typedef int (*sockmap_cb_t)(struct llb_sockmap_key *key, int fd, int doadd);
 typedef int (*peer_map_cb_t)(const struct llb_sockmap_key *self,
                              const struct llb_sockmap_key *peer,
                              int doadd);
+/* sock_verdict_map callback: add the socket fd under its own tuple (doadd=1) or
+ * delete that tuple (doadd=0, fd ignored). A socket must be added only after its
+ * peer_map entry and deleted before it, so the stream verdict never runs on a
+ * socket without a peer (see llb_kern_sockmap.c). Returns 0 or a negative errno;
+ * deleting a tuple that is not present returns 0. */
+typedef int (*verdict_map_cb_t)(const struct llb_sockmap_key *self, int fd,
+                                int doadd);
 typedef void (*proxy_info_cb_t)(struct dp_proxy_ct_ent *pct);
 int proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,
                   uint32_t *epip, uint16_t *epport, uint8_t *epprotocol);
@@ -1678,7 +1690,8 @@ int proxy_set_chwbl_prefix_config(struct proxy_ent *key,
 void proxy_dump_entry(proxy_info_cb_t);
 void proxy_get_entry_stats(uint32_t id, int epid, uint64_t *p, uint64_t *b);
 void pfe_ent_accouting(proxy_fd_ent_t *pfe, uint64_t bc, int txdir);
-int proxy_main(sockmap_cb_t cb, peer_map_cb_t peer_map_cb, int ktls_enabled);
+int proxy_main(sockmap_cb_t cb, peer_map_cb_t peer_map_cb,
+               verdict_map_cb_t verdict_map_cb, int ktls_enabled);
 
 // SNI Certificate Management API (Global Certificate Store)
 // These manage certificates independently of loadbalancer rules

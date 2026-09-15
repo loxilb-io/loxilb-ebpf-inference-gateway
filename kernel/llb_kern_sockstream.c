@@ -55,9 +55,7 @@ int llb_sock_verdict(struct __sk_buff *skb)
 #ifdef HAVE_SOCKOPS
   struct llb_sockmap_key redirect_key;
   struct llb_sockmap_key *peer_key;
-  struct llb_sockmap_portset_val *pv;
-  __u8 eligible = 0;
-  __u8 is_request = 0;
+  __u8 is_request;
 #endif
 
   if (skb->family != AF_INET) {
@@ -65,41 +63,28 @@ int llb_sock_verdict(struct __sk_buff *skb)
   }
 
 #ifdef HAVE_SOCKOPS
-  /* Only sockets in sock_verdict_map get here, but the portset is consulted on
-   * every skb so that a rule switched off, or to the other direction, stops
-   * redirecting at once instead of when its connections close.
-   * The VIP lookup only runs the endpoint lookup on a miss, so at most one
-   * portset pointer is live at a time: if both stayed live, -O2 could merge
-   * the NULL checks into "r0 = vip_ptr | ep_ptr", which the verifier rejects
-   * ("pointer |= pointer prohibited"). */
-  pv = sockmap_vip_portset_lookup(key.sip, (__u16)key.sport);
-  if (pv) {
-    /* local address and port are a VIP -> client/frontend socket, so the
-     * ingress data is a request (client->backend). */
-    is_request = 1;
-    eligible = pv->verdict_refs != 0;
-  } else {
-    pv = sockmap_ep_portset_lookup(key.dip, (__u16)key.dport);
-    if (pv) {
-      /* remote address and port are an endpoint -> backend socket, ingress
-       * data is a response (backend->client). */
-      eligible = pv->verdict_refs != 0;
-    }
-  }
-
-  if (!eligible) {
-    sockmap_stat_inc(SOCKMAP_STAT_INELIGIBLE);
-    return SK_PASS;
-  }
-
+  /* Userspace puts a socket into sock_verdict_map only after installing its
+   * peer_map entry, and takes it out before deleting that entry, so the peer
+   * lookup is the whole decision: whether a direction is accelerated was
+   * settled when the pair was installed. A rule changed or deleted later
+   * applies to new connections; an accelerated pair keeps redirecting until it
+   * closes. Nothing here may return SK_PASS on the normal path, because SK_PASS
+   * data on a strparser socket can stall the reader (see llb_kern_sockmap.c). */
   peer_key = bpf_map_lookup_elem(&peer_map, &key);
   if (!peer_key) {
+    /* Not reached while userspace keeps the two maps in step; counted so tests
+     * can assert it stays zero. */
     sockmap_stat_inc(SOCKMAP_STAT_PEER_MISS);
     BPF_DBG_PRINTK("sockstream: peer miss dport 0x%lx sport 0x%lx", key.dport, key.sport);
     return SK_PASS;
   }
 
   __builtin_memcpy(&redirect_key, peer_key, sizeof(redirect_key));
+
+  /* The portset only classifies the direction for the counters now: a socket
+   * whose local address and port are a VIP is a client socket, so its ingress
+   * is a request. */
+  is_request = sockmap_vip_portset_lookup(key.sip, (__u16)key.sport) != NULL;
 #endif
 
   BPF_DBG_PRINTK("sockstream: dip 0x%lx sip 0x%lx", key.dip, key.sip);

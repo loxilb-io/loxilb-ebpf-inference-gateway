@@ -1271,9 +1271,10 @@ struct llb_sockmap_portset_key {
  *                  a matching socket is a redirect target (sock_proxy_map).
  *   verdict_refs - how many of those rules accelerate the direction in which this
  *                  socket receives: the request direction for a VIP entry, the
- *                  response direction for an endpoint entry. Non-zero also puts
- *                  the socket into sock_verdict_map, so its ingress runs the
- *                  sk_skb verdict. */
+ *                  response direction for an endpoint entry. The datapath no
+ *                  longer reads it: userspace decides per connection, from the
+ *                  pool's mode, whether to put a socket into sock_verdict_map.
+ *                  It is kept as the loader's per-direction bookkeeping. */
 struct llb_sockmap_portset_val {
   __u32 refs;
   __u32 verdict_refs;

@@ -42,6 +42,7 @@
 #include "llb_dpapi.h"        /* provides full struct llb_sockmap_key definition */
 #include "sockproxy_internal.h"
 #include "sockproxy_cache.h"
+#include "sockproxy_conn.h"
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_trace_event.h"
 #include "sockproxy_trace.h"
@@ -633,6 +634,15 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
 
       notify_add_ent(proxy_struct->ns, ent->fd,
             NOTI_TYPE_IN|NOTI_TYPE_HUP, ent, ent->gen);
+
+#if defined(HAVE_SOCKOPS)
+      /* A backend send cache that held part of the forwarded request is empty
+       * now; the request direction may be activated. The backend fd shares the
+       * client fd's worker, so this runs serialized with the client reads. */
+      if (ent->peer_map_req_pending && ent->n_rfd > 0) {
+        proxy_peer_map_activate_req(ent->rfd_ent[0]);
+      }
+#endif
     } else {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("📬 [CACHE_NOT_EMPTY] fd=%d: Cache partially drained, keeping EPOLLOUT monitoring", ent->fd);

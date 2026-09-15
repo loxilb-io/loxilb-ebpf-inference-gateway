@@ -13,8 +13,8 @@
  * contend, but readers must sum values across CPUs. */
 #define LLB_SOCKMAP_STATS_SZ        8   /* Includes spare slots */
 #define SOCKMAP_STAT_REDIRECT_OK    0   /* Peer hit -> issue bpf_sk_redirect_hash (engage) */
-#define SOCKMAP_STAT_PEER_MISS      1   /* Eligible, but peer_map miss -> SK_PASS */
-#define SOCKMAP_STAT_INELIGIBLE     2   /* Portset miss, or no rule accelerates this direction -> SK_PASS */
+#define SOCKMAP_STAT_PEER_MISS      1   /* peer_map miss -> SK_PASS. Must stay 0: userspace keeps sock_verdict_map and peer_map in step */
+#define SOCKMAP_STAT_INELIGIBLE     2   /* Retired, always 0 for the stream verdict (index kept: tests read counters by index) */
 #define SOCKMAP_STAT_REDIRECT_REQ   3   /* REDIRECT_OK in the request direction (client->backend, vip hit) */
 #define SOCKMAP_STAT_REDIRECT_RESP  4   /* REDIRECT_OK in the response direction (backend->client, ep hit) */
 /* Bytes handed to bpf_sk_redirect_hash in the response direction.
@@ -31,6 +31,10 @@
  *                      (a miss is SK_DROP, and the dropped bytes are already ACKed).
  *   sock_verdict_map - the subset whose ingress direction is accelerated. The
  *                      stream parser and verdict are attached to this map.
+ *                      Userspace adds a socket only after its peer_map entry
+ *                      is installed and removes it before deleting that entry
+ *                      (sockops never adds to it), so the verdict always finds
+ *                      a peer and never has to SK_PASS.
  * A socket in response-only mode on the client side, for example, is only in
  * sock_proxy_map: it can receive redirected response bytes, while the requests it
  * receives stay on the plain TCP path instead of the psock ingress queue.

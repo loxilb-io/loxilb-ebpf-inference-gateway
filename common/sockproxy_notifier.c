@@ -621,7 +621,8 @@ proxy_liveness_watchdog_thread(void *arg)
 }
 
 int
-proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb, int ktls_enabled)
+proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
+           verdict_map_cb_t verdict_map_cb, int ktls_enabled)
 {
   int startfd = PROXY_START_MAPFD;
   notify_cbs_t cbs = { 0 };
@@ -642,6 +643,7 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb, int ktls_enabled)
   }
   proxy_struct->sockmap_cb = sockmap_cb;
   proxy_struct->peer_map_cb = peer_map_cb;
+  proxy_struct->verdict_map_cb = verdict_map_cb;
   proxy_struct->ns = notify_ctx_new(&cbs, PROXY_MAX_THREADS);
   assert(proxy_struct->ns);
 

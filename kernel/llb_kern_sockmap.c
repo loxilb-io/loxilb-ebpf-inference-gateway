@@ -18,16 +18,18 @@
 #include "../common/llb_sockmap.h"
 
 /* Registers a newly established socket that belongs to a sockmap-enabled rule.
- * Every such socket goes into sock_proxy_map so it can be a redirect target; it
- * also goes into sock_verdict_map when some rule accelerates the direction in
- * which it receives (see llb_sockmap.h). The redirect map is filled first, so
- * the verdict never starts on a socket its peer cannot yet reach.
+ * Every such socket goes into sock_proxy_map so it can be a redirect target.
+ * sock_verdict_map is filled by userspace instead, only once the socket has a
+ * peer to redirect to (llb_verdict_map_op): a socket in that map that the
+ * verdict has to SK_PASS is exposed to a kernel defect. When SK_PASS data from
+ * an earlier strparser read is still unread at the next read,
+ * tcp_bpf_strp_read_sock() moves copied_seq past rcv_nxt, and a later small
+ * segment never wakes the reader (h2c streams and small request tails stall).
  * Ports follow the low-half convention of llb_sockmap_key. */
 SEC("sockops")
 int llb_setup_sockmap(struct bpf_sock_ops *bpf_sops)
 {
   struct llb_sockmap_portset_val *pv;
-  __u8 verdict;
   struct llb_sockmap_key key = { .dip = bpf_sops->remote_ip4,
                                  .sip = bpf_sops->local_ip4,
                                  .dport = bpf_sops->remote_port >> 16,
@@ -50,12 +52,8 @@ int llb_setup_sockmap(struct bpf_sock_ops *bpf_sops)
   if (!pv) {
     return 0;
   }
-  verdict = pv->verdict_refs != 0;
 
   bpf_sock_hash_update(bpf_sops, &sock_proxy_map, &key, BPF_NOEXIST);
-  if (verdict) {
-    bpf_sock_hash_update(bpf_sops, &sock_verdict_map, &key, BPF_NOEXIST);
-  }
 
   return 0;
 }
