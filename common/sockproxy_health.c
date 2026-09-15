@@ -643,12 +643,17 @@ check_draining_endpoints(void)
                       pfe->fd, (long)elapsed, timeout);
             /* Record P/D timeout metrics before cleanup */
             {
-              char *pd_tmo_model = "";
-              if (pfe->x_model_header[0] != '\0') {
-                pd_tmo_model = pfe->x_model_header;
-              } else if (pfe->prefix_key.model[0] != '\0') {
-                pd_tmo_model = pfe->prefix_key.model;
-              }
+              /* proxy_effective_model, not a hand-rolled fallback. It
+               * resolves four sources in priority order and the first of them
+               * -- the admission gate's effective_model -- is the AUTHORITATIVE
+               * one: it is the model authorization was checked against.
+               * Checking only x_model_header and prefix_key.model, as this
+               * site used to, both skipped that authority and fell back to ""
+               * where the resolver would have found resp_model. The result was
+               * that a timed-out request was labelled with a different model
+               * from every other lifecycle event for the SAME request, so a
+               * per-model view of timeouts read zero while timeouts occurred. */
+              const char *pd_tmo_model = proxy_effective_model(pfe);
               int64_t t_prefill_ms = 0;
               if (pfe->pd_prefill_start_ns > 0) {
                 struct timespec _pdts;
@@ -661,7 +666,7 @@ check_draining_endpoints(void)
               int t_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
               log_info(" llb_ai_pd_record (prefill timeout): model=%s prefill=%lldms kv=%d",
                        pd_tmo_model, (long long)t_prefill_ms, t_kv);
-              llb_ai_pd_record(pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
+              llb_ai_pd_record((char *)pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
             }
             if (pfe->fd > 0) {
               send(pfe->fd, pd_timeout_resp, sizeof(pd_timeout_resp) - 1,
@@ -715,12 +720,11 @@ check_draining_endpoints(void)
                         pfe->fd, (long)dec_elapsed, dec_timeout);
             }
             {
-              char *dec_model = "";
-              if (pfe->x_model_header[0] != '\0') {
-                dec_model = pfe->x_model_header;
-              } else if (pfe->prefix_key.model[0] != '\0') {
-                dec_model = pfe->prefix_key.model;
-              }
+              /* Same resolver as the prefill-timeout site above, and for the
+               * same reason: the reaper must label a request the way every
+               * other site labels it, or the failure disappears from a
+               * per-model view. */
+              const char *dec_model = proxy_effective_model(pfe);
               if (pfe->pd_sg_active) {
                 /* The SG rendezvous wedge is a PAIR failure, and the leg
                  * actually parked is the PREFILL one: it sits at the engine's
@@ -730,7 +734,8 @@ check_draining_endpoints(void)
                  * an inherited default. SGLang never populates
                  * pd_kv_params_len (its KV handoff is engine-internal), so 0
                  * is the true kv answer here. */
-                llb_ai_pd_record(dec_model, 0, 0, 0, 1 /*prefill timeout*/);
+                llb_ai_pd_record((char *)dec_model, 0, 0, 0,
+                                 1 /*prefill timeout*/);
               } else {
                 /* The sequential machines wedged on the DECODE leg: prefill
                  * completed (we are in DECODE_SENDING and its response was
@@ -741,7 +746,31 @@ check_draining_endpoints(void)
                  * does. Hardcoding 0 would report a kv result the proxy
                  * already holds as "missing". */
                 int dec_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
-                llb_ai_pd_record(dec_model, 0, 0, dec_kv, 3 /*decode timeout*/);
+                /* The prefill duration is KNOWN here and was being thrown
+                 * away. On the sequential machines decode is dispatched only
+                 * after prefill answered, so decode_start - prefill_start IS
+                 * the prefill latency -- the same form the sibling decode-
+                 * failure site uses (sockproxy_http.c, "decode error").
+                 * Passing 0 meant loxilb_ai_pd_prefill_duration_seconds
+                 * silently dropped every sample whose request later wedged on
+                 * decode, biasing the histogram optimistic in exactly the
+                 * conditions an operator consults it.
+                 *
+                 * Deliberately NOT done on the SGLang branch above: its legs
+                 * are dispatched together, so the same subtraction is ~0
+                 * unless the drain path backdated prefill_start after a clean
+                 * prefill response -- which a rendezvous wedge never gets.
+                 * There the prefill leg genuinely has no completed duration
+                 * and 0 ("unknown") is the truthful answer. */
+                int64_t dec_prefill_ms = 0;
+                if (pfe->pd_prefill_start_ns > 0 &&
+                    pfe->pd_decode_start_ns > pfe->pd_prefill_start_ns) {
+                  dec_prefill_ms = (int64_t)((pfe->pd_decode_start_ns -
+                                              pfe->pd_prefill_start_ns) /
+                                             1000000ULL);
+                }
+                llb_ai_pd_record((char *)dec_model, dec_prefill_ms, 0, dec_kv,
+                                 3 /*decode timeout*/);
               }
             }
             if (pfe->fd > 0) {
