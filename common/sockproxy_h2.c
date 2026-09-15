@@ -2929,6 +2929,151 @@ proxy_h2_handle_client_data(proxy_fd_ent_t *pfe)
   return 0;
 }
 
+/* Called with send_lock held once the retry buffer is not empty: moves every
+ * further frame nghttp2 has queued into the buffer, behind the ones already
+ * there, arms EPOLLOUT and tries a drain. Releases send_lock. Returns 0, or -1
+ * if a frame could not be buffered. */
+static int
+h2_backend_queue_rest(backend_h2_session_t *backend_session, proxy_fd_ent_t *backend_pfe,
+                      int backend_fd)
+{
+  ssize_t sent;
+  const uint8_t *send_data;
+
+  while ((sent = nghttp2_session_mem_send(backend_session->session, &send_data)) > 0) {
+    pthread_mutex_unlock(&backend_session->send_lock);
+    if (proxy_h2_backend_add_send_buffer(backend_session, send_data, sent) < 0) {
+      log_error("[HTTP/2 Backend] ep[%d]: Failed to buffer %zd bytes for retry",
+                backend_session->ep_idx, sent);
+      return -1;
+    }
+    pthread_mutex_lock(&backend_session->send_lock);
+  }
+  pthread_mutex_unlock(&backend_session->send_lock);
+
+  if (backend_pfe) {
+    proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
+  }
+  proxy_h2_backend_drain_send_buffer(backend_session);
+  return 0;
+}
+
+/* Write every frame the backend session has queued: requests, and also the
+ * WINDOW_UPDATE, SETTINGS ACK and RST_STREAM frames nghttp2 queues while it
+ * receives. Frames the socket cannot take now are buffered and retried on
+ * EPOLLOUT. Returns 0, or -1 on a write error. */
+static int
+h2_backend_flush(backend_h2_session_t *backend_session, proxy_fd_ent_t *backend_pfe,
+                 int backend_fd)
+{
+  // ============================================================================
+  // BUG FIX: Send frames to backend with WANT_WRITE/WANT_READ retry support
+  // Mirrors HTTP/1.1 pattern from sockproxy.c:286-354 (proxy_add_xmitcache)
+  // ============================================================================
+  pthread_mutex_lock(&backend_session->send_lock);
+
+  if (backend_session->send_buffer_head) {
+    /* Earlier frames still wait in the retry buffer. Writing new ones directly
+     * would put them on the wire ahead of those, so queue behind them. */
+    return h2_backend_queue_rest(backend_session, backend_pfe, backend_fd);
+  }
+
+  if (backend_session->ssl) {
+    // Send via SSL with retry buffering
+    ssize_t sent;
+    const uint8_t *send_data;
+    while ((sent = nghttp2_session_mem_send(backend_session->session, &send_data)) > 0) {
+      int rv = SSL_write(backend_session->ssl, send_data, sent);
+      if (rv <= 0) {
+        int ssl_err = SSL_get_error(backend_session->ssl, rv);
+        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
+          // ✅ BUG FIX: Buffer unsent data for retry instead of dropping
+          pthread_mutex_unlock(&backend_session->send_lock);
+
+          if (proxy_h2_backend_add_send_buffer(backend_session, send_data, sent) < 0) {
+            log_error("[HTTP/2 Backend] ep[%d]: Failed to buffer %zd bytes for retry",
+                      backend_session->ep_idx, sent);
+            return -1;
+          }
+
+          if (backend_pfe) {
+            // Register EPOLLOUT for retry when socket becomes writable
+            proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
+          }
+
+          // ✅ BUG FIX: Immediately try to drain buffer (mirrors HTTP/1.1 Bug #3 fix)
+          // This prevents data starvation when socket becomes ready quickly
+          proxy_h2_backend_drain_send_buffer(backend_session);
+
+          log_debug("[HTTP/2 Backend] ep[%d]: Buffered %zd bytes due to WANT_WRITE/WANT_READ, total_buffered=%zu",
+                    backend_session->ep_idx, sent, backend_session->send_buffer_total_size);
+          return 0;  // Not a fatal error - will retry on EPOLLOUT
+        }
+        if (ssl_err == SSL_ERROR_SYSCALL) {
+          log_error("[HTTP/2 Backend] ep[%d]: SSL_write SYSCALL error (errno=%d: %s)",
+                    backend_session->ep_idx, errno, strerror(errno));
+        } else {
+          log_error("[HTTP/2 Backend] ep[%d]: SSL_write failed: %d",
+                    backend_session->ep_idx, ssl_err);
+        }
+        pthread_mutex_unlock(&backend_session->send_lock);
+        return -1;
+      }
+      backend_session->frames_sent++;
+      // Note: Statistics are accounted at socket layer (SSL_write), not here
+    }
+  } else {
+    // Send via plain TCP with retry buffering
+    ssize_t sent;
+    const uint8_t *send_data;
+    while ((sent = nghttp2_session_mem_send(backend_session->session, &send_data)) > 0) {
+      ssize_t rv = send(backend_fd, send_data, sent, 0);
+      if (rv >= 0 && rv < sent) {
+        /* Partial write: keep the rest of the frame, in order, for EPOLLOUT. */
+        pthread_mutex_unlock(&backend_session->send_lock);
+        if (proxy_h2_backend_add_send_buffer(backend_session, send_data + rv, sent - rv) < 0) {
+          return -1;
+        }
+        pthread_mutex_lock(&backend_session->send_lock);
+        return h2_backend_queue_rest(backend_session, backend_pfe, backend_fd);
+      }
+      if (rv < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          // ✅ BUG FIX: Buffer unsent data for retry instead of dropping
+          pthread_mutex_unlock(&backend_session->send_lock);
+
+          if (proxy_h2_backend_add_send_buffer(backend_session, send_data, sent) < 0) {
+            log_error("[HTTP/2 Backend] ep[%d]: Failed to buffer %zd bytes for retry",
+                      backend_session->ep_idx, sent);
+            return -1;
+          }
+
+          if (backend_pfe) {
+            // Register EPOLLOUT for retry when socket becomes writable
+            proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
+          }
+
+          // ✅ BUG FIX: Immediately try to drain buffer (mirrors HTTP/1.1 Bug #3 fix)
+          proxy_h2_backend_drain_send_buffer(backend_session);
+
+          log_debug("[HTTP/2 Backend] ep[%d]: Buffered %zd bytes due to EAGAIN/EWOULDBLOCK, total_buffered=%zu",
+                    backend_session->ep_idx, sent, backend_session->send_buffer_total_size);
+          return 0;  // Not a fatal error - will retry on EPOLLOUT
+        }
+        log_error("[HTTP/2 Backend] ep[%d]: send() failed (errno=%d: %s)",
+                  backend_session->ep_idx, errno, strerror(errno));
+        pthread_mutex_unlock(&backend_session->send_lock);
+        return -1;
+      }
+      backend_session->frames_sent++;
+      // Note: Statistics are accounted at socket layer (send), not here
+    }
+  }
+
+  pthread_mutex_unlock(&backend_session->send_lock);
+  return 0;
+}
+
 /**
  * Handle incoming HTTP/2 data from backend
  * This function processes responses from the backend HTTP/2 server
@@ -2994,6 +3139,14 @@ proxy_h2_handle_backend_data(proxy_fd_ent_t *pfe)
   // to avoid double-counting the same data
   
   pthread_mutex_unlock(&backend_session->send_lock);
+
+  /* Receiving queues frames for the backend too, most importantly the
+   * WINDOW_UPDATE that reopens the backend's flow-control window. Nothing else
+   * sends them until the next request is forwarded, so without this flush a
+   * response larger than the initial 64KB window stalls. */
+  if (h2_backend_flush(backend_session, pfe, pfe->fd) < 0) {
+    return -1;
+  }
   
   // Send any pending frames to client (responses from backend)
   rv = proxy_h2_client_send(client_pfe->h2_session);
@@ -4135,100 +4288,9 @@ h2_have_tepval:
   }
 #endif
   
-  // ============================================================================
-  // BUG FIX: Send frames to backend with WANT_WRITE/WANT_READ retry support
-  // Mirrors HTTP/1.1 pattern from sockproxy.c:286-354 (proxy_add_xmitcache)
-  // ============================================================================
-  pthread_mutex_lock(&backend_session->send_lock);
-
-  if (backend_session->ssl) {
-    // Send via SSL with retry buffering
-    ssize_t sent;
-    const uint8_t *send_data;
-    while ((sent = nghttp2_session_mem_send(backend_session->session, &send_data)) > 0) {
-      int rv = SSL_write(backend_session->ssl, send_data, sent);
-      if (rv <= 0) {
-        int ssl_err = SSL_get_error(backend_session->ssl, rv);
-        if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ) {
-          // ✅ BUG FIX: Buffer unsent data for retry instead of dropping
-          pthread_mutex_unlock(&backend_session->send_lock);
-
-          if (proxy_h2_backend_add_send_buffer(backend_session, send_data, sent) < 0) {
-            log_error("[HTTP/2 Backend] ep[%d]: Failed to buffer %zd bytes for retry",
-                      backend_session->ep_idx, sent);
-            return -1;
-          }
-
-          // Get backend pfe for EPOLLOUT registration
-          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[slot];
-          if (backend_pfe) {
-            // Register EPOLLOUT for retry when socket becomes writable
-            proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
-          }
-
-          // ✅ BUG FIX: Immediately try to drain buffer (mirrors HTTP/1.1 Bug #3 fix)
-          // This prevents data starvation when socket becomes ready quickly
-          proxy_h2_backend_drain_send_buffer(backend_session);
-
-          log_debug("[HTTP/2 Backend] ep[%d]: Buffered %zd bytes due to WANT_WRITE/WANT_READ, total_buffered=%zu",
-                    backend_session->ep_idx, sent, backend_session->send_buffer_total_size);
-          return 0;  // Not a fatal error - will retry on EPOLLOUT
-        }
-        if (ssl_err == SSL_ERROR_SYSCALL) {
-          log_error("[HTTP/2 Backend] ep[%d]: SSL_write SYSCALL error (errno=%d: %s)",
-                    backend_session->ep_idx, errno, strerror(errno));
-        } else {
-          log_error("[HTTP/2 Backend] ep[%d]: SSL_write failed: %d",
-                    backend_session->ep_idx, ssl_err);
-        }
-        pthread_mutex_unlock(&backend_session->send_lock);
-        return -1;
-      }
-      backend_session->frames_sent++;
-      // Note: Statistics are accounted at socket layer (SSL_write), not here
-    }
-  } else {
-    // Send via plain TCP with retry buffering
-    ssize_t sent;
-    const uint8_t *send_data;
-    while ((sent = nghttp2_session_mem_send(backend_session->session, &send_data)) > 0) {
-      ssize_t rv = send(backend_fd, send_data, sent, 0);
-      if (rv < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-          // ✅ BUG FIX: Buffer unsent data for retry instead of dropping
-          pthread_mutex_unlock(&backend_session->send_lock);
-
-          if (proxy_h2_backend_add_send_buffer(backend_session, send_data, sent) < 0) {
-            log_error("[HTTP/2 Backend] ep[%d]: Failed to buffer %zd bytes for retry",
-                      backend_session->ep_idx, sent);
-            return -1;
-          }
-
-          // Get backend pfe for EPOLLOUT registration
-          proxy_fd_ent_t *backend_pfe = pfe->rfd_ent[slot];
-          if (backend_pfe) {
-            // Register EPOLLOUT for retry when socket becomes writable
-            proxy_notify_add_fd(backend_fd, NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, backend_pfe);
-          }
-
-          // ✅ BUG FIX: Immediately try to drain buffer (mirrors HTTP/1.1 Bug #3 fix)
-          proxy_h2_backend_drain_send_buffer(backend_session);
-
-          log_debug("[HTTP/2 Backend] ep[%d]: Buffered %zd bytes due to EAGAIN/EWOULDBLOCK, total_buffered=%zu",
-                    backend_session->ep_idx, sent, backend_session->send_buffer_total_size);
-          return 0;  // Not a fatal error - will retry on EPOLLOUT
-        }
-        log_error("[HTTP/2 Backend] ep[%d]: send() failed (errno=%d: %s)",
-                  backend_session->ep_idx, errno, strerror(errno));
-        pthread_mutex_unlock(&backend_session->send_lock);
-        return -1;
-      }
-      backend_session->frames_sent++;
-      // Note: Statistics are accounted at socket layer (send), not here
-    }
+  if (h2_backend_flush(backend_session, pfe->rfd_ent[slot], backend_fd) < 0) {
+    return -1;
   }
-
-  pthread_mutex_unlock(&backend_session->send_lock);
   
   // P2 Task 2.3: Record circuit breaker success
   circuit_breaker_record_success(tepval, ep_idx);
