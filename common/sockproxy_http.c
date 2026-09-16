@@ -846,6 +846,39 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
 }
 
 /*
+ * proxy_sockmap_l7_rewrites_requests — whether this rule's data plane changes
+ * bytes on every request, which a direction handed to the kernel would skip.
+ *
+ * Two declarations put that work on the relay path:
+ *   - an attached L7 policy (has_l7_policy): X-Forwarded-For is overwritten,
+ *     X-Forwarded-Port/-Proto are added, and the insertHeaders SET/ADD/REMOVE
+ *     operations are applied, on every request; a Set-Cookie can be injected on
+ *     every response;
+ *   - a declared apikey_auth, an explicit "disabled" INCLUDED: the gateway owns
+ *     the X-Api-Key namespace and strips the header before dispatch on every
+ *     request (ai_security_should_strip_api_key).
+ *
+ * The control plane refuses a sockMapMode on such a rule, but that check runs
+ * when the rule is written and an L7 policy can be attached while connections
+ * are already live. This is the per-connection backstop; declining the pair
+ * leaves the connection on the userspace relay, which is the byte path such a
+ * rule needs.
+ */
+static int
+proxy_sockmap_l7_rewrites_requests(proxy_map_ent_t *ent, proxy_epval_t *epv)
+{
+  uint8_t apikey_auth;
+
+  if (!ent)
+    return 0;
+  if (ent->has_l7_policy)
+    return 1;
+  apikey_auth = epv ? epv->apikey_auth :
+                (ent->val.ephash ? ent->val.ephash->apikey_auth : 0);
+  return ai_security_should_strip_api_key(apikey_auth) ? 1 : 0;
+}
+
+/*
  * (CONTEXT) — H1 RESPONSE-side Set-Cookie
  * injection for stateless HTTP_COOKIE persistence. Splices a fixed-name
  * Set-Cookie carrying the opaque keyed-HMAC token of the BACKEND THIS REQUEST WAS
@@ -6687,7 +6720,8 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       // shared map (BPF_NOEXIST collisions). Pairing is expressed via peer_map
       // below instead.
 #if !defined(HAVE_SOCKOPS)
-      if (sockmap_eligible && proxy_struct->sockmap_cb && ent->val.sockmap_en) {
+      if (sockmap_eligible && proxy_struct->sockmap_cb && ent->val.sockmap_en &&
+          !proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
         int ret1 = proxy_struct->sockmap_cb(rkey, pfe->fd, 1);
         int ret2 = proxy_struct->sockmap_cb(key, ep_cfd, 1);
         if (ret1 != 0 || ret2 != 0) {
@@ -6790,6 +6824,24 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
 
 #if defined(HAVE_SOCKOPS)
     uint8_t sockmap_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
+
+    /* Second gate on the pairing, per connection. The control plane refuses a
+     * sockMapMode on a rule whose data plane rewrites bytes on every request —
+     * a declared apikey_auth (an explicit "disabled" included, which still
+     * strips X-Api-Key) or an attached L7 policy — but that check runs when the
+     * rule is written, and an L7 policy can be attached while connections are
+     * already live. Acceleration would then skip l7_inject_req_headers_h1 and
+     * ai_strip_upstream_api_key from the second keep-alive request on, carrying
+     * the tenant's key upstream and leaving a client-supplied X-Forwarded-For
+     * unrewritten. Declining the pair here costs a rule that should never have
+     * been accelerated its acceleration, and nothing else: the connection stays
+     * on the userspace relay, which is exactly the byte path it needs. */
+    if (sockmap_mode && proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
+      log_info("Sockmap: not pairing fd=%d/%d, the rule rewrites every request "
+               "(l7_policy=%u); staying on the userspace relay",
+               pfe->fd, ep_cfd, ent->has_l7_policy);
+      sockmap_mode = 0;
+    }
 
     if (sockmap_eligible && proxy_struct->peer_map_cb && proxy_struct->verdict_map_cb &&
         sockmap_mode) {
