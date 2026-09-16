@@ -150,6 +150,10 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   uint8_t *l_prefill = __atomic_exchange_n(&client_pfe->pd_prefill_resp_buf,
                                            NULL, __ATOMIC_ACQ_REL);
   if (!l_prefill) l_prefill_len = 0; else client_pfe->pd_prefill_resp_len = 0;
+  /* Claimed and cleared with the buffer it describes: the flag is a property of
+   * THIS body, and a pfe reused by a later request must not inherit it. */
+  int l_prefill_truncated = client_pfe->pd_prefill_truncated;
+  client_pfe->pd_prefill_truncated = 0;
 
   /* Origin-error feed (parity with the SGLang drain leg): the sequential
    * machine swallows the prefill response — a prefill 5xx degrades to
@@ -210,17 +214,36 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
       kv_epv->pd_kv_params_max < kv_capacity) {
       kv_capacity = kv_epv->pd_kv_params_max;
   }
-  int kv_ret = is_trt ?
-      pd_trt_extract_disagg_params(l_prefill,
-                       l_prefill_len,
-                       client_pfe->pd_kv_params,
-                       &client_pfe->pd_kv_params_len,
-                       kv_capacity) :
-      pd_extract_kv_params(l_prefill,
-                       l_prefill_len,
-                       client_pfe->pd_kv_params,
-                       &client_pfe->pd_kv_params_len,
-                       kv_capacity);
+  /* A truncated body is not a short body: the span the extractor would find is
+   * cut at an arbitrary byte, so it parses as PRESENT while being unusable.
+   * Both faces of that are wrong. The decode leg is handed a half object it
+   * cannot honour and the client gets no completion at all -- the very wedge
+   * the guard above exists to prevent, reached by another route -- and
+   * pd_kv_params_len > 0 is what the accounting reads as "params found", so a
+   * mangled object is counted as a successful transfer. Skipping the extract
+   * takes the same degradation the guard's own comment promises: no params,
+   * decode recomputes prefill, and the request is served. */
+  int kv_ret = 0;
+  if (l_prefill_truncated) {
+    client_pfe->pd_kv_params_len = 0;
+    kv_ret = -ENOENT;
+    log_warn("prefill response was truncated at the buffer cap — not "
+             "extracting %s; decode will recompute prefill (client_fd=%d)",
+             is_trt ? "disaggregated_params" : "kv_transfer_params",
+             client_pfe->fd);
+  } else {
+    kv_ret = is_trt ?
+        pd_trt_extract_disagg_params(l_prefill,
+                         l_prefill_len,
+                         client_pfe->pd_kv_params,
+                         &client_pfe->pd_kv_params_len,
+                         kv_capacity) :
+        pd_extract_kv_params(l_prefill,
+                         l_prefill_len,
+                         client_pfe->pd_kv_params,
+                         &client_pfe->pd_kv_params_len,
+                         kv_capacity);
+  }
   if (kv_ret == -EMSGSIZE) {
     log_error("%s overflow (%zu bytes) — decode will recompute prefill",
               is_trt ? "disaggregated_params" : "kv_transfer_params",

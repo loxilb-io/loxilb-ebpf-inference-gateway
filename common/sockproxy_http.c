@@ -1565,6 +1565,14 @@ skip_deferred_masking:
         if (copy_len < len) {
           log_warn("Prefill response buffer full (%zu/%zu), truncating",
                    rfd_ent->pd_prefill_resp_len, rfd_ent->pd_prefill_resp_cap);
+          /* Bytes were DROPPED, so whatever completes this body below describes
+           * a prefix. The Content-Length branch is not the only way out of
+           * PREFILL_WAITING: a chunked prefill response over the cap reaches
+           * pd_detect_http_msg_end with a buffer that is missing the bytes the
+           * terminator would have been in, and any match it does find is
+           * therefore mid-object. Mark it at the drop, which is the one place
+           * that sees the loss regardless of which completion path fires. */
+          rfd_ent->pd_prefill_truncated = 1;
         }
 
         /* Check if prefill HTTP response is complete (headers + Content-Length body) */
@@ -1603,6 +1611,15 @@ skip_deferred_masking:
                        " (client_fd=%d)",
                        pr_hdr_len, pr_content_len, rfd_ent->pd_prefill_resp_cap,
                        rfd_ent->fd);
+              /* What is in the buffer is a PREFIX of the declared response, and
+               * how long a prefix is a race on what the socket has delivered by
+               * now -- measured at 322, 27166, 54010 and 65536 bytes for one
+               * byte-identical 80KB response. Mark it, because "decode will
+               * recompute prefill" above is only true if nothing downstream
+               * trusts this body: a prefix that still contains the params key
+               * extracts a HALF object, which the decode leg cannot use and
+               * which no longer looks absent to the accounting. */
+              rfd_ent->pd_prefill_truncated = 1;
               pr_complete = 1;
             }
           } else if (pd_detect_http_msg_end(rfd_ent->pd_prefill_resp_buf,
@@ -4454,6 +4471,11 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
   pd_free_claim(&fd_ent->pd_prefill_resp_buf);
   fd_ent->pd_prefill_resp_len = 0;
   fd_ent->pd_prefill_resp_cap = 0;
+  /* Cleared with the buffer it describes. pd_initiate_decode claims the flag on
+   * the path that reaches it, but a prefill leg that dies before then leaves the
+   * pfe alive across a keep-alive boundary, and this is where that boundary
+   * resets the rest of the body state. */
+  fd_ent->pd_prefill_truncated = 0;
 
   /* INTG-06: Decrement active_conns for P/D EPs at teardown */
   if (fd_ent->epv) {

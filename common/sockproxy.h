@@ -1226,6 +1226,11 @@ struct proxy_fd_ent {
   uint8_t *pd_prefill_resp_buf;      // Heap: buffered prefill response (max 64KB)
   size_t   pd_prefill_resp_len;      // Current length of buffered prefill response
   size_t   pd_prefill_resp_cap;      // Capacity of prefill response buffer
+  uint8_t  pd_prefill_truncated;     // Prefill body was force-completed by the
+                                     // buffer-cap wedge guard, so it is a PREFIX of
+                                     // the declared response and its transfer-params
+                                     // span cannot be trusted. Append-only growth,
+                                     // zero-init (pfe_alloc) == not truncated.
   char     pd_kv_params[PD_KV_PARAMS_MAX_LEN]; // Extracted kv_transfer_params JSON (64KB)
   size_t   pd_kv_params_len;         // Length of kv_transfer_params
   size_t   pd_prefill_body_len;      // Length of rewritten prefill body (for Content-Length update)
