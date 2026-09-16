@@ -524,6 +524,17 @@ test_qos_bucket: test_qos_bucket.c sockproxy_qos.h
 test_qos: test_qos_bucket
 	./test_qos_bucket
 
+# Teardown settlement: a teardown's shape decides which connections it walks, never
+# whether a walked connection settles. Header-only and standalone; the test
+# carries its own red twin (the pre-fix `!is_listener` rule) and fails any case
+# that rule would also have got right, so it cannot go vacuously green.
+test_teardown_settle: test_teardown_settle.c sockproxy_teardown_settle.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_teardown
+test_teardown: test_teardown_settle
+	./test_teardown_settle
+
 # Phase 47 P47-R2: root-pipe cfg V2 validator + miss-dispatch unit test
 # Standalone -- mirrors the header struct inline, does NOT link against DOCA.
 test_doca_root_v2: test_doca_root_v2.c

@@ -73,6 +73,7 @@
 #include "sockproxy_ep.h"
 #include "sockproxy_ktls.h"
 #include "sockproxy_h2.h"
+#include "sockproxy_teardown_settle.h"
 /* pure HTTP-message-end detector (chunked "0\r\n\r\n" /
  * SSE "[DONE]") shared with the unit TU. Included AFTER sockproxy.h so the real
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
@@ -4554,6 +4555,155 @@ proxy_release_rfd_ctx(proxy_fd_ent_t *pfe)
   pfe->n_rfd = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Deferred teardown settles.
+ *
+ * All three settle shapes cross into the control plane, which re-enters the
+ * non-recursive PROXY_LOCK, so each is COLLECTED under the lock (identity
+ * copied, usage extracted while the stream pool is still guaranteed alive) and
+ * EMITTED after the final PROXY_UNLOCK.
+ *
+ * They are batched rather than held in one slot each because a listener
+ * teardown settles every connection on the rule, not just one. See
+ * sockproxy_teardown_settle.h for why the listener shape settles at all.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+  char    tenant[128];
+  char    model[MAX_MODEL_LEN];
+  char    user[128];
+  char    key[64];
+  char    svc_ident[64];
+  int     reserved;
+  int64_t res_epoch;
+} proxy_resv_rel_t;
+
+typedef struct {
+  char tenant[128];
+  char model[MAX_MODEL_LEN];
+} proxy_umiss_t;
+
+typedef struct {
+  proxy_resv_rel_t     *resv;  int n_resv,  c_resv;
+  proxy_umiss_t        *umiss; int n_umiss, c_umiss;
+  h2_inflight_settle_t *h2;    int n_h2,    c_h2;
+} proxy_settle_batch_t;
+
+/* Grow *arr to hold at least n+1 elements of size esz. Returns 0 on OOM, and
+ * says so: a dropped settle strands a tenant's claim until the quota window
+ * rolls, which the operator should be able to see. */
+static int
+proxy_settle_grow(void **arr, int *cap, int n, size_t esz)
+{
+  int ncap;
+  void *nv;
+
+  if (n < *cap)
+    return 1;
+  ncap = *cap ? *cap * 2 : 4;
+  nv = realloc(*arr, (size_t)ncap * esz);
+  if (!nv) {
+    log_error("[AI_TOKENS] teardown settle: OOM growing to %d — a claim will "
+              "self-heal only at window roll", ncap);
+    return 0;
+  }
+  *arr = nv;
+  *cap = ncap;
+  return 1;
+}
+
+/* Build the settlement view of a pfe, so the decision is made by the shared
+ * rule rather than by a condition restated at each call site. */
+static void
+proxy_teardown_view(const proxy_fd_ent_t *pfe, teardown_conn_t *v)
+{
+  memset(v, 0, sizeof(*v));
+  v->odir                  = pfe->odir;
+  v->ai_gw_mode            = pfe->ai_gw_mode ? 1 : 0;
+  v->usage_reserved_toks   = (int)pfe->usage_reserved_toks;
+  v->usage_consumed        = pfe->usage_consumed ? 1 : 0;
+  v->has_tenant            = pfe->tenant_id[0] != '\0';
+  v->has_h2_session        = pfe->h2_session ? 1 : 0;
+  v->metric_ai_recorded    = pfe->metric_ai_recorded ? 1 : 0;
+  v->metric_response_status = pfe->metric_response_status;
+}
+
+/*
+ * Collect every deferred settle this ONE connection owes.
+ *
+ * Called for the pfe being destroyed, and — this is the part that used to be
+ * missing — for each connection a listener teardown takes with it. `shape` is
+ * passed through to the shared rule, which ignores it by design: the shape
+ * decides which connections are walked, never whether a walked one settles.
+ *
+ * Must run BEFORE proxy_h2_cleanup_session() frees the streams.
+ */
+static void
+proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
+                           int shape)
+{
+  teardown_conn_t v;
+
+  if (!pfe)
+    return;
+  proxy_teardown_view(pfe, &v);
+  if (!teardown_conn_owes_settle(shape, &v))
+    return;
+
+  /* Mid-flight teardown with an unspent admission claim. The claim is
+   * node-local and epoch-tagged, so it self-heals when the window rolls, but
+   * until then it counts against the tenant's headroom and can deny admissions
+   * for a request that died before it burned anything. Hand it back explicitly
+   * instead of waiting out the window. */
+  if (teardown_owes_resv_rel(&v) &&
+      proxy_settle_grow((void **)&b->resv, &b->c_resv, b->n_resv,
+                        sizeof(*b->resv))) {
+    const char *m = proxy_effective_model(pfe);
+    proxy_resv_rel_t *r = &b->resv[b->n_resv++];
+    memset(r, 0, sizeof(*r));
+    r->reserved  = (int)pfe->usage_reserved_toks;
+    r->res_epoch = pfe->usage_res_epoch;
+    snprintf(r->tenant, sizeof(r->tenant), "%s", pfe->tenant_id);
+    snprintf(r->model, sizeof(r->model), "%s", m ? m : "");
+    snprintf(r->user, sizeof(r->user), "%s", pfe->auth_user_id);
+    snprintf(r->key, sizeof(r->key), "%s", pfe->auth_key_id);
+    proxy_pfe_svc_ident(pfe, r->svc_ident, sizeof(r->svc_ident));
+    /* Zero under the lock: nothing may release this claim twice. */
+    pfe->usage_reserved_toks = 0;
+    pfe->usage_res_epoch = 0;
+  }
+
+  /* Last response on this connection, finished with no readable usage object.
+   * Identity is copied here because the pfe may be recycled by the time this
+   * is emitted. */
+  if (teardown_owes_usage_missing(&v) &&
+      proxy_settle_grow((void **)&b->umiss, &b->c_umiss, b->n_umiss,
+                        sizeof(*b->umiss))) {
+    const char *um_model = proxy_effective_model(pfe);
+    proxy_umiss_t *u = &b->umiss[b->n_umiss++];
+    memset(u, 0, sizeof(*u));
+    snprintf(u->tenant, sizeof(u->tenant), "%s", pfe->tenant_id);
+    snprintf(u->model, sizeof(u->model), "%s", um_model ? um_model : "");
+    pfe->metric_ai_recorded = 0;   /* reported once */
+  }
+
+  /* HTTP/2 client connection: settle every stream still in flight. On an
+   * abrupt teardown nghttp2 never runs each stream's close, so those admitted
+   * or keyless streams never released their admission reservation nor recorded
+   * their request. The collector marks each stream settled, so a later close
+   * cannot double it. */
+  if (teardown_owes_h2_collect(&v)) {
+    h2_inflight_settle_t *got = NULL;
+    int n = proxy_h2_collect_inflight_settles(pfe, &got);
+    for (int i = 0; i < n; i++) {
+      if (!proxy_settle_grow((void **)&b->h2, &b->c_h2, b->n_h2,
+                             sizeof(*b->h2)))
+        break;
+      b->h2[b->n_h2++] = got[i];
+    }
+    free(got);
+  }
+}
+
 void
 proxy_pdestroy(void *priv)
 {
@@ -4576,42 +4726,11 @@ proxy_pdestroy(void *priv)
   } pd_retry_pend[MAX_PROXY_EP];
   int n_pd_retry_pend = 0;
 
-  /* An admission-time token reservation that this connection never settled.
-   * Collected under PROXY_LOCK and released after the final PROXY_UNLOCK, for
-   * the same reason the prefill retries are: the release crosses into Go.
-   * The strings are COPIED because the pfe may be freed by then. */
-  struct {
-    int      pending;
-    char     tenant[128];
-    char     model[MAX_MODEL_LEN];
-    char     user[128];
-    char     key[64];
-    char     svc_ident[64];
-    int      reserved;
-    int64_t  res_epoch;
-  } resv_rel = { 0, {0}, {0}, {0}, {0}, {0}, 0, 0 };
-
-  /* HTTP/2 in-flight per-stream settles. The resv_rel above hands back the
-   * single pfe-level reservation the H1 parser holds; an H2 connection can
-   * carry many admitted/keyless streams that never reached their own close.
-   * Collected (usage extracted, identity copied) under PROXY_LOCK and emitted
-   * to the control plane after the final PROXY_UNLOCK — same deferral reason
-   * as resv_rel: the settle re-enters the non-recursive PROXY_LOCK. */
-  h2_inflight_settle_t *h2_settle = NULL;
-  int n_h2_settle = 0;
-
-  /* The connection's LAST response may also have completed without a readable
-   * usage object. The per-request boundary in handle_on_message_begin
-   * reports that for every response that a request N+1 follows; the last one
-   * is followed by nothing, so without this twin a connection serving a single
-   * request — the common shape — would never report at all. Collected under
-   * PROXY_LOCK and emitted after the unlock, like resv_rel, because the
-   * recorder crosses into the control plane. */
-  struct {
-    int  pending;
-    char tenant[128];
-    char model[MAX_MODEL_LEN];
-  } usage_missing = { 0, {0}, {0} };
+  /* Deferred settles for every connection this teardown takes with it. A
+   * connection teardown contributes one; a listener teardown contributes one
+   * per connection on the rule. Collected under PROXY_LOCK, emitted after the
+   * final PROXY_UNLOCK — see proxy_collect_conn_settles above. */
+  proxy_settle_batch_t settles = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0 };
 
   assert(pfe);
 
@@ -4639,12 +4758,14 @@ proxy_pdestroy(void *priv)
       fd_ent = ent->val.fdlist;
       while (fd_ent) {
         if (fd_ent->odir == 0) {
-          /* Same per-connection HTTP/2 session leak as the single-connection
-           * path below, reached when the whole rule goes away. Streams are
-           * freed without settling here, matching what this path already does
-           * with the HTTP/1.1 reservation: the deferred settle belongs to the
-           * per-connection teardown, and a rule delete is taking the pools
-           * with it regardless. */
+          /* Settle this connection's claims BEFORE anything frees them. The
+           * rule is going away and it does take the endpoint pools with it —
+           * but the token bucket is per-TENANT and outlives the rule, so a
+           * claim dropped here is not released, it is stranded, withdrawing
+           * headroom from every other service on that tenant until the quota
+           * epoch rolls. Must precede proxy_h2_cleanup_session(), which frees
+           * the streams the collector reads. */
+          proxy_collect_conn_settles(fd_ent, &settles, TEARDOWN_LISTENER);
           if (fd_ent->h2_session) {
             proxy_h2_cleanup_session(fd_ent);
           }
@@ -4999,48 +5120,12 @@ proxy_pdestroy(void *priv)
       }
     }
 
-    /* Mid-flight teardown with an unspent admission claim. The claim is
-     * node-local and epoch-tagged, so it self-heals when the window rolls,
-     * but until then it counts against the tenant's headroom and can deny
-     * admissions for a request that died before it burned anything. Hand it
-     * back explicitly instead of waiting out the window. */
-    if (!is_listener && pfe->ai_gw_mode && pfe->usage_reserved_toks &&
-        !pfe->usage_consumed && pfe->tenant_id[0] != '\0') {
-      const char *m = proxy_effective_model(pfe);
-      resv_rel.pending = 1;
-      resv_rel.reserved = (int)pfe->usage_reserved_toks;
-      resv_rel.res_epoch = pfe->usage_res_epoch;
-      snprintf(resv_rel.tenant, sizeof(resv_rel.tenant), "%s", pfe->tenant_id);
-      snprintf(resv_rel.model, sizeof(resv_rel.model), "%s", m ? m : "");
-      snprintf(resv_rel.user, sizeof(resv_rel.user), "%s", pfe->auth_user_id);
-      snprintf(resv_rel.key, sizeof(resv_rel.key), "%s", pfe->auth_key_id);
-      proxy_pfe_svc_ident(pfe, resv_rel.svc_ident, sizeof(resv_rel.svc_ident));
-      /* Zero under the lock: nothing may release this claim twice. */
-      pfe->usage_reserved_toks = 0;
-      pfe->usage_res_epoch = 0;
-    }
-
-    /* Last response on this connection, finished with no readable usage
-     * object (see the declaration above). Identity is copied here because the
-     * pfe may be recycled by the time this is emitted. */
-    if (!is_listener && proxy_usage_went_unreported(pfe)) {
-      const char *um_model = proxy_effective_model(pfe);
-      usage_missing.pending = 1;
-      snprintf(usage_missing.tenant, sizeof(usage_missing.tenant), "%s",
-               pfe->tenant_id);
-      snprintf(usage_missing.model, sizeof(usage_missing.model), "%s",
-               um_model ? um_model : "");
-      pfe->metric_ai_recorded = 0;   /* reported once */
-    }
-
-    /* HTTP/2 client connection: settle every stream still in flight. On an
-     * abrupt teardown nghttp2 never runs each stream's close, so those admitted
-     * or keyless streams never released their admission reservation nor recorded
-     * their request. Collected here under the lock (usage extracted while the
-     * pool is still guaranteed alive); the control-plane charge/record is
-     * emitted after PROXY_UNLOCK below, exactly as resv_rel is. */
-    if (!is_listener && pfe->odir == 0 && pfe->h2_session) {
-      n_h2_settle = proxy_h2_collect_inflight_settles(pfe, &h2_settle);
+    /* This connection's own claims. The listener shape collected them for
+     * every connection on the rule, above, before freeing them; a connection
+     * teardown walks only itself. Either way the settle decision is the shared
+     * rule's, not a condition restated here. */
+    if (!is_listener) {
+      proxy_collect_conn_settles(pfe, &settles, TEARDOWN_CONN);
     }
 
     /* A backend teardown must not discard a client's undelivered payload.
@@ -5132,44 +5217,46 @@ proxy_pdestroy(void *priv)
   }
   PROXY_UNLOCK();
 
-  /* Deferred reservation release (collected above under PROXY_LOCK). A zero
+  /* Deferred reservation releases (collected above under PROXY_LOCK). A zero
    * count charges nothing and releases the claim. */
-  if (resv_rel.pending) {
-    llb_ai_token_quota_consume(resv_rel.tenant, resv_rel.model,
-                               resv_rel.user, resv_rel.key,
-                               resv_rel.svc_ident, 0, 0, 0,
-                               resv_rel.reserved, resv_rel.res_epoch, NULL);
+  for (int ri = 0; ri < settles.n_resv; ri++) {
+    proxy_resv_rel_t *r = &settles.resv[ri];
+    llb_ai_token_quota_consume(r->tenant, r->model, r->user, r->key,
+                               r->svc_ident, 0, 0, 0,
+                               r->reserved, r->res_epoch, NULL);
     log_info("[AI_TOKENS] released %d unspent reserved tokens on teardown "
-             "tenant=%s", resv_rel.reserved, resv_rel.tenant);
+             "tenant=%s", r->reserved, r->tenant);
   }
+  free(settles.resv);
 
-  /* Deferred missing-usage report (collected above under PROXY_LOCK). Charges
-   * nothing — it records that a response completed with no usage object to
-   * read, which is the counter's stated contract for every completed
-   * response, streamed or not. */
-  if (usage_missing.pending) {
+  /* Deferred missing-usage reports (collected above under PROXY_LOCK). Charge
+   * nothing — each records that a response completed with no usage object to
+   * read, which is the counter's stated contract for every completed response,
+   * streamed or not. */
+  for (int ui = 0; ui < settles.n_umiss; ui++) {
+    proxy_umiss_t *u = &settles.umiss[ui];
     /* CONNECTION_CLOSE, not RESPONSE_COMPLETE: this fired because the
      * connection went away. The 2xx status was seen, but nothing here proves
      * the exchange finished — a client that took the headers and cut lands on
-     * exactly this path. Naming the boundary keeps that ambiguity in the
-     * label instead of hiding it behind a guess. */
-    llb_ai_record_usage_missing(usage_missing.tenant, usage_missing.model,
+     * exactly this path. Naming the boundary keeps that ambiguity in the label
+     * instead of hiding it behind a guess. */
+    llb_ai_record_usage_missing(u->tenant, u->model,
                                 LLB_AI_UMISS_CONNECTION_CLOSE);
     log_info("[AI_TOKENS] response completed with no usage object "
              "tenant=%s model=%s reason=%s (reported, not charged)",
-             usage_missing.tenant, usage_missing.model,
-             LLB_AI_UMISS_CONNECTION_CLOSE);
+             u->tenant, u->model, LLB_AI_UMISS_CONNECTION_CLOSE);
   }
+  free(settles.umiss);
 
   /* Deferred HTTP/2 in-flight settles (collected above under PROXY_LOCK).
    * The consume call charges whatever usage was extracted and releases the
    * admission reservation in the same call — a zero-usage stream is a pure
-   * release, matching resv_rel. A request record is emitted ONLY when the
-   * response actually progressed (a backend status was seen); an aborted
-   * stream releases its reservation without fabricating a completed-request
-   * record, exactly as the H1 teardown does. */
-  for (int hi = 0; hi < n_h2_settle; hi++) {
-    h2_inflight_settle_t *e = &h2_settle[hi];
+   * release, matching the reservation releases above. A request record is
+   * emitted ONLY when the response actually progressed (a backend status was
+   * seen); an aborted stream releases its reservation without fabricating a
+   * completed-request record, exactly as the H1 teardown does. */
+  for (int hi = 0; hi < settles.n_h2; hi++) {
+    h2_inflight_settle_t *e = &settles.h2[hi];
     llb_ai_token_quota_consume(e->tenant, e->model, e->user, e->key,
                                e->svc_ident, e->prompt_toks, e->complet_toks,
                                0, e->reserved_toks, e->res_epoch, NULL);
@@ -5196,7 +5283,7 @@ proxy_pdestroy(void *priv)
              "completion=%d reserved=%d status=%d", e->tenant, e->prompt_toks,
              e->complet_toks, e->reserved_toks, e->status);
   }
-  free(h2_settle);
+  free(settles.h2);
 
   /* Deferred prefill mid-request failovers (collected above under
    * PROXY_LOCK). Same-thread with the dying leg's teardown — the client pfe
