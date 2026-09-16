@@ -302,6 +302,82 @@ proxy_peer_map_activate_req(proxy_fd_ent_t *client_pfe)
   }
 }
 
+/* proxy_sockmap_drop_accel — close the connections of one rule that the kernel
+ * is currently accelerating, and report how many were closed.
+ *
+ * Why this exists. The verdict decides on the peer_map lookup alone, so a rule
+ * changed or deleted applies to new connections while an accelerated pair keeps
+ * redirecting until it closes. That is deliberate: the verdict must never return
+ * SK_PASS on a socket in sock_verdict_map, which is what exposed it to the
+ * tcp_bpf copied_seq defect. It leaves the operator with no way to stop
+ * acceleration on live connections, and this is that way.
+ *
+ * It CLOSES rather than unmaps. Removing a socket from the sockhash while
+ * traffic flows races the strp_wq path and can drop bytes mid-connection;
+ * closing cannot, because the connection is over either way. The client sees a
+ * closed connection and reconnects, and the new connection follows the rule as
+ * it now stands.
+ *
+ * Only accelerated pairs are touched. A connection of the same rule that was
+ * never paired — one that has not sent a request yet, or an h2 connection,
+ * which installs no pair — keeps running on the userspace relay.
+ *
+ * shutdown() is called under PROXY_LOCK, the way the health path's stream-timeout
+ * teardown does: the lock keeps the pfe alive for the call, and the owning worker
+ * sees POLLHUP and runs the ordinary destroy, which removes the verdict entry
+ * before its peer_map entry (proxy_peer_map_delete) and so preserves the
+ * invariant this whole design rests on.
+ *
+ * Returns the number of connections dropped, or -ENOENT when the rule does not
+ * exist. A rule with nothing accelerated returns 0.
+ */
+int
+proxy_sockmap_drop_accel(proxy_ent_t *key)
+{
+  proxy_map_ent_t *node;
+  proxy_fd_ent_t *pfe;
+  int found = 0;
+  int dropped = 0;
+
+  if (!key) {
+    return -EINVAL;
+  }
+
+  PROXY_LOCK();
+  for (node = proxy_struct->head; node; node = node->next) {
+    if (!cmp_proxy_ent(&node->key, key)) {
+      continue;
+    }
+    found = 1;
+    /* fdlist carries the BACKEND pfe of each pair, which is where the install
+     * path records the peer_map flags; rfd_ent[0] is its client leg. Both ends
+     * are closed, since either alone would leave the other half-open on a
+     * connection whose point was that the kernel moves its bytes. */
+    for (pfe = node->val.fdlist; pfe; pfe = pfe->next) {
+      if (!pfe->peer_map_req_installed && !pfe->peer_map_resp_installed) {
+        continue;
+      }
+      if (pfe->fd > 0) {
+        shutdown(pfe->fd, SHUT_RDWR);
+      }
+      if (pfe->n_rfd > 0 && pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0) {
+        shutdown(pfe->rfd_ent[0]->fd, SHUT_RDWR);
+      }
+      dropped++;
+    }
+    break;
+  }
+  PROXY_UNLOCK();
+
+  if (!found) {
+    return -ENOENT;
+  }
+
+  log_info("Sockmap: dropped %d accelerated connection(s) on %s:%u",
+           dropped, inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport));
+  return dropped;
+}
+
 
 // Task 2.2: kTLS integration with sockmap
 // The old proxy_sock_init_ktls() stub has been removed.
