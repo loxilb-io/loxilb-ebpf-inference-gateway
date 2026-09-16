@@ -313,11 +313,23 @@ llb_ai_update_ep_queue_depth(uint32_t service_ip, uint16_t service_port,
 
 /*
  * llb_ai_update_ep_capacity - update per-EP advertised KV capacity
- * (num_gpu_blocks) from the Go vLLM scraper. Byte-for-byte mirror of
+ * (num_gpu_blocks) from the Go vLLM scraper. It shares the TRAVERSAL shape of
  * llb_ai_update_ep_queue_depth above (PROXY_LOCK + atomic_store, MAX_PROXY_EP
- * bound, pd_disagg + n_eps guard) — the only differences are the field stored
- * (num_gpu_blocks) and the value source. A 0 advertisement is stored as-is and
- * clamped to 1 at read time by pd_kv_clamp_capacity (V5 — never divide-by-zero).
+ * bound, pd_disagg + n_eps guard), but it is deliberately NOT a mirror of it:
+ * this writer does not stamp last_update_ts, and must not start.
+ *
+ * The asymmetry is load-bearing. There is exactly ONE last_update_ts per
+ * endpoint and it carries a single meaning - when the scraper last refreshed
+ * queued_requests - with pd_queued_is_fresh as its only reader. Stamping it
+ * here would let a live capacity push keep the timestamp fresh while
+ * queue-depth scraping was dead, so a stale queued_requests would read as
+ * FRESH and the staleness guard would silently stop working: a dead endpoint
+ * whose last report was queue=0 goes back to looking least-loaded forever,
+ * which is the exact failure that guard exists to prevent. If num_gpu_blocks
+ * ever needs a freshness guard of its own, it needs its OWN timestamp field.
+ *
+ * A 0 advertisement is stored as-is and clamped to 1 at read time by
+ * pd_kv_clamp_capacity (never divide-by-zero).
  */
 void
 llb_ai_update_ep_capacity(uint32_t service_ip, uint16_t service_port,
