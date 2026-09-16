@@ -1617,6 +1617,13 @@ int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive
  * address (a host-level signal); non-zero matches exactly. */
 int proxy_update_ep_health_by_addr(struct proxy_ent *key, uint32_t ep_ip,
                                    uint16_t ep_port, uint8_t inactive);
+
+/* Close the connections of one rule that the kernel is accelerating, and report
+ * how many were closed. -ENOENT when the rule does not exist; 0 when it exists
+ * with nothing accelerated. Connections of the rule that were never paired are
+ * left alone. See the definition in sockproxy_conn.c for why this closes rather
+ * than unmaps. */
+int proxy_sockmap_drop_accel(struct proxy_ent *key);
 int proxy_update_ep_health_by_ip(struct proxy_ent *key, uint32_t ep_ip, uint8_t inactive);
 
 /* Synchronous single-writer setter for the per-entry kv_exact_contract
