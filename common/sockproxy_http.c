@@ -6088,6 +6088,37 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         }
 #endif
 
+        /* A CLIENT that half-closed after a complete request is saying "that
+         * was my last request", not "forget the response". Tearing the pair
+         * down here answers nothing: the request was already parsed and
+         * forwarded, so the backend is generating a response for a client that
+         * will never see it, and the client sees a closed connection instead of
+         * its answer. HTTP/1 requests are not framed by EOF, so the backend
+         * needs no FIN of its own — the response leg simply keeps running.
+         *
+         * Only when a request really is in flight. A half-close on top of a
+         * partial request (rcvbuf still holding bytes, or a streamed body
+         * outstanding) can never complete, and a client with no backend leg is
+         * owed nothing; both keep the immediate teardown below. */
+        if (pfe->odir == 0 && pfe->resp_outstanding && pfe->n_rfd > 0 &&
+            pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0 &&
+            !pfe->rfd_ent[0]->peer_eof &&
+            pfe->rcv_off == 0 && pfe->stream_body_remaining == 0 &&
+            !pfe->client_half_closed) {
+          pfe->client_half_closed = 1;
+          proxy_defer_close_mark(pfe);
+          /* We will not read from this client again, but its write side stays
+           * open for the response. POLLRDHUP is level-triggered, so disarm the
+           * fd or the worker spins on an EOF nobody will consume; it stays
+           * registered and owned, and the backend leg's completion (or the
+           * sweep's bound) finishes the teardown. */
+          shutdown(pfe->fd, SHUT_RD);
+          notify_disarm_ent(proxy_struct->ns, pfe->fd);
+          log_info("[HALF_CLOSE] fd=%d: client finished its request and is awaiting "
+                   "the response; keeping the response leg open", pfe->fd);
+          return 1;
+        }
+
         // Check if peer connection still has data to send
         if (pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
           proxy_fd_ent_t *peer_pfe = pfe->rfd_ent[0];
@@ -6119,6 +6150,30 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             notify_disarm_ent(proxy_struct->ns, pfe->fd);
 
             // Return 1 to keep connection tracked (not -1 which removes from epoll)
+            return 1;
+          } else if (pfe->odir == 1 && pfe->peer_map_resp_verdict) {
+            /* An empty userspace cache does NOT mean the client has everything.
+             * With the response direction accelerated the bytes never enter that
+             * cache — the kernel moved them — and what it has taken for redirect
+             * but not yet delivered is visible to no userspace queue. Closing on
+             * the backend's EOF discards exactly that, so a backend that writes
+             * and then closes at once (a truncated or aborted response) reaches
+             * the client shorter than it was sent, sometimes losing the response
+             * headers entirely.
+             *
+             * There is no signal for "the redirect queue is empty", so the close
+             * is deferred to the 1Hz sweep instead. The kernel drains that queue
+             * in microseconds, so a bound measured in a second is ample; it is a
+             * timing bound rather than a proof, and it is deliberately on the
+             * side that costs a late FIN rather than lost bytes. */
+            peer_pfe->peer_eof = 1;
+            peer_pfe->eof_timestamp = time(NULL);
+            proxy_defer_close_mark(pfe);
+            shutdown(pfe->fd, SHUT_RD);
+            notify_disarm_ent(proxy_struct->ns, pfe->fd);
+            log_info("[EOF_DEFERRED_ACCEL] fd=%d closed, peer fd=%d has no userspace "
+                     "cache but its response was accelerated - deferring the close so "
+                     "redirected bytes are not discarded", pfe->fd, peer_pfe->fd);
             return 1;
           } else {
             // Peer cache is empty, safe to close immediately
@@ -7088,6 +7143,10 @@ handle_on_message_complete(llhttp_t* parser)
 
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
+  /* The client has its answer: a half-close from here on is an ordinary close. */
+  if (pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
+    pfe->rfd_ent[0]->resp_outstanding = 0;
+  }
   // L7 Metrics: capture request start timestamp for TTFB. Kept independent of
   // HAVE_HTTP_TRACE — the metric_* fields and record_latency_sample() are always
   // compiled (see sockproxy.h "L7 Metrics (independent of Jaeger tracing)"), so
@@ -8958,6 +9017,11 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     }
 
     llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
+
+    /* The backend now owns this request, so until its response is framed the
+     * client is owed an answer. A half-close arriving in that window must not
+     * tear the pair down; one arriving outside it is an ordinary close. */
+    pfe->resp_outstanding = 1;
 
 #if defined(HAVE_SOCKOPS)
     /* The request is handed to the backend and rcvbuf is reset; the request

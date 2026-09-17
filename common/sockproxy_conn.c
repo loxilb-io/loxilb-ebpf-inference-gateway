@@ -302,6 +302,55 @@ proxy_peer_map_activate_req(proxy_fd_ent_t *client_pfe)
   }
 }
 
+/* How many connections currently carry a deferred teardown. The health thread
+ * ticks fast so a deferred close lands within tens of milliseconds, and this is
+ * what keeps that cheap: while it is zero the tick neither takes PROXY_LOCK nor
+ * walks a single connection. */
+static _Atomic int defer_close_pending;
+
+uint64_t
+proxy_mono_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
+}
+
+/* Idempotent: a connection deferred twice is counted once, and keeps its first
+ * deadline so a repeated EOF cannot postpone its close indefinitely. */
+void
+proxy_defer_close_mark(proxy_fd_ent_t *pfe)
+{
+  if (!pfe || pfe->defer_close_ms != 0) {
+    return;
+  }
+  pfe->defer_close_ms = proxy_mono_ms();
+  if (pfe->defer_close_ms == 0) {
+    pfe->defer_close_ms = 1;      /* 0 means "not deferred" */
+  }
+  atomic_fetch_add(&defer_close_pending, 1);
+}
+
+/* Called both when the sweep finishes a deferred close and when the pfe is
+ * recycled, since a deferred connection can also end on its own first (the
+ * backend completing, the client closing for real). Whichever comes first
+ * decrements; the other sees 0 and does nothing. */
+void
+proxy_defer_close_clear(proxy_fd_ent_t *pfe)
+{
+  if (!pfe || pfe->defer_close_ms == 0) {
+    return;
+  }
+  pfe->defer_close_ms = 0;
+  atomic_fetch_sub(&defer_close_pending, 1);
+}
+
+int
+proxy_defer_close_pending(void)
+{
+  return atomic_load(&defer_close_pending);
+}
+
 /* proxy_sockmap_drop_accel — close the connections of one rule that the kernel
  * is currently accelerating, and report how many were closed.
  *
@@ -941,6 +990,10 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   if (!pfe) {
     return;
   }
+
+  /* A connection that ended on its own before the sweep reached it must not
+   * leave the pending count raised, or the fast tick keeps walking for nothing. */
+  proxy_defer_close_clear(pfe);
 
   /* Free the per-connection heap buffer. The shell is NEVER free()d — its address
    * must stay valid for any in-flight stale notify dispatch. */
