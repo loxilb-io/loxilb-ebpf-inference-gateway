@@ -6099,9 +6099,26 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
          * Only when a request really is in flight. A half-close on top of a
          * partial request (rcvbuf still holding bytes, or a streamed body
          * outstanding) can never complete, and a client with no backend leg is
-         * owed nothing; both keep the immediate teardown below. */
+         * owed nothing; both keep the immediate teardown below.
+         *
+         * And only where the RESPONSE direction is accelerated. resp_outstanding is cleared by
+         * the response framer, but that framer is not a general signal: it is
+         * installed only under pd_framing_v2 and skips feeds on lock contention.
+         * On every other connection nothing ever clears the flag, so gating on it
+         * alone deferred EVERY close after a first request on EVERY FullProxy
+         * rule — releasing per-endpoint load late enough to move load-aware
+         * selection. An accelerated response is where the deferral is needed
+         * regardless — the kernel may still hold response bytes no userspace
+         * queue can see, the same reason the backend-EOF deferral below keys on
+         * peer_map_resp_verdict — so the cost is confined to it. A request-only
+         * rule gains nothing from deferring: its response runs through the
+         * userspace relay exactly as with sockmap off, and a half-closed client's
+         * request entry is dropped at activation anyway (the socket is no longer
+         * ESTABLISHED). Everywhere else a half-close keeps the teardown it had
+         * before. */
         if (pfe->odir == 0 && pfe->resp_outstanding && pfe->n_rfd > 0 &&
             pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0 &&
+            pfe->rfd_ent[0]->peer_map_resp_verdict &&
             !pfe->rfd_ent[0]->peer_eof &&
             pfe->rcv_off == 0 && pfe->stream_body_remaining == 0 &&
             !pfe->client_half_closed) {
@@ -7143,10 +7160,6 @@ handle_on_message_complete(llhttp_t* parser)
 
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
-  /* The client has its answer: a half-close from here on is an ordinary close. */
-  if (pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
-    pfe->rfd_ent[0]->resp_outstanding = 0;
-  }
   // L7 Metrics: capture request start timestamp for TTFB. Kept independent of
   // HAVE_HTTP_TRACE — the metric_* fields and record_latency_sample() are always
   // compiled (see sockproxy.h "L7 Metrics (independent of Jaeger tracing)"), so
@@ -7798,6 +7811,20 @@ handle_resp_message_complete(llhttp_t *parser)
   }
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
+  /* The client has its answer, so a half-close from here on is an ordinary close.
+   * This runs on the RESPONSE leg: pfe is a backend leg, and every backend leg —
+   * the ordinary pair, and the P/D decode, drain and dual-dispatch legs — points
+   * back at its client through rfd_ent[0].
+   *
+   * It must not live in handle_on_message_complete. That callback belongs to the
+   * CLIENT's request parser and fires before the request is even forwarded; there
+   * pfe is the client and rfd_ent[0] its backend, so it cleared the wrong flag and
+   * the client's was never cleared at all. Every close after a first request was
+   * then deferred, on every FullProxy rule, which delayed releasing per-endpoint
+   * load at teardown and moved load-aware selection. */
+  if (pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
+    pfe->rfd_ent[0]->resp_outstanding = 0;
+  }
 
   /* Reaper interlock: latch stream_end_ts on the CLIENT pfe (rfd_ent[0]) — the
    * entry the reaper iterates and gates on (it carries pd_phase /
