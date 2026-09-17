@@ -939,6 +939,28 @@ struct proxy_fd_ent {
   int peer_eof;                  // 1 if peer closed, waiting for our cache to drain
   time_t eof_timestamp;          // When peer EOF detected (for timeout enforcement)
 
+  /* Deferred teardown. A connection whose EOF must NOT tear the pair down at
+   * once records when it was deferred (CLOCK_MONOTONIC milliseconds, 0 = not
+   * deferred); the health thread's fast tick finishes it. Set and cleared only
+   * through proxy_defer_close_mark/_clear, which keep the pending count that lets
+   * that tick skip the connection walk while nothing is deferred. Two cases set
+   * this, both in proxy_sock_read_err:
+   *   - a CLIENT that half-closed after a complete request: it is owed the
+   *     response, so the pair lives until the backend is done;
+   *   - a BACKEND whose response direction is accelerated: bytes the kernel
+   *     already took for redirect are not visible to any userspace queue, so
+   *     closing on its EOF discards whatever has not reached the client yet. */
+  uint64_t defer_close_ms;
+  uint8_t client_half_closed;    // 1 if this client sent FIN and is awaiting its response
+  /* 1 while this CLIENT has a request with the backend whose response has not
+   * been framed yet. Set where the request is handed over, cleared by the
+   * response leg's single completion consumer (handle_resp_message_complete).
+   * It is what separates a client that half-closed mid-request, which is owed an
+   * answer, from one that simply closed after getting its last one — at EOF the
+   * two are otherwise identical, since shutdown(SHUT_WR) and close() both arrive
+   * as recv()==0. */
+  uint8_t resp_outstanding;
+
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
   int peer_map_pair_installed;   // 1 if this backend pfe owns any peer_map entry
@@ -1629,6 +1651,12 @@ int proxy_update_ep_health_by_addr(struct proxy_ent *key, uint32_t ep_ip,
  * left alone. See the definition in sockproxy_conn.c for why this closes rather
  * than unmaps. */
 int proxy_sockmap_drop_accel(struct proxy_ent *key);
+
+/* Deferred teardown bookkeeping (see proxy_fd_ent_t.defer_close_ms). */
+uint64_t proxy_mono_ms(void);
+void proxy_defer_close_mark(proxy_fd_ent_t *pfe);
+void proxy_defer_close_clear(proxy_fd_ent_t *pfe);
+int proxy_defer_close_pending(void);
 int proxy_update_ep_health_by_ip(struct proxy_ent *key, uint32_t ep_ip, uint8_t inactive);
 
 /* Synchronous single-writer setter for the per-entry kv_exact_contract

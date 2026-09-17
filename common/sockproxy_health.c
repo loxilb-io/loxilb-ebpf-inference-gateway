@@ -62,6 +62,10 @@
 
 /* Forward declaration for internal use (defined later in this file) */
 static void check_draining_endpoints(void);
+static void finish_deferred_closes(uint64_t now_ms);
+/* Deferred teardown timing; the reasoning is on finish_deferred_closes below. */
+#define DEFERRED_CLOSE_MS 50
+#define DEFERRED_CLOSE_TICK_MS 25
 
 /* (conc=128 single-owner teardown) — replaces the
  * `pd_teardown_legs(pfe, notify_delete_ent_adapter, ns) + proxy_release_fd_ctx(pfe,1)`
@@ -194,7 +198,23 @@ proxy_drain_checker_thread(void *arg)
      * `elapsed >= threshold` against time(NULL)), so a finer 1Hz cadence only makes those deadlines
      * fire more promptly; it never changes WHICH connections are eligible. This realises the
      * documented 1-second granularity the timeoutMemberData feature was specified against. */
-    sleep(1);
+    /* Fast tick for deferred teardowns (see DEFERRED_CLOSE_MS). It costs one
+     * atomic read while nothing is deferred; only then does it take PROXY_LOCK
+     * and walk connections. Everything below keeps its once-a-second cadence. */
+    usleep(DEFERRED_CLOSE_TICK_MS * 1000);
+    if (proxy_defer_close_pending() > 0) {
+      PROXY_LOCK();
+      finish_deferred_closes(proxy_mono_ms());
+      PROXY_UNLOCK();
+    }
+    {
+      static uint64_t last_drain_ms;
+      uint64_t now_ms = proxy_mono_ms();
+      if (now_ms - last_drain_ms < 1000) {
+        continue;
+      }
+      last_drain_ms = now_ms;
+    }
     check_draining_endpoints();
 
     /* : bounded-footprint soak observability. Every ~10s emit a
@@ -364,8 +384,57 @@ cleanup_endpoint_sessions(proxy_map_ent_t *ent, int ep_index,
   return removed;
 }
 
-// P2: Check draining endpoints and force-close if timeout exceeded
-// Called periodically (every 5 seconds) by proxy_run() thread
+/* DEFERRED_CLOSE_MS (defined at the top) — how long a teardown deferred by proxy_sock_read_err waits
+ * before this thread finishes it.
+ *
+ * What it has to outlast is short. A BACKEND whose response direction is
+ * accelerated is waiting only for the kernel to deliver bytes it already took for
+ * redirect, which its workqueue does in microseconds. A CLIENT that half-closed
+ * mid-request is normally closed well before this by the backend finishing; for
+ * it this is the backstop against a backend that never answers.
+ *
+ * It was one second, riding the once-a-second drain pass. That was measurably too
+ * long: every accelerated connection outlived its close by 1-2 s, which showed up
+ * as sockhash residue a later check could see and would cost fds and pfe shells
+ * under connection churn. The deferral now has its own fast tick. */
+
+/* Finishes the teardowns proxy_sock_read_err deferred. Called with PROXY_LOCK
+ * held.
+ *
+ * Closing is all it does: shutdown() on both legs, exactly as the admin teardown
+ * and the stream-timeout reaper do, so the owning worker sees POLLHUP and runs
+ * the ordinary destroy. The fds were disarmed when the close was deferred, but
+ * poll() reports POLLHUP regardless of the event mask, so they still come back.
+ * fdlist carries clients as well as backends, so both kinds of deferral are
+ * reached by the same walk.
+ */
+static void
+finish_deferred_closes(uint64_t now_ms)
+{
+  proxy_map_ent_t *node;
+  proxy_fd_ent_t *pfe;
+
+  for (node = proxy_struct->head; node; node = node->next) {
+    for (pfe = node->val.fdlist; pfe; pfe = pfe->next) {
+      if (pfe->defer_close_ms == 0 ||
+          now_ms - pfe->defer_close_ms < DEFERRED_CLOSE_MS) {
+        continue;
+      }
+      log_debug("[DEFERRED_CLOSE] fd=%d (odir=%d, half_closed=%u): finishing the "
+                "teardown deferred %llu ms ago",
+                pfe->fd, pfe->odir, pfe->client_half_closed,
+                (unsigned long long)(now_ms - pfe->defer_close_ms));
+      proxy_defer_close_clear(pfe);
+      if (pfe->fd > 0) {
+        shutdown(pfe->fd, SHUT_RDWR);
+      }
+      if (pfe->n_rfd > 0 && pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0) {
+        shutdown(pfe->rfd_ent[0]->fd, SHUT_RDWR);
+      }
+    }
+  }
+}
+
 static void
 check_draining_endpoints(void)
 {
