@@ -4799,6 +4799,21 @@ proxy_pdestroy(void *priv)
   if (pfe) {
     PROXY_ENT_LOCK(pfe);
     proxy_peer_map_delete(pfe);
+    /* The pair lives on the backend entry, and removing it credits what the
+     * kernel carried to the client's endpoint. When the client goes first,
+     * proxy_release_rfd_ctx below unlinks the two, and by the time the backend
+     * is torn down the client can be gone. So remove the pair now, while the
+     * client is still linked. Same lock order as proxy_release_rfd_ctx. */
+    if (pfe->odir == 0) {
+      for (int i = 0; i < MAX_PROXY_EP; i++) {
+        proxy_fd_ent_t *be = pfe->rfd_ent[i];
+        if (be && be->peer_map_pair_installed) {
+          PROXY_ENT_LOCK(be);
+          proxy_peer_map_delete(be);
+          PROXY_ENT_UNLOCK(be);
+        }
+      }
+    }
     ent = pfe->head;
     if (!ent) {
       assert(0);
@@ -6959,15 +6974,15 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       uint8_t dir = sockmap_mode;
       int do_req = (dir == 1 || dir == 2);
       int do_resp = (dir == 1 || dir == 3);
-      int ret1 = do_req ? proxy_struct->peer_map_cb(key, rkey, 1) : 0;
-      int ret2 = do_resp ? proxy_struct->peer_map_cb(rkey, key, 1) : 0;
+      int ret1 = do_req ? proxy_struct->peer_map_cb(key, rkey, 1, NULL) : 0;
+      int ret2 = do_resp ? proxy_struct->peer_map_cb(rkey, key, 1, NULL) : 0;
 
       if (ret1 != 0 || ret2 != 0) {
         if (do_req && ret1 == 0) {
-          proxy_struct->peer_map_cb(key, NULL, 0);
+          proxy_struct->peer_map_cb(key, NULL, 0, NULL);
         }
         if (do_resp && ret2 == 0) {
-          proxy_struct->peer_map_cb(rkey, NULL, 0);
+          proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
         }
         log_error("Sockmap: peer_map registration failed! mode=%u client_ret=%d, backend_ret=%d",
                   dir, ret1, ret2);
@@ -6984,7 +6999,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
             npfe2->peer_map_resp_installed = 1;
             npfe2->peer_map_resp_verdict = 1;
           } else {
-            proxy_struct->peer_map_cb(rkey, NULL, 0);
+            proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
             log_error("Sockmap: sock_verdict_map add failed for backend fd=%d (%d), "
                       "response direction stays on the userspace relay", ep_cfd, vret);
           }

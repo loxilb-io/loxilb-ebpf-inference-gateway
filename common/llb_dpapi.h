@@ -1257,6 +1257,16 @@ struct llb_sockmap_key {
   __be32 sport;
 };
 
+/* peer_map value: the socket the key socket's ingress is redirected to, and
+ * what the stream verdict has redirected there. The verdict adds to bytes and
+ * segs after each successful redirect; the proxy reads them when it removes the
+ * pair, which is how bytes the kernel carried reach the rule's statistics. */
+struct llb_sockmap_peer {
+  struct llb_sockmap_key peer;
+  __u64 bytes;
+  __u64 segs;
+};
+
 /* sockmap portset key. ip and port are net-order. On the VIP portset ip is the
  * address the proxy listener is bound to, and 0 stands for a wildcard (0.0.0.0)
  * VIP; on the endpoint portset ip is the endpoint address. */

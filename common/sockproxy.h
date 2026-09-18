@@ -1621,11 +1621,13 @@ _Static_assert(sizeof(struct proxy_arg) <= 4096,
 
 typedef int (*sockmap_cb_t)(struct llb_sockmap_key *key, int fd, int doadd);
 /* peer_map pairing callback: self-tuple -> peer-tuple (doadd=1) or delete
- * self-tuple (doadd=0, peer ignored). Installed by the loader when sockmap
- * support is enabled. */
+ * self-tuple (doadd=0, peer ignored). On a delete, a non-NULL last receives the
+ * entry as it stood (bytes and segments the verdict redirected for self), or
+ * zeros if there was none. Installed by the loader when sockmap support is
+ * enabled. */
 typedef int (*peer_map_cb_t)(const struct llb_sockmap_key *self,
                              const struct llb_sockmap_key *peer,
-                             int doadd);
+                             int doadd, struct llb_sockmap_peer *last);
 /* sock_verdict_map callback: add the socket fd under its own tuple (doadd=1) or
  * delete that tuple (doadd=0, fd ignored). A socket must be added only after its
  * peer_map entry and deleted before it, so the stream verdict never runs on a
