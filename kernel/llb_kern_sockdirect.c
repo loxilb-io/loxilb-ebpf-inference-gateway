@@ -22,7 +22,7 @@ SEC("sk_msg")
 int llb_sockmap_dir(struct sk_msg_md *mmd)
 {
   struct llb_sockmap_key redirect_key;
-  struct llb_sockmap_key *peer_key;
+  struct llb_sockmap_peer *peer;
   struct llb_sockmap_portset_val *pv;
   struct llb_sockmap_key key = { .dip = mmd->local_ip4,
                                  .sip = mmd->remote_ip4,
@@ -44,15 +44,15 @@ int llb_sockmap_dir(struct sk_msg_md *mmd)
     return SK_PASS;
   }
 
-  peer_key = bpf_map_lookup_elem(&peer_map, &key);
-  if (!peer_key) {
+  peer = bpf_map_lookup_elem(&peer_map, &key);
+  if (!peer) {
     sockmap_stat_inc(SOCKMAP_STAT_PEER_MISS);
     BPF_DBG_PRINTK("sockdir: peer miss sport %lu dport %lu",
                    bpf_ntohs(key.sport), bpf_ntohs(key.dport));
     return SK_PASS;
   }
 
-  __builtin_memcpy(&redirect_key, peer_key, sizeof(redirect_key));
+  __builtin_memcpy(&redirect_key, &peer->peer, sizeof(redirect_key));
 
   sockmap_stat_inc(SOCKMAP_STAT_REDIRECT_OK);
   BPF_DBG_PRINTK("sockdir: sport %lu dport %lu", bpf_ntohs(key.sport), bpf_ntohs(key.dport));

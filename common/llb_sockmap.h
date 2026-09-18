@@ -12,7 +12,7 @@
  * Values are cumulative. Because this is PERCPU, per-packet increments do not
  * contend, but readers must sum values across CPUs. */
 #define LLB_SOCKMAP_STATS_SZ        8   /* Includes spare slots */
-#define SOCKMAP_STAT_REDIRECT_OK    0   /* Peer hit -> issue bpf_sk_redirect_hash (engage) */
+#define SOCKMAP_STAT_REDIRECT_OK    0   /* bpf_sk_redirect_hash accepted the redirect (engage) */
 #define SOCKMAP_STAT_PEER_MISS      1   /* peer_map miss -> SK_PASS. Must stay 0: userspace keeps sock_verdict_map and peer_map in step */
 #define SOCKMAP_STAT_INELIGIBLE     2   /* Retired, always 0 for the stream verdict (index kept: tests read counters by index) */
 #define SOCKMAP_STAT_REDIRECT_REQ   3   /* REDIRECT_OK in the request direction (client->backend, vip hit) */
@@ -22,6 +22,11 @@
  * duplicated segment passed through this verdict (counts match) or was produced
  * further down the kernel's send path (client receives more than we redirected). */
 #define SOCKMAP_STAT_RESP_BYTES     5
+/* bpf_sk_redirect_hash refused the redirect: the target is missing from
+ * sock_proxy_map or cannot take a redirect, so the verdict returns SK_DROP. The
+ * bytes were already ACKed to the sender, so the stream stalls. Must stay 0;
+ * REDIRECT_OK, _REQ, _RESP and RESP_BYTES count only accepted redirects. */
+#define SOCKMAP_STAT_REDIRECT_DROP  6
 
 /* Two sockhashes, so that only the direction a rule accelerates pays for the
  * sk_skb verdict:
@@ -86,7 +91,7 @@ sockmap_stat_add(__u32 idx, __u64 val)
 struct sockmap_peer_map_d {
   __uint(type,        BPF_MAP_TYPE_HASH);
   __type(key,         struct llb_sockmap_key);
-  __type(value,       struct llb_sockmap_key);
+  __type(value,       struct llb_sockmap_peer);
   __uint(max_entries, LLB_SOCK_MAP_SZ);
 } peer_map SEC(".maps");
 

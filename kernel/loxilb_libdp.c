@@ -1086,7 +1086,7 @@ llb_sockmap_op(struct llb_sockmap_key *key, int fd, int doadd)
 static int
 llb_peer_map_op(const struct llb_sockmap_key *self,
                 const struct llb_sockmap_key *peer,
-                int doadd)
+                int doadd, struct llb_sockmap_peer *last)
 {
   if (xh->have_noebpf) {
     return 0;
@@ -1109,9 +1109,18 @@ llb_peer_map_op(const struct llb_sockmap_key *self,
     if (xh->smfd <= 0 || bpf_map_lookup_elem(xh->smfd, peer, &cookie) != 0) {
       return -ENOENT;
     }
-    return bpf_map_update_elem(xh->smpeerfd, self, peer, BPF_ANY);
+    struct llb_sockmap_peer val = { .peer = *peer };
+    return bpf_map_update_elem(xh->smpeerfd, self, &val, BPF_ANY);
   }
 
+  /* What the verdict redirected for this socket, read on the way out. The
+   * caller has already taken the socket out of sock_verdict_map, so only a
+   * verdict that was already running can still add to it. A failed lookup
+   * leaves zeros. */
+  if (last) {
+    memset(last, 0, sizeof(*last));
+    bpf_map_lookup_elem(xh->smpeerfd, self, last);
+  }
   return bpf_map_delete_elem(xh->smpeerfd, self);
 }
 

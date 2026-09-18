@@ -201,11 +201,46 @@ proxy_peer_map_clear(proxy_fd_ent_t *pfe)
   memset(&pfe->peer_map_backend_key, 0, sizeof(pfe->peer_map_backend_key));
 }
 
+/* Adds what the kernel carried for an accelerated pair to the rule endpoint's
+ * statistics, the way pfe_ent_accouting would have counted it in userspace:
+ * the response direction as bytes transmitted to the client (ntb/ntp, which is
+ * the endpoint counter), the request direction as bytes received from it
+ * (nrb/nrp). They are credited to the client entry's endpoint, because the
+ * backend entry carries no epv (see setup_proxy_path). Atomic, because the
+ * caller holds the backend entry's lock but not always the client's. */
+static void
+proxy_peer_map_fold(proxy_fd_ent_t *be, const struct llb_sockmap_peer *req,
+                    const struct llb_sockmap_peer *resp)
+{
+  proxy_fd_ent_t *client = be->n_rfd > 0 ? be->rfd_ent[0] : NULL;
+  proxy_epval_t *epv;
+  int n;
+
+  if (!client || !client->epv) {
+    return;
+  }
+  epv = client->epv;
+  n = client->ep_num;
+  if (n < 0 || n >= MAX_PROXY_EP) {
+    return;
+  }
+  if (resp->segs) {
+    __atomic_fetch_add(&epv->ep_stats[n].ntb, resp->bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&epv->ep_stats[n].ntp, resp->segs, __ATOMIC_RELAXED);
+  }
+  if (req->segs) {
+    __atomic_fetch_add(&epv->ep_stats[n].nrb, req->bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&epv->ep_stats[n].nrp, req->segs, __ATOMIC_RELAXED);
+  }
+}
+
 void
 proxy_peer_map_delete(proxy_fd_ent_t *pfe)
 {
   smap_key_t client_key;
   smap_key_t backend_key;
+  struct llb_sockmap_peer req_last = { 0 };
+  struct llb_sockmap_peer resp_last = { 0 };
 
   if (!pfe->peer_map_pair_installed || proxy_struct->peer_map_cb == NULL) {
     return;
@@ -227,17 +262,20 @@ proxy_peer_map_delete(proxy_fd_ent_t *pfe)
   }
 
   /* Delete only the directions that were actually installed (see the directional
-   * sockMapMode gating in setup_proxy_path). */
+   * sockMapMode gating in setup_proxy_path). Both sockets are out of
+   * sock_verdict_map by now, so the counters read here are final but for a
+   * verdict that was already running. */
   if (pfe->peer_map_req_installed &&
-      proxy_struct->peer_map_cb(&client_key, NULL, 0) != 0) {
+      proxy_struct->peer_map_cb(&client_key, NULL, 0, &req_last) != 0) {
     log_error("Sockmap: peer_map delete failed for client fd=%d", pfe->fd);
   }
 
   if (pfe->peer_map_resp_installed &&
-      proxy_struct->peer_map_cb(&backend_key, NULL, 0) != 0) {
+      proxy_struct->peer_map_cb(&backend_key, NULL, 0, &resp_last) != 0) {
     log_error("Sockmap: peer_map delete failed for backend fd=%d", pfe->fd);
   }
 
+  proxy_peer_map_fold(pfe, &req_last, &resp_last);
   proxy_peer_map_clear(pfe);
 }
 
@@ -288,7 +326,7 @@ proxy_peer_map_activate_req(proxy_fd_ent_t *client_pfe)
     return;
   }
 
-  if (proxy_struct->peer_map_cb(&client_key, NULL, 0) == 0) {
+  if (proxy_struct->peer_map_cb(&client_key, NULL, 0, NULL) == 0) {
     be->peer_map_req_installed = 0;
     be->peer_map_pair_installed = be->peer_map_resp_installed;
   }

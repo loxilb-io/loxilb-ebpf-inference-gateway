@@ -54,7 +54,9 @@ int llb_sock_verdict(struct __sk_buff *skb)
                                 };
 #ifdef HAVE_SOCKOPS
   struct llb_sockmap_key redirect_key;
-  struct llb_sockmap_key *peer_key;
+  struct llb_sockmap_peer *peer;
+  __u32 len;
+  long ret;
   __u8 is_request;
 #endif
 
@@ -70,8 +72,8 @@ int llb_sock_verdict(struct __sk_buff *skb)
    * applies to new connections; an accelerated pair keeps redirecting until it
    * closes. Nothing here may return SK_PASS on the normal path, because SK_PASS
    * data on a strparser socket can stall the reader (see llb_kern_sockmap.c). */
-  peer_key = bpf_map_lookup_elem(&peer_map, &key);
-  if (!peer_key) {
+  peer = bpf_map_lookup_elem(&peer_map, &key);
+  if (!peer) {
     /* Not reached while userspace keeps the two maps in step; counted so tests
      * can assert it stays zero. */
     sockmap_stat_inc(SOCKMAP_STAT_PEER_MISS);
@@ -79,7 +81,7 @@ int llb_sock_verdict(struct __sk_buff *skb)
     return SK_PASS;
   }
 
-  __builtin_memcpy(&redirect_key, peer_key, sizeof(redirect_key));
+  __builtin_memcpy(&redirect_key, &peer->peer, sizeof(redirect_key));
 
   /* The portset only classifies the direction for the counters now: a socket
    * whose local address and port are a VIP is a client socket, so its ingress
@@ -91,15 +93,28 @@ int llb_sock_verdict(struct __sk_buff *skb)
   BPF_DBG_PRINTK("sockstream: dport 0x%lx sport 0x%lx", key.dport, key.sport);
 
 #ifdef HAVE_SOCKOPS
+  BPF_DBG_PRINTK("sockstream: peer dport 0x%lx sport 0x%lx", redirect_key.dport, redirect_key.sport);
+  len = skb->len;
+  ret = bpf_sk_redirect_hash(skb, &sock_proxy_map2, &redirect_key, 0);
+  if (ret != SK_PASS) {
+    /* The target is gone from sock_proxy_map (or cannot take a redirect), so
+     * the kernel drops these bytes. Counted apart from the redirects so that a
+     * refused redirect never reads as engagement. */
+    sockmap_stat_inc(SOCKMAP_STAT_REDIRECT_DROP);
+    return ret;
+  }
   sockmap_stat_inc(SOCKMAP_STAT_REDIRECT_OK);
   sockmap_stat_inc(is_request ? SOCKMAP_STAT_REDIRECT_REQ : SOCKMAP_STAT_REDIRECT_RESP);
   /* Byte accounting for the response direction only: the client compares what it
    * received against this to locate where a duplicated segment came from. */
   if (!is_request) {
-    sockmap_stat_add(SOCKMAP_STAT_RESP_BYTES, skb->len);
+    sockmap_stat_add(SOCKMAP_STAT_RESP_BYTES, len);
   }
-  BPF_DBG_PRINTK("sockstream: peer dport 0x%lx sport 0x%lx", redirect_key.dport, redirect_key.sport);
-  return bpf_sk_redirect_hash(skb, &sock_proxy_map2, &redirect_key, 0);
+  /* Per pair and direction: the proxy folds these into the rule's statistics
+   * when it removes the pair, since these bytes never pass through userspace. */
+  __sync_fetch_and_add(&peer->bytes, len);
+  __sync_fetch_and_add(&peer->segs, 1);
+  return ret;
 #else
   return bpf_sk_redirect_hash(skb, &sock_proxy_map2,  &key, 0);
 #endif
