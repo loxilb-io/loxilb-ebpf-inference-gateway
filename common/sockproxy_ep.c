@@ -1805,6 +1805,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
 void *
 proxy_conversation_cleanup_thread(void *arg)
 {
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
   time_t now;
   uint32_t total_removed;
   
@@ -1980,6 +1981,7 @@ proxy_conversation_cleanup_thread(void *arg)
 void *
 proxy_run(void *arg)
 {
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
   // Start notification system for socket events (this blocks)
   notify_start(proxy_struct->ns);
   return NULL;

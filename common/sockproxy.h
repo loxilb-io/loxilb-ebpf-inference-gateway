@@ -28,6 +28,13 @@ struct proxy_arg;
 struct llb_sockmap_key;
 struct dp_proxy_ct_ent;
 
+/* Set to 1 at the entry of every raw C thread (proxy workers, reapers, watchdog,
+ * trace cleanup, libdp threads) so a fatal signal on it is reported and cored by
+ * llb_fatal_handler instead of being chained into the Go runtime, which has no
+ * goroutine there and re-raises it silently (badsignal -> raisebadsignal:
+ * exit 139, no line, no core). */
+#include <signal.h>
+extern __thread volatile sig_atomic_t g_llb_proxy_worker;
 #define PROXY_LOCK() pthread_rwlock_wrlock(&proxy_struct->lock)
 #define PROXY_RDLOCK() pthread_rwlock_rdlock(&proxy_struct->lock)
 #define PROXY_UNLOCK() pthread_rwlock_unlock(&proxy_struct->lock)

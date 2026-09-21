@@ -187,6 +187,7 @@ pd_prefill_timeout_default(void)
 void *
 proxy_drain_checker_thread(void *arg)
 {
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
  
   while (1) {
     /* Tick at 1Hz.: timeoutMemberData is enforced inside
@@ -428,8 +429,13 @@ finish_deferred_closes(uint64_t now_ms)
       if (pfe->fd > 0) {
         shutdown(pfe->fd, SHUT_RDWR);
       }
-      if (pfe->n_rfd > 0 && pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0) {
-        shutdown(pfe->rfd_ent[0]->fd, SHUT_RDWR);
+      /* One load of the leg pointer: a worker's proxy_release_rfd_ctx clears
+       * client->rfd_ent[] holding no lock this pass shares (see the note at
+       * the QoS pass below), so re-reading it between the test and the use
+       * dereferences NULL. */
+      proxy_fd_ent_t *leg0 = __atomic_load_n(&pfe->rfd_ent[0], __ATOMIC_ACQUIRE);
+      if (pfe->n_rfd > 0 && leg0 && leg0->fd > 0) {
+        shutdown(leg0->fd, SHUT_RDWR);
       }
     }
   }
@@ -528,8 +534,15 @@ check_draining_endpoints(void)
         int qp_parked = pfe->qos_parked;
         int qj;
         if (!qp_parked) {
-          for (qj = 0; qj < pfe->n_rfd; qj++) {
-            if (pfe->rfd_ent[qj] && pfe->rfd_ent[qj]->qos_parked) {
+          /* A worker's proxy_release_rfd_ctx (the keep-alive boundary arm in
+           * sockproxy_http.c) clears client->rfd_ent[qj] holding no lock this
+           * pass shares, so a pointer loaded once for the NULL test and again
+           * for the dereference faulted in between. Load it exactly once; the
+           * pfe pool keeps a recycled shell mapped, so a stale peer read is a
+           * wrong QoS hint for one tick, never a fault. */
+          for (qj = 0; qj < pfe->n_rfd && qj < MAX_PROXY_EP; qj++) {
+            proxy_fd_ent_t *peer = __atomic_load_n(&pfe->rfd_ent[qj], __ATOMIC_ACQUIRE);
+            if (peer && peer->qos_parked) {
               qp_parked = 1;
               break;
             }

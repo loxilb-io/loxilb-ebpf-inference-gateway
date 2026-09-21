@@ -407,6 +407,7 @@ static void *
 llb_trace_proc_main(void *arg)
 {
   struct perf_buffer *pb = arg;
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
 
   while (1) {
     perf_buffer__poll(pb, 100 /* timeout, ms */);
@@ -548,6 +549,7 @@ static void *
 llb_cp_proc_main(void *arg)
 {
   struct perf_buffer *pb = arg;
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
 
   while (1) {
     perf_buffer__poll(pb, 100 /* timeout, ms */);
@@ -656,6 +658,7 @@ static void *
 llb_maptrace_main(void *arg)
 {
   struct perf_buffer *pb = arg;
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
 
   while (1) {
     perf_buffer__poll(pb, 100 /* timeout, ms */);
