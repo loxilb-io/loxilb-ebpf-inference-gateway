@@ -315,7 +315,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
        * boundary is all this site can honestly claim. */
       llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model,
                                   LLB_AI_UMISS_H2_STREAM_CLOSE);
-      log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
+      log_debug("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
                "object tenant=%s model=%s reason=%s (reported, not charged)",
                stream->stream_id, stream->tenant_id, stream->effective_model,
                LLB_AI_UMISS_H2_STREAM_CLOSE);
@@ -325,7 +325,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   /* status=0 names the release-only settle explicitly, so the log says which
    * of the two shapes ran instead of leaving it to be inferred from a 200
    * that no backend ever sent. */
-  log_info("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
+  log_debug("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
            stream->stream_id, up, uc, status);
 }
 
@@ -3757,10 +3757,10 @@ h2_have_tepval:
       if (cep != L7_COOKIE_MISS && cep >= 0 && cep < tepval->n_eps &&
           is_endpoint_healthy(tepval, cep)) {
         ep_idx = cep;
-        log_info("[HTTP/2][COOKIE_PIN] stream %d: valid LB cookie -> ep[%d] (PROXY_AFFINITY_COOKIE)",
+        log_debug("[HTTP/2][COOKIE_PIN] stream %d: valid LB cookie -> ep[%d] (PROXY_AFFINITY_COOKIE)",
                  stream->stream_id, cep);
       } else {
-        log_info("[HTTP/2][COOKIE_MISS] stream %d: no live-member match -> rehash",
+        log_debug("[HTTP/2][COOKIE_MISS] stream %d: no live-member match -> rehash",
                  stream->stream_id);
       }
     }

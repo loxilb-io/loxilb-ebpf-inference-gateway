@@ -598,7 +598,7 @@ check_draining_endpoints(void)
           }
 
           if (elapsed >= cap) {
-            log_info("[SSE_CAP] fd=%d: elapsed=%lds >= cap=%lds, terminating stream",
+            log_debug("[SSE_CAP] fd=%d: elapsed=%lds >= cap=%lds, terminating stream",
                      pfe->fd, (long)elapsed, (long)cap);
             /* Deliver an error SSE event before shutdown so the client can react. */
             if (pfe->fd > 0) {
@@ -671,7 +671,7 @@ check_draining_endpoints(void)
             pfe->sse_active == 0 &&         /* do not kill active SSE streams */
             pfe->last_activity > 0 &&
             idle_expired) {
-          log_info("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
+          log_debug("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
                    pfe->fd, (long)(now - pfe->last_activity), idle_to_s,
                    (l7_data_to_s > 0) ? " (L7 timeoutMemberData)" : "");
           if (pfe->fd > 0) {
@@ -1001,7 +1001,7 @@ check_draining_endpoints(void)
                 pfe->pd_phase == PD_PHASE_DECODE_STREAMING,
                 pfe->sse_active, pfe->stream_end_ts, pfe->pd_last_decode_ts,
                 now, decode_idle_cap)) {
-          log_info("[PD_GRACEFUL_DONE] fd=%d backend-idle=%lds >= cap=%us — "
+          log_debug("[PD_GRACEFUL_DONE] fd=%d backend-idle=%lds >= cap=%us — "
                    "synthesizing data: [DONE] (vLLM dropped terminator)",
                    pfe->fd, (long)(now - pfe->pd_last_decode_ts), decode_idle_cap);
 

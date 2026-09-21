@@ -332,7 +332,7 @@ proxy_send_local_100_continue(proxy_fd_ent_t *pfe)
     return -1;
   }
   pfe->json_stream_continue_sent = 1;
-  log_info("[JSON_STREAM_CONTINUE] fd=%d sent local 100 Continue", pfe->fd);
+  log_debug("[JSON_STREAM_CONTINUE] fd=%d sent local 100 Continue", pfe->fd);
   return 0;
 }
 
@@ -358,15 +358,15 @@ inject_forwarded_headers(uint8_t *buf, size_t buflen, size_t bufsize,
                          int is_ssl, const char *host)
 {
   // P7: Validate this is HTTP text data, not binary (check for HTTP method)
-  if (buflen < 4 || (memcmp(buf, "GET ", 4) != 0 && 
-                      memcmp(buf, "POST", 4) != 0 && 
+  if (buflen < 4 || (memcmp(buf, "GET ", 4) != 0 &&
+                      memcmp(buf, "POST", 4) != 0 &&
                       memcmp(buf, "PUT ", 4) != 0 &&
                       memcmp(buf, "DELE", 4) != 0 &&
                       memcmp(buf, "HEAD", 4) != 0 &&
                       memcmp(buf, "PATC", 4) != 0)) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[BINARY_SKIP] Skipping header injection for non-HTTP data (first 4 bytes: %02x %02x %02x %02x)",
-              buflen >= 4 ? buf[0] : 0, buflen >= 4 ? buf[1] : 0, 
+              buflen >= 4 ? buf[0] : 0, buflen >= 4 ? buf[1] : 0,
               buflen >= 4 ? buf[2] : 0, buflen >= 4 ? buf[3] : 0);
 #endif
     return buflen;  // Return unchanged - this is binary data
@@ -1172,7 +1172,7 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
     // Find body start by searching for "\r\n\r\n" (end of headers)
     const char *body_start = NULL;
     size_t body_len = 0;
-    
+
     for (size_t i = 0; i < len - 3; i++) {
       if (((char *)msg)[i] == '\r' && ((char *)msg)[i+1] == '\n' &&
           ((char *)msg)[i+2] == '\r' && ((char *)msg)[i+3] == '\n') {
@@ -1181,15 +1181,15 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
         break;
       }
     }
-    
+
     if (body_start && body_len > 0) {
       size_t headers_size = body_start - (const char *)msg;
-      
+
       // CRITICAL: We're working with ent->rcvbuf directly through msg pointer
       // msg points to ent->rcvbuf, so modifications here affect the source buffer
       char *buffer = (char *)msg;
       size_t buffer_capacity = SP_SOCK_MSG_LEN;
-      
+
       // Update Content-Length header to match masked body size
       char *cl_start = memmem(buffer, headers_size, "Content-Length:", 15);
       if (cl_start) {
@@ -1197,12 +1197,12 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
         while (value_start < body_start && *value_start == ' ') value_start++;
         char *value_end = value_start;
         while (value_end < body_start && *value_end >= '0' && *value_end <= '9') value_end++;
-        
+
         char new_value[32];
         int new_value_len = snprintf(new_value, sizeof(new_value), "%zu", ent->pii_masked_len);
         int old_value_len = value_end - value_start;
         int shift = new_value_len - old_value_len;
-        
+
         if (shift == 0) {
           // Same length - simple overwrite
           memcpy(value_start, new_value, new_value_len);
@@ -1210,29 +1210,29 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
           // Different length - need to shift body
           size_t bytes_after_value = len - (value_end - buffer);
           size_t new_total_size = len + shift;
-          
+
           if (new_total_size > buffer_capacity) {
             log_error("[PII_CL_OVERFLOW] fd=%d: new_total_size=%zu > capacity=%zu",
                       ent->fd, new_total_size, buffer_capacity);
             goto skip_deferred_masking;
           }
-          
+
           // Shift everything after the old value
           memmove(value_end + shift, value_end, bytes_after_value);
           memcpy(value_start, new_value, new_value_len);
-          
+
           // Update pointers and length
           body_start += shift;
           len += shift;
           headers_size += shift;
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[PII_CL_SHIFT] fd=%d: Shifted buffer by %d bytes (CL: %.*s→%s)",
                     ent->fd, shift, old_value_len, value_start - shift, new_value);
 #endif
         }
       }
-      
+
       // Copy masked body over original body
       // Check if there's enough space in the buffer for the masked body
       size_t new_total_size = headers_size + ent->pii_masked_len;
@@ -1243,29 +1243,29 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
         size_t before_len = body_len > 200 ? 200 : body_len;
         memcpy(before_preview, body_start, before_len);
         before_preview[before_len] = '\0';
-        log_debug("[PII_BEFORE_APPLY] fd=%d: Original (first 200): %s", 
+        log_debug("[PII_BEFORE_APPLY] fd=%d: Original (first 200): %s",
                  ent->fd, before_preview);
 #endif
-        
+
         memcpy((void *)body_start, ent->pii_masked_text, ent->pii_masked_len);
-        
+
         // Update message length to reflect new body size
         len = headers_size + ent->pii_masked_len;
-        
+
         // Update rcv_off in the source buffer
         ent->rcv_off = len;
-        
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         // Show masked body after application (first 200 chars)
         char after_preview[201];
         size_t after_len = ent->pii_masked_len > 200 ? 200 : ent->pii_masked_len;
         memcpy(after_preview, body_start, after_len);
         after_preview[after_len] = '\0';
-        log_debug("[PII_AFTER_APPLY] fd=%d: Masked (first 200): %s", 
+        log_debug("[PII_AFTER_APPLY] fd=%d: Masked (first 200): %s",
                  ent->fd, after_preview);
 #endif
-        
-        log_info("[PII_APPLIED] fd=%d: Applied deferred masking (%zu→%zu bytes)", 
+
+        log_debug("[PII_APPLIED] fd=%d: Applied deferred masking (%zu→%zu bytes)",
                  ent->fd, body_len, ent->pii_masked_len);
       } else {
         log_error("[PII_OVERFLOW] fd=%d: Masked text total size (%zu) > buffer capacity (%zu), skipping",
@@ -1274,7 +1274,7 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
     }
 
 skip_deferred_masking:
-    
+
     // Free the temporary storage
     free(ent->pii_masked_text);
     ent->pii_masked_text = NULL;
@@ -1435,12 +1435,12 @@ skip_deferred_masking:
 #ifdef HAVE_HTTP_TRACE
     // Parse HTTP response status and Content-Length for tracing (ONCE per connection)
     // Only parse from backend connections (odir=1) when we haven't captured status yet
-    if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 && 
+    if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
         rfd_ent->response_status_code == 0 && len > 16) {
-      
+
       const char *buf = (const char *)msg;
       size_t header_search_len = (len < 2048) ? len : 2048;  // Only search first 2KB
-      
+
       // Check for HTTP response status line: "HTTP/1.1 200 OK\r\n"
       if (memcmp(buf, "HTTP/1.", 7) == 0 && len > 12) {
         // Extract status code (3 digits after "HTTP/1.x ")
@@ -1454,18 +1454,18 @@ skip_deferred_masking:
                     rfd_ent->fd, ent->fd, rfd_ent->response_status_code);
 #endif
         }
-        
+
         // Find Content-Length header (case-insensitive)
         const char *content_length_pos = memmem(buf, header_search_len, "Content-Length:", 15);
         if (!content_length_pos) {
           content_length_pos = memmem(buf, header_search_len, "content-length:", 15);
         }
-        
+
         if (content_length_pos && content_length_pos + 15 < buf + len) {
           // Skip "Content-Length:" and whitespace
           const char *value_start = content_length_pos + 15;
           while (*value_start == ' ' && value_start < buf + len) value_start++;
-          
+
           // Parse integer value
           rfd_ent->response_content_length = 0;
           while (*value_start >= '0' && *value_start <= '9' && value_start < buf + len) {
@@ -1539,7 +1539,7 @@ skip_deferred_masking:
      * buffer the backend response instead of forwarding to client.
      * The prefill response is small (max_tokens=1) and will be parsed for kv_params. */
     if (ent->odir == 1) {
-      log_info("[PD_EPXMIT] odir=1 rfd_ent=%p pd_phase=%d len=%zu",
+      log_debug("[PD_EPXMIT] odir=1 rfd_ent=%p pd_phase=%d len=%zu",
                rfd_ent, rfd_ent ? rfd_ent->pd_phase : -1, len);
     }
 
@@ -1636,7 +1636,7 @@ skip_deferred_masking:
             pr_complete = 1;
           }
           if (pr_complete) {
-            log_info("Prefill response complete — client_fd=%d "
+            log_debug("Prefill response complete — client_fd=%d "
                      "resp_len=%zu", rfd_ent->fd, rfd_ent->pd_prefill_resp_len);
             rfd_ent->pd_phase = PD_PHASE_PREFILL_DONE;
             PROXY_ENT_UNLOCK(rfd_ent);
@@ -1725,7 +1725,7 @@ skip_deferred_masking:
          * snapshot > "" */
         const char *sse_model = proxy_effective_model(rfd_ent);
         llb_ai_stream_start("", (char *)sse_model);
-        log_info("[SSE_ACTIVATED] client_fd=%d backend_fd=%d model=%s",
+        log_debug("[SSE_ACTIVATED] client_fd=%d backend_fd=%d model=%s",
                  rfd_ent->fd, ent->fd, sse_model);
 
         /* P/D decode streaming transition — decode EP is now streaming */
@@ -1736,7 +1736,7 @@ skip_deferred_masking:
            * reaper. This read carried the activation bytes, so "now" is the last
            * backend activity. Refreshed per byte in the [DONE] scanner below. */
           rfd_ent->pd_last_decode_ts = time(NULL);
-          log_info("Decode streaming started — client_fd=%d backend_fd=%d",
+          log_debug("Decode streaming started — client_fd=%d backend_fd=%d",
                    rfd_ent->fd, ent->fd);
         }
       }
@@ -1777,7 +1777,7 @@ skip_deferred_masking:
           rfd_ent->usage_reserved_toks = 0;
           rfd_ent->usage_res_epoch = 0;
           rfd_ent->usage_consumed = 1;
-          log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (non-stream)",
+          log_debug("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (non-stream)",
                    rfd_ent->fd, up, uc);
         }
       }
@@ -1811,7 +1811,7 @@ skip_deferred_masking:
                             rfd_ent->usage_prompt_toks,
                             rfd_ent->usage_complet_toks, 0, 0, "");
       rfd_ent->metric_ai_recorded = 1;
-      log_info("[AI_NONSSE_RECORDED] client_fd=%d backend_fd=%d model=%s status=%u",
+      log_debug("[AI_NONSSE_RECORDED] client_fd=%d backend_fd=%d model=%s status=%u",
                rfd_ent->fd, ent->fd, ai_ns_model,
                (unsigned)rfd_ent->metric_response_status);
     }
@@ -1928,7 +1928,7 @@ skip_deferred_masking:
                                       &sse_tok_p, &sse_tok_c) == 0) {
             rfd_ent->usage_prompt_toks = sse_tok_p;
             rfd_ent->usage_complet_toks = sse_tok_c;
-            log_info("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (stream)",
+            log_debug("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (stream)",
                      rfd_ent->fd, sse_tok_p, sse_tok_c);
           } else {
             /* No usage object despite the request-side include_usage
@@ -1940,7 +1940,7 @@ skip_deferred_masking:
             sse_estimated = (sse_tok_p + sse_tok_c) > 0;
             rfd_ent->usage_prompt_toks = sse_tok_p;
             rfd_ent->usage_complet_toks = sse_tok_c;
-            log_info("[AI_TOKENS] client_fd=%d no usage in final chunk — "
+            log_debug("[AI_TOKENS] client_fd=%d no usage in final chunk — "
                      "estimated prompt=%d completion=%d",
                      rfd_ent->fd, sse_tok_p, sse_tok_c);
           }
@@ -1971,7 +1971,7 @@ skip_deferred_masking:
         llb_ai_record_request((char *)sse_tenant, (char *)sse_model, sse_status,
                               latency_ms, sse_tok_p, sse_tok_c, 0, 0, "");
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
-        log_info("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
+        log_debug("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
         /* Step 6: Reset sse_active AFTER llb_ai_stream_end (idempotent)
  * to signal stream lifecycle complete */
@@ -1999,7 +1999,7 @@ skip_deferred_masking:
             int pd_kv = (rfd_ent->pd_kv_params_len > 0) ? 1 : 0;
             llb_ai_pd_record((char *)sse_model, prefill_ms, decode_ms, pd_kv, 0);
           }
-          log_info("P/D flow complete — client_fd=%d backend_fd=%d",
+          log_debug("P/D flow complete — client_fd=%d backend_fd=%d",
                    rfd_ent->fd, ent->fd);
           pd_cleanup(rfd_ent);
         }
@@ -2179,7 +2179,7 @@ skip_deferred_masking:
         // HIGH_WATER (12MB) does NOT return -1, so this is true overflow!
         log_error("[TRY_EPXMIT_OVERFLOW] fd=%d: Cache add failed (TRUE OVERFLOW), "
                   "dropping %zu bytes and CLOSING CONNECTION", rfd_ent->fd, len);
-        
+
 #ifdef HAVE_HTTP_TRACE
         // CRITICAL: Emit REQ_END for cache overflow before closing
         if (rfd_ent->odir == 0 && rfd_ent->root_span_id != 0 && is_tracing_enabled()) {
@@ -2188,18 +2188,18 @@ skip_deferred_masking:
             uint64_t now = get_timestamp_ns();
             duration_us = (now - rfd_ent->req_start_ts) / 1000;
           }
-          
+
           // Set HTTP 507 Insufficient Storage for cache overflow
           rfd_ent->http_status_code = 507;
-          
+
           log_info("[TRACE_ERROR] fd=%d: Emitting REQ_END with status 507 (cache overflow) duration=%luμs trace=%016lx%016lx",
                    rfd_ent->fd, duration_us, rfd_ent->trace_id_hi, rfd_ent->trace_id_lo);
-          
+
           emit_trace_event(rfd_ent, LXB_EVENT_REQ_END, duration_us);
           rfd_ent->root_span_id = 0;
         }
 #endif
-        
+
         PROXY_ENT_UNLOCK(rfd_ent);
         return -1;  // Signal connection should be closed
       }
@@ -2239,7 +2239,7 @@ skip_deferred_masking:
       if (n <= 0) {
         int ssl_err;
         ssl_err = SSL_get_error(rfd_ent->ssl, n);
-        
+
         switch (ssl_err) {
           case SSL_ERROR_WANT_WRITE:
             // CRITICAL: SSL has buffered data internally, we MUST retry with same buffer
@@ -2250,7 +2250,7 @@ skip_deferred_masking:
               // But this might cause issues if SSL has internal state
               if (proxy_add_xmitcache(rfd_ent, msg, len) < 0) {
                 log_error("SSL cache full, closing connection (fd=%d)", rfd_ent->fd);
-                
+
 #ifdef HAVE_HTTP_TRACE
                 // Emit REQ_END for SSL cache overflow
                 if (rfd_ent->odir == 0 && rfd_ent->root_span_id != 0 && is_tracing_enabled()) {
@@ -2266,7 +2266,7 @@ skip_deferred_masking:
                   rfd_ent->root_span_id = 0;
                 }
 #endif
-                
+
                 PROXY_ENT_UNLOCK(rfd_ent);
                 return -1;
               }
@@ -2286,7 +2286,7 @@ skip_deferred_masking:
             if (!sel) {
               if (proxy_add_xmitcache(rfd_ent, msg, len) < 0) {
                 log_error("SSL cache full, closing connection (fd=%d)", rfd_ent->fd);
-                
+
 #ifdef HAVE_HTTP_TRACE
                 // Emit REQ_END for SSL cache overflow (WANT_READ path)
                 if (rfd_ent->odir == 0 && rfd_ent->root_span_id != 0 && is_tracing_enabled()) {
@@ -2302,7 +2302,7 @@ skip_deferred_masking:
                   rfd_ent->root_span_id = 0;
                 }
 #endif
-                
+
                 PROXY_ENT_UNLOCK(rfd_ent);
                 return -1;
               }
@@ -2331,18 +2331,18 @@ skip_deferred_masking:
                 uint64_t now = get_timestamp_ns();
                 duration_us = (now - rfd_ent->req_start_ts) / 1000;
               }
-              
+
               // Set HTTP 500 Internal Server Error for SSL failures
               rfd_ent->http_status_code = 500;
-              
+
               log_info("[TRACE_ERROR] fd=%d: Emitting REQ_END with status 500 (SSL error) duration=%luμs trace=%016lx%016lx",
                        rfd_ent->fd, duration_us, rfd_ent->trace_id_hi, rfd_ent->trace_id_lo);
-              
+
               emit_trace_event(rfd_ent, LXB_EVENT_REQ_END, duration_us);
               rfd_ent->root_span_id = 0;  // Prevent duplicate emission
             }
 #endif
-            
+
             if (ssl_err != SSL_ERROR_SSL && ssl_err != SSL_ERROR_SYSCALL) {
               SSL_shutdown(rfd_ent->ssl);
             } else {
@@ -2510,11 +2510,11 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           return -ENOMEM;
         }
 #endif
-        
+
         // P6: Store composite key for hash table
         strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
         tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
-        
+
         // Store custom header configuration
         if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
           tepval->session_header_enabled = 1;
@@ -2533,7 +2533,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           tepval->session_header_name[0] = '\0';
         }
 
-        // SSE streaming configuration 
+        // SSE streaming configuration
         tepval->sse_mode = arg->sse_mode;
         /* A new pool on a live VIP:port, including a rule re-created after the
          * last one was deleted (the listener survives), must not inherit the
@@ -2652,12 +2652,12 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
             tepval->chwbl_config->mean_load_factor = 175;  // Default: 175% of average
             tepval->chwbl_config->replication = 256;       // Default: 256 virtual nodes
             tepval->chwbl_config->prefix_char_length = 0;  // Unused for now
-            
+
             // PHASE 1: Initialize prefix hash configuration
             tepval->chwbl_config->prefix_hash_level = (arg && arg->chwbl_prefix_hash_level > 0) ? arg->chwbl_prefix_hash_level : 1;  // From config or default L1
             tepval->chwbl_config->prefix_hash_flags = 0;   // Default: auto-detect
             tepval->chwbl_config->enable_cache_salt = 0;   // Default: optional
-            
+
             // Initialize load trackers for all endpoints
             for (int i = 0; i < tepval->n_eps; i++) {
               atomic_init(&tepval->chwbl_config->ep_loads[i].active_conns, 0);
@@ -2665,7 +2665,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
               tepval->chwbl_config->ep_loads[i].last_update_ts = time(NULL);
               tepval->chwbl_config->ep_loads[i].ep_available = (tepval->eps[i].inv == 0) ? 1 : 0;
             }
-            
+
             // Build consistent hash ring
             if (chwbl_build_ring(tepval, 256) < 0) {
               log_error("CHWBL: Failed to build hash ring for rule %u", tepval->_id);
@@ -2682,7 +2682,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           }
         }
 #endif /* HAVE_DP_GPU_ROUTING */
-        
+
         // P3: Initialize WRR if selection mode is WRR
         if (tepval->select == PROXY_SEL_WRR) {
           wrr_init_state(tepval);
@@ -2690,7 +2690,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           log_info("P3: WRR initialized for %s with %d endpoints",
                    arg->host_url[0] ? arg->host_url : "default",
                    tepval->n_eps);
-          
+
           // Log endpoint weights for verification
           for (int i = 0; i < tepval->n_eps; i++) {
             log_info("P3:   EP%d: %s:%u weight=%d",
@@ -2699,7 +2699,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           }
 #endif
         }
-        
+
 #ifdef HAVE_DP_GPU_ROUTING
         // P3.5: Initialize WRR_HASH if selection mode is WRR_HASH
         if (tepval->select == PROXY_SEL_WRR_HASH && !tepval->chwbl_config) {
@@ -2709,7 +2709,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
             tepval->chwbl_config->mean_load_factor = 175;  // 1.75x average (same as CHWBL)
             tepval->chwbl_config->replication = 256;       // Total vnodes (weighted allocation)
             tepval->chwbl_config->prefix_hash_level = (arg && arg->chwbl_prefix_hash_level > 0) ? arg->chwbl_prefix_hash_level : 1;  // From config or default L1
-            
+
             // Initialize load trackers for all endpoints
             for (int i = 0; i < tepval->n_eps; i++) {
               atomic_init(&tepval->chwbl_config->ep_loads[i].active_conns, 0);
@@ -2717,7 +2717,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
               tepval->chwbl_config->ep_loads[i].last_update_ts = time(NULL);
               tepval->chwbl_config->ep_loads[i].ep_available = (tepval->eps[i].inv == 0) ? 1 : 0;
             }
-            
+
             // Build weighted consistent hash ring
             if (chwbl_build_weighted_ring(tepval) < 0) {
               log_error("WRR_HASH: Failed to build weighted hash ring for rule %u", tepval->_id);
@@ -2742,12 +2742,12 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           }
         }
 #endif /* HAVE_DP_GPU_ROUTING */
-        
+
         // P6: Use stored key for hash table insertion
         HASH_ADD_KEYPTR(hh, ent->val.ephash,
                         tepval->ephash_key, strlen(tepval->ephash_key),
                         tepval);
-        
+
         PROXY_UNLOCK();
         return 0;
       }
@@ -2765,11 +2765,11 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   node->val.main_fd = -1;
   node->val.have_ssl = arg->have_ssl;
   node->val.ppv2 = arg->ppv2;   /* L7 fullproxy PROXY protocol v2 emission (mandatory when set) */
-  
+
   // Store proxy_arg pointer for later cleanup if heap-allocated
   // This enables proper memory management for both mTLS and non-mTLS cases
   node->arg_ptr = arg;
-  
+
 #ifdef HAVE_HTTP_TRACE
   // Lookup catalog_id for this service from shared memory mapping (non-critical)
   // Initialize to 0 (no tracing) in case lookup fails
@@ -2788,7 +2788,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     // today's behaviour when the TLS-pinning fields are unset (-COMPAT).
     ssl_ctx = proxy_server_ssl_ctx_init(arg);
     assert(ssl_ctx);
-    
+
     if (proxy_ssl_cfg_opts(ssl_ctx,
           strcmp(arg->host_url, "") ? arg->host_url : NULL, 0)) {
       log_error("[LB Rule] Failed to load SSL certificates for hostname: '%s'",
@@ -2808,7 +2808,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     // Register SNI callback for dynamic certificate selection (GLOBAL STORE)
     SSL_CTX_set_tlsext_servername_callback((SSL_CTX *)ssl_ctx, sni_servername_callback);
     SSL_CTX_set_tlsext_servername_arg((SSL_CTX *)ssl_ctx, NULL);  // Not used - callback uses global store
-    
+
 #ifdef HAVE_MTLS
     // Configure frontend mTLS (client certificate verification)
     if (arg->frontend_mtls_mode > 0) {
@@ -2831,7 +2831,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[mTLS] Frontend mTLS configured successfully for %s",
                 strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-      log_debug("[mTLS] Stored proxy_arg=%p in SSL_CTX=%p with index=%d", 
+      log_debug("[mTLS] Stored proxy_arg=%p in SSL_CTX=%p with index=%d",
                 (void*)arg, (void*)ssl_ctx, g_ssl_ctx_proxy_arg_index);
 #endif
     }
@@ -2849,9 +2849,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
       PROXY_UNLOCK();
       return -EINVAL;
     }
-    
+
 #ifdef HAVE_MTLS
-    // Backend mTLS is now integrated into proxy_client_ssl_ctx_init 
+    // Backend mTLS is now integrated into proxy_client_ssl_ctx_init
     // No additional configuration needed here - kept for backward compatibility check
     // backend material referenced by certId.
     if (arg->backend_verify_cert || arg->backend_client_cert_id[0] != '\0') {
@@ -2880,18 +2880,18 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
       ssl_ctx = NULL;
     }
     PROXY_UNLOCK();
-    return -1; 
+    return -1;
   }
 
   node->val.main_fd = lsd;
   node->val.ssl_ctx = ssl_ctx;
   node->val.ssl_epctx = ssl_epctx;
   node->val.proxy_mode = arg->proxy_mode;
-  
+
   // Initialize backend protocol capability (default: HTTP/1.1 only for safety)
   node->val.backend_protocol_cap = arg->backend_protocol_cap;
   node->val.sockmap_en = arg->sockmap_en;
-  
+
   // Configure ALPN callback with backend protocol capability
   if (ssl_ctx) {
     SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_callback, &node->val.backend_protocol_cap);
@@ -2958,7 +2958,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
       SSL_CTX_free(node->val.ssl_ctx);
       node->val.ssl_ctx = NULL;
     }
-    return -1; 
+    return -1;
   }
   fd_ctx->used++;
 
@@ -2972,7 +2972,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   // P6: Store composite key in tepval for hash table
   strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
   tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
-  
+
   // Store custom header configuration
   if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
     tepval->session_header_enabled = 1;
@@ -2991,7 +2991,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     tepval->session_header_name[0] = '\0';
   }
 
-  // SSE streaming configuration 
+  // SSE streaming configuration
   tepval->sse_mode = arg->sse_mode;
   tepval->sockmap_en = arg->sockmap_en;
   tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
@@ -3107,12 +3107,12 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
       tepval->chwbl_config->mean_load_factor = 175;  // Default: 175% of average
       tepval->chwbl_config->replication = 256;       // Default: 256 virtual nodes
       tepval->chwbl_config->prefix_char_length = 0;  // Unused for now
-      
+
       // PHASE 1: Initialize prefix hash configuration
       tepval->chwbl_config->prefix_hash_level = (arg && arg->chwbl_prefix_hash_level > 0) ? arg->chwbl_prefix_hash_level : 1;  // From config or default L1
       tepval->chwbl_config->prefix_hash_flags = 0;   // Default: auto-detect
       tepval->chwbl_config->enable_cache_salt = 0;   // Default: optional
-      
+
       // Initialize load trackers for all endpoints
       for (int i = 0; i < tepval->n_eps; i++) {
         atomic_init(&tepval->chwbl_config->ep_loads[i].active_conns, 0);
@@ -3120,7 +3120,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->chwbl_config->ep_loads[i].last_update_ts = time(NULL);
         tepval->chwbl_config->ep_loads[i].ep_available = (tepval->eps[i].inv == 0) ? 1 : 0;
       }
-      
+
       // Build consistent hash ring
       if (chwbl_build_ring(tepval, 256) < 0) {
         log_error("CHWBL: Failed to build hash ring for rule %u", tepval->_id);
@@ -3137,7 +3137,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     }
   }
 #endif /* HAVE_DP_GPU_ROUTING */
-  
+
   // P3: Initialize WRR if selection mode is WRR
   if (tepval->select == PROXY_SEL_WRR) {
     wrr_init_state(tepval);
@@ -3146,7 +3146,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
              tepval->_id,
              arg->host_url[0] ? arg->host_url : "default",
              tepval->n_eps);
-    
+
     // Log endpoint weights for verification
     for (int i = 0; i < tepval->n_eps; i++) {
       log_info("P3:   EP%d: %s:%u weight=%d",
@@ -3155,7 +3155,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     }
 #endif
   }
-  
+
 #ifdef HAVE_DP_GPU_ROUTING
   // P3.5: Initialize WRR_HASH if selection mode is WRR_HASH (second location)
   if (tepval->select == PROXY_SEL_WRR_HASH && !tepval->chwbl_config) {
@@ -3165,7 +3165,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
       tepval->chwbl_config->mean_load_factor = 175;  // 1.75x average (same as CHWBL)
       tepval->chwbl_config->replication = 256;       // Total vnodes (weighted allocation)
       tepval->chwbl_config->prefix_hash_level = (arg && arg->chwbl_prefix_hash_level > 0) ? arg->chwbl_prefix_hash_level : 1;  // From config or default L1
-      
+
       // Initialize load trackers for all endpoints
       for (int i = 0; i < tepval->n_eps; i++) {
         atomic_init(&tepval->chwbl_config->ep_loads[i].active_conns, 0);
@@ -3173,7 +3173,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->chwbl_config->ep_loads[i].last_update_ts = time(NULL);
         tepval->chwbl_config->ep_loads[i].ep_available = (tepval->eps[i].inv == 0) ? 1 : 0;
       }
-      
+
       // Build weighted consistent hash ring
       if (chwbl_build_weighted_ring(tepval) < 0) {
         log_error("WRR_HASH: Failed to build weighted hash ring for rule %u", tepval->_id);
@@ -3198,7 +3198,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     }
   }
 #endif /* HAVE_DP_GPU_ROUTING */
-  
+
   // P6: Use stored key for hash table insertion
   HASH_ADD_KEYPTR(hh, node->val.ephash,
                   tepval->ephash_key, strlen(tepval->ephash_key),
@@ -3216,7 +3216,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   }
 
   PROXY_UNLOCK();
-  
+
   return 0;
 }
 
@@ -3302,7 +3302,7 @@ pd_parked_drain_ep(proxy_epval_t *tepval, int ep_index, const char *why)
 // providing a 100x performance improvement (50-100ms → <1ms) over full rule sync.
 //
 // CONNECTION DRAINING BEHAVIOR:
-// 
+//
 // When marking endpoint INACTIVE (inactive=1):
 //   * NEW connections: Will NOT select this endpoint (inv=1, ep_available=0)
 //   * EXISTING connections: Continue using established file descriptors (graceful draining)
@@ -4009,19 +4009,19 @@ proxy_set_drain_policy(proxy_ent_t *key, unsigned int policy, uint32_t timeout_s
 {
   proxy_map_ent_t *ent;
   proxy_epval_t *tepval, *tmp_epval;
-  
+
   if (!key) {
     log_error("P2: proxy_set_drain_policy - invalid key");
     return -EINVAL;
   }
-  
+
   if (policy > DRAIN_POLICY_IMMEDIATE) {
     log_error("P2: proxy_set_drain_policy - invalid policy %d", policy);
     return -EINVAL;
   }
 
   PROXY_LOCK();
-  
+
   // Find existing proxy entry
   ent = proxy_struct->head;
   while (ent) {
@@ -4030,15 +4030,15 @@ proxy_set_drain_policy(proxy_ent_t *key, unsigned int policy, uint32_t timeout_s
       HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
         tepval->drain_policy = (drain_policy_t)policy;
         tepval->drain_timeout_sec = timeout_sec > 0 ? timeout_sec : 60; // Default 60s
-        
+
         log_info("P2: Drain policy updated - service %s:%u, policy=%d, timeout=%us",
                  inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
                  policy, tepval->drain_timeout_sec);
-        
+
         PROXY_UNLOCK();
         return 0;
       }
-      
+
       PROXY_UNLOCK();
       log_error("P2: proxy_set_drain_policy - no ephash entry found");
       return -ENOENT;
@@ -4061,34 +4061,34 @@ proxy_set_chwbl_prefix_config(proxy_ent_t *key,
 {
   proxy_map_ent_t *ent;
   proxy_epval_t *tepval, *tmp_epval;
-  
+
   if (!key) {
     log_error("proxy_set_chwbl_prefix_config: NULL key");
     return -EINVAL;
   }
-  
+
   // Validate level
   if (level < 1 || level > 3) {
     log_error("proxy_set_chwbl_prefix_config: Invalid level=%u (must be 1-3)", level);
     return -EINVAL;
   }
-  
+
   // PHASE 2: Warn about Level 2 cache fragmentation
   if (level == 2) {
     log_warn("proxy_set_chwbl_prefix_config: Level 2 enabled for service %s:%u - "
              "cache will be per-session (lower global hit rate expected)",
              inet_ntoa(*(struct in_addr *)(&key->xip)), ntohs(key->xport));
   }
-  
+
   // PHASE 3: Warn about Level 3 cache fragmentation
   if (level == 3) {
     log_warn("proxy_set_chwbl_prefix_config: Level 3 enabled for service %s:%u - "
              "cache will be per-RAG-context (specialized for document-specific workloads)",
              inet_ntoa(*(struct in_addr *)(&key->xip)), ntohs(key->xport));
   }
-  
+
   PROXY_LOCK();
-  
+
   // Find proxy entry
   ent = proxy_struct->head;
   while (ent) {
@@ -4101,34 +4101,34 @@ proxy_set_chwbl_prefix_config(proxy_ent_t *key,
           log_warn("proxy_set_chwbl_prefix_config: CHWBL/WRR_HASH not enabled (select=%d)", tepval->select);
           return -EINVAL;
         }
-        
+
         // Check if CHWBL config exists
         if (!tepval->chwbl_config) {
           PROXY_UNLOCK();
           log_error("proxy_set_chwbl_prefix_config: chwbl_config is NULL");
           return -ENOENT;
         }
-        
+
         // Update configuration
         tepval->chwbl_config->prefix_hash_level = level;
         tepval->chwbl_config->prefix_hash_flags = flags;
         tepval->chwbl_config->enable_cache_salt = enable_cache_salt;
-        
+
         log_info("CHWBL prefix config updated: service=%s:%u, level=%u, flags=0x%x, cache_salt=%u",
                  inet_ntoa(*(struct in_addr *)(&key->xip)), ntohs(key->xport),
                  level, flags, enable_cache_salt);
-        
+
         PROXY_UNLOCK();
         return 0;
       }
-      
+
       PROXY_UNLOCK();
       log_error("proxy_set_chwbl_prefix_config: No ephash entry found");
       return -ENOENT;
     }
     ent = ent->next;
   }
-  
+
   PROXY_UNLOCK();
   log_error("proxy_set_chwbl_prefix_config: Service not found");
   return -ENOENT;
@@ -4140,19 +4140,19 @@ proxy_set_chwbl_prefix_config(proxy_ent_t *key,
 // failure_threshold: Number of consecutive failures before opening (0=use default 5)
 // open_timeout_sec: Timeout before HALF_OPEN (0=use default 30)
 int
-proxy_set_circuit_breaker(proxy_ent_t *key, uint8_t enabled, 
+proxy_set_circuit_breaker(proxy_ent_t *key, uint8_t enabled,
                           uint32_t failure_threshold, uint32_t open_timeout_sec)
 {
   proxy_map_ent_t *ent;
   proxy_epval_t *tepval, *tmp_epval;
-  
+
   if (!key) {
     log_error("proxy_set_circuit_breaker - invalid key");
     return -EINVAL;
   }
 
   PROXY_LOCK();
-  
+
   // Find existing proxy entry
   ent = proxy_struct->head;
   while (ent) {
@@ -4160,12 +4160,12 @@ proxy_set_circuit_breaker(proxy_ent_t *key, uint8_t enabled,
       // Entry found - update circuit breaker config
       HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
         tepval->cb_enabled = enabled;
-        
+
         if (enabled) {
           // Initialize circuit breakers for all endpoints
           for (int i = 0; i < tepval->n_eps; i++) {
             circuit_breaker_init(&tepval->circuit_breakers[i]);
-            
+
             // Apply custom thresholds if provided
             if (failure_threshold > 0) {
               tepval->circuit_breakers[i].failure_threshold = failure_threshold;
@@ -4174,12 +4174,12 @@ proxy_set_circuit_breaker(proxy_ent_t *key, uint8_t enabled,
               tepval->circuit_breakers[i].open_timeout_sec = open_timeout_sec;
             }
           }
-        } 
-        
+        }
+
         PROXY_UNLOCK();
         return 0;
       }
-      
+
       PROXY_UNLOCK();
       return -ENOENT;
     }
@@ -4338,7 +4338,7 @@ proxy_selftests()
   proxy_arg_t *arg = NULL;
   proxy_ent_t key2 = { 0 };
   int n = 0;
-  
+
   // Use heap allocation for consistency with production code
   arg = calloc(1, sizeof(proxy_arg_t));
   if (!arg) {
@@ -4542,7 +4542,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
 {
   /* RES-03: Log pd_phase on teardown for debugging disconnects */
   if (fd_ent->pd_phase != PD_PHASE_NONE) {
-    log_info("pd_cleanup: fd=%d pd_phase=%d prefill_ep=%d decode_ep=%d",
+    log_debug("pd_cleanup: fd=%d pd_phase=%d prefill_ep=%d decode_ep=%d",
              fd_ent->fd, fd_ent->pd_phase,
              fd_ent->pd_prefill_ep_idx, fd_ent->pd_decode_ep_idx);
   }
@@ -4628,7 +4628,7 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
         fd_ent->pd_decode_ep_idx < teardown_epval->n_eps) {
       /* Bug3-fix (US-H201): guard against uint32_t underflow on double-cleanup */
       uint32_t cur_dec = atomic_load(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns);
-      
+
       if (cur_dec > 0)
         atomic_fetch_sub(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns, 1);
     }
@@ -4889,7 +4889,7 @@ proxy_pdestroy(void *priv)
 
   // Log sticky session cleanup
   if (pfe->is_sticky && pfe->session_key[0] != '\0') {
-    log_info("STICKY-SESSION: Cleaning up sticky session - fd=%d, key='%s', server=%d, created=%ld", 
+    log_debug("STICKY-SESSION: Cleaning up sticky session - fd=%d, key='%s', server=%d, created=%ld",
              pfe->fd, pfe->session_key, pfe->sticky_server_id, pfe->session_created);
   }
 
@@ -5069,7 +5069,7 @@ proxy_pdestroy(void *priv)
           }
           pfe->rfd_ent[pd_i] = NULL;
           pfe->n_rfd--;
-          log_info("[US-H202] Decode backend fd=%d detaching from keep-alive client fd=%d "
+          log_debug("[US-H202] Decode backend fd=%d detaching from keep-alive client fd=%d "
                    "(pd_phase=NONE, P/D already complete)",
                    pfe->fd, client_pfe->fd);
           continue;
@@ -5191,7 +5191,7 @@ proxy_pdestroy(void *priv)
             if (!pfe->is_pd_decode_backend) {
               is_prefill_backend = 1;
               client_pfe->rfd_ent[j] = NULL;
-              log_info("Prefill backend EOF during decode — detaching "
+              log_debug("Prefill backend EOF during decode — detaching "
                        "client_fd=%d backend_fd=%d phase=%d",
                        client_pfe->fd, pfe->fd, client_pfe->pd_phase);
             }
@@ -5241,7 +5241,7 @@ proxy_pdestroy(void *priv)
         } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
           /* Decode backend EOF — non-streaming decode complete */
           client_pfe->pd_phase = PD_PHASE_COMPLETE;
-          log_info("Non-streaming decode complete (decode backend EOF) — "
+          log_debug("Non-streaming decode complete (decode backend EOF) — "
                    "client_fd=%d decode_fd=%d",
                    client_pfe->fd, pfe->fd);
           {
@@ -5261,7 +5261,7 @@ proxy_pdestroy(void *priv)
                                      client_pfe->pd_decode_start_ns) / 1000000ULL);
             }
             int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            log_info(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
+            log_debug(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
                      pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
             llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv, 0);
           }
@@ -5318,7 +5318,7 @@ proxy_pdestroy(void *priv)
             cpfe->eof_timestamp = time(NULL);
             atomic_fetch_add(&global_stats.peer_eof_graceful, 1);
           }
-          log_info("[EOF_DEFER_TEARDOWN] backend fd=%d destroyed; client fd=%d "
+          log_debug("[EOF_DEFER_TEARDOWN] backend fd=%d destroyed; client fd=%d "
                    "still owes cache_count=%u (%.2f MB) — detaching client for "
                    "graceful drain",
                    pfe->fd, cpfe->fd, cpfe->cache_count,
@@ -5392,7 +5392,7 @@ proxy_pdestroy(void *priv)
     llb_ai_token_quota_consume(r->tenant, r->model, r->user, r->key,
                                r->svc_ident, 0, 0, 0,
                                r->reserved, r->res_epoch, NULL);
-    log_info("[AI_TOKENS] released %d unspent reserved tokens on teardown "
+    log_debug("[AI_TOKENS] released %d unspent reserved tokens on teardown "
              "tenant=%s", r->reserved, r->tenant);
   }
   free(settles.resv);
@@ -5410,7 +5410,7 @@ proxy_pdestroy(void *priv)
      * instead of hiding it behind a guess. */
     llb_ai_record_usage_missing(u->tenant, u->model,
                                 LLB_AI_UMISS_CONNECTION_CLOSE);
-    log_info("[AI_TOKENS] response completed with no usage object "
+    log_debug("[AI_TOKENS] response completed with no usage object "
              "tenant=%s model=%s reason=%s (reported, not charged)",
              u->tenant, u->model, LLB_AI_UMISS_CONNECTION_CLOSE);
   }
@@ -5441,13 +5441,13 @@ proxy_pdestroy(void *priv)
          * report above, and the same ambiguity. */
         llb_ai_record_usage_missing(e->tenant, e->model,
                                     LLB_AI_UMISS_CONNECTION_CLOSE);
-        log_info("[AI_TOKENS][HTTP/2] teardown settle: response completed with "
+        log_debug("[AI_TOKENS][HTTP/2] teardown settle: response completed with "
                  "no usage object tenant=%s model=%s reason=%s "
                  "(reported, not charged)", e->tenant, e->model,
                  LLB_AI_UMISS_CONNECTION_CLOSE);
       }
     }
-    log_info("[AI_TOKENS][HTTP/2] teardown settle tenant=%s prompt=%d "
+    log_debug("[AI_TOKENS][HTTP/2] teardown settle tenant=%s prompt=%d "
              "completion=%d reserved=%d status=%d", e->tenant, e->prompt_toks,
              e->complet_toks, e->reserved_toks, e->status);
   }
@@ -5491,9 +5491,9 @@ generate_ip_session_key(int fd, char *session_key, size_t key_size)
 {
   struct sockaddr_in client_addr;
   socklen_t addr_len = sizeof(client_addr);
-  
+
   if (getpeername(fd, (struct sockaddr*)&client_addr, &addr_len) == 0) {
-    snprintf(session_key, key_size, "ip_%s", 
+    snprintf(session_key, key_size, "ip_%s",
             inet_ntoa(client_addr.sin_addr));
   } else {
     snprintf(session_key, key_size, "ip_unknown_%d", fd);
@@ -5504,25 +5504,25 @@ generate_ip_session_key(int fd, char *session_key, size_t key_size)
 }
 
 static int
-extract_content_session_key(const char *http_data, size_t data_len, 
+extract_content_session_key(const char *http_data, size_t data_len,
                            char *session_key, size_t key_size)
 {
   const char *url_start __attribute__((unused)) = NULL;
   const char *url_end __attribute__((unused)) = NULL;
   char method[16] = {0};
   char url[256] = {0};
-  
-  
+
+
   // Parse first line: "METHOD /path HTTP/1.1"
   if (sscanf(http_data, "%15s %255s", method, url) != 2) {
     return -1;
-  }  
-  
+  }
+
   // Extract content ID from common patterns:
   // POST /upload/file123 -> content_file123
   // GET /download/file456 -> content_file456
   // PUT /content/abc789 -> content_abc789
-  
+
   if (strstr(url, "/upload/") || strstr(url, "/download/") || strstr(url, "/content/")) {
     const char *content_id = strrchr(url, '/');
     if (content_id && strlen(content_id) > 1) {
@@ -5530,7 +5530,7 @@ extract_content_session_key(const char *http_data, size_t data_len,
       return 0;
     }
   }
-  
+
   // Fallback: use full URL as session key
   snprintf(session_key, key_size, "url_%s", url);
   return 0;
@@ -5545,25 +5545,25 @@ extract_cookie_session_key(const char *http_data, size_t data_len,
   const char *cookie_header = strstr(http_data, "Cookie:");
   if (!cookie_header) {
     return -1;
-  }  
-  
+  }
+
   // Look for JSESSIONID or similar
   const char *session_start = strstr(cookie_header, "JSESSIONID=");
   if (!session_start) {
     session_start = strstr(cookie_header, "sessionid=");
   }
-  
+
   if (session_start) {
     session_start = strchr(session_start, '=') + 1;
     const char *session_end = strpbrk(session_start, ";\r\n ");
-    
+
     size_t session_len = session_end ? (session_end - session_start) : strlen(session_start);
     if (session_len > 0 && session_len < key_size - 8) {
       snprintf(session_key, key_size, "cookie_%.*s", (int)session_len, session_start);
       return 0;
     }
   }
-  
+
   return -1;
 }
 
@@ -5597,7 +5597,7 @@ extract_cookie_by_name(const char *headers, const char *cookie_name,
   // Build search pattern: "cookie_name="
   char search_pattern[256];
   snprintf(search_pattern, sizeof(search_pattern), "%s=", cookie_name);
-  
+
   const char *cookie_start = strstr(cookie_header, search_pattern);
   if (!cookie_start) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -5609,19 +5609,19 @@ extract_cookie_by_name(const char *headers, const char *cookie_name,
 
   // Skip past "cookie_name="
   const char *value_start = cookie_start + strlen(search_pattern);
-  
+
   // Find end of cookie value (semicolon, CR, LF, or space)
   const char *value_end = strpbrk(value_start, ";\r\n ");
-  
+
   size_t cookie_len = value_end ? (value_end - value_start) : strlen(value_start);
-  
+
   if (cookie_len == 0) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[COOKIE_EXTRACT_EMPTY] Cookie '%s' has empty value", cookie_name);
 #endif
     return -1;
   }
-  
+
   if (cookie_len >= value_size) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_warn("[COOKIE_EXTRACT_TOOLONG] Cookie '%s' value too long (%zu bytes, max %zu), truncating",
@@ -5672,7 +5672,7 @@ extract_query_param_value(const char *url, const char *param_name,
   // Build search pattern: "param_name="
   char search_pattern[256];
   snprintf(search_pattern, sizeof(search_pattern), "%s=", param_name);
-  
+
   // Search for parameter in query string
   // Handle both ?param=val and &param=val cases
   const char *param_start = strstr(query_start, search_pattern);
@@ -5699,19 +5699,19 @@ extract_query_param_value(const char *url, const char *param_name,
 
   // Skip past "param_name="
   const char *value_start = param_start + strlen(search_pattern);
-  
+
   // Find end of parameter value (&, #, space, or end of string)
   const char *value_end = strpbrk(value_start, "& #\r\n");
-  
+
   size_t param_len = value_end ? (value_end - value_start) : strlen(value_start);
-  
+
   if (param_len == 0) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[QUERY_EXTRACT_EMPTY] Query parameter '%s' has empty value", param_name);
 #endif
     return -1;
   }
-  
+
   if (param_len >= value_size) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_warn("[QUERY_EXTRACT_TOOLONG] Query parameter '%s' value too long (%zu bytes, max %zu), truncating",
@@ -5767,7 +5767,7 @@ extract_basic_auth_username(const char *headers, char *username, size_t username
 
   const char *auth_header = strstr(headers, "Authorization: Basic ");
   const char *encoded_start = NULL;
-  
+
   if (auth_header) {
     // Full header format: "Authorization: Basic dXNlcjpwYXNz"
     encoded_start = auth_header + 21;  // Skip "Authorization: Basic "
@@ -5782,11 +5782,11 @@ extract_basic_auth_username(const char *headers, char *username, size_t username
     }
     encoded_start = basic_prefix + 6;  // Skip "Basic "
   }
-  
+
   // Find end of Base64 string (CR, LF, or space)
   const char *encoded_end = strpbrk(encoded_start, "\r\n ");
   size_t encoded_len = encoded_end ? (encoded_end - encoded_start) : strlen(encoded_start);
-  
+
   if (encoded_len == 0 || encoded_len > 1024) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[BASICAUTH_EXTRACT_INVLEN] Invalid Base64 length: %zu", encoded_len);
@@ -5795,35 +5795,35 @@ extract_basic_auth_username(const char *headers, char *username, size_t username
   }
 
   // Simple Base64 decoder (sufficient for Basic Auth)
-  static const char base64_chars[] = 
+  static const char base64_chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  
+
   char decoded[512];
   size_t decoded_idx = 0;
-  
+
   for (size_t i = 0; i < encoded_len && decoded_idx < sizeof(decoded) - 1; ) {
     unsigned char sextet[4] = {0};
     int valid_count = 0;
-    
+
     // Decode 4 Base64 chars → 3 bytes
     for (int j = 0; j < 4 && i < encoded_len; j++) {
       if (encoded_start[i] == '=') {
         i++;
         break;  // Padding
       }
-      
+
       const char *pos = strchr(base64_chars, encoded_start[i]);
       if (!pos) {
         i++;
         j--;  // Don't count this as a valid position
         continue;  // Skip invalid chars
       }
-      
+
       sextet[j] = (unsigned char)(pos - base64_chars);
       valid_count++;
       i++;
     }
-    
+
     if (valid_count >= 2) {
       decoded[decoded_idx++] = (sextet[0] << 2) | (sextet[1] >> 4);
     }
@@ -5847,14 +5847,14 @@ extract_basic_auth_username(const char *headers, char *username, size_t username
   // Decoded format: "username:password"
   const char *colon = strchr(decoded, ':');
   size_t user_len = colon ? (colon - decoded) : decoded_idx;
-  
+
   if (user_len == 0) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[BASICAUTH_EXTRACT_NOUSER] No username found in decoded auth");
 #endif
     return -1;
   }
-  
+
   if (user_len >= username_size) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_warn("[BASICAUTH_EXTRACT_TOOLONG] Username too long (%zu bytes, max %zu), truncating",
@@ -5881,16 +5881,16 @@ get_server_for_session(const char *session_key, int num_servers)
     log_error("STICKY-SESSION: Invalid server count: %d", num_servers);
     return 0;
   }
-  
+
   // Use consistent hashing to always select the same server for a session
   uint32_t hash = session_key_hash(session_key);
   int server_id = hash % num_servers;
-  
+
   if (server_id < 0 || server_id >= num_servers) {
     log_error("STICKY-SESSION: Invalid server_id calculation: %d (max: %d)", server_id, num_servers-1);
     return 0;
   }
-  
+
   return server_id;
 }
 
@@ -5904,18 +5904,18 @@ cleanup_expired_sessions(void)
   int cleaned_count = 0;
 
   PROXY_LOCK();
-  
+
   node = proxy_struct->head;
   while (node) {
     fd_ent = node->val.fdlist;
     while (fd_ent) {
-      if (fd_ent->is_sticky && 
+      if (fd_ent->is_sticky &&
           (now - fd_ent->last_activity) > PROXY_SESSION_TIMEOUT) {
-        
-        log_info("STICKY-SESSION: Expiring session - fd=%d, key='%s', server=%d, idle=%ld seconds", 
-                 fd_ent->fd, fd_ent->session_key, fd_ent->sticky_server_id, 
+
+        log_debug("STICKY-SESSION: Expiring session - fd=%d, key='%s', server=%d, idle=%ld seconds",
+                 fd_ent->fd, fd_ent->session_key, fd_ent->sticky_server_id,
                  now - fd_ent->last_activity);
-        
+
 #ifdef HAVE_DP_GPU_ROUTING
         // PRODUCTION FIX: Decrement CHWBL/WRR_HASH load for expired sessions to prevent ghost load accumulation
         if (fd_ent->epv && fd_ent->ep_num >= 0) {
@@ -5926,7 +5926,7 @@ cleanup_expired_sessions(void)
           }
         }
 #endif /* HAVE_DP_GPU_ROUTING */
-        
+
         // Reset sticky session
         fd_ent->is_sticky = 0;
         fd_ent->sticky_server_id = -1;
@@ -5939,10 +5939,10 @@ cleanup_expired_sessions(void)
     }
     node = node->next;
   }
-  
+
   proxy_struct->last_session_cleanup = now;
   PROXY_UNLOCK();
-  
+
   if (cleaned_count > 0) {
     log_info("STICKY-SESSION: Cleaned up %d expired sessions", cleaned_count);
   }
@@ -5964,45 +5964,45 @@ proxy_select_ep_sticky(proxy_fd_ent_t *pfe, void *inbuf, size_t insz, int *ep)
   if (pfe->is_sticky && pfe->sticky_server_id < pfe->n_rfd) {
     *ep = pfe->sticky_server_id;
     return PROXY_SEL_EP_UC;
-  }    
-  
+  }
+
   // For new connections, determine session key and server
   char session_key[64] = {0};
   int server_id = -1;
-  
+
   // Try different session key extraction methods
   if (pfe->affinity_type == PROXY_AFFINITY_CONTENT && inbuf && insz > 0) {
     if (extract_content_session_key((const char*)inbuf, insz, session_key, sizeof(session_key)) == 0) {
       server_id = get_server_for_session(session_key, pfe->n_rfd);
-      log_info("STICKY-SESSION: CONTENT affinity SUCCESS - key='%s' -> server=%d", session_key, server_id);
-    } 
+      log_debug("STICKY-SESSION: CONTENT affinity SUCCESS - key='%s' -> server=%d", session_key, server_id);
+    }
   } else if (pfe->affinity_type == PROXY_AFFINITY_COOKIE && inbuf && insz > 0) {
     if (extract_cookie_session_key((const char*)inbuf, insz, session_key, sizeof(session_key)) == 0) {
       server_id = get_server_for_session(session_key, pfe->n_rfd);
-      log_info("STICKY-SESSION: COOKIE affinity SUCCESS - key='%s' -> server=%d", session_key, server_id);
-    } 
+      log_debug("STICKY-SESSION: COOKIE affinity SUCCESS - key='%s' -> server=%d", session_key, server_id);
+    }
   }
-  
+
   // Fallback to IP-based affinity
   if (server_id < 0) {
     generate_ip_session_key(pfe->fd, session_key, sizeof(session_key));
     server_id = get_server_for_session(session_key, pfe->n_rfd);
     pfe->affinity_type = PROXY_AFFINITY_IP;
-    log_info("STICKY-SESSION: IP affinity APPLIED - key='%s' -> server=%d", session_key, server_id);
+    log_debug("STICKY-SESSION: IP affinity APPLIED - key='%s' -> server=%d", session_key, server_id);
   }
-  
+
   // Bind this connection to the selected server
   pfe->sticky_server_id = server_id;
   pfe->is_sticky = 1;
   pfe->session_created = time(NULL);
   pfe->last_activity = time(NULL);
   strncpy(pfe->session_key, session_key, sizeof(pfe->session_key) - 1);
-  
-  *ep = server_id;  
-  
-  log_info("STICKY-SESSION: NEW BINDING CREATED - fd=%d, key='%s', server=%d, affinity_type=%d", 
+
+  *ep = server_id;
+
+  log_debug("STICKY-SESSION: NEW BINDING CREATED - fd=%d, key='%s', server=%d, affinity_type=%d",
            pfe->fd, session_key, server_id, pfe->affinity_type);
-  
+
   return PROXY_SEL_EP_UC;
 }
 
@@ -6150,13 +6150,13 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             uint64_t now = get_timestamp_ns();
             duration_us = (now - pfe->req_start_ts) / 1000;
           }
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[TRACE_EOF_CHECK] fd=%d odir=%d root_span=%016lx tracing_enabled=%d | "
                     "Will check if REQ_END or UP_END should be emitted",
                     pfe->fd, pfe->odir, pfe->root_span_id, is_tracing_enabled());
 #endif
-          
+
           if (pfe->odir == 1) {
             // Backend connection (odir=1) - emit UP_END
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -6244,7 +6244,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
            * sweep's bound) finishes the teardown. */
           shutdown(pfe->fd, SHUT_RD);
           notify_disarm_ent(proxy_struct->ns, pfe->fd);
-          log_info("[HALF_CLOSE] fd=%d: client finished its request and is awaiting "
+          log_debug("[HALF_CLOSE] fd=%d: client finished its request and is awaiting "
                    "the response; keeping the response leg open", pfe->fd);
           return 1;
         }
@@ -6262,7 +6262,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             // METRICS: Track graceful close with cache drain (TIER 3, Metric #12)
             atomic_fetch_add(&global_stats.peer_eof_graceful, 1);
 
-            log_info("[EOF_DEFERRED] fd=%d closed, but peer fd=%d has cache_count=%u (%.2f MB) - "
+            log_debug("[EOF_DEFERRED] fd=%d closed, but peer fd=%d has cache_count=%u (%.2f MB) - "
                      "Deferring shutdown until peer cache drains",
                      pfe->fd, peer_pfe->fd,
                      peer_pfe->cache_count, peer_pfe->cache_total_size / (1024.0 * 1024.0));
@@ -6301,7 +6301,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             proxy_defer_close_mark(pfe);
             shutdown(pfe->fd, SHUT_RD);
             notify_disarm_ent(proxy_struct->ns, pfe->fd);
-            log_info("[EOF_DEFERRED_ACCEL] fd=%d closed, peer fd=%d has no userspace "
+            log_debug("[EOF_DEFERRED_ACCEL] fd=%d closed, peer fd=%d has no userspace "
                      "cache but its response was accelerated - deferring the close so "
                      "redirected bytes are not discarded", pfe->fd, peer_pfe->fd);
             return 1;
@@ -6309,21 +6309,21 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             // Peer cache is empty, safe to close immediately
             // Log BEFORE accessing peer_pfe fields (defensive programming)
             int peer_fd = peer_pfe->fd;
-            log_info("[EOF_IMMEDIATE] fd=%d closed, peer fd=%d cache empty - Closing this side",
+            log_debug("[EOF_IMMEDIATE] fd=%d closed, peer fd=%d cache empty - Closing this side",
                      pfe->fd, peer_fd);
             shutdown(pfe->fd, SHUT_RDWR);
             return -1;
           }
         } else {
           // No peer connection, close immediately
-          log_info("[EOF] fd=%d (odir=%d): Peer closed connection (clean EOF), cache_count=%u, cache_size=%.2f MB",
+          log_debug("[EOF] fd=%d (odir=%d): Peer closed connection (clean EOF), cache_count=%u, cache_size=%.2f MB",
                    pfe->fd, pfe->odir,
                    pfe->cache_count, pfe->cache_total_size / (1024.0 * 1024.0));
           shutdown(pfe->fd, SHUT_RDWR);
           return -1;
         }
       }
-      
+
       // kTLS-specific: EIO can occur in several scenarios:
       // 1. TLS session ends normally (client sent FIN)
       // 2. Client closed connection (normal shutdown)
@@ -6344,9 +6344,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
           return -1;
         }
       }
-      
+
       if (errno != EWOULDBLOCK && errno != EAGAIN) {
-        log_info("recv() error on fd=%d: rval=%d, errno=%d (%s)",
+        log_debug("recv() error on fd=%d: rval=%d, errno=%d (%s)",
                  pfe->fd, rval, errno, strerror(errno));
         shutdown(pfe->fd, SHUT_RDWR);
         return -1;
@@ -6362,7 +6362,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
     log_debug("[SSL_PATH] fd=%d odir=%d rval=%d | Taking SSL error handling path",
               pfe->fd, pfe->odir, rval);
 #endif
-    
+
     if (rval > 0) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[SSL_RVAL_POSITIVE] fd=%d odir=%d rval=%d | Returning 0 (success)",
@@ -6370,7 +6370,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
 #endif
       return 0;
     }
-    
+
     int ssl_error = SSL_get_error(pfe->ssl, rval);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[SSL_GET_ERROR] fd=%d odir=%d rval=%d ssl_error=%d | "
@@ -6379,7 +6379,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
               SSL_ERROR_NONE, SSL_ERROR_ZERO_RETURN, SSL_ERROR_WANT_READ,
               SSL_ERROR_WANT_WRITE, SSL_ERROR_SYSCALL, SSL_ERROR_SSL);
 #endif
-    
+
     switch (ssl_error) {
       case SSL_ERROR_NONE:
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -6395,7 +6395,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
 #endif
         log_trace("ssl-syscall-failed %s",
           ERR_error_string(ERR_get_error(), NULL));
-        
+
 #ifdef HAVE_HTTP_TRACE
         // Emit REQ_END trace event for SSL errors when rval==0 (EOF) on frontend
         if (rval == 0 && is_tracing_enabled() && pfe->odir == 0 && pfe->root_span_id != 0) {
@@ -6404,7 +6404,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             uint64_t now = get_timestamp_ns();
             duration_us = (now - pfe->req_start_ts) / 1000;
           }
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[TRACE_EVENT_REQ_END_SSL_ERROR] fd=%d odir=%d | "
                     "Emitting REQ_END for SSL error (ssl_error=%d) | "
@@ -6413,11 +6413,11 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
                     pfe->trace_id_hi, pfe->trace_id_lo,
                     pfe->root_span_id, duration_us);
 #endif
-          
+
           emit_trace_event(pfe, 2, duration_us);
         }
 #endif
-        
+
         pfe->ssl_err = 1;
         shutdown(pfe->fd, SHUT_RDWR);
         return -1;
@@ -6458,13 +6458,13 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             uint64_t now = get_timestamp_ns();
             duration_us = (now - pfe->req_start_ts) / 1000;
           }
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[TRACE_SSL_EOF_CHECK] fd=%d odir=%d root_span=%016lx | "
                     "SSL connection closed, checking trace emission",
                     pfe->fd, pfe->odir, pfe->root_span_id);
 #endif
-          
+
           if (pfe->odir == 1) {
             // Backend connection (odir=1) - emit UP_END
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -6507,7 +6507,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             // METRICS: Track graceful close with cache drain (TIER 3, Metric #12)
             atomic_fetch_add(&global_stats.peer_eof_graceful, 1);
 
-            log_info("[SSL_EOF_DEFERRED] fd=%d SSL closed, but peer fd=%d has cache_count=%u (%.2f MB) - "
+            log_debug("[SSL_EOF_DEFERRED] fd=%d SSL closed, but peer fd=%d has cache_count=%u (%.2f MB) - "
                      "Deferring shutdown until peer cache drains",
                      pfe->fd, peer_pfe->fd,
                      peer_pfe->cache_count, peer_pfe->cache_total_size / (1024.0 * 1024.0));
@@ -6626,9 +6626,9 @@ mtls_validate_client_cn(SSL *ssl, proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
   X509 *peer_cert = NULL;
   SSL_CTX *ssl_ctx = NULL;
   proxy_arg_t *arg = NULL;
-  
+
   (void)tepval;  // Unused parameter - kept for API compatibility
-  
+
   if (!ssl || !pfe) {
     return 0;  // No validation needed
   }
@@ -6651,13 +6651,13 @@ mtls_validate_client_cn(SSL *ssl, proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
 
   // Retrieve proxy_arg_t from SSL_CTX ex_data (stored during proxy_add_entry)
   // Note: g_ssl_ctx_proxy_arg_index is defined/initialized in sockproxy_mtls.c
-  log_debug("[mTLS] Retrieving config for fd=%d: ssl=%p ctx=%p index=%d", 
+  log_debug("[mTLS] Retrieving config for fd=%d: ssl=%p ctx=%p index=%d",
             pfe->fd, (void*)ssl, (void*)ssl_ctx, g_ssl_ctx_proxy_arg_index);
-  
+
   arg = SSL_CTX_get_ex_data(ssl_ctx, g_ssl_ctx_proxy_arg_index);
-  
+
   log_debug("[mTLS] Retrieved proxy_arg=%p for fd=%d", (void*)arg, pfe->fd);
-  
+
   if (!arg) {
     // No mTLS config stored - accept connection
     log_debug("[mTLS] No mTLS config in SSL_CTX for fd=%d, accepting", pfe->fd);
@@ -6691,7 +6691,7 @@ mtls_validate_client_cn(SSL *ssl, proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
   }
 
   // CN matches pattern - accept connection
-  log_info("[mTLS] CN pattern validated successfully for fd=%d", pfe->fd);
+  log_debug("[mTLS] CN pattern validated successfully for fd=%d", pfe->fd);
   X509_free(peer_cert);
   atomic_fetch_add(&global_stats.mtls_frontend_verify_success, 1);
   return 0;
@@ -6703,7 +6703,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
 {
   proxy_ep_sel_t ep_sel = { 0 };
   // int j, n_eps = 0, seltype = 0;   // TODO: Change Me. Current default select type is 0 (PROXY_SEL_RR)
-  int j, n_eps = 0, seltype = PROXY_SEL_STICKY;   
+  int j, n_eps = 0, seltype = PROXY_SEL_STICKY;
   int epprotocol, protocol;
   uint32_t rid = 0;
   proxy_fd_ent_t *npfe1 = pfe;
@@ -6715,9 +6715,9 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
 
   ent = pfe->head;
   assert(ent);
-  
+
   log_debug("[SETUP_PROXY_PATH] fd=%d: Called with prefix_hash=0x%lx, conv_id=%s, seltype=%d",
-            pfe->fd, pfe->prefix_key.hash, 
+            pfe->fd, pfe->prefix_key.hash,
             pfe->has_conv_id ? pfe->conversation_id : "(none)",
             pfe->seltype);
 
@@ -6727,7 +6727,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
   }
 
   memset(&ep_sel, 0, sizeof(ep_sel));
-  
+
   // NEW: Pass custom session header value (if extracted).
   // Fallback priority: X-Conversation-Id/custom header → JSON "user" field.
   // This enables per-conversation stickiness for normal (non-P/D) AI GW mode
@@ -6740,12 +6740,12 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     custom_header = pfe->user_id;
   }
 
-  log_info("[NS_SETUP_PATH] fd=%d session_hdr='%s' has_custom=%d custom_val='%s' has_user=%d user='%s'",
+  log_debug("[NS_SETUP_PATH] fd=%d session_hdr='%s' has_custom=%d custom_val='%s' has_user=%d user='%s'",
            pfe->fd, pfe->session_header_name[0] ? pfe->session_header_name : "(none)",
            pfe->has_custom_session_header,
            pfe->has_custom_session_header ? pfe->custom_session_header_value : "",
            pfe->has_user_id, pfe->has_user_id ? pfe->user_id : "");
-  
+
   /* PROXY protocol v2 (L7 fullproxy, mandatory when enabled on the rule): build the
    * 28-byte v4 header once from the client socket's addresses. key->dip/dport = the
    * real client (getpeername), key->sip/sport = the VIP the client dialed
@@ -6784,13 +6784,13 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
     }
     pfe->pd_phase = PD_PHASE_PARKED;
-    log_info("[PD_ADMISSION] fd=%d SUSPENDED (parked ep=%d) — EPOLLIN-paused, held open",
+    log_debug("[PD_ADMISSION] fd=%d SUSPENDED (parked ep=%d) — EPOLLIN-paused, held open",
              pfe->fd, pfe->park_ep_idx);
     return PD_SETUP_PARKED;
   }
   if (psep_rc) {
     proxy_log_always("no endpoint", key);
-    
+
 #ifdef HAVE_HTTP_TRACE
     // CRITICAL: Emit REQ_END with error status before closing connection
     // This ensures traces show up in Jaeger for backend failure scenarios
@@ -6800,20 +6800,20 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         uint64_t now = get_timestamp_ns();
         duration_us = (now - pfe->req_start_ts) / 1000;
       }
-      
+
       // Set HTTP 502 Bad Gateway status for backend connection failure
       pfe->http_status_code = 502;
-      
+
       log_info("[TRACE_ERROR] fd=%d: Emitting REQ_END with status 502 (backend unavailable) duration=%luμs trace=%016lx%016lx",
                pfe->fd, duration_us, pfe->trace_id_hi, pfe->trace_id_lo);
-      
+
       emit_trace_event(pfe, LXB_EVENT_REQ_END, duration_us);
-      
+
       // Clear root_span_id to prevent duplicate REQ_END emission during cleanup
       pfe->root_span_id = 0;
     }
 #endif
-    
+
     /* Selection/connect failed. Every rule-matched failure path now emits an
      * HTTP error body first (P/D 429/503, generalized connect-retry 502,
      * all-down 503) and marks lb_err_body_sent — so this counter now ticks
@@ -6829,11 +6829,11 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
   }
 
   n_eps = ep_sel.n_eps;
-  
+
   // Session Learning: If proxy_setup_ep__ marked connection for learning, set up npfe1
   if (ep_sel.n_eps > 0 && ep_sel.ep_cfds[0].needs_learning) {
     npfe1->needs_session_learning = 1;
-    strncpy(npfe1->session_header_name, ep_sel.session_header_name, 
+    strncpy(npfe1->session_header_name, ep_sel.session_header_name,
             sizeof(npfe1->session_header_name) - 1);
     npfe1->session_header_name[sizeof(npfe1->session_header_name) - 1] = '\0';
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -6855,7 +6855,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       if (ssl) {
         SSL_shutdown(ssl);
       }
-      
+
 #ifdef HAVE_DP_GPU_ROUTING
       // CRITICAL FIX: Decrement CHWBL/WRR_HASH load on skmap key extraction failure
       // Connection was established but failed to get socket metadata
@@ -6866,7 +6866,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         }
       }
 #endif /* HAVE_DP_GPU_ROUTING */
-      
+
       shutdown(pfe->fd, SHUT_RDWR);
       return -1;
     }
@@ -6881,7 +6881,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     //
     // Rationale: Only HTTP→HTTP is supported for simplicity and reliability.
     // kTLS provides sufficient performance for HTTPS scenarios without sockmap complexity.
-    
+
     int sockmap_eligible = 0;
     int ktls_client_enabled __attribute__((unused)) = 0;
     int ktls_backend_enabled __attribute__((unused)) = 0;
@@ -6900,7 +6900,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         } else if (ktls_is_active(pfe->fd)) {
           ktls_client_enabled = 1;
           pfe->ktls_enabled = 1;
-        } 
+        }
       }
       // Case 3: HTTPS→HTTPS (TLS transit) - SOCKMAP DISABLED, kTLS ONLY
       else if (pfe->ssl && ssl && g_ktls_cfg.enabled) {
@@ -6957,7 +6957,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->_id = rid;
     npfe2->epv = NULL;  // P1.3: Backend FD should NOT have epv reference
     npfe2->n_rfd++;
-    
+
 #ifdef HAVE_HTTP_TRACE
     // CRITICAL: Copy trace context AND client connection info from frontend to backend
     // This ensures UP_END and backend TLS_HS events have the correct trace_id and client_ip
@@ -6977,7 +6977,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     log_debug("[TRACE_CONTEXT_COPY] Backend fd=%d inherited trace_id=%016lx%016lx client=%s:%u from frontend fd=%d",
               npfe2->fd, npfe2->trace_id_hi, npfe2->trace_id_lo, client_ip_str, npfe1->client_port, npfe1->fd);
 #endif
-    
+
     // Emit UP_START event (upstream connection established)
     // NOTE: Must be emitted AFTER trace context is copied so root_span_id is set correctly
     if (is_tracing_enabled()) {
@@ -6992,7 +6992,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       emit_trace_event(npfe2, LXB_EVENT_UP_START, 0);
     }
 #endif
-    
+
     // Session Learning: Copy learning parameters from client to backend connection
     if (npfe1->needs_session_learning) {
       npfe2->needs_session_learning = 1;
@@ -7001,7 +7001,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
        * model pool on this service starts at 0. Carry the pool that owns it
        * (epv stays NULL here by the P1.3 load-accounting rule above). */
       npfe2->learn_epv = tepval;
-      strncpy(npfe2->session_header_name, npfe1->session_header_name, 
+      strncpy(npfe2->session_header_name, npfe1->session_header_name,
               sizeof(npfe2->session_header_name) - 1);
       npfe2->session_header_name[sizeof(npfe2->session_header_name) - 1] = '\0';
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -7018,7 +7018,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     } else {
       npfe2->ktls_enabled = 0;
     }
-    
+
     // Initialize cache tracking for backend connection
     npfe2->cache_count = 0;
     npfe2->cache_total_size = 0;
@@ -7044,7 +7044,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
      * been accelerated its acceleration, and nothing else: the connection stays
      * on the userspace relay, which is exactly the byte path it needs. */
     if (sockmap_mode && proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
-      log_info("Sockmap: not pairing fd=%d/%d, the rule rewrites every request "
+      log_debug("Sockmap: not pairing fd=%d/%d, the rule rewrites every request "
                "(l7_policy=%u); staying on the userspace relay",
                pfe->fd, ep_cfd, ent->has_l7_policy);
       sockmap_mode = 0;
@@ -7158,7 +7158,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         npfe2->ssl = NULL;
       }
       pfe_recycle(npfe2);   /* D2 root fix: pool the shell (frees rcvbuf, bumps gen) */
-      
+
 #ifdef HAVE_DP_GPU_ROUTING
       // CRITICAL FIX: Decrement CHWBL/WRR_HASH load on notify_add_ent failure
       // Connection was established but failed to register with notification system
@@ -7170,7 +7170,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         }
       }
 #endif /* HAVE_DP_GPU_ROUTING */
-      
+
       shutdown(pfe->fd, SHUT_RDWR);
       log_error("failed to add epcfd %d", ep_cfd);
       return -1;
@@ -7449,7 +7449,7 @@ handle_on_message_complete(llhttp_t* parser)
   if (pii_cfg && pii_cfg->enabled && pfe->http_content_length > 0 && pfe->rcv_off > 0) {
     if (pfe->http_content_length >= pii_cfg->min_body_size &&
         pfe->http_content_length <= pii_cfg->max_body_size) {
-      
+
       // Find body start
       const char *body_start = NULL;
       size_t body_len = 0;
@@ -7461,7 +7461,7 @@ handle_on_message_complete(llhttp_t* parser)
           break;
         }
       }
-      
+
       if (body_start && body_len > 0) {
         // Check URL patterns
         int should_scan = 1;
@@ -7474,13 +7474,13 @@ handle_on_message_complete(llhttp_t* parser)
             }
           }
         }
-        
+
         if (should_scan && presidio_is_initialized()) {
           // Check if content is JSON (Content-Type detection)
           int is_json = 0;
           const char *headers = (const char *)pfe->rcvbuf;
           size_t headers_len = body_start - headers;
-          
+
           if (headers_len > 20 && headers_len < 8192) {
             // Search for Content-Type: application/json (case-insensitive)
             const char *ct_pos = strnstr_portable(headers, "Content-Type:", headers_len);
@@ -7498,37 +7498,37 @@ handle_on_message_complete(llhttp_t* parser)
               }
             }
           }
-          
+
           // Scan with Presidio (JSON-aware or text mode)
           presidio_operators_t ops = {0};
           ops.default_op.type = PRESIDIO_OP_REPLACE;
-          strncpy(ops.default_op.params, "{\"new_value\":\"***PII***\"}", 
+          strncpy(ops.default_op.params, "{\"new_value\":\"***PII***\"}",
                   sizeof(ops.default_op.params) - 1);
-          
+
           // Set entity-specific operators (required for structured anonymization)
           ops.email_op.type = PRESIDIO_OP_REPLACE;
-          strncpy(ops.email_op.params, "{\"new_value\":\"***PII***\"}", 
+          strncpy(ops.email_op.params, "{\"new_value\":\"***PII***\"}",
                   sizeof(ops.email_op.params) - 1);
-          
+
           ops.ssn_op.type = PRESIDIO_OP_REPLACE;
-          strncpy(ops.ssn_op.params, "{\"new_value\":\"***PII***\"}", 
+          strncpy(ops.ssn_op.params, "{\"new_value\":\"***PII***\"}",
                   sizeof(ops.ssn_op.params) - 1);
-          
+
           ops.credit_card_op.type = PRESIDIO_OP_REPLACE;
-          strncpy(ops.credit_card_op.params, "{\"new_value\":\"***PII***\"}", 
+          strncpy(ops.credit_card_op.params, "{\"new_value\":\"***PII***\"}",
                   sizeof(ops.credit_card_op.params) - 1);
-          
+
           ops.phone_op.type = PRESIDIO_OP_REPLACE;
-          strncpy(ops.phone_op.params, "{\"new_value\":\"***PII***\"}", 
+          strncpy(ops.phone_op.params, "{\"new_value\":\"***PII***\"}",
                   sizeof(ops.phone_op.params) - 1);
-          
+
           ops.person_op.type = PRESIDIO_OP_REPLACE;
-          strncpy(ops.person_op.params, "{\"new_value\":\"***PII***\"}", 
+          strncpy(ops.person_op.params, "{\"new_value\":\"***PII***\"}",
                   sizeof(ops.person_op.params) - 1);
-          
+
           pii_scan_result_v2_t *scan_result_v2 = NULL;
           int scan_rc;
-          
+
           if (is_json && presidio_json_enabled()) {
             // JSON-aware anonymization
             log_debug("[PII_JSON] Using JSON mode for request");
@@ -7537,13 +7537,13 @@ handle_on_message_complete(llhttp_t* parser)
             // Text-based anonymization (existing)
             scan_rc = presidio_scan_v2(body_start, body_len, &ops, &scan_result_v2);
           }
-          
-          if (scan_rc == 0 && scan_result_v2 && scan_result_v2->anonymized_text && 
+
+          if (scan_rc == 0 && scan_result_v2 && scan_result_v2->anonymized_text &&
               scan_result_v2->anonymized_len > 0) {
-            
+
             log_info("[PII_DETECTED] fd=%d path=%s entities=%d",
                     pfe->fd, pfe->request_path, scan_result_v2->entity_count);
-            
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
             // Show original body preview (first 200 chars)
             char orig_preview[201];
@@ -7552,7 +7552,7 @@ handle_on_message_complete(llhttp_t* parser)
             orig_preview[orig_preview_len] = '\0';
             log_debug("[PII_ORIGINAL] fd=%d: Original body (first 200): %s",
                      pfe->fd, orig_preview);
-            
+
             // Show masked body preview (first 200 chars)
             char masked_preview[201];
             size_t masked_preview_len = scan_result_v2->anonymized_len > 200 ? 200 : scan_result_v2->anonymized_len;
@@ -7561,23 +7561,23 @@ handle_on_message_complete(llhttp_t* parser)
             log_debug("[PII_MASKED] fd=%d: Masked body (first 200): %s",
                      pfe->fd, masked_preview);
 #endif
-            
+
             // Store masked text for deferred application
             if (pii_cfg->mode != PRESIDIO_MODE_DETECT_ONLY) {
               pfe->pii_masked_text = malloc(scan_result_v2->anonymized_len + 1);
               if (pfe->pii_masked_text) {
-                memcpy(pfe->pii_masked_text, scan_result_v2->anonymized_text, 
+                memcpy(pfe->pii_masked_text, scan_result_v2->anonymized_text,
                        scan_result_v2->anonymized_len);
                 pfe->pii_masked_text[scan_result_v2->anonymized_len] = '\0';
                 pfe->pii_masked_len = scan_result_v2->anonymized_len;
                 pfe->pii_needs_masking = 1;
-                
-                log_info("[PII_DEFERRED] fd=%d: Stored masked text %zu→%zu bytes",
+
+                log_debug("[PII_DEFERRED] fd=%d: Stored masked text %zu→%zu bytes",
                         pfe->fd, body_len, pfe->pii_masked_len);
               }
             }
           }
-          
+
           if (scan_result_v2) {
             presidio_free_result_v2(scan_result_v2);
           }
@@ -7698,7 +7698,7 @@ handle_on_message_complete(llhttp_t* parser)
     // Look up catalog_id from proxy entry BEFORE emitting REQ_START
     // This ensures body capture can be triggered if catalog matches
     catalog_id = pfe->catalog_id;
-    
+
     // If catalog_id not set yet, try to get it from proxy entry now
     if (catalog_id == 0 && pfe->request_path[0] != '\0' && pfe->head != NULL) {
       proxy_map_ent_t *ent = (proxy_map_ent_t *)pfe->head;
@@ -7726,7 +7726,7 @@ handle_on_message_complete(llhttp_t* parser)
         // Find body start by searching for "\r\n\r\n" (end of headers)
         const char *body_start = NULL;
         size_t body_len = 0;
-        
+
         for (size_t i = 0; i < pfe->rcv_off - 3; i++) {
           if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
               pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
@@ -7735,17 +7735,17 @@ handle_on_message_complete(llhttp_t* parser)
             break;
           }
         }
-      
+
         if (body_start && body_len > 0) {
           // Generate root_span_id BEFORE body capture to avoid filename collision
           // (Multiple concurrent requests would all use 0000000000000000 otherwise)
           if (pfe->root_span_id == 0) {
             pfe->root_span_id = lxb_gen_span_id();
           }
-          
+
           char filename[32];
           snprintf(filename, sizeof(filename), "lxb-body-%016lx.json", pfe->root_span_id);
-          
+
           int result = lxb_capture_body_to_tmpfs(
             pfe->trace_id_hi,
             pfe->root_span_id,
@@ -7753,21 +7753,21 @@ handle_on_message_complete(llhttp_t* parser)
             body_len,
             catalog_id
           );
-          
+
           if (result >= 0) {
             strncpy(pfe->body_file_path, filename, sizeof(pfe->body_file_path) - 1);
             pfe->body_file_path[sizeof(pfe->body_file_path) - 1] = '\0';
             pfe->has_body_file = 1;
             body_captured = 1;
           }
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[HTTP_TRACE] Body captured from rcvbuf: path=/dev/shm/%s size=%zu result=%d",
                     filename, body_len, result);
 #endif
         }
       }  // End of should_sample && content_length check
-      
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       // Debug log to show the sampling/capture decision
       log_debug("[TRACE_EVENT_REQ_START] fd=%d odir=%d | "
@@ -7792,7 +7792,7 @@ handle_on_message_complete(llhttp_t* parser)
       proxy_fd_ent_t *client_pfe = pfe->rfd_ent[0];
       if (client_pfe->pd_phase == PD_PHASE_PREFILL_WAITING) {
         client_pfe->pd_phase = PD_PHASE_PREFILL_DONE;
-        log_info("Prefill complete — client_fd=%d backend_fd=%d "
+        log_debug("Prefill complete — client_fd=%d backend_fd=%d "
                  "resp_len=%zu",
                  client_pfe->fd, pfe->fd, client_pfe->pd_prefill_resp_len);
 
@@ -7819,7 +7819,7 @@ handle_on_message_complete(llhttp_t* parser)
                                         1000000ULL);
             }
             int d_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            log_info(" llb_ai_pd_record (decode error): model=%s prefill=%lldms kv=%d",
+            log_debug(" llb_ai_pd_record (decode error): model=%s prefill=%lldms kv=%d",
                      pd_dec_model, (long long)d_prefill_ms, d_kv);
             llb_ai_pd_record((char *)pd_dec_model, d_prefill_ms, 0, d_kv, 2);
           }
@@ -8079,28 +8079,28 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
   //   2. Cookie: "cookie:JSESSIONID" → extracts specific cookie value
   //   3. Query param: "query:sessionid" → extracts from URL query string
   //   4. Basic Auth: "basic-auth" → extracts username from Authorization header
-  
+
   if (pfe->session_header_name[0] != '\0') {
-    
+
     // ROUTE 1: Cookie-specific extraction (cookie:NAME)
     if (strncmp(pfe->session_header_name, "cookie:", 7) == 0) {
       // Only process Cookie header
       if (!strncasecmp("Cookie", pfe->last_header_name, 6)) {
         const char *cookie_name = pfe->session_header_name + 7;  // Skip "cookie:"
-        
+
         // Build full Cookie header string for parsing
         char cookie_header[2048];
         snprintf(cookie_header, sizeof(cookie_header), "Cookie: %.*s", (int)length, at);
-        
+
         char cookie_value[256];
-        if (extract_cookie_by_name(cookie_header, cookie_name, 
+        if (extract_cookie_by_name(cookie_header, cookie_name,
                                    cookie_value, sizeof(cookie_value)) == 0) {
           // Successfully extracted cookie value
-          strncpy(pfe->custom_session_header_value, cookie_value, 
+          strncpy(pfe->custom_session_header_value, cookie_value,
                   sizeof(pfe->custom_session_header_value) - 1);
           pfe->custom_session_header_value[sizeof(pfe->custom_session_header_value) - 1] = '\0';
           pfe->has_custom_session_header = 1;
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[SESSION_COOKIE] fd=%d: Extracted cookie '%s'='%s' for session affinity",
                    pfe->fd, cookie_name, cookie_value);
@@ -8108,13 +8108,13 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
         }
       }
     }
-    
+
     // ROUTE 2: Query parameter extraction (query:NAME)
     else if (strncmp(pfe->session_header_name, "query:", 6) == 0) {
       // Extract from URL in request line (stored during http_on_url callback)
       if (pfe->url_path[0] != '\0') {
         const char *param_name = pfe->session_header_name + 6;  // Skip "query:"
-        
+
         char param_value[256];
         if (extract_query_param_value(pfe->url_path, param_name,
                                       param_value, sizeof(param_value)) == 0) {
@@ -8122,7 +8122,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
                   sizeof(pfe->custom_session_header_value) - 1);
           pfe->custom_session_header_value[sizeof(pfe->custom_session_header_value) - 1] = '\0';
           pfe->has_custom_session_header = 1;
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[SESSION_QUERY] fd=%d: Extracted query param '%s'='%s' from URL '%s'",
                    pfe->fd, param_name, param_value, pfe->url_path);
@@ -8130,7 +8130,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
         }
       }
     }
-    
+
     // ROUTE 3: HTTP Basic Auth username extraction (basic-auth)
     else if (strcmp(pfe->session_header_name, "basic-auth") == 0) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -8149,26 +8149,26 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
         if (length < sizeof(auth_value)) {
           strncpy(auth_value, at, length);
           auth_value[length] = '\0';
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[BASICAUTH_BEFORE_EXTRACT] fd=%d: auth_value='%s'",
                    pfe->fd, auth_value);
 #endif
-          
+
           char username[256];
           int extract_result = extract_basic_auth_username(auth_value, username, sizeof(username));
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[BASICAUTH_AFTER_EXTRACT] fd=%d: extract_result=%d",
                    pfe->fd, extract_result);
 #endif
-          
+
           if (extract_result == 0) {
             strncpy(pfe->custom_session_header_value, username,
                     sizeof(pfe->custom_session_header_value) - 1);
             pfe->custom_session_header_value[sizeof(pfe->custom_session_header_value) - 1] = '\0';
             pfe->has_custom_session_header = 1;
-            
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
             log_debug("[SESSION_BASICAUTH] fd=%d: Extracted username='%s' from Basic Auth",
                      pfe->fd, username);
@@ -8177,17 +8177,17 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
         }
       }
     }
-    
+
     // ROUTE 4: Regular header extraction (default behavior - backward compatible)
     else {
       size_t header_name_len = strlen(pfe->session_header_name);
-      
+
       // Case-insensitive comparison with configured header name
       if (header_name_len == strlen(pfe->last_header_name) &&
-          !strncasecmp(pfe->session_header_name, 
-                      pfe->last_header_name, 
+          !strncasecmp(pfe->session_header_name,
+                      pfe->last_header_name,
                       header_name_len)) {
-        
+
         /* Match found. A value that does not fit is reduced to a digest of
          * the whole value rather than dropped: the previous "only if it
          * fits" guard silently disabled stickiness for every long value,
@@ -8198,7 +8198,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
                                sizeof(pfe->custom_session_header_value),
                                at, length) == 0) {
           pfe->has_custom_session_header = 1;
-          
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
           log_debug("[SESSION_HEADER] fd=%d: Extracted header '%s'='%.*s' (bound as '%s') for session affinity",
                    pfe->fd, pfe->session_header_name, (int)length, at,
@@ -8293,7 +8293,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
       if (length < sizeof(header_buf) - 1) {
         strncpy(header_buf, at, length);
         header_buf[length] = '\0';
-        
+
         // Parse traceparent header
         uint8_t flags = 0;
         int ret = lxb_parse_traceparent(header_buf,
@@ -8398,18 +8398,18 @@ handle_url(llhttp_t *parser, const char *at, size_t length)
 
 /*
  * handle_new_connection - Accept and initialize new client connections
- * 
+ *
  * Extracted from proxy_notifier to improve debuggability.
  * Handles: accept(), SSL handshake, ALPN negotiation, HTTP/2 setup,
  * session initialization, and registration with notification system.
- * 
+ *
  * @param fd: Listen socket file descriptor
  * @param pfe: Proxy file descriptor entry for listen socket
  * @param ent: Proxy map entry containing config (SSL context, etc.)
  * @param key: Sockmap key (output parameter)
  * @param rkey: Reverse sockmap key (output parameter)
  * @param ep_sel: Endpoint selection data (output parameter)
- * 
+ *
  * Returns: 0 on success (connection accepted), -1 to restart, 1 to continue loop
  */
 int
@@ -8444,7 +8444,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
             &global_stats.pd_admission_total_blocked, 1, memory_order_relaxed) + 1;
         /* Rate-limit the log so a sustained flood does not spam: every 1024th. */
         if ((blk & 1023u) == 1u) {
-          log_info("[PD_ADMISSION] accept gated: total_inflight=%lu >= bound=%u "
+          log_debug("[PD_ADMISSION] accept gated: total_inflight=%lu >= bound=%u "
                    "(blocked_total=%lu) — SYN held in listen backlog",
                    (unsigned long)cur, total_bound, (unsigned long)blk);
         }
@@ -8500,7 +8500,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[SSL_HANDSHAKE_OK] fd=%d: SSL_accept succeeded, ssl=%p", new_sd, ssl);
 #endif
-    
+
     // Note: Frontend TLS_HS event will be emitted later when we have pfe context
     // (after npfe1 is fully initialized below)
   } else {
@@ -8515,7 +8515,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   // Allocate and initialize new proxy entry
   npfe1 = pfe_alloc();   /* D2 root fix: pooled pfe shell */
   assert(npfe1);
-  
+
   npfe1->stype = PROXY_SOCK_ACTIVE;
   npfe1->fd = new_sd;
   npfe1->seltype = pfe->seltype;
@@ -8532,7 +8532,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   } else {
     npfe1->ktls_enabled = 0;
   }
-  
+
 #ifdef HAVE_HTTP_TRACE
   // Emit frontend TLS handshake event (for HTTPS→* proxy modes)
   if (ssl && is_tracing_enabled()) {
@@ -8549,22 +8549,22 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     emit_trace_event(npfe1, LXB_EVENT_TLS_HS, 0);
   }
 #endif
-  
+
   // Check ALPN and initialize HTTP/2 session if negotiated
   if (ssl) {
     const unsigned char *alpn_proto = NULL;
     unsigned int alpn_len = 0;
     SSL_get0_alpn_selected(ssl, &alpn_proto, &alpn_len);
-    
+
     if (alpn_proto && alpn_len > 0) {
       char alpn_str[32] = {0};
       snprintf(alpn_str, sizeof(alpn_str), "%.*s", (int)alpn_len, alpn_proto);
-      
+
       // Check for HTTP/2
       if (alpn_len == 2 && memcmp(alpn_proto, "h2", 2) == 0) {
         if (proxy_check_and_setup_h2(npfe1) != 0) {
           npfe1->protocol_version = 1;
-        } 
+        }
       } else if (alpn_len == 8 && memcmp(alpn_proto, "http/1.1", 8) == 0) {
         npfe1->protocol_version = 1;
       } else {
@@ -8577,7 +8577,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     // No SSL - must be HTTP/1.1
     npfe1->protocol_version = 1;
   }
-  
+
   // Initialize session affinity fields
   npfe1->sticky_server_id = -1;
   npfe1->is_sticky = 0;
@@ -8585,22 +8585,22 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->session_created = 0;
   npfe1->last_activity = 0;
   npfe1->affinity_type = PROXY_AFFINITY_NONE;
-  
+
   // Initialize custom session header fields
   npfe1->custom_session_header_value[0] = '\0';
   npfe1->has_custom_session_header = 0;
   npfe1->session_header_name[0] = '\0';
-  
+
   // Link to service entry and copy session header config
   npfe1->head = ent;
   if (ent && ent->val.ephash && ent->val.ephash->session_header_enabled) {
     strncpy(npfe1->session_header_name, ent->val.ephash->session_header_name,
             sizeof(npfe1->session_header_name) - 1);
     npfe1->session_header_name[sizeof(npfe1->session_header_name) - 1] = '\0';
-    log_info("[NS_CONN_INIT] fd=%d session_header_name='%s' (sticky enabled)",
+    log_debug("[NS_CONN_INIT] fd=%d session_header_name='%s' (sticky enabled)",
              new_sd, npfe1->session_header_name);
   } else {
-    log_info("[NS_CONN_INIT] fd=%d no session header (ent=%p ephash=%p enabled=%d)",
+    log_debug("[NS_CONN_INIT] fd=%d no session header (ent=%p ephash=%p enabled=%d)",
              new_sd, (void*)ent, ent ? (void*)ent->val.ephash : NULL,
              (ent && ent->val.ephash) ? ent->val.ephash->session_header_enabled : 0);
   }
@@ -8766,7 +8766,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       size_t old_len = pfe->rcv_off;
       int removed = sp_http_strip_expect_100_continue(pfe->rcvbuf,
                                                        &pfe->rcv_off);
-      log_info("[JSON_STREAM_CONTINUE] fd=%d stripped %d upstream Expect "
+      log_debug("[JSON_STREAM_CONTINUE] fd=%d stripped %d upstream Expect "
                "header(s), request bytes %zu->%zu", pfe->fd, removed,
                old_len, pfe->rcv_off);
     }
@@ -8808,7 +8808,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
             pfe->rcv_off = ug_hdr_len + ug_new_len;
             pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
                                      SP_SOCK_MSG_LEN, ug_new_len);
-            log_info("[AI_USAGE_INJECT] fd=%d body %zu -> %zu bytes",
+            log_debug("[AI_USAGE_INJECT] fd=%d body %zu -> %zu bytes",
                      pfe->fd, ug_body_len, ug_new_len);
           }
           /* Size the prompt-estimate net while the body is at hand — only
@@ -9017,7 +9017,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     {
       int pd_dis = (pfe->epv &&
                     ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) ? 1 : 0;
-      log_info("[PD_DECISION] fd=%d reqid=%s has_reqid=%d cl=%zu streamable=%d "
+      log_debug("[PD_DECISION] fd=%d reqid=%s has_reqid=%d cl=%zu streamable=%d "
                "disagg=%d odir=%d pd_phase=%d n_rfd=%d ep_num=%d decision=%s",
                pfe->fd,
                pfe->vllm_request_id[0] ? pfe->vllm_request_id : "-",
@@ -9077,7 +9077,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       if (pfe->http_content_length > sb_body_fwd) {
         pfe->stream_body_remaining =
             sp_stream_body_remaining(pfe->http_content_length, sb_body_fwd);
-        log_info("[STREAM_BODY_TRACK] fd=%d streamed request: %zu of %zu body "
+        log_debug("[STREAM_BODY_TRACK] fd=%d streamed request: %zu of %zu body "
                  "bytes forwarded with headers, %zu outstanding — relay mode "
                  "until drained", pfe->fd, sb_body_fwd,
                  pfe->http_content_length, pfe->stream_body_remaining);
@@ -9139,7 +9139,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     // These fields belong to request N's (now-finished) response stream; N+1's response has
     // not begun (we just forwarded N+1's prefill), so the reset is unconditional and safe.
     if (pfe->sse_active || pfe->stream_end_ts != 0 || pfe->sse_tail_len) {
-      log_info("[KA_SSE_RESET] fd=%d clearing stale stream state before next keep-alive "
+      log_debug("[KA_SSE_RESET] fd=%d clearing stale stream state before next keep-alive "
                "request (sse_active=%d stream_end_ts=%ld sse_tail_len=%d)",
                pfe->fd, pfe->sse_active, (long)pfe->stream_end_ts, pfe->sse_tail_len);
     }
@@ -9268,7 +9268,7 @@ pd_resume_parked(int fd)
   struct llb_sockmap_key rkey = { 0 };
   const char *phurl = pfe->http_hvok ? pfe->host_url : NULL;
 
-  log_info("[PD_ADMISSION] fd=%d RESUME (owner worker) — re-driving dispatch", fd);
+  log_debug("[PD_ADMISSION] fd=%d RESUME (owner worker) — re-driving dispatch", fd);
 
   int fwd_rc = pd_setup_and_forward(fd, pfe, &key, &rkey, phurl);
   if (fwd_rc == SP_FWD_PARKED) {
@@ -9426,11 +9426,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         qos_bucket_credit(qos_b, qos_grant);
       }
     }
-    
+
     // Log only errors and EOF for debugging
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     if (rc == 0) {
-      log_info("🔌 [EOF_READ] fd=%d (odir=%d): Connection closed by peer (EOF)",
+      log_debug("🔌 [EOF_READ] fd=%d (odir=%d): Connection closed by peer (EOF)",
                fd, pfe->odir);
     } else if (rc < 0 && saved_errno != EAGAIN && saved_errno != EWOULDBLOCK) {
       log_debug("⚠️  [READ_ERROR] fd=%d (odir=%d): Read error %d (%s)",
@@ -9445,7 +9445,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
      * stall; pd_phase_start_ts/n_rfd/ep_num expose why no reaper gate matched. Correlate reqid with
      * the client x-request-id. Unconditional so evidence survives any build-flag config. */
     if (rc == 0 && pfe->odir == 0) {
-      log_info("[PD_STUCK] fd=%d reqid=%s pd_phase=%d n_rfd=%d ep_num=%d sse_active=%d "
+      log_debug("[PD_STUCK] fd=%d reqid=%s pd_phase=%d n_rfd=%d ep_num=%d sse_active=%d "
                "pd_phase_start_ts=%ld disagg=%d",
                fd, pfe->vllm_request_id[0] ? pfe->vllm_request_id : "-",
                (int)pfe->pd_phase, pfe->n_rfd, pfe->ep_num, pfe->sse_active,
@@ -9468,16 +9468,16 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 fd, pfe->odir);
       break;
     }
-    
+
     errno = saved_errno;  // Restore errno before error checking
-    
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     if (rc <= 0) {
       log_debug("[BEFORE_SOCK_READ_ERR] fd=%d odir=%d rc=%d | About to call proxy_sock_read_err()",
                 fd, pfe->odir, rc);
     }
 #endif
-    
+
     if ((sret = proxy_sock_read_err(pfe, rc))) {
       // CRITICAL FIX: Break out of burst read loop when EOF is deferred
       // If proxy_sock_read_err returns 1 (keep alive), it means peer has cached data
@@ -9485,7 +9485,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       // Instead, break out and return to epoll - peer will trigger EPOLLOUT when cache drains
       break;
     }
-    
+
     if (!pfe->odir) {  // Client → Proxy direction (odir=0)
       const char *phurl = "";
 
@@ -9509,7 +9509,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                     : L7_TCP_INSPECT_DEFAULT_MS;
               uint32_t inspect_s = (inspect_ms + 999) / 1000;
               if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
-                log_info("[TCP_INSPECT] fd=%d (h2): header-accumulation deadline %ums exceeded "
+                log_debug("[TCP_INSPECT] fd=%d (h2): header-accumulation deadline %ums exceeded "
                          "(slowloris guard) — dropping connection", fd, inspect_ms);
                 return -1;
               }
@@ -9555,7 +9555,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
         pfe->stream_body_remaining -= sb_take;
         if (pfe->stream_body_remaining == 0) {
-          log_info("[STREAM_BODY_TRACK] fd=%d streamed body fully relayed",
+          log_debug("[STREAM_BODY_TRACK] fd=%d streamed body fully relayed",
                    pfe->fd);
         }
         if ((size_t)rc > sb_take) {
@@ -9610,7 +9610,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->pd_phase == PD_PHASE_NONE &&
           ((pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) ||
            ai_gw_boundary)) {
-        log_info("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
+        log_debug("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
                  "request (n_rfd=%d rfd0=%d ai_gw=%d) — reframe/gate re-arm",
                  pfe->fd, pfe->n_rfd, pfe->rfd[0], ai_gw_boundary);
         proxy_release_rfd_ctx(pfe);
@@ -9643,7 +9643,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                     : L7_TCP_INSPECT_DEFAULT_MS;
               uint32_t inspect_s = (inspect_ms + 999) / 1000;  /* round up to whole seconds */
               if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
-                log_info("[TCP_INSPECT] fd=%d: header-accumulation deadline %ums exceeded "
+                log_debug("[TCP_INSPECT] fd=%d: header-accumulation deadline %ums exceeded "
                          "(slowloris guard) — dropping connection", fd, inspect_ms);
                 return -1;  /* restart/teardown — partial headers dropped at the deadline */
               }
@@ -9655,7 +9655,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         // HTTP/2 connection preface: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes)
         if (pfe->rcv_off >= 24 && !pfe->h2_session) {
           const char *preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-          if (memcmp(pfe->rcvbuf, preface, 24) == 0) {                  
+          if (memcmp(pfe->rcvbuf, preface, 24) == 0) {
             // Initialize HTTP/2 session
             if (proxy_check_and_setup_h2(pfe) == 0) {
               /* Hand rcvbuf to nghttp2 now, as the h2 branch above does.
@@ -9700,7 +9700,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             if (data_preview[i] < 32 || data_preview[i] > 126) data_preview[i] = '.';
           }
         }
-        
+
         // Reset flags before parsing
         int json_stream_was_pending = pfe->json_stream_route_pending;
         pfe->http_pok = 0;
@@ -9708,10 +9708,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         pfe->http_hvok = 0;
         pfe->http_body_complete = 0;
         pfe->is_streamable = 0;
-        
+
         // Parse only the NEW data (incremental parsing)
         size_t to_parse = pfe->rcv_off - pfe->parsed_off;
-        
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         // Show first 200 bytes of data being parsed
         char parse_preview[256];
@@ -9725,10 +9725,10 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         log_debug("[PARSE_DATA] fd=%d: Parsing %zu bytes starting at offset %zu: %.200s",
                   fd, to_parse, pfe->parsed_off, parse_preview);
 #endif
-        
+
         enum llhttp_errno err = llhttp_execute(&pfe->parser,
                                 (char *)pfe->rcvbuf + pfe->parsed_off, to_parse);
-        
+
         // Update how much we've parsed
         pfe->parsed_off = pfe->rcv_off;
 
@@ -9740,7 +9740,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->http_hok = 1;
           pfe->http_hvok = pfe->host_url[0] != '\0';
         }
-        
+
         if (err == HPE_OK) {
           /* headers complete — clear the accumulation anchor so the tcp_inspect
            * deadline never bounds the body-upload phase (it guards header accumulation only). */
@@ -9814,7 +9814,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           if (needs_body_inspection &&
               pfe->http_content_length > SP_JSON_INSPECT_MAX) {
             if (!pfe->json_stream_route_pending) {
-              log_info("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
+              log_debug("[JSON_STREAM_FALLBACK] fd=%d: JSON Content-Length=%zu > "
                        "inspect cap %d - bounded model routing before streaming "
                        "(Tier-2 fail-open)",
                        fd, pfe->http_content_length, SP_JSON_INSPECT_MAX);
@@ -9825,7 +9825,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           }
 
           int is_streamable = !needs_body_inspection;
-          
+
           if (pfe->http_hok && is_streamable && pfe->http_content_length > (64 * 1024)) {
             if (json_stream_fallback) {
               const uint8_t *route_body = NULL;
@@ -9851,7 +9851,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                     log_error("[JSON_STREAM_MODEL] fd=%d failed to send "
                               "complete bounded 400 response", fd);
                   pfe->lb_err_body_sent = 1;
-                  log_info("[JSON_STREAM_MODEL] fd=%d no complete top-level "
+                  log_debug("[JSON_STREAM_MODEL] fd=%d no complete top-level "
                            "model within %u buffered body bytes", fd,
                            SP_JSON_ROUTE_PREFIX_MAX);
                   return -1;
@@ -9862,33 +9862,33 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               sp_store_authoritative_body_model(
                   pfe->prefix_key.model, sizeof(pfe->prefix_key.model),
                   pfe->x_model_header, body_model);
-              log_info("[JSON_STREAM_MODEL] fd=%d model='%s' resolved from %zu "
+              log_debug("[JSON_STREAM_MODEL] fd=%d model='%s' resolved from %zu "
                        "buffered body bytes", fd, pfe->prefix_key.model,
                        route_body_len);
             }
 
-            log_error("🚀 [EARLY_BACKEND_CONNECT] fd=%d: LARGE CONTENT detected (Content-Length=%zu bytes, %.2f KB) - "
+            log_debug("🚀 [EARLY_BACKEND_CONNECT] fd=%d: LARGE CONTENT detected (Content-Length=%zu bytes, %.2f KB) - "
                      "Streaming mode enabled (not application/json or form-urlencoded, no body inspection needed)",
                      fd, pfe->http_content_length, pfe->http_content_length / 1024.0);
-            
+
             // Mark body as "complete" to trigger backend connection
             // Even though full body hasn't arrived yet, we have enough info to route
             pfe->http_body_complete = 1;
-            
+
             // Mark as streamable to skip JSON body parsing below
             pfe->is_streamable = 1;
-            
+
             // Fall through to backend setup code below
             // Remaining body will be streamed via proxy_multiplexor in burst loop
           }
-          
+
           // Backend setup conditions:
           // 1. STREAMING MODE: hok=1 + early body_complete=1 (for large non-JSON content)
           // 2. BUFFERING MODE: pok=1 + body_complete=1 (for JSON/form data needing body inspection)
           if ((pfe->http_hok && pfe->http_body_complete && pfe->is_streamable) ||
               (pfe->http_pok && pfe->http_body_complete && !pfe->is_streamable)) {
             // Now we have the complete HTTP request (or early trigger for large streamable content)
-            
+
             // P0.2: Extract LLM prefix from JSON body
             // SKIP for streamable content - only inspect JSON/form data
             if (!pfe->is_streamable && pfe->http_content_length > 0 && pfe->rcv_off > 0) {
@@ -9897,7 +9897,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               // For llhttp, we need to find body start by looking for "\r\n\r\n"
               const char *body_start = NULL;
               size_t body_len = 0;
-              
+
               // Search for end of headers marker
               for (size_t search_idx = 0; search_idx < pfe->rcv_off - 3; search_idx++) {
                 if (pfe->rcvbuf[search_idx] == '\r' &&
@@ -9909,9 +9909,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                   break;
                 }
               }
-              
+
               log_debug("[BODY_SEARCH] fd=%d: body_start=%p, body_len=%zu", fd, body_start, body_len);
-              
+
               if (body_start && body_len > 0) {
 #ifdef HAVE_HTTP_TRACE
                 // CRITICAL FIX: Capture body for deep inspection BEFORE protocol-specific parsing
@@ -9925,7 +9925,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                       // Use only root_span_id for shorter filename (fits in 32 bytes)
                       snprintf(filename, sizeof(filename), "lxb-body-%016lx.json", pfe->root_span_id);
                       snprintf(body_path, sizeof(body_path), "/dev/shm/%s", filename);
-                      
+
                       int result = lxb_capture_body_to_tmpfs(
                         pfe->trace_id_hi,
                         pfe->root_span_id,
@@ -9933,14 +9933,14 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                         body_len,
                         pfe->catalog_id
                       );
-                      
+
                       if (result >= 0) {
                         // Store ONLY filename (Go will prepend /dev/shm/)
                         strncpy(pfe->body_file_path, filename, sizeof(pfe->body_file_path) - 1);
                         pfe->body_file_path[sizeof(pfe->body_file_path) - 1] = '\0';
                         pfe->has_body_file = 1;
                       }
-                      
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
                       log_debug("[HTTP_TRACE] Body captured: catalog_id=%d size=%zu result=%d path=%s",
                                 pfe->catalog_id, body_len, result, body_path);
@@ -9948,7 +9948,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                     }
                 }
 #endif
-                
+
                 // (B1): chat-routing signal + raw-body locator for
                 // the KV-exact tokenize stage. body_start points INTO pfe->rcvbuf
                 // (== rcvbuf + header_end + 4), so we pin the body as an
@@ -9974,20 +9974,20 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 log_debug("[PREFIX_EXTRACT_ATTEMPT] fd=%d: Trying to extract prefix from JSON body_len=%zu",
                           fd, body_len);
                 if (extract_llm_prefix(body_start, body_len, &pfe->prefix_key) == 0) {
-                  
+
                   // P1.1: Compute hash for CHWBL routing using xxHash
                   uint64_t prefix_hash = compute_prefix_hash(&pfe->prefix_key);
                   pfe->prefix_key.hash = prefix_hash;
-                  log_debug("[PREFIX_EXTRACTED] fd=%d: prefix_hash=0x%lx, model=%s, prefix=%s", 
+                  log_debug("[PREFIX_EXTRACTED] fd=%d: prefix_hash=0x%lx, model=%s, prefix=%s",
                             fd, prefix_hash, pfe->prefix_key.model, pfe->prefix_key.prefix);
-                  
+
                   // P0.3: Generate conversation ID if not provided by client
                   if (!pfe->has_conv_id && pfe->prefix_key.valid) {
                     // FIX #1 CORRECTED: Salt by prefix hash, not fd
                     // This ensures same user gets same conversation ID across turns
                     // but different users with similar queries get different IDs
-                    uint64_t user_salt = XXH64(pfe->prefix_key.prefix, 
-                                                strlen(pfe->prefix_key.prefix), 
+                    uint64_t user_salt = XXH64(pfe->prefix_key.prefix,
+                                                strlen(pfe->prefix_key.prefix),
                                                 0xCAFEBABE);
                     snprintf(pfe->conversation_id, sizeof(pfe->conversation_id),
                              "auto-%016lx-%08lx", prefix_hash, (unsigned long)(user_salt & 0xFFFFFFFF));
@@ -10012,7 +10012,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               log_debug("[NO_CONTENT_LENGTH] fd=%d: http_content_length=%zu, rcv_off=%zu - skipping prefix extraction",
                         fd, pfe->http_content_length, pfe->rcv_off);
             }
-            
+
             if (pfe->http_hvok) {
               phurl = pfe->host_url;
             } else {
@@ -10048,7 +10048,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             // Setup backend connection + forward.: the dispatch+forward
             // sequence is factored into pd_setup_and_forward() so the bounded-admission
             // RESUME path (pd_resume_parked) re-drives the EXACT same code as a fresh
-            // dispatch. PARKED => held/suspended (keep fd, no forward, no close — 
+            // dispatch. PARKED => held/suspended (keep fd, no forward, no close —
             // resumes via the owner-worker wake). DONE => forwarded (break the loop).
             {
               int fwd_rc = pd_setup_and_forward(fd, pfe, key, rkey, phurl);
@@ -10064,7 +10064,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             // Early backend connection (at 512KB) should prevent reaching this threshold
             if (pfe->rcv_off >= (SP_SOCK_MSG_LEN * 95 / 100)) {
               log_error("⚠️  BUFFER OVERFLOW: Request too large (%zu/%d bytes, 95%% full) - "
-                       "Content-Length header missing or upload exceeds buffer capacity! fd=%d", 
+                       "Content-Length header missing or upload exceeds buffer capacity! fd=%d",
                        pfe->rcv_off, SP_SOCK_MSG_LEN, fd);
               log_error("   Parse state: pok=%d hok=%d body_complete=%d content_len=%zu",
                        pfe->http_pok, pfe->http_hok, pfe->http_body_complete, pfe->http_content_length);
@@ -10075,7 +10075,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           }
           // Continue reading more data in next iteration
           continue;
-          
+
         } else if (pfe->ai_gw_denied) {
           /* Not malformed HTTP — the AI gate refused this request from inside
            * on_message_complete, already answered the client and shut its
@@ -10182,32 +10182,32 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       // Backend pfe (odir=1) doesn't have h2_session - check client pfe instead
       proxy_fd_ent_t *client_pfe = (pfe->odir == 1 && pfe->n_rfd > 0) ? pfe->rfd_ent[0] : NULL;
       if (client_pfe && client_pfe->h2_session && client_pfe->h2_session->h2_enabled) {
-        // HTTP/2 backend response path - use nghttp2 to process frames              
+        // HTTP/2 backend response path - use nghttp2 to process frames
         // Accumulate data in buffer for nghttp2 processing
         pfe->rcv_off += rc;
-        
+
         // Process HTTP/2 frames from backend and forward to client
         if (proxy_h2_handle_backend_data(pfe) < 0) {
           log_error("[HTTP/2 Backend] fd=%d: Failed to handle backend response", fd);
           return -1; // Restart
         }
-        
+
         // Reset buffer after processing (nghttp2 consumed all data)
         pfe->rcv_off = 0;
-        
+
         // HTTP/2 handler manages state, skip HTTP/1.1 forwarding below
         continue;
       }
-      
+
       // HTTP/1.1 backend response - parse headers for session learning
       if (rc > 0) {
         char preview[512];
         int preview_len = rc < 400 ? rc : 400;
         memcpy(preview, pfe->rcvbuf, preview_len);
         preview[preview_len] = '\0';
-        
+
         // DIAGNOSTIC: Check if this looks like HTTP headers
-        if (pfe->rcv_off == 0 && rc > 10 && 
+        if (pfe->rcv_off == 0 && rc > 10 &&
             memcmp(pfe->rcvbuf, "HTTP/", 5) == 0) {
           // This is the start of an HTTP response - log headers
           char *header_end = strstr((char *)pfe->rcvbuf, "\r\n\r\n");
@@ -10217,7 +10217,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             size_t copy_len = header_len < sizeof(headers) - 1 ? header_len : sizeof(headers) - 1;
             memcpy(headers, pfe->rcvbuf, copy_len);
             headers[copy_len] = '\0';
-            
+
             // Session Learning: Extract session header from backend response
             // Only attempt if: (1) needs_session_learning flag set, (2) session_header_name configured
             if (pfe->needs_session_learning && pfe->session_header_name[0] != '\0') {
@@ -10228,64 +10228,64 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 while (line_start && line_start < headers + copy_len) {
                   char *line_end = strstr(line_start, "\r\n");
                   if (!line_end || line_end == line_start) break;  // End of headers
-                  
+
                   // Check if this line contains our session header
                   char *colon = strchr(line_start, ':');
                   if (colon && colon < line_end) {
                     size_t header_name_len = colon - line_start;
                     size_t session_name_len = strlen(pfe->session_header_name);
-                    
+
                     // Case-insensitive header name comparison
-                    if (header_name_len == session_name_len && 
+                    if (header_name_len == session_name_len &&
                         strncasecmp(line_start, pfe->session_header_name, header_name_len) == 0) {
                       // Found session header! Extract value
                       char *value_start = colon + 1;
                       while (value_start < line_end && (*value_start == ' ' || *value_start == '\t')) {
                         value_start++;  // Skip whitespace
                       }
-                      
+
                       size_t value_len = line_end - value_start;
                       if (value_len > 0 && value_len < sizeof(pfe->learned_session_id) - 1) {
                         // Store learned session ID
                         memcpy(pfe->learned_session_id, value_start, value_len);
                         pfe->learned_session_id[value_len] = '\0';
-                        
+
                         // Get service entry and store binding in conversation map
                         proxy_map_ent_t *ent = (proxy_map_ent_t *)pfe->head;
                         if (ent && pfe->ep_num >= 0) {
                           // Create conversation ID from header name + value
                           char conv_id[MAX_CONV_ID_LEN];
                           // CRITICAL FIX: Validate combined length before storing
-                          size_t total_len = strlen("custom__") + strlen(pfe->session_header_name) + 
+                          size_t total_len = strlen("custom__") + strlen(pfe->session_header_name) +
                                              strlen(pfe->learned_session_id) + 1;
                           if (total_len >= MAX_CONV_ID_LEN) {
                             log_warn("[SESSION_LEARN_OVERFLOW] Session ID too long (%zu bytes), truncating to %d",
                                      total_len, MAX_CONV_ID_LEN);
                           }
-                          snprintf(conv_id, sizeof(conv_id), "custom_%s_%s", 
+                          snprintf(conv_id, sizeof(conv_id), "custom_%s_%s",
                                    pfe->session_header_name, pfe->learned_session_id);
-                          
+
                           // Store mapping: session_id → endpoint_index
                           /* Backend leg: the pool rides on learn_epv, not epv. */
                           if (store_conversation_endpoint(ent, conv_id, pfe->ep_num,
                                                           (const proxy_epval_t *)pfe->learn_epv) == 0) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-                            log_info("[SESSION_LEARNED] Backend returned '%s: %s' → bound to endpoint[%d]",
+                            log_debug("[SESSION_LEARNED] Backend returned '%s: %s' → bound to endpoint[%d]",
                                      pfe->session_header_name, pfe->learned_session_id, pfe->ep_num);
 #endif
                           }
                         }
-                        
+
                         pfe->needs_session_learning = 0;  // Learning complete
                       }
                       break;  // Found and processed session header
                     }
                   }
-                  
+
                   line_start = line_end + 2;  // Move to next line
                 }
               }
-              
+
               // If we didn't find session header in response, that's OK (backward compat)
               // Just clear the learning flag and continue with IP-based routing
               if (pfe->needs_session_learning) {
@@ -10296,7 +10296,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 pfe->needs_session_learning = 0;
               }
             }
-            
+
             // Check for Content-Length or Transfer-Encoding
             if (strstr(headers, "Content-Length:")) {
               log_trace("http-content-length fd=%d", fd);
@@ -10309,16 +10309,16 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             }
           }
         }
-        
+
         // Log as hex to see chunk framing clearly
         for (int i = 0; i < preview_len && i < 200; i += 16) {
           char hex_line[80];
           char ascii_line[20] __attribute__((unused));  // P6: Mark unused to suppress warning
           int line_len = (preview_len - i) < 16 ? (preview_len - i) : 16;
-          
+
           for (int j = 0; j < line_len; j++) {
             sprintf(hex_line + j*3, "%02x ", (unsigned char)pfe->rcvbuf[i+j]);
-            ascii_line[j] = (pfe->rcvbuf[i+j] >= 32 && pfe->rcvbuf[i+j] < 127) ? 
+            ascii_line[j] = (pfe->rcvbuf[i+j] >= 32 && pfe->rcvbuf[i+j] < 127) ?
                              pfe->rcvbuf[i+j] : '.';
           }
           ascii_line[line_len] = '\0';
@@ -10337,13 +10337,13 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         // Check for header end marker (\r\n\r\n) in current packet
         char *headers_end_check = memmem(pfe->rcvbuf, rc, "\r\n\r\n", 4);
         int should_inject = (headers_end_check != NULL);
-        
+
         // P7 FIX: If body is present, skip injection to prevent corruption
         // Body data in same packet as headers means Content-Length mismatch risk
         if (should_inject && headers_end_check) {
           size_t header_len = (headers_end_check + 4) - (char*)pfe->rcvbuf;
           size_t body_in_packet = rc - header_len;
-          
+
           // If there's substantial body data (>10 bytes), this is likely a complete
           // POST request with JSON body - DON'T inject to avoid corrupting body
           if (body_in_packet > 10) {
@@ -10443,6 +10443,6 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 burst_break:
   // 🔍 DEBUG: Log burst loop exit
   log_trace("burst-end fd=%d", fd);
-  
+
   return 0; // Success
 }
