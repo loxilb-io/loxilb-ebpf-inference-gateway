@@ -1679,7 +1679,7 @@ pd_max_park_sec(void)
  * EXACTLY. 0/unset = DISABLED ⇒ accept() is byte-identical (no gate, no counter
  * check). When >0, accept() refuses a new client connection once the global
  * pd_admission_total_inflight gauge has reached this bound, leaving the SYN in
- * the listen(fd,32) backlog so the kernel applies natural TCP backpressure (the
+ * the listen backlog so the kernel applies natural TCP backpressure (the
  * XDP-safest primitive under --net=host — no established-conn epoll/XDP state is
  * touched). This is a SEPARATE outer guard from the per-EP cap and the
  * per-EP FIFO (/05). */

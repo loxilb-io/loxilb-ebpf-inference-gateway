@@ -590,7 +590,10 @@ proxy_server_setup(int fd, uint32_t server, uint16_t port, uint8_t protocol)
     return -1; 
   }
 
-  rc = listen(fd, 32);
+  /* The accept loop shares its worker with the relay, so a burst of
+   * connects has to wait in the kernel backlog until that worker gets back
+   * to the listener. The kernel caps the backlog at net.core.somaxconn. */
+  rc = listen(fd, SOMAXCONN);
   if (rc < 0) {
     log_error("listen failed %s", strerror(errno));
     close(fd);

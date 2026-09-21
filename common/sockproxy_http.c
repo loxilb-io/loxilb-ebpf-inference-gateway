@@ -8427,7 +8427,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
    * LLB_PD_MAX_TOTAL_INFLIGHT). BEFORE accept(), if the bound is enabled
    * (pd_max_total_inflight() > 0, i.e. LLB_PD_MAX_TOTAL_INFLIGHT set) and the
    * global in-flight gauge has reached it, REFUSE this accept() — return WITHOUT
-   * calling accept() so the SYN stays in the listen(fd,32) backlog and the kernel
+   * calling accept() so the SYN stays in the listen backlog and the kernel
    * applies natural TCP backpressure. This is the XDP-safest primitive under
    * --net=host: it touches NO established-conn epoll/XDP state and does NOT delete
    * the listener from the pollset (a busy spin while over the bound is bounded by
