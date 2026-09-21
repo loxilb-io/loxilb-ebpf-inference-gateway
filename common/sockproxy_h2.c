@@ -540,6 +540,25 @@ append_stream_data(proxy_h2_stream_t *stream, const uint8_t *data, size_t len)
 // nghttp2 Callbacks
 // ============================================================================
 
+/* A request header block has begun on the client session: arm the
+ * header-completion deadline (cleared on END_HEADERS in
+ * proxy_h2_on_frame_recv_callback). Only header blocks are timed, so DATA,
+ * PING and WINDOW_UPDATE frames of a live stream never arm it. */
+static int
+proxy_h2_on_begin_headers_callback(nghttp2_session *session,
+                                   const nghttp2_frame *frame,
+                                   void *user_data)
+{
+  proxy_fd_ent_t *pfe = (proxy_fd_ent_t *)user_data;
+
+  (void)session;
+  (void)frame;
+  if (pfe && pfe->l7_hdr_accum_start == 0) {
+    pfe->l7_hdr_accum_start = time(NULL);
+  }
+  return 0;
+}
+
 /**
  * Called when a complete frame is received
  */
@@ -2363,6 +2382,11 @@ proxy_setup_h2_session(proxy_fd_ent_t *pfe, int is_client)
   pfe->h2_session->h2_enabled = 1;
   pfe->h2_session->max_concurrent_streams = 100;  // Default
   pfe->h2_session->created_ts = time(NULL);
+  /* A client session owes its first HEADERS within the header-completion
+   * deadline, counted from the preface. Cleared on END_HEADERS. */
+  if (!is_client && pfe->l7_hdr_accum_start == 0) {
+    pfe->l7_hdr_accum_start = pfe->h2_session->created_ts;
+  }
 
   // METRICS: Track HTTP/2 session creation (TIER 1, Metric #4)
   atomic_fetch_add(&global_stats.h2_sessions, 1);
@@ -2386,6 +2410,10 @@ proxy_setup_h2_session(proxy_fd_ent_t *pfe, int is_client)
   nghttp2_session_callbacks_set_send_callback(callbacks, proxy_h2_send_callback);
   nghttp2_session_callbacks_set_recv_callback(callbacks, proxy_h2_recv_callback);
   nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, proxy_h2_on_frame_recv_callback);
+  if (!is_client) {
+    nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks,
+        proxy_h2_on_begin_headers_callback);
+  }
   nghttp2_session_callbacks_set_on_header_callback(callbacks, proxy_h2_on_header_callback);
   nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, proxy_h2_on_data_chunk_recv_callback);
   nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, proxy_h2_on_stream_close_callback);

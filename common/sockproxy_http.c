@@ -9529,27 +9529,20 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       if (pfe->h2_session && pfe->h2_session->h2_enabled) {
         pfe->rcv_off += rc;
 
-        /* (H2 parity with the H1 path below): header-accumulation deadline.
-         * On the L7_Proxy peer only (has_l7_policy==1), anchor at the first client byte and drop
-         * the connection if the HEADERS frame has not completed within timeout_tcp_inspect_ms
-         * (or the bounded default). The anchor is cleared in proxy_h2_on_frame_recv_callback once
- * END_HEADERS arrives. No-op for the AI peer / un-configured listeners. */
+        /* Header-completion deadline (slowloris guard). The anchor is set
+         * when the session is created and when a header block begins
+         * (proxy_h2_on_begin_headers_callback) and cleared on END_HEADERS
+         * (proxy_h2_on_frame_recv_callback), so it only measures header
+         * blocks, never the frames of a live stream. */
         {
           proxy_map_ent_t *h2ent = (proxy_map_ent_t *)pfe->head;
-          if (h2ent && h2ent->has_l7_policy) {
-            if (pfe->l7_hdr_accum_start == 0) {
-              pfe->l7_hdr_accum_start = time(NULL);
-            } else {
-              uint32_t inspect_ms = (h2ent->arg_ptr && h2ent->arg_ptr->timeout_tcp_inspect_ms > 0)
-                                    ? h2ent->arg_ptr->timeout_tcp_inspect_ms
-                                    : L7_TCP_INSPECT_DEFAULT_MS;
-              uint32_t inspect_s = (inspect_ms + 999) / 1000;
-              if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
-                log_debug("[TCP_INSPECT] fd=%d (h2): header-accumulation deadline %ums exceeded "
-                         "(slowloris guard) — dropping connection", fd, inspect_ms);
-                return -1;
-              }
-            }
+          if (proxy_hdr_deadline_expired(h2ent, pfe, time(NULL))) {
+            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+            atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            log_debug("[TCP_INSPECT] fd=%d (h2): header-completion deadline %ums exceeded "
+                     "(slowloris guard) — dropping connection", fd,
+                     proxy_hdr_deadline_ms(h2ent));
+            return -1;
           }
         }
 
@@ -9660,30 +9653,26 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         // Accumulate data in buffer
         pfe->rcv_off += rc;
 
-        /* header-accumulation deadline (slowloris guard). On the L7_Proxy
-         * peer ONLY (has_l7_policy==1), bound the total time spent accumulating the request headers
-         * before they complete. Anchor the deadline at the first byte of the in-progress request,
-         * then drop the connection if the configured timeout_tcp_inspect_ms (or the bounded default
-         * when 0) elapses before http_hok flips. For the AI peer / un-configured listeners
- * (has_l7_policy==0) this is a pure no-op (byte-for-byte unchanged). The H1
-         * \r\n\r\n terminator is reflected by pfe->http_hok after llhttp_execute below; we evaluate
-         * the deadline here, before re-parsing, using the anchor set on the previous (partial) read. */
+        /* Header-completion deadline (slowloris guard), every listener.
+         * Anchor at the first byte of the in-progress request, then drop the
+         * connection if the listener's deadline elapses before http_hok
+         * flips. The \r\n\r\n terminator is reflected by pfe->http_hok after
+         * llhttp_execute below; the deadline is evaluated here, before
+         * re-parsing, against the anchor set on the previous partial read.
+         * The health pass evaluates the same deadline for a client that
+         * stops sending altogether. */
         {
           proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
-          if (hent && hent->has_l7_policy) {
-            if (pfe->l7_hdr_accum_start == 0) {
-              pfe->l7_hdr_accum_start = time(NULL);  /* anchor at first partial-header byte */
-            } else if (pfe->http_hok == 0) {
-              uint32_t inspect_ms = (hent->arg_ptr && hent->arg_ptr->timeout_tcp_inspect_ms > 0)
-                                    ? hent->arg_ptr->timeout_tcp_inspect_ms
-                                    : L7_TCP_INSPECT_DEFAULT_MS;
-              uint32_t inspect_s = (inspect_ms + 999) / 1000;  /* round up to whole seconds */
-              if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
-                log_debug("[TCP_INSPECT] fd=%d: header-accumulation deadline %ums exceeded "
-                         "(slowloris guard) — dropping connection", fd, inspect_ms);
-                return -1;  /* restart/teardown — partial headers dropped at the deadline */
-              }
-            }
+          if (pfe->l7_hdr_accum_start == 0) {
+            pfe->l7_hdr_accum_start = time(NULL);  /* anchor at first partial-header byte */
+          } else if (pfe->http_hok == 0 &&
+                     proxy_hdr_deadline_expired(hent, pfe, time(NULL))) {
+            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+            atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
+                     "(slowloris guard) — dropping connection", fd,
+                     proxy_hdr_deadline_ms(hent));
+            return -1;  /* restart/teardown — partial headers dropped at the deadline */
           }
         }
 

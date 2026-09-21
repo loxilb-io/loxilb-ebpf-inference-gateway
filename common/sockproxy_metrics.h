@@ -141,6 +141,11 @@ typedef struct proxy_metrics_snapshot {
      * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks
      * above. */
     uint64_t pd_admission_overflow_shed;
+
+    /* Client connections dropped for not completing their request headers
+     * within the listener's deadline (read path and health pass). TAIL-APPEND
+     * ONLY — same three-way lockstep contract as the blocks above. */
+    uint64_t hdr_deadline_drops;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

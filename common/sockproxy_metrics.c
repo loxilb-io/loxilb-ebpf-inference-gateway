@@ -228,6 +228,7 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.pd_decode_zero_byte_eof    = atomic_load(&global_stats.pd_decode_zero_byte_eof);
     snapshot.pd_connect_failover        = atomic_load(&global_stats.pd_connect_failover);
     snapshot.lb_select_failure_shutdown = atomic_load(&global_stats.lb_select_failure_shutdown);
+    snapshot.hdr_deadline_drops         = atomic_load(&global_stats.hdr_deadline_drops);
 
     /* Same-EP reconnect counters (tail-appended snapshot fields). */
     snapshot.pd_connect_retry_same_ep    = atomic_load(&global_stats.pd_connect_retry_same_ep);
