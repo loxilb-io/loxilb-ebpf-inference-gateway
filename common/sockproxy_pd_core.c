@@ -160,7 +160,7 @@ pd_frame_mismatch_log(proxy_fd_ent_t *pfe, const uint8_t *buf, size_t cur_len,
   size_t hdr_len   = he ? (size_t)(he + 4 - buf) : 0;
   size_t body_bytes = (cur_len > hdr_len) ? cur_len - hdr_len : 0;
   int mismatch = (declared_cl > 0 && body_bytes != declared_cl);
-  log_info("[FRAME_MISMATCH] fd=%d method=%s decl_cl=%zu hdr_len=%zu body=%zu "
+  log_debug("[FRAME_MISMATCH] fd=%d method=%s decl_cl=%zu hdr_len=%zu body=%zu "
            "rcv_off=%zu mismatch=%d tid=%lu site=%s",
            pfe->fd,
            llhttp_method_name(llhttp_get_method(&pfe->parser)),

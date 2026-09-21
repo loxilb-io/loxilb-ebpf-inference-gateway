@@ -28,6 +28,24 @@ struct proxy_arg;
 struct llb_sockmap_key;
 struct dp_proxy_ct_ent;
 
+/* Set to 1 at the entry of every raw C thread (proxy workers, reapers, watchdog,
+ * trace cleanup, libdp threads) so a fatal signal on it is reported and cored by
+ * llb_fatal_handler instead of being chained into the Go runtime, which has no
+ * goroutine there and re-raises it silently (badsignal -> raisebadsignal:
+ * exit 139, no line, no core). */
+#include <signal.h>
+extern __thread volatile sig_atomic_t g_llb_proxy_worker;
+struct proxy_fd_ent;
+/* Connection-list operation trace, enabled by LLB_FDLIST_TRACE=1 (see sockproxy_conn.c). */
+int pfe_trace_enabled(void);
+struct proxy_map_ent;
+/* Link a connection into / unlink it from its rule's connection list; both
+ * take the global proxy lock. The link refuses, with a log line, a shell that
+ * is already linked and returns 0 when linked. */
+int proxy_conn_list_add(struct proxy_map_ent *ent, struct proxy_fd_ent *pfe, const char *what);
+void proxy_conn_list_del(struct proxy_map_ent *ent, struct proxy_fd_ent *pfe);
+void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
+
 #define PROXY_LOCK() pthread_rwlock_wrlock(&proxy_struct->lock)
 #define PROXY_RDLOCK() pthread_rwlock_rdlock(&proxy_struct->lock)
 #define PROXY_UNLOCK() pthread_rwlock_unlock(&proxy_struct->lock)

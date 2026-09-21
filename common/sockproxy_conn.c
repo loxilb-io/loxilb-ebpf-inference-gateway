@@ -942,6 +942,45 @@ proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,
  * holding it — so it introduces no ordering relationship with NOTI/PROXY/ENT
  * (invariant I5 preserved).
  * ========================================================================= */
+/* `used` of a shell that sits on the freelist; no live shell can reach it */
+#define PFE_POOLED (-0x7ffffff)
+
+/* Connection-list operation trace. When LLB_FDLIST_TRACE=1 is set in the
+ * environment, every insert into and unlink from a rule's connection list, and
+ * every pool pop and recycle of a shell, writes one line carrying the list
+ * head and count observed at that moment. An offline replay of those lines
+ * (audit-perf/fdlist_replay.py) rebuilds the list and reports the first
+ * operation after which the real list and the rebuilt one disagree. Off by
+ * default: the enable check is one relaxed load. */
+static int pfe_trace_state = -1;   /* -1 not yet read, 0 off, 1 on */
+
+int
+pfe_trace_enabled(void)
+{
+  int s = __atomic_load_n(&pfe_trace_state, __ATOMIC_RELAXED);
+  if (s < 0) {
+    const char *e = getenv("LLB_FDLIST_TRACE");
+    s = (e && *e && *e != '0') ? 1 : 0;
+    __atomic_store_n(&pfe_trace_state, s, __ATOMIC_RELAXED);
+  }
+  return s;
+}
+
+void
+pfe_trace_op(const char *op, void *rule, proxy_fd_ent_t *pfe)
+{
+  proxy_map_ent_t *ent = rule;
+  if (!pfe_trace_enabled() || !pfe) {
+    return;
+  }
+  log_error("[FDLIST-OP] %s rule=%p node=%p fd=%d odir=%d used=%d gen=%lu next=%p head=%p list=%p nfds=%u tid=%ld",
+            op, rule, (void *)pfe, pfe->fd, pfe->odir, pfe->used,
+            (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed),
+            (void *)pfe->next, pfe->head,
+            ent ? (void *)ent->val.fdlist : NULL, ent ? ent->val.nfds : 0u,
+            (long)syscall(SYS_gettid));
+}
+
 static pthread_mutex_t pfe_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static proxy_fd_ent_t *pfe_pool_free;   /* freelist head, linked via ->next */
 static unsigned long   pfe_pool_total;  /* shells ever created (high-water)  */
@@ -957,6 +996,7 @@ pfe_alloc(void)
   pfe = pfe_pool_free;
   if (pfe) {
     pfe_pool_free = pfe->pool_next;   /* pop a recycled shell (gen preserved) */
+    pfe->used = 0;                    /* clears the PFE_POOLED mark (memset below does too) */
   }
   pfe_pool_live++;
   pthread_mutex_unlock(&pfe_pool_lock);
@@ -1002,6 +1042,7 @@ pfe_alloc(void)
      * dispatcher still holding an old (priv,gen) can never alias the new
      * connection's gen on this same address. */
     gen = atomic_load_explicit(&pfe->gen, memory_order_relaxed);
+    pfe_trace_op("pop", pfe->head, pfe);
     memset(pfe, 0, sizeof(*pfe));
     atomic_store_explicit(&pfe->gen, gen, memory_order_relaxed);
   }
@@ -1028,6 +1069,17 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   if (!pfe) {
     return;
   }
+  if (pfe->used == PFE_POOLED) {
+    /* Double recycle: the shell is already on the freelist. Refuse and log.
+     * The mark lives in `used` (a pooled shell has no user), so the layout of
+     * proxy_fd_ent stays unchanged. */
+    log_error("[PFE_POOL] double recycle of shell %p (fd=%d odir=%d used=%d gen=%lu) refused",
+              (void *)pfe, pfe->fd, pfe->odir, pfe->used,
+              (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed));
+    return;
+  }
+  pfe_trace_op("rec", pfe->head, pfe);
+  pfe->used = PFE_POOLED;
 
   /* A connection that ended on its own before the sweep reached it must not
    * leave the pending count raised, or the fast tick keeps walking for nothing. */
@@ -1122,6 +1174,9 @@ pfe_pool_selftest(void)
 static void
 proxy_free_fd_ctx(proxy_fd_ent_t *pfe)
 {
+  if (pfe->used == PFE_POOLED) {
+    return;   /* already on the freelist (pfe_recycle logged the double release) */
+  }
   if (pfe->used <= 0) {
 #ifdef HAVE_PII_DETECTION
     // Free deferred PII masking buffer if allocated
@@ -1139,6 +1194,14 @@ proxy_free_fd_ctx(proxy_fd_ent_t *pfe)
 void
 proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe)
 {
+  if (pfe->used == PFE_POOLED || pfe->used <= 0) {
+    /* A second release of a shell whose last reference is already gone: the
+     * first release recycled it (or is about to). Dropping the count below
+     * zero would recycle it again — see the pooled guard in pfe_recycle. */
+    log_error("[PFE_POOL] release of an already-freed shell %p (fd=%d odir=%d used=%d) — ignored",
+              (void *)pfe, pfe->fd, pfe->odir, pfe->used);
+    return;
+  }
   pfe->used--;
   proxy_free_fd_ctx(pfe);
 }

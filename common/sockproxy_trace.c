@@ -665,6 +665,7 @@ static int capture_body_for_tracing(proxy_fd_ent_t *pfe, lxb_trace_event_t *evt)
  */
 void *trace_file_cleanup_thread(void *arg) {
   (void)arg;
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
   
   while (proxy_struct->run) {
     DIR *dir = opendir("/dev/shm");

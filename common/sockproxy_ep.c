@@ -903,7 +903,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
              * can decrement even if the backend TCP connect fails before epv
              * is normally set. */
             if (!pfe->epv) pfe->epv = tepval;
-            log_info("[KV_SR] fd=%d single-role Tier-1.5 HIT -> EP%d",
+            log_debug("[KV_SR] fd=%d single-role Tier-1.5 HIT -> EP%d",
                      pfe->fd, kv_sr_ep);
           }
         }
@@ -1614,7 +1614,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
               connect_success = 1;
               
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-              log_info("[STICKY_SUCCESS] Connected to endpoint[%d]: %s:%u",
+              log_debug("[STICKY_SUCCESS] Connected to endpoint[%d]: %s:%u",
                        selected_ep, 
                        inet_ntoa(*(struct in_addr *)(&epip)), 
                        ntohs(epport));
@@ -1805,6 +1805,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
 void *
 proxy_conversation_cleanup_thread(void *arg)
 {
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
   time_t now;
   uint32_t total_removed;
   
@@ -1980,6 +1981,7 @@ proxy_conversation_cleanup_thread(void *arg)
 void *
 proxy_run(void *arg)
 {
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
   // Start notification system for socket events (this blocks)
   notify_start(proxy_struct->ns);
   return NULL;

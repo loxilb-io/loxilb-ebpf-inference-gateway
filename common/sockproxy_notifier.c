@@ -565,14 +565,14 @@ llb_install_fatal_handlers(void)
  * reader/writer-starvation false positives. (tryrdlock is base POSIX, with no
  * _GNU_SOURCE/_XOPEN feature-macro dependency unlike the timed lock variants.)
  *
- * Exit = _exit(134), NOT abort(): abort() raises SIGABRT, which on this raw C
- * thread the Go runtime can SWALLOW the same way it swallowed the original crash
- * (sigtrampgo→badsignal→raisebadsignal spin) — leaving us still wedged. _exit is a
- * direct syscall that no signal handler (Go's included) can intercept, guaranteeing
- * the process actually dies so docker --restart unless-stopped self-heals. */
+ * Exit = abort() on this fail-loud-marked thread (it used to be _exit(134) because
+ * an unmarked thread's SIGABRT was swallowed by the Go runtime); llb_fatal_handler
+ * re-raises with SIG_DFL, so the process dies with status 134 as before AND leaves
+ * a core that names the lock holder. */
 static void *
 proxy_liveness_watchdog_thread(void *arg)
 {
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
   (void)arg;
   /* WD_POLL_SEC * WD_MAX_CONSECUTIVE = 2 * 15 = ~30s of continuous global-lock
    * starvation before declaring a wedge. A healthy writer holds the lock for
@@ -581,6 +581,15 @@ proxy_liveness_watchdog_thread(void *arg)
   const int WD_POLL_SEC = 2;
   const int WD_MAX_CONSECUTIVE = 15;
   int consecutive = 0;
+  /* Under connection churn every worker takes PROXY_LOCK on accept and on
+   * close, so the lock is busy at every probe while the holder changes all
+   * the time — the gateway is slow, not wedged. A wedge is ONE writer that
+   * never releases: the abort therefore also requires the
+   * writer's tid (glibc's __cur_writer, 0 once released) to be the same on
+   * every consecutive probe. Contention with a changing holder is reported and
+   * left alone. Without the glibc field the old behaviour stands. */
+  unsigned last_writer = 0;
+  int same_writer = 0;
 
   for (;;) {
     sleep(WD_POLL_SEC);
@@ -592,23 +601,50 @@ proxy_liveness_watchdog_thread(void *arg)
         log_warn("[WATCHDOG] proxy global lock recovered after %ds of contention",
                  consecutive * WD_POLL_SEC);
       }
-      consecutive = 0;
+      consecutive = 0; same_writer = 0; last_writer = 0;
       continue;
     }
 
     if (rc == EBUSY) {
+      unsigned writer = 0;
+#ifdef __GLIBC__
+      writer = (unsigned)proxy_struct->lock.__data.__cur_writer;
+#endif
       consecutive++;
+      if (writer != 0 && writer == last_writer) {
+        same_writer++;
+      } else {
+        same_writer = 1;
+      }
+      last_writer = writer;
       if ((consecutive % 3) == 0) {
         log_error("[WATCHDOG] proxy global lock contended: PROXY_LOCK busy ~%ds "
-                  "(%d/%d consecutive probes)", consecutive * WD_POLL_SEC,
-                  consecutive, WD_MAX_CONSECUTIVE);
+                  "(%d/%d consecutive probes, writer tid %u held %d probe(s))",
+                  consecutive * WD_POLL_SEC, consecutive, WD_MAX_CONSECUTIVE,
+                  writer, same_writer);
       }
-      if (consecutive >= WD_MAX_CONSECUTIVE) {
-        log_error("[WATCHDOG] proxy data plane WEDGED ~%ds (PROXY_LOCK never released) — "
-                  "_exit(134) for container restart (lock-wedge self-heal)",
-                  consecutive * WD_POLL_SEC);
-        /* Guaranteed, unswallowable process exit (see header comment). */
-        _exit(134);
+      int wedged = (consecutive >= WD_MAX_CONSECUTIVE) &&
+                   (writer == 0 || same_writer >= WD_MAX_CONSECUTIVE);
+      if (consecutive >= WD_MAX_CONSECUTIVE && !wedged) {
+        /* keep probing; the counter keeps the 3-probe log cadence honest */
+        consecutive = WD_MAX_CONSECUTIVE - 1;
+      }
+      if (wedged) {
+        log_error("[WATCHDOG] proxy data plane WEDGED ~%ds (PROXY_LOCK never released, "
+                  "writer tid %u) — abort() for a core + container restart (lock-wedge self-heal)",
+                  consecutive * WD_POLL_SEC,
+#ifdef __GLIBC__
+                  (unsigned)proxy_struct->lock.__data.__cur_writer
+#else
+                  0u
+#endif
+                  );
+        /* This thread is fail-loud marked (g_llb_proxy_worker), so SIGABRT reaches
+         * llb_fatal_handler's worker branch: banner, C backtrace, SIG_DFL re-raise —
+         * a core with every thread's stack (who holds the lock, who waits) and the
+         * same exit status 134 docker's restart policy already keys on. The Go
+         * runtime cannot swallow it: the handler never chains for a marked thread. */
+        abort();
       }
       continue;
     }

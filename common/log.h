@@ -23,6 +23,11 @@ typedef struct {
   void *udata;
   int line;
   int level;
+  /* The line as the built-in sinks emit it, formatted once per log_log call:
+   * "YYYY-MM-DD HH:MM:SS LEVEL file:line: message\n". A callback may write
+   * it with one write(2) instead of formatting ev->fmt / ev->ap itself. */
+  const char *line_buf;
+  size_t line_len;
 } log_Event;
 
 typedef void (*log_LogFn)(log_Event *ev);

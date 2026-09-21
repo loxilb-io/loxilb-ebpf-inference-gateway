@@ -315,7 +315,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
        * boundary is all this site can honestly claim. */
       llb_ai_record_usage_missing(stream->tenant_id, stream->effective_model,
                                   LLB_AI_UMISS_H2_STREAM_CLOSE);
-      log_info("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
+      log_debug("[AI_TOKENS][HTTP/2] stream=%d response completed with no usage "
                "object tenant=%s model=%s reason=%s (reported, not charged)",
                stream->stream_id, stream->tenant_id, stream->effective_model,
                LLB_AI_UMISS_H2_STREAM_CLOSE);
@@ -325,7 +325,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   /* status=0 names the release-only settle explicitly, so the log says which
    * of the two shapes ran instead of leaving it to be inferred from a 200
    * that no backend ever sent. */
-  log_info("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
+  log_debug("[AI_TOKENS][HTTP/2] stream=%d prompt=%d completion=%d status=%d",
            stream->stream_id, up, uc, status);
 }
 
@@ -3757,10 +3757,10 @@ h2_have_tepval:
       if (cep != L7_COOKIE_MISS && cep >= 0 && cep < tepval->n_eps &&
           is_endpoint_healthy(tepval, cep)) {
         ep_idx = cep;
-        log_info("[HTTP/2][COOKIE_PIN] stream %d: valid LB cookie -> ep[%d] (PROXY_AFFINITY_COOKIE)",
+        log_debug("[HTTP/2][COOKIE_PIN] stream %d: valid LB cookie -> ep[%d] (PROXY_AFFINITY_COOKIE)",
                  stream->stream_id, cep);
       } else {
-        log_info("[HTTP/2][COOKIE_MISS] stream %d: no live-member match -> rehash",
+        log_debug("[HTTP/2][COOKIE_MISS] stream %d: no live-member match -> rehash",
                  stream->stream_id);
       }
     }
@@ -4125,6 +4125,13 @@ h2_have_tepval:
     backend_pfe->rfd_ent[0] = pfe;            // Back-link to client pfe
     backend_pfe->n_rfd = 1;
 
+    /* Link the leg into the rule's connection list like every other leg, and
+     * do it before the fd is registered: registration publishes the shell to
+     * its worker, which may tear the leg down at once, and a teardown must
+     * find the node it unlinks. Linked legs are also what the health passes
+     * and the metrics walkers see. */
+    proxy_conn_list_add(ent, backend_pfe, "HTTP/2 backend");
+
     // ✅ CRITICAL: Register with event loop - enables backend response handling
     /* Pinned to the CLIENT fd's notify worker: every handler touching the
      * client's h2_session (proxy_h2_handle_backend_data walks its hashes with
@@ -4135,7 +4142,8 @@ h2_have_tepval:
                                    backend_pfe, pfe->fd) != 0) {
       log_error("[HTTP/2] stream %d: Failed to register backend fd=%d with event loop",
                 stream->stream_id, backend_fd);
-      pfe->rfd_ent[slot] = NULL;   /* D2 root fix: unlink before recycling the shell */
+      proxy_conn_list_del(ent, backend_pfe);   /* nothing was published: take it off the list */
+      pfe->rfd_ent[slot] = NULL;
       pfe->rfd[slot] = -1;         /* the fd closes below; a stale positive here
                                     * would satisfy the reuse probe forever */
       pfe_recycle(backend_pfe);      /* pool the shell (frees rcvbuf, bumps gen) */

@@ -187,6 +187,7 @@ pd_prefill_timeout_default(void)
 void *
 proxy_drain_checker_thread(void *arg)
 {
+  g_llb_proxy_worker = 1;   /* fail loud (core + line) on a fatal signal here */
  
   while (1) {
     /* Tick at 1Hz.: timeoutMemberData is enforced inside
@@ -428,8 +429,13 @@ finish_deferred_closes(uint64_t now_ms)
       if (pfe->fd > 0) {
         shutdown(pfe->fd, SHUT_RDWR);
       }
-      if (pfe->n_rfd > 0 && pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0) {
-        shutdown(pfe->rfd_ent[0]->fd, SHUT_RDWR);
+      /* One load of the leg pointer: a worker's proxy_release_rfd_ctx clears
+       * client->rfd_ent[] holding no lock this pass shares (see the note at
+       * the QoS pass below), so re-reading it between the test and the use
+       * dereferences NULL. */
+      proxy_fd_ent_t *leg0 = __atomic_load_n(&pfe->rfd_ent[0], __ATOMIC_ACQUIRE);
+      if (pfe->n_rfd > 0 && leg0 && leg0->fd > 0) {
+        shutdown(leg0->fd, SHUT_RDWR);
       }
     }
   }
@@ -528,8 +534,15 @@ check_draining_endpoints(void)
         int qp_parked = pfe->qos_parked;
         int qj;
         if (!qp_parked) {
-          for (qj = 0; qj < pfe->n_rfd; qj++) {
-            if (pfe->rfd_ent[qj] && pfe->rfd_ent[qj]->qos_parked) {
+          /* A worker's proxy_release_rfd_ctx (the keep-alive boundary arm in
+           * sockproxy_http.c) clears client->rfd_ent[qj] holding no lock this
+           * pass shares, so a pointer loaded once for the NULL test and again
+           * for the dereference faulted in between. Load it exactly once; the
+           * pfe pool keeps a recycled shell mapped, so a stale peer read is a
+           * wrong QoS hint for one tick, never a fault. */
+          for (qj = 0; qj < pfe->n_rfd && qj < MAX_PROXY_EP; qj++) {
+            proxy_fd_ent_t *peer = __atomic_load_n(&pfe->rfd_ent[qj], __ATOMIC_ACQUIRE);
+            if (peer && peer->qos_parked) {
               qp_parked = 1;
               break;
             }
@@ -585,7 +598,7 @@ check_draining_endpoints(void)
           }
 
           if (elapsed >= cap) {
-            log_info("[SSE_CAP] fd=%d: elapsed=%lds >= cap=%lds, terminating stream",
+            log_debug("[SSE_CAP] fd=%d: elapsed=%lds >= cap=%lds, terminating stream",
                      pfe->fd, (long)elapsed, (long)cap);
             /* Deliver an error SSE event before shutdown so the client can react. */
             if (pfe->fd > 0) {
@@ -658,7 +671,7 @@ check_draining_endpoints(void)
             pfe->sse_active == 0 &&         /* do not kill active SSE streams */
             pfe->last_activity > 0 &&
             idle_expired) {
-          log_info("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
+          log_debug("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
                    pfe->fd, (long)(now - pfe->last_activity), idle_to_s,
                    (l7_data_to_s > 0) ? " (L7 timeoutMemberData)" : "");
           if (pfe->fd > 0) {
@@ -988,7 +1001,7 @@ check_draining_endpoints(void)
                 pfe->pd_phase == PD_PHASE_DECODE_STREAMING,
                 pfe->sse_active, pfe->stream_end_ts, pfe->pd_last_decode_ts,
                 now, decode_idle_cap)) {
-          log_info("[PD_GRACEFUL_DONE] fd=%d backend-idle=%lds >= cap=%us — "
+          log_debug("[PD_GRACEFUL_DONE] fd=%d backend-idle=%lds >= cap=%us — "
                    "synthesizing data: [DONE] (vLLM dropped terminator)",
                    pfe->fd, (long)(now - pfe->pd_last_decode_ts), decode_idle_cap);
 
