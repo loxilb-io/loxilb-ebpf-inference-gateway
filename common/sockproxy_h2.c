@@ -4125,6 +4125,13 @@ h2_have_tepval:
     backend_pfe->rfd_ent[0] = pfe;            // Back-link to client pfe
     backend_pfe->n_rfd = 1;
 
+    /* Link the leg into the rule's connection list like every other leg, and
+     * do it before the fd is registered: registration publishes the shell to
+     * its worker, which may tear the leg down at once, and a teardown must
+     * find the node it unlinks. Linked legs are also what the health passes
+     * and the metrics walkers see. */
+    proxy_conn_list_add(ent, backend_pfe, "HTTP/2 backend");
+
     // ✅ CRITICAL: Register with event loop - enables backend response handling
     /* Pinned to the CLIENT fd's notify worker: every handler touching the
      * client's h2_session (proxy_h2_handle_backend_data walks its hashes with
@@ -4135,7 +4142,8 @@ h2_have_tepval:
                                    backend_pfe, pfe->fd) != 0) {
       log_error("[HTTP/2] stream %d: Failed to register backend fd=%d with event loop",
                 stream->stream_id, backend_fd);
-      pfe->rfd_ent[slot] = NULL;   /* D2 root fix: unlink before recycling the shell */
+      proxy_conn_list_del(ent, backend_pfe);   /* nothing was published: take it off the list */
+      pfe->rfd_ent[slot] = NULL;
       pfe->rfd[slot] = -1;         /* the fd closes below; a stale positive here
                                     * would satisfy the reuse probe forever */
       pfe_recycle(backend_pfe);      /* pool the shell (frees rcvbuf, bumps gen) */

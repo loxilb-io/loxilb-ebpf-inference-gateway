@@ -2934,6 +2934,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   node->val.fdlist = fd_ctx;
   node->val.nfds++;
   fd_ctx->head = node;
+  pfe_trace_op("ins", node, fd_ctx);
   fd_ctx->stype = PROXY_SOCK_LISTEN;
   fd_ctx->fd = lsd;
   fd_ctx->seltype = arg->select;
@@ -4376,6 +4377,60 @@ proxy_selftests()
   return 0;
 }
 
+
+/* Is `pfe` already linked in `ent`'s connection list? Bounded walk. */
+static int
+proxy_fdlist_contains(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe)
+{
+  proxy_fd_ent_t *p = ent->val.fdlist;
+  long guard = (long)ent->val.nfds + 64;
+  while (p && guard-- > 0) {
+    if (p == pfe) return 1;
+    p = p->next;
+  }
+  return 0;
+}
+
+static int
+proxy_fdlist_link(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, const char *what)
+{
+  if (proxy_fdlist_contains(ent, pfe)) {
+    /* A shell that is still linked was recycled without an unlink; linking
+     * it again would close the list into a cycle. */
+    log_error("[FDLIST] %s shell %p (fd=%d gen=%lu) is already linked in rule %p — insert refused",
+              what, (void *)pfe, pfe->fd, (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed), (void *)ent);
+    pfe_trace_op("ins-refused", ent, pfe);
+    return -1;
+  }
+  pfe->next = ent->val.fdlist;
+  ent->val.fdlist = pfe;
+  ent->val.nfds++;
+  pfe_trace_op("ins", ent, pfe);
+  return 0;
+}
+
+/* Cut a cycle in `ent`'s fdlist (Floyd), logging the node that closes it. */
+static void
+proxy_fdlist_cut_cycle(proxy_map_ent_t *ent)
+{
+  proxy_fd_ent_t *slow = ent->val.fdlist, *fast = ent->val.fdlist;
+  while (fast && fast->next) {
+    slow = slow->next; fast = fast->next->next;
+    if (slow == fast) break;
+  }
+  if (!fast || !fast->next) return;   /* no cycle */
+  /* find the entry node of the cycle, then the node whose next closes it */
+  slow = ent->val.fdlist;
+  while (slow != fast) { slow = slow->next; fast = fast->next; }
+  proxy_fd_ent_t *entry = slow, *last = entry;
+  while (last->next != entry) last = last->next;
+  log_error("[FDLIST] cycle in rule %p: node %p (fd=%d odir=%d used=%d n_rfd=%d head=%p) is reached twice; "
+            "%p->next (fd=%d odir=%d used=%d) closed the loop — cut",
+            (void *)ent, (void *)entry, entry->fd, entry->odir, entry->used, entry->n_rfd, (void *)entry->head,
+            (void *)last, last->fd, last->odir, last->used);
+  last->next = NULL;
+}
+
 void
 proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe)
 {
@@ -4394,7 +4449,11 @@ proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe)
     }
     ent->val.fdlist = NULL;
   } else {
-    while (fd_ent) {
+    /* Bounded: nfds is maintained under the same lock, so a walk that goes
+     * far beyond it means the list is corrupt (a cycle) — say so and stop
+     * instead of spinning under PROXY_LOCK until the watchdog aborts. */
+    long guard = (long)ent->val.nfds + 4096;
+    while (fd_ent && guard-- > 0) {
       if (fd_ent == match_pfe) {
         if (pfd_ent) {
           pfd_ent->next = fd_ent->next;
@@ -4402,12 +4461,51 @@ proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe)
           ent->val.fdlist = fd_ent->next;
         }
         ent->val.nfds--;
+        pfe_trace_op("unl", ent, fd_ent);
+        break;
+      }
+      if (fd_ent->next == fd_ent) {
+        log_error("[FDLIST] self-linked node %p (fd=%d) in rule %p while unlinking %p — cut",
+                  (void *)fd_ent, fd_ent->fd, (void *)ent, match_pfe);
+        fd_ent->next = NULL;
         break;
       }
       pfd_ent = fd_ent;
       fd_ent = fd_ent->next;
     }
+    if (guard <= 0) {
+      log_error("[FDLIST] walk of rule %p exceeded nfds=%u by 4096 while unlinking %p — list corrupt",
+                (void *)ent, ent->val.nfds, match_pfe);
+      proxy_fdlist_cut_cycle(ent);
+      pfe_trace_op("cut", ent, match_pfe);
+    } else if (!fd_ent) {
+      /* The node to unlink is not in the list its head names: it was never
+       * linked, or the list lost it. Say so; the pool guards catch the rest. */
+      proxy_fd_ent_t *m = match_pfe;
+      pfe_trace_op("miss", ent, m);
+      log_error("[FDLIST] unlink miss: shell %p (fd=%d odir=%d used=%d gen=%lu head=%p) not found in rule %p (nfds=%u)",
+                (void *)m, m->fd, m->odir, m->used, (unsigned long)atomic_load_explicit(&m->gen, memory_order_relaxed),
+                (void *)m->head, (void *)ent, ent->val.nfds);
+    }
   }
+}
+
+int
+proxy_conn_list_add(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, const char *what)
+{
+  int rc;
+  PROXY_LOCK();
+  rc = proxy_fdlist_link(ent, pfe, what);
+  PROXY_UNLOCK();
+  return rc;
+}
+
+void
+proxy_conn_list_del(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe)
+{
+  PROXY_LOCK();
+  proxy_reset_fd_list(ent, pfe);
+  PROXY_UNLOCK();
 }
 
 static void __attribute__((unused))
@@ -7010,11 +7108,11 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     }
 #endif
 
-    PROXY_LOCK();
-    npfe2->next = ent->val.fdlist;
-    ent->val.fdlist = npfe2;
-    ent->val.nfds++;
-    PROXY_UNLOCK();
+    proxy_conn_list_add(ent, npfe2, "backend");
+    /* In use before the notifier can hand the leg's first event, and with it
+     * a teardown, to its worker: a release that finds the count at zero
+     * neither frees nor unlinks. */
+    npfe2->used++;
 
     npfe1->_id = rid;
     npfe1->ep_num = ep_num;  // P1.3: Store endpoint number for load decrement
@@ -7038,9 +7136,19 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
         SSL_set_fd(npfe2->ssl, ep_cfd);
       }
     }
-    npfe2->used++;
 
     if (retry >= PROXY_MAPFD_RETRIES) {
+      /* The leg is already linked into the rule's connection list and into
+       * the client's leg table. Take both back before the shell returns to
+       * the pool: a pooled shell that stays linked is handed out again while
+       * the list still reaches it, and the client's teardown would release a
+       * leg it no longer owns. */
+      proxy_conn_list_del(ent, npfe2);
+      if (npfe1->n_rfd > 0 && npfe1->rfd_ent[npfe1->n_rfd - 1] == npfe2) {
+        npfe1->n_rfd--;
+        __atomic_store_n(&npfe1->rfd_ent[npfe1->n_rfd], NULL, __ATOMIC_RELEASE);
+        npfe1->rfd[npfe1->n_rfd] = -1;
+      }
       proxy_destroy_eps(pfe->fd, &ep_sel);
       proxy_release_fd_ctx(npfe2, 0);
       proxy_peer_map_delete(npfe2);
@@ -8562,6 +8670,17 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   log_debug("[HTTP_PARSER_INIT] fd=%d: Parser initialized, ready for HTTP data", new_sd);
 #endif
 
+  /* Mark the shell in use and link it into the rule's connection list BEFORE
+   * the fd is registered with the notifier. Registration publishes the shell
+   * to the worker that owns the fd (fd modulo worker count, usually not this
+   * thread); from that moment that worker can run the whole request and tear
+   * the connection down. A teardown that found the shell unlinked recycled it
+   * while this thread went on to link it, so the pool later handed out a node
+   * that was still on the list, the list was cut at that node and finally
+   * closed into a cycle every walker spun on under the global lock. */
+  npfe1->used++;
+  proxy_conn_list_add(ent, npfe1, "client");
+
   // Register with notification system (with retry for fd mapping)
   for (retry = 0; retry < PROXY_MAPFD_RETRIES; retry++) {
     if (notify_add_ent(proxy_struct->ns, new_sd,
@@ -8574,12 +8693,13 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       SSL_set_fd(npfe1->ssl, new_sd);
     }
   }
-  npfe1->used++;
 
   if (retry >= PROXY_MAPFD_RETRIES) {
+    /* Nothing was published: take the shell off the list and pool it. */
+    proxy_conn_list_del(ent, npfe1);
     proxy_destroy_eps(new_sd, ep_sel);
     proxy_release_fd_ctx(npfe1, 0);
-    pfe_recycle(npfe1);   /* D2 root fix: pool the shell (frees rcvbuf, bumps gen) */
+    pfe_recycle(npfe1);
     log_error("failed to add new_sd %d", new_sd);
     return 1; // Continue
   }
@@ -8595,13 +8715,6 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       return -1; // Restart
     }
   }
-
-  // Add to connection list
-  PROXY_LOCK();
-  npfe1->next = ent->val.fdlist;
-  ent->val.fdlist = npfe1;
-  ent->val.nfds++;
-  PROXY_UNLOCK();
 
   return 0; // Success
 }
@@ -9659,9 +9772,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // - File uploads (>64KB) benefit from streaming → prevents buffer overflow
           // - Conservative threshold ensures we catch 250KB uploads (customer case)
 
-          // DEBUG: Always log upload detection for diagnosis (use log_error to ensure visibility)
+          // upload detection instrument: one line per request, so debug level only
           if (pfe->http_hok) {
-            log_error("[UPLOAD_DEBUG] fd=%d: pok=%d hok=%d hvok=%d Content-Length=%zu threshold=%d",
+            log_debug("[UPLOAD_DEBUG] fd=%d: pok=%d hok=%d hvok=%d Content-Length=%zu threshold=%d",
                      fd, pfe->http_pok, pfe->http_hok, pfe->http_hvok,
                      pfe->http_content_length, (64 * 1024));
           }

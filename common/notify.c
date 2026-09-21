@@ -53,6 +53,11 @@ typedef struct notify_ent {
   int thr_id;
   void *priv;
   uint64_t gen;   /* D2 root fix: pfe generation stamp at registration time */
+  /* eviction is requested per REGISTRATION (this fd, this gen), not per poll
+   * slot: slots are compacted on every delete, so a flag left on a slot index
+   * lands on whatever fd occupies that slot by the time the worker looks
+   * (the worker then tore down a live, newer registration). */
+  uint8_t evict;
 } notify_ent_t;
 
 #define NOTI_LOCK(C) pthread_rwlock_wrlock(&(C)->lock)
@@ -349,6 +354,7 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
   ent->priv = priv;
   ent->gen = gen;
   ent->thr_id = tslot;
+  ent->evict = 0;
   
   pctx->pfds[pctx->n_pfds].fd = fd;
   pctx->pfds[pctx->n_pfds].events = events;
@@ -379,7 +385,7 @@ notify_add_ent_pinned(void *ctx, int fd, notify_type_t type, void *priv, uint64_
 }
 
 int
-notify_delete_ent__(void *ctx, int fd)
+__notify_delete_ent(void *ctx, int fd, uint64_t gen, int check_gen)
 {
   int i = 0;
   notify_ctx_t *nctx = ctx;
@@ -401,6 +407,14 @@ notify_delete_ent__(void *ctx, int fd)
   if (ent->fd <= 0) {
     NOTI_UNLOCK(nctx);
     return -ENOENT;
+  }
+  /* The event that asked for this delete was captured against a registration
+   * (fd, gen). If the fd has since been closed and re-registered by a newer
+   * connection, that registration is not ours to destroy (under connection
+   * churn fd numbers are reused within the same poll round). */
+  if (check_gen && ent->gen != gen) {
+    NOTI_UNLOCK(nctx);
+    return -ESTALE;
   }
 
   if (ent->poll_slot < 0 || ent->poll_slot >= MAX_NOTIFY_POLL_FDS) {
@@ -457,6 +471,19 @@ notify_delete_ent__(void *ctx, int fd)
   return 0;
 }
 
+static int
+notify_delete_ent__(void *ctx, int fd)
+{
+  return __notify_delete_ent(ctx, fd, 0, 0);
+}
+
+/* delete only the registration the event was captured against */
+static int
+notify_delete_ent_gen__(void *ctx, int fd, uint64_t gen)
+{
+  return __notify_delete_ent(ctx, fd, gen, 1);
+}
+
 #ifdef HAVE_NOTIFY_EVICT
 static int
 notify_delete_ent_evict__(void *ctx, int fd)
@@ -506,6 +533,7 @@ notify_delete_ent_evict__(void *ctx, int fd)
   }
 
   pctx->npfds[poll_slot].evict = 1;
+  ent->evict = 1;
   NOTI_UNLOCK(nctx);
 
   return 0;
@@ -771,9 +799,10 @@ notify_run(void *ctx, int thread)
 
 #ifdef HAVE_NOTIFY_EVICT
       for (i = 0; i < n_pfds; i++) {
+        int efd = pfds[i].fd;   /* the fd this copied slot really carries */
         NOTI_LOCK(nctx);
-        if (nctx->poll_ctx[thread].npfds[i].evict &&
-            nctx->poll_ctx[thread].pfds[i].fd > 0) {
+        if (efd > 0 && efd < MAX_NOTIFY_FDS &&
+            nctx->earr[efd].fd == efd && nctx->earr[efd].evict) {
           evict = 1;
           pfds[i].revents = POLLERR;
         }
@@ -835,7 +864,7 @@ notify_run(void *ctx, int thread)
 
       if (type & (NOTI_TYPE_HUP|NOTI_TYPE_ERROR)) {
         //log_trace("notify:hup %d", fd);
-        notify_delete_ent__(nctx, fd); 
+        notify_delete_ent_gen__(nctx, fd, gen);   /* only the registration this event belongs to */
       }
       nproc++;
     }
