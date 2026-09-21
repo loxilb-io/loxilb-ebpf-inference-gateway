@@ -4736,9 +4736,14 @@ typedef struct {
 } proxy_umiss_t;
 
 typedef struct {
+  char model[MAX_MODEL_LEN];
+} proxy_stream_end_t;
+
+typedef struct {
   proxy_resv_rel_t     *resv;  int n_resv,  c_resv;
   proxy_umiss_t        *umiss; int n_umiss, c_umiss;
   h2_inflight_settle_t *h2;    int n_h2,    c_h2;
+  proxy_stream_end_t   *ends;  int n_ends,  c_ends;
 } proxy_settle_batch_t;
 
 /* Grow *arr to hold at least n+1 elements of size esz. Returns 0 on OOM, and
@@ -4778,6 +4783,7 @@ proxy_teardown_view(const proxy_fd_ent_t *pfe, teardown_conn_t *v)
   v->has_h2_session        = pfe->h2_session ? 1 : 0;
   v->metric_ai_recorded    = pfe->metric_ai_recorded ? 1 : 0;
   v->metric_response_status = pfe->metric_response_status;
+  v->sse_active            = pfe->sse_active ? 1 : 0;
 }
 
 /*
@@ -4839,6 +4845,21 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     pfe->metric_ai_recorded = 0;   /* reported once */
   }
 
+  /* A stream still open at teardown. The orderly close ends it when the
+   * terminator arrives; a client that resets mid-stream never gets there,
+   * and the active-streams gauge would count the stream until the process
+   * restarts. Cleared under the lock so nothing ends it twice. */
+  if (teardown_owes_stream_end(&v) &&
+      proxy_settle_grow((void **)&b->ends, &b->c_ends, b->n_ends,
+                        sizeof(*b->ends))) {
+    const char *se_model = proxy_effective_model(pfe);
+    proxy_stream_end_t *s = &b->ends[b->n_ends++];
+    memset(s, 0, sizeof(*s));
+    snprintf(s->model, sizeof(s->model), "%s", se_model ? se_model : "");
+    pfe->sse_active = 0;
+    pfe->stream_end_ts = time(NULL);
+  }
+
   /* HTTP/2 client connection: settle every stream still in flight. On an
    * abrupt teardown nghttp2 never runs each stream's close, so those admitted
    * or keyless streams never released their admission reservation nor recorded
@@ -4883,7 +4904,8 @@ proxy_pdestroy(void *priv)
    * connection teardown contributes one; a listener teardown contributes one
    * per connection on the rule. Collected under PROXY_LOCK, emitted after the
    * final PROXY_UNLOCK — see proxy_collect_conn_settles above. */
-  proxy_settle_batch_t settles = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0 };
+  proxy_settle_batch_t settles = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0,
+                                   NULL, 0, 0 };
 
   assert(pfe);
 
@@ -5415,6 +5437,15 @@ proxy_pdestroy(void *priv)
              u->tenant, u->model, LLB_AI_UMISS_CONNECTION_CLOSE);
   }
   free(settles.umiss);
+
+  /* Deferred stream ends (collected above under PROXY_LOCK): the gauge side
+   * of a stream whose connection went away before its terminator. */
+  for (int si = 0; si < settles.n_ends; si++) {
+    llb_ai_stream_end("", settles.ends[si].model);
+    log_debug("[SSE_ABORT] stream ended on teardown model=%s",
+             settles.ends[si].model);
+  }
+  free(settles.ends);
 
   /* Deferred HTTP/2 in-flight settles (collected above under PROXY_LOCK).
    * The consume call charges whatever usage was extracted and releases the
@@ -7385,7 +7416,7 @@ handle_on_message_complete(llhttp_t* parser)
             status_line, adm.error_code, adm.error_msg);
         }
         if (n > 0 && n < (int)sizeof(resp_buf))
-          send(pfe->fd, resp_buf, (size_t)n, 0);
+          send(pfe->fd, resp_buf, (size_t)n, MSG_NOSIGNAL);
         shutdown(pfe->fd, SHUT_RDWR);
         switch (adm.stage) {
         case AI_GW_STAGE_CONFLICT:
@@ -7657,7 +7688,7 @@ handle_on_message_complete(llhttp_t* parser)
             "{\"error\":\"Request blocked by LlamaFirewall\",\"reason\":\"Security threat detected\"}\r\n";
 
           size_t response_len = strlen(block_response);
-          ssize_t sent = send(pfe->fd, block_response, response_len, 0);
+          ssize_t sent = send(pfe->fd, block_response, response_len, MSG_NOSIGNAL);
 
           if (sent > 0) {
             log_info("[LlamaFirewall] Sent 403 response: fd=%d sent=%zd bytes", pfe->fd, sent);
@@ -8427,7 +8458,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
    * LLB_PD_MAX_TOTAL_INFLIGHT). BEFORE accept(), if the bound is enabled
    * (pd_max_total_inflight() > 0, i.e. LLB_PD_MAX_TOTAL_INFLIGHT set) and the
    * global in-flight gauge has reached it, REFUSE this accept() — return WITHOUT
-   * calling accept() so the SYN stays in the listen(fd,32) backlog and the kernel
+   * calling accept() so the SYN stays in the listen backlog and the kernel
    * applies natural TCP backpressure. This is the XDP-safest primitive under
    * --net=host: it touches NO established-conn epoll/XDP state and does NOT delete
    * the listener from the pollset (a busy spin while over the bound is bounded by
@@ -9143,6 +9174,11 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                "request (sse_active=%d stream_end_ts=%ld sse_tail_len=%d)",
                pfe->fd, pfe->sse_active, (long)pfe->stream_end_ts, pfe->sse_tail_len);
     }
+    if (pfe->sse_active) {
+      /* The stream never reached its terminator; end it here rather than
+       * leave the active-streams gauge counting it. */
+      llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
+    }
     pfe->sse_active = 0;
     pfe->stream_start_ts = 0;
     pfe->stream_end_ts = 0;
@@ -9493,27 +9529,20 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       if (pfe->h2_session && pfe->h2_session->h2_enabled) {
         pfe->rcv_off += rc;
 
-        /* (H2 parity with the H1 path below): header-accumulation deadline.
-         * On the L7_Proxy peer only (has_l7_policy==1), anchor at the first client byte and drop
-         * the connection if the HEADERS frame has not completed within timeout_tcp_inspect_ms
-         * (or the bounded default). The anchor is cleared in proxy_h2_on_frame_recv_callback once
- * END_HEADERS arrives. No-op for the AI peer / un-configured listeners. */
+        /* Header-completion deadline (slowloris guard). The anchor is set
+         * when the session is created and when a header block begins
+         * (proxy_h2_on_begin_headers_callback) and cleared on END_HEADERS
+         * (proxy_h2_on_frame_recv_callback), so it only measures header
+         * blocks, never the frames of a live stream. */
         {
           proxy_map_ent_t *h2ent = (proxy_map_ent_t *)pfe->head;
-          if (h2ent && h2ent->has_l7_policy) {
-            if (pfe->l7_hdr_accum_start == 0) {
-              pfe->l7_hdr_accum_start = time(NULL);
-            } else {
-              uint32_t inspect_ms = (h2ent->arg_ptr && h2ent->arg_ptr->timeout_tcp_inspect_ms > 0)
-                                    ? h2ent->arg_ptr->timeout_tcp_inspect_ms
-                                    : L7_TCP_INSPECT_DEFAULT_MS;
-              uint32_t inspect_s = (inspect_ms + 999) / 1000;
-              if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
-                log_debug("[TCP_INSPECT] fd=%d (h2): header-accumulation deadline %ums exceeded "
-                         "(slowloris guard) — dropping connection", fd, inspect_ms);
-                return -1;
-              }
-            }
+          if (proxy_hdr_deadline_expired(h2ent, pfe, time(NULL))) {
+            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+            atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            log_debug("[TCP_INSPECT] fd=%d (h2): header-completion deadline %ums exceeded "
+                     "(slowloris guard) — dropping connection", fd,
+                     proxy_hdr_deadline_ms(h2ent));
+            return -1;
           }
         }
 
@@ -9624,30 +9653,26 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         // Accumulate data in buffer
         pfe->rcv_off += rc;
 
-        /* header-accumulation deadline (slowloris guard). On the L7_Proxy
-         * peer ONLY (has_l7_policy==1), bound the total time spent accumulating the request headers
-         * before they complete. Anchor the deadline at the first byte of the in-progress request,
-         * then drop the connection if the configured timeout_tcp_inspect_ms (or the bounded default
-         * when 0) elapses before http_hok flips. For the AI peer / un-configured listeners
- * (has_l7_policy==0) this is a pure no-op (byte-for-byte unchanged). The H1
-         * \r\n\r\n terminator is reflected by pfe->http_hok after llhttp_execute below; we evaluate
-         * the deadline here, before re-parsing, using the anchor set on the previous (partial) read. */
+        /* Header-completion deadline (slowloris guard), every listener.
+         * Anchor at the first byte of the in-progress request, then drop the
+         * connection if the listener's deadline elapses before http_hok
+         * flips. The \r\n\r\n terminator is reflected by pfe->http_hok after
+         * llhttp_execute below; the deadline is evaluated here, before
+         * re-parsing, against the anchor set on the previous partial read.
+         * The health pass evaluates the same deadline for a client that
+         * stops sending altogether. */
         {
           proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
-          if (hent && hent->has_l7_policy) {
-            if (pfe->l7_hdr_accum_start == 0) {
-              pfe->l7_hdr_accum_start = time(NULL);  /* anchor at first partial-header byte */
-            } else if (pfe->http_hok == 0) {
-              uint32_t inspect_ms = (hent->arg_ptr && hent->arg_ptr->timeout_tcp_inspect_ms > 0)
-                                    ? hent->arg_ptr->timeout_tcp_inspect_ms
-                                    : L7_TCP_INSPECT_DEFAULT_MS;
-              uint32_t inspect_s = (inspect_ms + 999) / 1000;  /* round up to whole seconds */
-              if ((time(NULL) - pfe->l7_hdr_accum_start) > (time_t)inspect_s) {
-                log_debug("[TCP_INSPECT] fd=%d: header-accumulation deadline %ums exceeded "
-                         "(slowloris guard) — dropping connection", fd, inspect_ms);
-                return -1;  /* restart/teardown — partial headers dropped at the deadline */
-              }
-            }
+          if (pfe->l7_hdr_accum_start == 0) {
+            pfe->l7_hdr_accum_start = time(NULL);  /* anchor at first partial-header byte */
+          } else if (pfe->http_hok == 0 &&
+                     proxy_hdr_deadline_expired(hent, pfe, time(NULL))) {
+            pfe->l7_hdr_accum_start = 0;   /* counted once; teardown follows */
+            atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+            log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
+                     "(slowloris guard) — dropping connection", fd,
+                     proxy_hdr_deadline_ms(hent));
+            return -1;  /* restart/teardown — partial headers dropped at the deadline */
           }
         }
 
@@ -10119,7 +10144,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 "\r\n"
                 "{\"error\":\"bad_request\",\"message\":\"unparseable or "
                 "ambiguously framed request refused before admission\"}\r\n";
-              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, 0);
+              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);
               shutdown(pfe->fd, SHUT_RDWR);
               log_info("[AIGateway] fd=%d parse error on an enforcing "
                        "service — refused before admission (no raw relay)",
@@ -10151,6 +10176,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
           // TRUNCATION FIX: also clear stale SSE/streaming state on the parse-error reset
           // path (same omission as the success-path keep-alive reset above).
+          if (pfe->sse_active) {
+            llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
+          }
           pfe->sse_active = 0;
           pfe->stream_start_ts = 0;
           pfe->stream_end_ts = 0;

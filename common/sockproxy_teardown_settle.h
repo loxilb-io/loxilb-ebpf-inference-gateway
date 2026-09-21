@@ -50,6 +50,7 @@ typedef struct {
   int has_h2_session;
   int metric_ai_recorded;
   int metric_response_status;
+  int sse_active;              /* a stream was started and never ended */
 } teardown_conn_t;
 
 /* 2xx, matching proxy_status_is_2xx. Restated rather than included so this
@@ -100,6 +101,18 @@ teardown_owes_h2_collect(const teardown_conn_t *c)
 }
 
 /*
+ * A stream that was started and never ended. The orderly close ends it when
+ * the terminator arrives; a client that resets mid-stream, or a backend that
+ * dies under it, never gets there, and the active-streams gauge would count
+ * the stream until the process restarts.
+ */
+static inline int
+teardown_owes_stream_end(const teardown_conn_t *c)
+{
+  return c && c->odir == 0 && c->sse_active;
+}
+
+/*
  * Does a teardown of this shape walk connections other than the pfe itself?
  *
  * This is the ONLY question the shape is allowed to answer.
@@ -125,7 +138,7 @@ teardown_conn_owes_settle(int shape, const teardown_conn_t *c)
 {
   (void)shape;   /* the shape decides the walk set, never the settle */
   return teardown_owes_resv_rel(c) || teardown_owes_usage_missing(c) ||
-         teardown_owes_h2_collect(c);
+         teardown_owes_h2_collect(c) || teardown_owes_stream_end(c);
 }
 
 #endif /* __SOCKPROXY_TEARDOWN_SETTLE_H__ */

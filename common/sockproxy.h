@@ -125,10 +125,10 @@ void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
 #ifndef L7_HDR_VALUE_MAX
 #define L7_HDR_VALUE_MAX 256         // max stored header-value length (incl NUL)
 #endif
-// Octavia: bounded default for timeout_tcp_inspect_ms when unset (0).
-// 10s mirrors a conservative HAProxy `timeout http-request` default — long enough not to trip
-// legitimate slow clients on the L7_Proxy peer, short enough to bound a slowloris hold. Only
-// ever applied when has_l7_policy==1 (the L7 listener); the AI peer is never gated by this.
+// Header-completion deadline (ms) for every listener whose rule sets no
+// timeout_tcp_inspect_ms. 10s mirrors a conservative HAProxy `timeout
+// http-request`: long enough not to trip legitimate slow clients, short
+// enough to bound a slowloris hold. 0 disables the deadline.
 #ifndef L7_TCP_INSPECT_DEFAULT_MS
 #define L7_TCP_INSPECT_DEFAULT_MS 10000
 #endif
@@ -203,6 +203,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t pd_connect_retry_same_ep;    // same-EP reconnect attempts
     _Atomic uint64_t pd_connect_retry_same_ep_ok; // attempts that succeeded (affinity preserved)
     _Atomic uint64_t lb_select_failure_shutdown; // non-P/D: selection/connect failed -> raw shutdown, no HTTP error
+    _Atomic uint64_t hdr_deadline_drops;         // client connections dropped for not completing their request headers in time
     // SGLang P/D dual-dispatch observability (mirrors the failover family above)
     _Atomic uint64_t pd_sg_prefill_abort_decode; // prefill drain-leg failure forced a decode-leg abort
     _Atomic uint64_t pd_sg_decode_close_drain;   // decode-leg failure closed the prefill drain leg
@@ -1044,14 +1045,15 @@ struct proxy_fd_ent {
   } l7_headers[L7_MAX_CAPTURED_HEADERS];
   uint16_t n_l7_headers;        // count of populated l7_headers slots (<= cap)
 
-  // Octavia: header-accumulation deadline anchor (slowloris guard).
-  // Set to time(NULL) on the FIRST data byte of the request parsing phase (rfd[0]<=0 and
-  // http_hok==0). Enforced ONLY on the L7_Proxy peer (has_l7_policy==1) and ONLY while the
-  // request headers are still incomplete: if (now - l7_hdr_accum_start) exceeds the listener's
-  // timeout_tcp_inspect_ms deadline (ms, or a bounded default when 0) before \r\n\r\n / the full
-  // HEADERS frame arrives, the connection is dropped. Cleared (0) once headers complete so it
-  // never bounds body upload. Pure no-op for the AI peer / un-configured listeners.
-  time_t l7_hdr_accum_start;    // first-byte ts of the in-progress request headers (0=unset)
+  // Header-completion deadline anchor (slowloris guard), every listener.
+  // HTTP/1.1: set on the first byte of a request's headers, cleared once
+  // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2: set
+  // when the session is created and when a header block begins, cleared on
+  // END_HEADERS, so it never bounds DATA, PING or WINDOW_UPDATE traffic on a
+  // live stream. While set, the read path and the 1 Hz health pass drop the
+  // connection once (now - anchor) exceeds the listener's deadline; the
+  // health pass is what catches a client that simply stops sending.
+  time_t l7_hdr_accum_start;    // anchor of the in-progress request headers (0=unset)
 
   llm_prefix_key_t prefix_key;  // LLM prefix extraction (P0.2)
 
@@ -1553,8 +1555,8 @@ struct proxy_arg {
   // for un-configured L7 listeners;). Enforced only on the L7_Proxy peer (has_l7_policy==1).
   uint32_t timeout_member_connect_ms; // 0 ⇒ 500 (today's sockproxy_conn.c:408 connect-poll literal)
   uint32_t timeout_member_data_ms;    // 0 ⇒ existing client-idle value (member-side relay idle)
-  // header-accumulation deadline — max time to await the complete request headers
-  // (\r\n\r\n / full HEADERS frame) before evaluating L7 rules (slowloris protection).
+  // header-completion deadline — max time to await the complete request headers
+  // (\r\n\r\n / full HEADERS frame) on every listener (slowloris protection).
   // NOTE (Pitfall 4): NON-REPRESENTABLE on Gateway-API export (Gateway exposes only
   // timeouts.request/backendRequest); a future Gateway controller MUST hard-error, never silent-drop.
   uint32_t timeout_tcp_inspect_ms;    // 0 ⇒ sane bounded default (header-accum deadline)
@@ -1632,6 +1634,31 @@ struct proxy_arg {
 #endif /* HAVE_MTLS */
 };
 typedef struct proxy_arg proxy_arg_t;
+
+/* Header-completion deadline of a listener in ms; 0 = disabled. */
+static inline uint32_t
+proxy_hdr_deadline_ms(const proxy_map_ent_t *ent)
+{
+  if (ent && ent->arg_ptr && ent->arg_ptr->timeout_tcp_inspect_ms > 0) {
+    return ent->arg_ptr->timeout_tcp_inspect_ms;
+  }
+  return L7_TCP_INSPECT_DEFAULT_MS;
+}
+
+/* True once a client connection has been accumulating request headers for
+ * longer than its listener's deadline. The deadline is rounded up to whole
+ * seconds, the resolution of the anchor and of the health pass. */
+static inline int
+proxy_hdr_deadline_expired(const proxy_map_ent_t *ent,
+                           const proxy_fd_ent_t *pfe, time_t now)
+{
+  uint32_t ms = proxy_hdr_deadline_ms(ent);
+
+  if (ms == 0 || pfe->l7_hdr_accum_start == 0) {
+    return 0;
+  }
+  return (now - pfe->l7_hdr_accum_start) > (time_t)((ms + 999) / 1000);
+}
 
 // Ensure structure doesn't exceed eBPF map limits (critical for kernel compatibility)
 _Static_assert(sizeof(struct proxy_arg) <= 4096, 

@@ -627,6 +627,34 @@ check_draining_endpoints(void)
     }
   }
 
+  /* Header-completion deadline for a client that stopped sending. The read
+   * path evaluates the deadline only when a byte arrives, so a connection
+   * that opened, sent part of its request headers and went silent would keep
+   * its fd, epoll slot and buffers until the idle deadline, which only counts
+   * from an armed last_activity. Same deadline, evaluated on the clock. */
+  {
+    proxy_map_ent_t *hd_node = proxy_struct->head;
+    while (hd_node) {
+      uint32_t hd_ms = proxy_hdr_deadline_ms(hd_node);
+      proxy_fd_ent_t *pfe = hd_ms ? hd_node->val.fdlist : NULL;
+      while (pfe) {
+        proxy_fd_ent_t *pfe_next = pfe->next;
+        if (pfe->odir == 0 && pfe->fd > 0 && pfe->fd != hd_node->val.main_fd &&
+            pfe->l7_hdr_accum_start > 0 &&
+            (pfe->h2_session || pfe->http_hok == 0) &&
+            proxy_hdr_deadline_expired(hd_node, pfe, now)) {
+          atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
+          log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
+                   "with no further client bytes — dropping connection", pfe->fd, hd_ms);
+          shutdown(pfe->fd, SHUT_RDWR);
+          pfe->l7_hdr_accum_start = 0;   /* counted once; the close event tears it down */
+        }
+        pfe = pfe_next;
+      }
+      hd_node = hd_node->next;
+    }
+  }
+
   /* C-4: Per-rule idle timeout enforcement — terminate connections that have been
    * idle (no data received) for longer than the rule's inactiveTimeOut setting.
    * Suppressed when sse_active=1 so active SSE streams are not killed by idle
