@@ -872,7 +872,7 @@ proxy_h2_send_callback(nghttp2_session *session,
     }
   } else {
     // Send via plain TCP
-    rv = send(pfe->fd, data, length, 0);
+    rv = send(pfe->fd, data, length, MSG_NOSIGNAL);
     if (rv < 0) {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         return NGHTTP2_ERR_WOULDBLOCK;

@@ -7385,7 +7385,7 @@ handle_on_message_complete(llhttp_t* parser)
             status_line, adm.error_code, adm.error_msg);
         }
         if (n > 0 && n < (int)sizeof(resp_buf))
-          send(pfe->fd, resp_buf, (size_t)n, 0);
+          send(pfe->fd, resp_buf, (size_t)n, MSG_NOSIGNAL);
         shutdown(pfe->fd, SHUT_RDWR);
         switch (adm.stage) {
         case AI_GW_STAGE_CONFLICT:
@@ -7657,7 +7657,7 @@ handle_on_message_complete(llhttp_t* parser)
             "{\"error\":\"Request blocked by LlamaFirewall\",\"reason\":\"Security threat detected\"}\r\n";
 
           size_t response_len = strlen(block_response);
-          ssize_t sent = send(pfe->fd, block_response, response_len, 0);
+          ssize_t sent = send(pfe->fd, block_response, response_len, MSG_NOSIGNAL);
 
           if (sent > 0) {
             log_info("[LlamaFirewall] Sent 403 response: fd=%d sent=%zd bytes", pfe->fd, sent);
@@ -10119,7 +10119,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 "\r\n"
                 "{\"error\":\"bad_request\",\"message\":\"unparseable or "
                 "ambiguously framed request refused before admission\"}\r\n";
-              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, 0);
+              send(pfe->fd, smuggle_400, sizeof(smuggle_400) - 1, MSG_NOSIGNAL);
               shutdown(pfe->fd, SHUT_RDWR);
               log_info("[AIGateway] fd=%d parse error on an enforcing "
                        "service — refused before admission (no raw relay)",
