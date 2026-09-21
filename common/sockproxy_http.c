@@ -4736,9 +4736,14 @@ typedef struct {
 } proxy_umiss_t;
 
 typedef struct {
+  char model[MAX_MODEL_LEN];
+} proxy_stream_end_t;
+
+typedef struct {
   proxy_resv_rel_t     *resv;  int n_resv,  c_resv;
   proxy_umiss_t        *umiss; int n_umiss, c_umiss;
   h2_inflight_settle_t *h2;    int n_h2,    c_h2;
+  proxy_stream_end_t   *ends;  int n_ends,  c_ends;
 } proxy_settle_batch_t;
 
 /* Grow *arr to hold at least n+1 elements of size esz. Returns 0 on OOM, and
@@ -4778,6 +4783,7 @@ proxy_teardown_view(const proxy_fd_ent_t *pfe, teardown_conn_t *v)
   v->has_h2_session        = pfe->h2_session ? 1 : 0;
   v->metric_ai_recorded    = pfe->metric_ai_recorded ? 1 : 0;
   v->metric_response_status = pfe->metric_response_status;
+  v->sse_active            = pfe->sse_active ? 1 : 0;
 }
 
 /*
@@ -4839,6 +4845,21 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     pfe->metric_ai_recorded = 0;   /* reported once */
   }
 
+  /* A stream still open at teardown. The orderly close ends it when the
+   * terminator arrives; a client that resets mid-stream never gets there,
+   * and the active-streams gauge would count the stream until the process
+   * restarts. Cleared under the lock so nothing ends it twice. */
+  if (teardown_owes_stream_end(&v) &&
+      proxy_settle_grow((void **)&b->ends, &b->c_ends, b->n_ends,
+                        sizeof(*b->ends))) {
+    const char *se_model = proxy_effective_model(pfe);
+    proxy_stream_end_t *s = &b->ends[b->n_ends++];
+    memset(s, 0, sizeof(*s));
+    snprintf(s->model, sizeof(s->model), "%s", se_model ? se_model : "");
+    pfe->sse_active = 0;
+    pfe->stream_end_ts = time(NULL);
+  }
+
   /* HTTP/2 client connection: settle every stream still in flight. On an
    * abrupt teardown nghttp2 never runs each stream's close, so those admitted
    * or keyless streams never released their admission reservation nor recorded
@@ -4883,7 +4904,8 @@ proxy_pdestroy(void *priv)
    * connection teardown contributes one; a listener teardown contributes one
    * per connection on the rule. Collected under PROXY_LOCK, emitted after the
    * final PROXY_UNLOCK — see proxy_collect_conn_settles above. */
-  proxy_settle_batch_t settles = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0 };
+  proxy_settle_batch_t settles = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0,
+                                   NULL, 0, 0 };
 
   assert(pfe);
 
@@ -5415,6 +5437,15 @@ proxy_pdestroy(void *priv)
              u->tenant, u->model, LLB_AI_UMISS_CONNECTION_CLOSE);
   }
   free(settles.umiss);
+
+  /* Deferred stream ends (collected above under PROXY_LOCK): the gauge side
+   * of a stream whose connection went away before its terminator. */
+  for (int si = 0; si < settles.n_ends; si++) {
+    llb_ai_stream_end("", settles.ends[si].model);
+    log_debug("[SSE_ABORT] stream ended on teardown model=%s",
+             settles.ends[si].model);
+  }
+  free(settles.ends);
 
   /* Deferred HTTP/2 in-flight settles (collected above under PROXY_LOCK).
    * The consume call charges whatever usage was extracted and releases the
@@ -9143,6 +9174,11 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                "request (sse_active=%d stream_end_ts=%ld sse_tail_len=%d)",
                pfe->fd, pfe->sse_active, (long)pfe->stream_end_ts, pfe->sse_tail_len);
     }
+    if (pfe->sse_active) {
+      /* The stream never reached its terminator; end it here rather than
+       * leave the active-streams gauge counting it. */
+      llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
+    }
     pfe->sse_active = 0;
     pfe->stream_start_ts = 0;
     pfe->stream_end_ts = 0;
@@ -10151,6 +10187,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
           // TRUNCATION FIX: also clear stale SSE/streaming state on the parse-error reset
           // path (same omission as the success-path keep-alive reset above).
+          if (pfe->sse_active) {
+            llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
+          }
           pfe->sse_active = 0;
           pfe->stream_start_ts = 0;
           pfe->stream_end_ts = 0;

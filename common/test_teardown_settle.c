@@ -36,15 +36,20 @@ static int failures = 0;
 static int checks   = 0;
 
 /*
- * The PRE-FIX rule, kept verbatim: every settle block in proxy_pdestroy was
- * guarded by `!is_listener`, so a listener teardown settled nothing at all.
+ * The PRE-FIX rule: every settle block in proxy_pdestroy was guarded by
+ * `!is_listener`, so a listener teardown settled nothing at all, and no
+ * shape ended a stream that was still open, so a client reset mid-stream
+ * left the active-streams gauge counting it.
  */
 static int
 prefix_owes_settle(int shape, const teardown_conn_t *c)
 {
+  teardown_conn_t pre = *c;
+
+  pre.sse_active = 0;              /* <- an open stream was never ended */
   if (shape == TEARDOWN_LISTENER)
     return 0;                      /* <- the defect */
-  return teardown_conn_owes_settle(shape, c);
+  return teardown_conn_owes_settle(shape, &pre);
 }
 
 /*
@@ -130,6 +135,23 @@ main(void)
       .metric_ai_recorded = 0, .metric_response_status = 0,
   };
 
+  /* A client reset while its stream was still open: the usage was already
+   * settled, so nothing else is owed, but the stream was never ended. */
+  teardown_conn_t stream_open = {
+      .odir = 0, .ai_gw_mode = 1, .usage_reserved_toks = 0,
+      .usage_consumed = 1, .has_tenant = 1, .has_h2_session = 0,
+      .metric_ai_recorded = 1, .metric_response_status = 200,
+      .sse_active = 1,
+  };
+
+  /* The same stream on a backend leg: the client owns the stream. */
+  teardown_conn_t stream_open_backend = {
+      .odir = 1, .ai_gw_mode = 1, .usage_reserved_toks = 0,
+      .usage_consumed = 1, .has_tenant = 1, .has_h2_session = 0,
+      .metric_ai_recorded = 1, .metric_response_status = 200,
+      .sse_active = 1,
+  };
+
   printf("teardown: the shape decides the walk set, not the settle\n");
 
   printf("\n TEARDOWN_CONN - the shape that always worked:\n");
@@ -139,6 +161,8 @@ main(void)
   check("already settled",         TEARDOWN_CONN, &settled,     0, 0);
   check("backend leg",             TEARDOWN_CONN, &backend,     0, 0);
   check("admitted with no tenant", TEARDOWN_CONN, &no_tenant,   0, 0);
+  check("stream still open",       TEARDOWN_CONN, &stream_open, 1, 1);
+  check("stream open, backend leg",TEARDOWN_CONN, &stream_open_backend, 0, 0);
 
   printf("\n TEARDOWN_LISTENER - the same connections, rule going away:\n");
   check("h1 unspent claim",        TEARDOWN_LISTENER, &h1_claim,    1, 1);
@@ -150,6 +174,8 @@ main(void)
   check("already settled",         TEARDOWN_LISTENER, &settled,     0, 0);
   check("backend leg",             TEARDOWN_LISTENER, &backend,     0, 0);
   check("admitted with no tenant", TEARDOWN_LISTENER, &no_tenant,   0, 0);
+  check("stream still open",       TEARDOWN_LISTENER, &stream_open, 1, 1);
+  check("stream open, backend leg",TEARDOWN_LISTENER, &stream_open_backend, 0, 0);
 
   printf("\n the walk set is the shape's ONLY business:\n");
   checks++;
