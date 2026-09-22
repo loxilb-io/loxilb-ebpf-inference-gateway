@@ -1376,6 +1376,8 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   fd_ent->is_streamable = 0;
   fd_ent->json_stream_route_pending = 0;
   fd_ent->json_stream_continue_sent = 0;
+  fd_ent->ka_reparse = 0;
+  fd_ent->ka_keep_leg = 0;
   fd_ent->rcv_off = 0;
   fd_ent->parsed_off = 0;
   fd_ent->last_header_name[0] = '\0';

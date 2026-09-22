@@ -535,6 +535,16 @@ test_teardown_settle: test_teardown_settle.c sockproxy_teardown_settle.h
 test_teardown: test_teardown_settle
 	./test_teardown_settle
 
+# Keep-alive leg reuse: the framed request rides the previous request's backend
+# leg unless routing would have taken it elsewhere. Header-only and standalone;
+# the test carries its own red twin (the pre-fix release-on-every-boundary rule).
+test_ka_leg: test_ka_leg.c sockproxy_ka_leg.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_ka
+test_ka: test_ka_leg
+	./test_ka_leg
+
 # Phase 47 P47-R2: root-pipe cfg V2 validator + miss-dispatch unit test
 # Standalone -- mirrors the header struct inline, does NOT link against DOCA.
 test_doca_root_v2: test_doca_root_v2.c
