@@ -48,6 +48,7 @@
 #include "sockproxy_routing.h"
 #include "sockproxy_lb.h"
 #include "sockproxy_health.h"
+#include "sockproxy_malloc.h"
 #include "sockproxy_ssl.h"
 #include "sockproxy_trace.h"
 #include "sockproxy_json.h"
@@ -683,6 +684,26 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
 {
   int startfd = PROXY_START_MAPFD;
   notify_cbs_t cbs = { 0 };
+  const char *mmap_env = getenv(PROXY_MALLOC_MMAP_THRESHOLD_ENV);
+  long mmap_thr;
+
+  /* Before the first receive buffer is allocated: keep them private
+   * mappings so a connection burst does not leave the heap at its
+   * high-water mark (sockproxy_malloc.h). */
+  if (proxy_malloc_mmap_threshold(mmap_env) < 0) {
+    log_warn("allocator: %s='%s' is not a byte count, using the default",
+             PROXY_MALLOC_MMAP_THRESHOLD_ENV, mmap_env);
+  }
+  mmap_thr = proxy_malloc_tune(mmap_env);
+  if (mmap_thr < 0) {
+    log_warn("allocator: mmap threshold pin refused, leaving it dynamic");
+  } else if (mmap_thr == 0) {
+    log_info("allocator: mmap threshold left dynamic (%s=0)",
+             PROXY_MALLOC_MMAP_THRESHOLD_ENV);
+  } else {
+    log_info("allocator: mmap threshold pinned at %ld bytes", mmap_thr);
+  }
+
   cbs.notify = proxy_notifier;
   cbs.pdestroy = proxy_pdestroy;
   /* (R1): owner-worker resume hook for the bounded admission layer. The

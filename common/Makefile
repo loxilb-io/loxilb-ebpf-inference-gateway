@@ -560,6 +560,17 @@ test_async_connect: test_async_connect.c sockproxy_connect.h
 test_aconn: test_async_connect
 	./test_async_connect
 
+# Allocator pin: the per-leg receive buffer stays a private mapping, so a
+# burst of connections does not leave the process at its high-water mark.
+# Header-only and standalone; the test reproduces the dynamic-threshold
+# behaviour first and then shows the pin undoing it.
+test_malloc_pin: test_malloc_pin.c sockproxy_malloc.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_mpin
+test_mpin: test_malloc_pin
+	./test_malloc_pin
+
 # Listener shard: listening sockets register on the worker after the relay
 # shards; relay placement (fd modulo, pinned) is unchanged.
 test_notify_shard: test_notify_shard.c notify.c log.c notify.h
