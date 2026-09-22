@@ -388,14 +388,22 @@ restart:
       type &= ~NOTI_TYPE_RDHUP;
 
       if (pfe->stype == PROXY_SOCK_LISTEN) {
-        // Handle new connection acceptance (extracted for clarity)
-        int result = handle_new_connection(fd, pfe, ent, &key, &rkey, &ep_sel);
-        if (result < 0) {
-          goto restart; // Restart requested
-        } else if (result > 0) {
-          continue; // Continue to next event
+        /* Drain the backlog, a bounded batch per readable event. This runs
+         * on the listener shard, so the batch holds up other listeners at
+         * most, never a relay worker; poll is level-triggered and reports
+         * the listener again while the backlog is not empty. */
+        int result = PROXY_ACCEPT_DONE;
+        int n_acc;
+        for (n_acc = 0; n_acc < PROXY_ACCEPT_BATCH; n_acc++) {
+          result = handle_new_connection(fd, pfe, ent, &key, &rkey, &ep_sel);
+          if (result == PROXY_ACCEPT_DONE || result == PROXY_ACCEPT_RESTART) {
+            break;
+          }
         }
-        // result == 0: Success, continue normal flow
+        if (result == PROXY_ACCEPT_RESTART) {
+          goto restart;
+        }
+        continue; // nothing to relay on a listener
       } else if (pfe->stype == PROXY_SOCK_ACTIVE) {
         // Handle client data (extracted for clarity and debuggability)
         int result = handle_client_data(fd, pfe, &key, &rkey);

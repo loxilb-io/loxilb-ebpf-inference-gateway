@@ -246,7 +246,11 @@ lxb_ring_t* lxb_ring_get(void) {
         return g_rings[i];
       }
     }
-    log_error("[LXB_RING] Failed to auto-detect worker ID for pthread=%lu", (unsigned long)self);
+    /* Not a relay worker (the listener shard, a health or Go thread): no
+     * ring. Remember that, so this thread asks once instead of on every
+     * event it emits. */
+    g_worker_id = g_num_workers;
+    log_info("[LXB_RING] No ring for pthread=%lu (not a relay worker)", (unsigned long)self);
   }
   
   return NULL;  // Worker ID not set or invalid
