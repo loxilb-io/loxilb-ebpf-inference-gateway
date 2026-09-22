@@ -1010,7 +1010,14 @@ struct proxy_fd_ent {
   int peer_map_resp_verdict;     // 1 if the backend socket is in sock_verdict_map
   int peer_map_req_pending;      // request entry installed, client socket not added yet (proxy_peer_map_activate_req)
 
+  /* The rule's connection list (sockproxy_fdlist.h). Readers walk `next`;
+   * `prev` and the rule mark are the list's own, so that an insert and an
+   * unlink touch only this shell and its neighbours. The mark is the rule
+   * whose list the shell is on, NULL while it is on none; it survives the
+   * pool, so a shell recycled while linked cannot be inserted twice. */
   struct proxy_fd_ent *next;
+  struct proxy_fd_ent *prev;
+  struct proxy_map_ent *fdlist_rule;
   void *head;
   void *ssl;
   void *epv;

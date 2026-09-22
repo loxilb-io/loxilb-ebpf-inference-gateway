@@ -582,6 +582,16 @@ test_rcvbuf_cache: test_rcvbuf_cache.c sockproxy_rcvbuf.h
 test_rbc: test_rcvbuf_cache
 	./test_rcvbuf_cache
 
+# A rule's connection list: doubly linked with a per-shell rule mark, so an
+# insert's membership check and an unlink are constant-time. Header-only and
+# standalone.
+test_fdlist: test_fdlist.c sockproxy_fdlist.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_fdl
+test_fdl: test_fdlist
+	./test_fdlist
+
 # Listener shard: listening sockets register on the worker after the relay
 # shards; relay placement (fd modulo, pinned) is unchanged.
 test_notify_shard: test_notify_shard.c notify.c log.c notify.h

@@ -1200,7 +1200,20 @@ pfe_alloc_ex(int with_rcvbuf)
      * connection's gen on this same address. */
     gen = atomic_load_explicit(&pfe->gen, memory_order_relaxed);
     pfe_trace_op("pop", pfe->head, pfe);
-    memset(pfe, 0, sizeof(*pfe));
+    if (pfe->fdlist_rule) {
+      /* Still on a rule's connection list (recycled without an unlink; the
+       * recycle logged it). The list fields stay as they are, so the next
+       * insert of this shell is refused and a later unlink still finds its
+       * neighbours, instead of the list closing into a cycle. */
+      struct proxy_fd_ent *next = pfe->next, *prev = pfe->prev;
+      struct proxy_map_ent *rule = pfe->fdlist_rule;
+      memset(pfe, 0, sizeof(*pfe));
+      pfe->next = next;
+      pfe->prev = prev;
+      pfe->fdlist_rule = rule;
+    } else {
+      memset(pfe, 0, sizeof(*pfe));
+    }
     atomic_store_explicit(&pfe->gen, gen, memory_order_relaxed);
   }
 
@@ -1264,6 +1277,15 @@ pfe_recycle(proxy_fd_ent_t *pfe)
     return;
   }
   pfe_trace_op("rec", pfe->head, pfe);
+  if (pfe->fdlist_rule) {
+    /* Every release unlinks before it recycles; a shell that reaches the
+     * pool still linked is a bug upstream. Its list fields are kept across
+     * the pool so the list stays intact and its next insert is refused. */
+    log_error("[FDLIST] shell %p (fd=%d odir=%d gen=%lu) recycled while still linked in rule %p",
+              (void *)pfe, pfe->fd, pfe->odir,
+              (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed),
+              (void *)pfe->fdlist_rule);
+  }
   pfe->used = PFE_POOLED;
 
   /* A connection that ended on its own before the sweep reached it must not
