@@ -46,9 +46,12 @@ int proxy_conn_list_add(struct proxy_map_ent *ent, struct proxy_fd_ent *pfe, con
 void proxy_conn_list_del(struct proxy_map_ent *ent, struct proxy_fd_ent *pfe);
 void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
 
-#define PROXY_LOCK() pthread_rwlock_wrlock(&proxy_struct->lock)
-#define PROXY_RDLOCK() pthread_rwlock_rdlock(&proxy_struct->lock)
-#define PROXY_UNLOCK() pthread_rwlock_unlock(&proxy_struct->lock)
+/* The global proxy lock. Plain rwlock calls unless LLB_PROXY_LOCK_TRACE=1,
+ * which accounts wait and hold time by call site (sockproxy_locktrace.h). */
+#include "sockproxy_locktrace.h"
+#define PROXY_LOCK() proxy_lock_take(&proxy_struct->lock, 1, __func__, __LINE__)
+#define PROXY_RDLOCK() proxy_lock_take(&proxy_struct->lock, 0, __func__, __LINE__)
+#define PROXY_UNLOCK() proxy_lock_drop(&proxy_struct->lock)
 
 #define PROXY_ENT_LOCK(e) pthread_rwlock_wrlock(&e->lock)
 #define PROXY_ENT_UNLOCK(e) pthread_rwlock_unlock(&e->lock)

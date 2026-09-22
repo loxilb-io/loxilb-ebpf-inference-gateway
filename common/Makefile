@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -208,6 +208,10 @@ sockproxy_pd_trie.o: sockproxy_pd_trie.c
 
 # Phase 70 — sockproxy HA state sync receiver
 sockproxy_sync.o: sockproxy_sync.c sockproxy.h sockproxy_internal.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Global proxy lock accounting by call site (LLB_PROXY_LOCK_TRACE=1)
+sockproxy_locktrace.o: sockproxy_locktrace.c sockproxy_locktrace.h log.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Phase 75 — L7 content-routing policy engine (Plan 01: compiling stub TU)
@@ -553,6 +557,15 @@ test_notify_shard: test_notify_shard.c notify.c log.c notify.h
 .PHONY: test_shard
 test_shard: test_notify_shard
 	./test_notify_shard
+
+# Global proxy lock accounting: wait and hold time land on the acquiring site,
+# nested and cross-function holds included; the off path records nothing.
+test_locktrace: test_locktrace.c sockproxy_locktrace.c log.c sockproxy_locktrace.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_locktrace.c sockproxy_locktrace.c log.c -I. -lpthread
+
+.PHONY: test_lt
+test_lt: test_locktrace
+	./test_locktrace
 
 # Phase 47 P47-R2: root-pipe cfg V2 validator + miss-dispatch unit test
 # Standalone -- mirrors the header struct inline, does NOT link against DOCA.
