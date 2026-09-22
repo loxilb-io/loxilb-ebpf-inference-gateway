@@ -980,6 +980,46 @@ struct proxy_fd_ent {
    * as recv()==0. */
   uint8_t resp_outstanding;
 
+  /* Response framing on the CLIENT entry.
+   *
+   * resp_outstanding above is set where the request is handed over and cleared
+   * only by handle_resp_message_complete, which pd_resp_parser_init installs and
+   * which runs only under pd_framing_v2 — off by default. So on an ordinary
+   * connection nothing ever clears it and it cannot say whether an answer is
+   * still owed. These fields replace it with a pair of counters that a framer on
+   * THIS entry maintains: owed == cresp_forwarded > cresp_completed.
+   *
+   * The framer lives here, on the client, rather than on the backend where
+   * pd_framing_v2 puts it, and that is the whole reason it is affordable: the
+   * relay already holds this entry's lock when it scans response bytes
+   * (the SSE detector does its writes under it), so feeding a parser that keeps
+   * its state here takes no second lock and opens no lock-order cycle. A parser
+   * on the backend entry would need one, which is why that feed is a trylock
+   * that drops feeds under contention.
+   *
+   * Zero-init (pfe_alloc memsets recycled shells) == no framing seen yet. */
+  /* The request side of the same count. There is no per-request hook to borrow:
+   * the routing parser runs only while there is no backend leg yet, or on the
+   * AI-gateway gate re-arm (the PARSING PHASE gate in handle_client_data), so on
+   * an ordinary keep-alive connection requests 2..N are relayed without ever
+   * reaching llhttp. That is also why resp_outstanding is set once per
+   * connection rather than once per request. This framer sees every request
+   * because it is fed from the read itself, beside the routing parser rather
+   * than through it. */
+  llhttp_t creq_parser;            // HTTP_REQUEST; settings are one shared static
+  uint8_t  creq_parser_inited;
+
+  llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
+  uint8_t  cresp_parser_inited;
+  uint8_t  cresp_unframed;         // this response is delimited by the backend's EOF
+  uint32_t cresp_forwarded;        // requests handed to the backend
+  uint32_t cresp_completed;        // responses framed to completion
+  /* llhttp in response mode cannot know the request method, so a HEAD response
+   * would be read as having the body its Content-Length promises. Queue one bit
+   * per outstanding request; pipelining (E-5) is why it is a queue. */
+  uint8_t  cresp_head_q;           // bitmap, oldest outstanding request in bit 0
+  uint8_t  cresp_head_n;           // how many bits are live
+
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
   int peer_map_pair_installed;   // 1 if this backend pfe owns any peer_map entry
