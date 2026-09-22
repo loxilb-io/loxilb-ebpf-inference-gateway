@@ -74,6 +74,7 @@
 #include "sockproxy_ktls.h"
 #include "sockproxy_h2.h"
 #include "sockproxy_teardown_settle.h"
+#include "sockproxy_ka_leg.h"
 /* pure HTTP-message-end detector (chunked "0\r\n\r\n" /
  * SSE "[DONE]") shared with the unit TU. Included AFTER sockproxy.h so the real
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
@@ -8776,8 +8777,33 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                      struct llb_sockmap_key *rkey,
                      const char *phurl)
 {
-  // Setup backend connection
-  {
+  /* Keep-alive gate re-arm: both flags are consumed here. ka_keep_leg says
+   * the framed request rides the previous request's backend leg; otherwise
+   * the leg was already released and selection runs as for a first request.
+   * Cleared before dispatch so a parked/resumed request and the next
+   * boundary start clean. */
+  int ka_keep_leg = pfe->ka_keep_leg && pfe->rfd[0] > 0 && pfe->n_rfd > 0 &&
+                    pfe->rfd_ent[0] != NULL;
+  pfe->ka_reparse = 0;
+  pfe->ka_keep_leg = 0;
+
+  if (ka_keep_leg) {
+#ifdef HAVE_HTTP_TRACE
+    /* The leg carries the request's trace identity and start time (copied at
+     * setup for a fresh leg); refresh them for this request. */
+    proxy_fd_ent_t *ka_be = pfe->rfd_ent[0];
+    ka_be->trace_id_hi = pfe->trace_id_hi;
+    ka_be->trace_id_lo = pfe->trace_id_lo;
+    ka_be->parent_span_id = pfe->parent_span_id;
+    ka_be->root_span_id = pfe->root_span_id;
+    ka_be->trace_flags = pfe->trace_flags;
+    ka_be->has_traceparent = pfe->has_traceparent;
+    ka_be->req_start_ts = pfe->req_start_ts;
+#endif
+    log_trace("[KA_FIX] fd=%d forwarding on kept backend leg fd=%d",
+              pfe->fd, pfe->rfd[0]);
+  } else {
+    // Setup backend connection
     int sp_rc = setup_proxy_path(key, rkey, pfe, phurl);
     /* parked = held/suspended. Keep the fd, do NOT forward
      * to a backend (there is none yet), do NOT close. resumes it. */
@@ -9616,18 +9642,23 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * After release rfd[0]==-1 so this SAME read falls into the parse branch and reframes
        * cleanly. No race with the Phase-89-pinned decode path: req N+1 only arrives after
        * req N's response fully drained, so pd_phase already went COMPLETE->NONE. */
-      /* AI-gateway arm of the same boundary release: on an ai_gw_mode
-       * connection EVERY keep-alive request must re-enter the parse phase, or
-       * the auth/RPS/model gate (and the future TPM charge) runs only on
-       * request #1 of the connection and a client that holds one connection
-       * open bypasses enforcement entirely. Same boundary guards as the P/D
-       * arm (rcv_off==0 request boundary; streamed-forward mid-body excluded
-       * above), plus sse_active==0 so an in-flight streamed response is never
-       * torn down by an early (pipelined) next request. Cost: the backend leg
-       * is re-established per request — which also re-runs endpoint selection,
-       * so a long-lived client connection no longer pins every request to the
-       * EP chosen for request #1. Like the P/D arm, this assumes the client
-       * does not pipeline request N+1 before N's response drains. */
+      /* AI-gateway arm of the same boundary: on an ai_gw_mode connection
+       * EVERY keep-alive request must re-enter the parse phase, or the
+       * auth/RPS/model gate (and the TPM charge) runs only on request #1 of
+       * the connection and a client that holds one connection open bypasses
+       * enforcement entirely. Same boundary guards as the P/D arm (rcv_off==0
+       * request boundary; streamed-forward mid-body excluded above), plus
+       * sse_active==0 so an in-flight streamed response is never disturbed
+       * by an early (pipelined) next request. This arm does NOT release the
+       * leg: it sets ka_reparse, which keys the parse phase below while
+       * rfd[0] stays live, and the dispatch step decides whether the framed
+       * request rides that leg or selects an endpoint afresh
+       * (sockproxy_ka_leg.h: released when the pinned endpoint is unhealthy
+       * or the request names another model). Releasing here cost one
+       * backend connect per request — TIME-WAIT toward the backends grew
+       * with the request rate until the ephemeral port range ran out. Like
+       * the P/D arm, this assumes the client does not pipeline request N+1
+       * before N's response drains. */
       int ai_gw_boundary = 0;
       if (pfe->head) {
         proxy_map_ent_t *ka_hent = (proxy_map_ent_t *)pfe->head;
@@ -9636,16 +9667,20 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           ai_gw_boundary = 1;
       }
       if (pfe->rcv_off == 0 && pfe->n_rfd > 0 &&
-          pfe->pd_phase == PD_PHASE_NONE &&
-          ((pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) ||
-           ai_gw_boundary)) {
-        log_debug("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
-                 "request (n_rfd=%d rfd0=%d ai_gw=%d) — reframe/gate re-arm",
-                 pfe->fd, pfe->n_rfd, pfe->rfd[0], ai_gw_boundary);
-        proxy_release_rfd_ctx(pfe);
+          pfe->pd_phase == PD_PHASE_NONE) {
+        if (pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) {
+          log_debug("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
+                   "request (n_rfd=%d rfd0=%d) — reframe",
+                   pfe->fd, pfe->n_rfd, pfe->rfd[0]);
+          proxy_release_rfd_ctx(pfe);
+        } else if (ai_gw_boundary) {
+          log_trace("[KA_FIX] fd=%d gate re-arm on live backend leg "
+                    "(n_rfd=%d rfd0=%d)", pfe->fd, pfe->n_rfd, pfe->rfd[0]);
+          pfe->ka_reparse = 1;
+        }
       }
 
-      if (pfe->rfd[0] <= 0) {  // No backend connection yet - PARSING PHASE
+      if (pfe->rfd[0] <= 0 || pfe->ka_reparse) {  // No backend connection yet, or gate re-arm - PARSING PHASE
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[FIRST_DATA] fd=%d: First data received (rfd[0]=%d), rc=%zd, ssl=%p, ktls_enabled=%d",
                   fd, pfe->rfd[0], rc, pfe->ssl, pfe->ktls_enabled);
@@ -10044,6 +10079,36 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               phurl = NULL;
             }
 
+            /* Keep-alive gate re-arm: the request is framed and admitted, so
+             * decide now whether it rides the leg the previous request used.
+             * A kept leg keeps its endpoint pin and load accounting (the
+             * connection is still one connection on that endpoint); a
+             * released one goes through selection exactly as a first request. */
+            pfe->ka_keep_leg = 0;
+            if (pfe->ka_reparse) {
+              int ka_reason = KA_LEG_KEPT;
+              ka_leg_ctx_t ka_ctx = {
+                .leg_live   = (pfe->rfd[0] > 0 && pfe->n_rfd > 0 &&
+                               pfe->rfd_ent[0] != NULL),
+                .ep_pinned  = (pfe->epv != NULL && pfe->ep_num >= 0),
+                .ep_healthy = (pfe->epv != NULL && pfe->ep_num >= 0 &&
+                               is_endpoint_healthy((proxy_epval_t *)pfe->epv,
+                                                   pfe->ep_num)),
+                .prev_model = pfe->resp_model,
+                .next_model = proxy_effective_model(pfe),
+              };
+              if (ka_leg_reusable(&ka_ctx, &ka_reason)) {
+                pfe->ka_keep_leg = 1;
+                log_trace("[KA_FIX] fd=%d keeping backend leg fd=%d ep=%d",
+                          pfe->fd, pfe->rfd[0], pfe->ep_num);
+              } else if (ka_ctx.leg_live) {
+                log_debug("[KA_FIX] fd=%d releasing backend leg fd=%d ep=%d (%s) "
+                         "before re-selecting", pfe->fd, pfe->rfd[0],
+                         pfe->ep_num, ka_leg_reason_str(ka_reason));
+                proxy_release_rfd_ctx(pfe);
+              }
+            }
+
 #ifdef HAVE_DP_GPU_ROUTING
             /* PRODUCTION FIX: HTTP keep-alive double-increment guard.
              * When a client reuses a TCP connection for a second request,
@@ -10052,8 +10117,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
              * increments active_conns AGAIN for the new request without ever
              * decrementing the old one — because ep_num gets overwritten and
              * proxy_release_fd_ctx() only decrements the final ep_num.
-             * Fix: decrement the stale counter before the new selection. */
-            if (pfe->ep_num >= 0 && pfe->epv) {
+             * Fix: decrement the stale counter before the new selection.
+             * A kept leg is not re-selected, so its counter stays. */
+            if (!pfe->ka_keep_leg && pfe->ep_num >= 0 && pfe->epv) {
               proxy_epval_t *old_epv = (proxy_epval_t *)pfe->epv;
               if ((old_epv->select == PROXY_SEL_CHWBL ||
                    old_epv->select == PROXY_SEL_WRR_HASH) &&

@@ -1030,6 +1030,14 @@ struct proxy_fd_ent {
    * streamed-forward path resets rcv_off to 0, which otherwise makes
    * mid-body look exactly like a keep-alive request boundary). */
   size_t stream_body_remaining;
+  /* Keep-alive gate re-arm on an AI-gateway connection. Set at the request
+   * boundary instead of releasing the backend leg: the parse phase (and with
+   * it the admission gate) runs while rfd[0] is still live. Cleared when the
+   * framed request is dispatched. ka_keep_leg records the outcome of the
+   * reuse decision (sockproxy_ka_leg.h) for the dispatch step: 1 = forward on
+   * the existing leg, 0 = select an endpoint as for a first request. */
+  uint8_t ka_reparse;
+  uint8_t ka_keep_leg;
   char host_url[256];
   char request_path[256];  // P6: Request URL path ("/v1/users")
   char url_path[512];      // Full URL with query string for query parameter extraction
