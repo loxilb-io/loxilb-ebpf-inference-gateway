@@ -50,6 +50,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_conn.h"
 #include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
 #include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
 #include "sockproxy_health.h"
@@ -63,6 +64,7 @@
 /* Forward declaration for internal use (defined later in this file) */
 static void check_draining_endpoints(void);
 static void finish_deferred_closes(uint64_t now_ms);
+static void reap_pending_connects(uint64_t now_ms);
 /* Deferred teardown timing; the reasoning is on finish_deferred_closes below. */
 #define DEFERRED_CLOSE_MS 50
 #define DEFERRED_CLOSE_TICK_MS 25
@@ -206,6 +208,11 @@ proxy_drain_checker_thread(void *arg)
     if (proxy_defer_close_pending() > 0) {
       PROXY_LOCK();
       finish_deferred_closes(proxy_mono_ms());
+      PROXY_UNLOCK();
+    }
+    if (proxy_connect_pending_legs() > 0) {
+      PROXY_LOCK();
+      reap_pending_connects(proxy_mono_ms());
       PROXY_UNLOCK();
     }
     {
@@ -437,6 +444,39 @@ finish_deferred_closes(uint64_t now_ms)
       if (pfe->n_rfd > 0 && leg0 && leg0->fd > 0) {
         shutdown(leg0->fd, SHUT_RDWR);
       }
+    }
+  }
+}
+
+/* Backstop for a backend connect the kernel deadline did not end. The
+ * deadline is checked only when the SYN retransmit timer fires, and a kernel
+ * that does not apply TCP_USER_TIMEOUT to the handshake would let the SYN
+ * retry for minutes with the client's request held. Shuts the leg down so
+ * its owner worker sees POLLHUP and fails the request from
+ * proxy_backend_connect_event; nothing is freed here. Called with
+ * PROXY_LOCK held. */
+#define PENDING_CONNECT_REAP_SLACK_MS 1500
+
+static void
+reap_pending_connects(uint64_t now_ms)
+{
+  proxy_map_ent_t *node;
+  proxy_fd_ent_t *pfe;
+
+  for (node = proxy_struct->head; node; node = node->next) {
+    for (pfe = node->val.fdlist; pfe; pfe = pfe->next) {
+      if (!pfe->connect_pending || pfe->fd <= 0) {
+        continue;
+      }
+      if (now_ms - pfe->connect_start_ms <
+          (uint64_t)pfe->connect_deadline_ms + PENDING_CONNECT_REAP_SLACK_MS) {
+        continue;
+      }
+      log_warn("[CONNECT] backend fd=%d: handshake still pending after %llu ms "
+               "(deadline %u ms), cutting it",
+               pfe->fd, (unsigned long long)(now_ms - pfe->connect_start_ms),
+               pfe->connect_deadline_ms);
+      shutdown(pfe->fd, SHUT_RDWR);
     }
   }
 }

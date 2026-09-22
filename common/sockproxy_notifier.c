@@ -213,6 +213,12 @@ proxy_notifier(int fd, notify_type_t type, void *priv, uint64_t gen)
     return 0;
   }
 
+  /* A backend leg whose connect is still in flight: its first event is the
+   * handshake's outcome, not relay traffic. Consumed whole. */
+  if (pfe->connect_pending) {
+    return proxy_backend_connect_event(fd, pfe, (int)type);
+  }
+
   // Periodic session cleanup
   time_t now = time(NULL);
   if ((now - proxy_struct->last_session_cleanup) > PROXY_SESSION_CLEANUP_INTERVAL) {
@@ -457,6 +463,13 @@ restart:
            * owned. The backpressure release / shaper refill re-arms EPOLLIN
            * and the read path then consumes tail + EOF and closes
            * gracefully. */
+          notify_disarm_ent(proxy_struct->ns, fd);
+        } else if (pfe->connect_wait) {
+          /* A client holding its request for a backend connect half-closed:
+           * it is owed the response. Disarm the level-triggered RDHUP and
+           * keep the fd; the resume re-arms EPOLLIN and the read path then
+           * meets the EOF behind a request in flight, which defers the
+           * close until the response is done (proxy_sock_read_err). */
           notify_disarm_ent(proxy_struct->ns, fd);
         } else {
           /* A paused CLIENT (parked upload / admission park) half-closed:

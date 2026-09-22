@@ -58,6 +58,7 @@ typedef struct proxy_ep_val {
   int ep_cfd;
   int ep_num;
   int needs_learning;             /* Session learning flag */
+  int connect_pending;            /* handshake in flight: wired from the writable event */
 } proxy_ep_val_t;
 
 /*
@@ -157,6 +158,11 @@ void proxy_try_free_fd_ctx(proxy_fd_ent_t *pfe);
  * buffers (rcvbuf), bump `gen`, and return the shell to the freelist — NEVER
  * free() it to the heap, so a stale notify dispatch reading pfe->gen is safe. */
 proxy_fd_ent_t *pfe_alloc(void);
+/* The shell without its receive buffer, for a backend leg whose connect is
+ * still in flight; pfe_rcvbuf_alloc attaches the buffer once the leg is
+ * connected (0, or -1 on OOM with the shell untouched). */
+proxy_fd_ent_t *pfe_alloc_bare(void);
+int pfe_rcvbuf_alloc(proxy_fd_ent_t *pfe);
 void pfe_recycle(proxy_fd_ent_t *pfe);
 /* : read-only snapshot of the pfe-pool high-water gauges for the
  * bounded-footprint soak (live = shells checked out now; total = shells ever made).
@@ -169,6 +175,11 @@ void pd_cleanup(proxy_fd_ent_t *fd_ent);
  * alone (key via proxy_skmap_key_from_fd; phurl via pfe->host_url), and re-drives
  * pd_setup_and_forward. Never runs off-owner (the Phase-89/90 cross-thread UAF invariant). */
 void pd_resume_parked(int fd);
+/* The writable or error event of a backend leg whose connect setup_proxy_path
+ * left in flight. Runs on the worker that owns both legs and consumes the
+ * event: completes the leg, resumes the client and forwards the request it
+ * held, or fails the request with a 502. `type` is the notify_type_t mask. */
+int proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type);
 /* drain (pop + owner-worker wake) EVERY parked-admission entry for an EP that
  * just became ineligible for selection (health inv-flip, circuit-breaker
  * OPEN). The slot-free dequeue pops one head per dying conn — this releases

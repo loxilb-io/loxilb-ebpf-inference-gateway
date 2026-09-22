@@ -549,6 +549,17 @@ test_ka_leg: test_ka_leg.c sockproxy_ka_leg.h
 test_ka: test_ka_leg
 	./test_ka_leg
 
+# Backend connect in two halves: the relay path issues the connect and
+# finishes the leg from the writable event instead of holding its worker for
+# the round trip. Header-only and standalone; the test measures the kept
+# synchronous half as its own red twin against an injected handshake delay.
+test_async_connect: test_async_connect.c sockproxy_connect.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_aconn
+test_aconn: test_async_connect
+	./test_async_connect
+
 # Listener shard: listening sockets register on the worker after the relay
 # shards; relay placement (fd modulo, pinned) is unchanged.
 test_notify_shard: test_notify_shard.c notify.c log.c notify.h
