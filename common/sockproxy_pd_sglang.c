@@ -1022,6 +1022,7 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
       pfe->pd_prefill_body_len = sg_len;
       pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
                                SP_SOCK_MSG_LEN, sg_len);
+      pfe_rcv_note(pfe);
       pfe->pd_sg_active = 1;
       pfe->pd_sg_room = sg_room;
       pfe->pd_phase_start_ts = time(NULL);

@@ -1028,6 +1028,7 @@ struct proxy_fd_ent {
   uint64_t ntb;
   uint64_t ntp;
   size_t rcv_off;
+  size_t rcv_hwm;     // Furthest byte this user wrote into rcvbuf (sockproxy_rcvbuf.h)
   size_t parsed_off;  // How much of rcvbuf has been parsed
   int http_pok;
   int http_hok;
@@ -1370,6 +1371,23 @@ struct proxy_fd_ent {
                                       // reset boundary like the fields it supersedes.
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
+
+/* The receive buffer is recycled (sockproxy_rcvbuf.h): its next user gets the
+ * span this one wrote zeroed, and nothing more, so every site that writes
+ * into rcvbuf past the current offset records how far it got. */
+static inline void
+pfe_rcv_note_len(proxy_fd_ent_t *pfe, size_t len)
+{
+  if (len > pfe->rcv_hwm) {
+    pfe->rcv_hwm = len;
+  }
+}
+
+static inline void
+pfe_rcv_note(proxy_fd_ent_t *pfe)
+{
+  pfe_rcv_note_len(pfe, pfe->rcv_off);
+}
 
 /* True for a response status that was supposed to carry a usage object: a
  * successful completion, and nothing else.

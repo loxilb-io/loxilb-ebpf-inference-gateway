@@ -163,6 +163,7 @@ proxy_fd_ent_t *pfe_alloc(void);
  * connected (0, or -1 on OOM with the shell untouched). */
 proxy_fd_ent_t *pfe_alloc_bare(void);
 int pfe_rcvbuf_alloc(proxy_fd_ent_t *pfe);
+void proxy_rcvbuf_cache_setup(const char *env);
 void pfe_recycle(proxy_fd_ent_t *pfe);
 /* : read-only snapshot of the pfe-pool high-water gauges for the
  * bounded-footprint soak (live = shells checked out now; total = shells ever made).

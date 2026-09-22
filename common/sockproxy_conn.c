@@ -62,6 +62,7 @@
 #include "sockproxy_ssl.h"
 #include "sockproxy_ktls.h"
 #include "sockproxy_mtls.h"
+#include "sockproxy_rcvbuf.h"
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_trace_event.h"
 #include "sockproxy_trace.h"
@@ -1094,6 +1095,51 @@ pfe_trace_op(const char *op, void *rule, proxy_fd_ent_t *pfe)
 
 static pthread_mutex_t pfe_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static proxy_fd_ent_t *pfe_pool_free;   /* freelist head, linked via ->next */
+
+/* Released receive buffers wait here for the next leg instead of being
+ * unmapped (sockproxy_rcvbuf.h). Disabled (cap 0) until proxy_main sets it up,
+ * so an early caller simply allocates. */
+static rcvbuf_cache_t rcvbuf_cache = {
+  .lock = PTHREAD_MUTEX_INITIALIZER,
+  .size = SP_SOCK_MSG_LEN,
+};
+
+/* LLB_RCVBUF_CHECK=1: on every release, scan the buffer beyond the recorded
+ * high-water mark for a byte the user wrote without recording it, and log it.
+ * A debugging aid for the contract the cache rests on; off by default. */
+static int rcvbuf_check_state = -1;
+static _Atomic unsigned long rcvbuf_check_fail;
+
+static int
+rcvbuf_check_enabled(void)
+{
+  int s = __atomic_load_n(&rcvbuf_check_state, __ATOMIC_RELAXED);
+  if (s < 0) {
+    const char *e = getenv("LLB_RCVBUF_CHECK");
+    s = (e && *e && *e != '0') ? 1 : 0;
+    __atomic_store_n(&rcvbuf_check_state, s, __ATOMIC_RELAXED);
+  }
+  return s;
+}
+
+void
+proxy_rcvbuf_cache_setup(const char *env)
+{
+  size_t cap;
+
+  if (rcvbuf_cache_cap_from_env(env, &cap) < 0) {
+    log_warn("rcvbuf: %s='%s' is not a count, using the default",
+             RCVBUF_CACHE_ENV, env);
+  }
+  rcvbuf_cache_init(&rcvbuf_cache, SP_SOCK_MSG_LEN, cap, RCVBUF_CACHE_MAX_DIRTY);
+  if (cap == 0) {
+    log_info("rcvbuf: buffer cache disabled (%s=0)", RCVBUF_CACHE_ENV);
+  } else {
+    log_info("rcvbuf: keeping up to %zu released buffers, one used past %zu bytes is freed%s",
+             cap, (size_t)RCVBUF_CACHE_MAX_DIRTY,
+             rcvbuf_check_enabled() ? " (high-water check on)" : "");
+  }
+}
 static unsigned long   pfe_pool_total;  /* shells ever created (high-water)  */
 static unsigned long   pfe_pool_live;   /* shells currently checked out      */
 
@@ -1193,11 +1239,12 @@ pfe_rcvbuf_alloc(proxy_fd_ent_t *pfe)
   if (pfe->rcvbuf) {
     return 0;
   }
-  pfe->rcvbuf = calloc(1, SP_SOCK_MSG_LEN);
+  pfe->rcvbuf = rcvbuf_cache_get(&rcvbuf_cache);
   if (!pfe->rcvbuf) {
     log_error("pfe_alloc: rcvbuf OOM");
     return -1;
   }
+  pfe->rcv_hwm = 0;
   return 0;
 }
 
@@ -1223,11 +1270,28 @@ pfe_recycle(proxy_fd_ent_t *pfe)
    * leave the pending count raised, or the fast tick keeps walking for nothing. */
   proxy_defer_close_clear(pfe);
 
-  /* Free the per-connection heap buffer. The shell is NEVER free()d — its address
-   * must stay valid for any in-flight stale notify dispatch. */
+  /* Release the per-connection buffer to the cache with the span this user
+   * wrote, so its next user gets exactly that zeroed. The shell is NEVER
+   * free()d — its address must stay valid for any in-flight stale notify
+   * dispatch. */
   if (pfe->rcvbuf) {
-    free(pfe->rcvbuf);
+    size_t dirty;
+
+    pfe_rcv_note(pfe);
+    dirty = pfe->rcv_hwm;
+    if (rcvbuf_check_enabled()) {
+      long at = rcvbuf_first_nonzero(pfe->rcvbuf, dirty, SP_SOCK_MSG_LEN);
+      if (at >= 0) {
+        atomic_fetch_add(&rcvbuf_check_fail, 1);
+        log_error("[RCVBUF] fd=%d odir=%d wrote past its high-water mark: hwm=%zu rcv_off=%zu non-zero at %ld (failures %lu)",
+                  pfe->fd, pfe->odir, dirty, pfe->rcv_off, at,
+                  (unsigned long)atomic_load(&rcvbuf_check_fail));
+        dirty = SP_SOCK_MSG_LEN;
+      }
+    }
+    rcvbuf_cache_put(&rcvbuf_cache, pfe->rcvbuf, dirty);
     pfe->rcvbuf = NULL;
+    pfe->rcv_hwm = 0;
   }
 
   /* Bump the generation BEFORE the shell re-enters the freelist (release pairs
@@ -1287,6 +1351,7 @@ pfe_pool_selftest(void)
   void *rcv0 = p->rcvbuf;
   /* touch the whole heap rcvbuf — OOB/UAF would trip ASan / fail-loud */
   memset(p->rcvbuf, 0xD2, SP_SOCK_MSG_LEN);
+  pfe_rcv_note_len(p, SP_SOCK_MSG_LEN);
   uintptr_t addr = (uintptr_t)p;
 
   pfe_recycle(p);   /* gen++, rcvbuf freed, shell pooled */
@@ -1299,6 +1364,7 @@ pfe_pool_selftest(void)
   int stale_rejected = (gen1 != gen0);            /* old (q,gen0) would mismatch q->gen */
   int rcv_fresh = (q->rcvbuf != NULL && q->rcvbuf != rcv0 ? 1 : (q->rcvbuf != NULL));
   if (q->rcvbuf) memset(q->rcvbuf, 0x2D, SP_SOCK_MSG_LEN);  /* fresh buffer writable */
+  if (q->rcvbuf) pfe_rcv_note_len(q, SP_SOCK_MSG_LEN);
 
   log_info("[PFE_SELFTEST] %s shell_reused=%d gen %llu->%llu (advanced=%d) stale_rejected=%d rcvbuf_realloced=%d",
            (reused && gen_adv && stale_rejected && rcv_fresh) ? "PASS" : "FAIL",

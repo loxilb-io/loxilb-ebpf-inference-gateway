@@ -1266,6 +1266,7 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 
         // Update rcv_off in the source buffer
         ent->rcv_off = len;
+        pfe_rcv_note(ent);
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         // Show masked body after application (first 200 chars)
@@ -8945,6 +8946,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
             pfe->rcv_off = ug_hdr_len + ug_new_len;
             pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
                                      SP_SOCK_MSG_LEN, ug_new_len);
+            pfe_rcv_note(pfe);
             log_debug("[AI_USAGE_INJECT] fd=%d body %zu -> %zu bytes",
                      pfe->fd, ug_body_len, ug_new_len);
           }
@@ -9038,6 +9040,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 #endif
     }
     pfe->rcv_off = new_len;
+    pfe_rcv_note(pfe);
 
     /* NEW L7-gated request-header
      * injection — ALWAYS-overwrite X-Forwarded-For (real TCP peer IP) +
@@ -9051,6 +9054,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       if (l7node && l7node->has_l7_policy) {
         pfe->rcv_off = l7_inject_req_headers_h1(pfe, l7node, pfe->rcvbuf,
                                                 pfe->rcv_off, SP_SOCK_MSG_LEN, fd);
+        pfe_rcv_note(pfe);
       }
     }
 
@@ -9089,6 +9093,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
         /* Update Content-Length for rewritten prefill body */
         pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
                                  SP_SOCK_MSG_LEN, pfe->pd_prefill_body_len);
+        pfe_rcv_note(pfe);
         /* R2 [FRAME_MISMATCH] instrument (log-only): rewritten prefill CL site.
          * decl_cl uses the rewritten body len so candidate-2
          * (CL-rewrite divergence) is distinguishable from the
@@ -9119,6 +9124,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                                             pfe->vllm_request_id);
       if (rc_inj == 0) {
         pfe->rcv_off = inject_len;
+        pfe_rcv_note(pfe);
         pfe->request_id_injected = 1;
       }
     }
@@ -9649,6 +9655,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
     int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, rd_want);
     int saved_errno = errno;  // Save errno immediately after recv()
+    if (rc > 0) {
+      pfe_rcv_note_len(pfe, pfe->rcv_off + (size_t)rc);
+    }
 
     if (qos_b) {
       if (rc > 0) {
@@ -10485,7 +10494,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         if (pfe->rcv_off == 0 && rc > 10 &&
             memcmp(pfe->rcvbuf, "HTTP/", 5) == 0) {
           // This is the start of an HTTP response - log headers
-          char *header_end = strstr((char *)pfe->rcvbuf, "\r\n\r\n");
+          char *header_end = memmem(pfe->rcvbuf, (size_t)rc, "\r\n\r\n", 4);
           if (header_end) {
             size_t header_len = (header_end + 4) - (char *)pfe->rcvbuf;
             char headers[2048];

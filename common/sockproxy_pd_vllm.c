@@ -780,6 +780,7 @@ pd_seq_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
         /* Replace body in rcvbuf */
         memcpy(pfe->rcvbuf + hdr_len, prefill_buf, prefill_body_len);
         pfe->rcv_off = hdr_len + prefill_body_len;
+        pfe_rcv_note(pfe);
         pfe->pd_prefill_body_len = prefill_body_len;
 
         /* 3. Allocate prefill response buffer (64KB cap) */
