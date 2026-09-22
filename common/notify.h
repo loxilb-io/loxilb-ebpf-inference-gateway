@@ -64,6 +64,14 @@ int notify_disarm_ent(void *ctx, int fd);
 int notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen);
 /* Option A: like notify_add_ent but pins fd to pin_fd's notify worker. */
 int notify_add_ent_pinned(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen, int pin_fd);
+/* Register a listening socket on the listener shard: the worker after the
+ * n_thrs relay shards, which polls listeners only. Accepted connections are
+ * registered by the accept path with notify_add_ent / _pinned as before. */
+int notify_add_ent_listener(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen);
+/* The shard `fd` is registered on (-1 when not registered), and the listener
+ * shard's index (== n_thrs). */
+int notify_ent_thr(void *ctx, int fd);
+int notify_listener_thr(void *ctx);
 /* (R1): which notify worker owns `fd` (its `fd % n_thrs` shard, or the
  * pinned thr_id if registered). Returns -1 if ctx invalid. Lets the slot-freeing
  * thread route a parked fd's resume to its OWNER worker (never re-dispatch off-owner). */

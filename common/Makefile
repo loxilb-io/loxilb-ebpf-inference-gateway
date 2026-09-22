@@ -545,6 +545,15 @@ test_ka_leg: test_ka_leg.c sockproxy_ka_leg.h
 test_ka: test_ka_leg
 	./test_ka_leg
 
+# Listener shard: listening sockets register on the worker after the relay
+# shards; relay placement (fd modulo, pinned) is unchanged.
+test_notify_shard: test_notify_shard.c notify.c log.c notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_notify_shard.c notify.c log.c -I. -lpthread
+
+.PHONY: test_shard
+test_shard: test_notify_shard
+	./test_notify_shard
+
 # Phase 47 P47-R2: root-pipe cfg V2 validator + miss-dispatch unit test
 # Standalone -- mirrors the header struct inline, does NOT link against DOCA.
 test_doca_root_v2: test_doca_root_v2.c

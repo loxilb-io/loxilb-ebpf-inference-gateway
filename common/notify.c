@@ -96,6 +96,11 @@ typedef struct notify_ctx {
   int n_fds;
   int thr_sel;
   int n_thrs;
+  /* The listener shard. Listening sockets are polled by a worker of their
+   * own, after the n_thrs relay shards, so a connect burst is accepted at the
+   * pace of accept() and not at the pace of the relay loop it used to share
+   * (one accept per poll round, behind that round's relay events). */
+  int acc_thr;
   notify_cbs_t cbs;
   notify_poll_ctx_t poll_ctx[MAX_NOTIFY_THREADS];
 } notify_ctx_t ;
@@ -162,12 +167,14 @@ notify_ctx_new(notify_cbs_t *cbs, int n_thrs)
     nc->cbs.tick = cbs->tick;       /* per-loop maintenance hook (self-rate-limited) */
   }
 
-  if (n_thrs > MAX_NOTIFY_THREADS) {
+  /* n_thrs relay shards plus the listener shard. */
+  if (n_thrs <= 0 || n_thrs + 1 > MAX_NOTIFY_THREADS) {
     free(nc);
     return NULL;
   }
 
   nc->n_thrs = n_thrs;
+  nc->acc_thr = n_thrs;
 
   /* (R1): init each worker's resume-pending ring lock + mark wake_fd
    * uninited. The eventfd itself is created lazily on the worker thread in
@@ -292,7 +299,8 @@ notify_check_slot(void *ctx, int fd)
  * use-after-free that permanently wedged loxilb under load. pin_fd<=0 => historic
  * behaviour. The earr[pin_fd] read happens under NOTI_LOCK (held below). */
 static int
-__notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen, int pin_fd)
+__notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen,
+                 int pin_fd, int want_thr)
 {
   notify_ctx_t *nctx = ctx;
   notify_ent_t *ent;
@@ -302,7 +310,11 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
 
   assert(ctx);
 
-  if (fd <= 0 || fd > MAX_NOTIFY_FDS) {
+  /* earr[] has MAX_NOTIFY_FDS entries, so the last valid fd is one below. */
+  if (fd <= 0 || fd >= MAX_NOTIFY_FDS) {
+    return -EINVAL;
+  }
+  if (want_thr >= MAX_NOTIFY_THREADS) {
     return -EINVAL;
   }
 
@@ -311,7 +323,7 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
     return -EINVAL;
   }
 
-  NOTI_LOCK(nctx); 
+  NOTI_LOCK(nctx);
   ent = &nctx->earr[fd];
   if (ent->fd > 0) {
     pctx = &nctx->poll_ctx[ent->thr_id];
@@ -330,8 +342,11 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
 
   //nctx->thr_sel++;
   //tslot = ctx->thr_sel % nctx->n_thrs;
-  /* Option A: pin to pin_fd's worker when it is a live registered fd. */
-  if (pin_fd > 0 && pin_fd < MAX_NOTIFY_FDS && nctx->earr[pin_fd].fd > 0) {
+  /* A listener goes to the listener shard; anything else to pin_fd's worker
+   * when that is a live registered fd, else to its fd modulo shard. */
+  if (want_thr >= 0) {
+    tslot = want_thr;
+  } else if (pin_fd > 0 && pin_fd < MAX_NOTIFY_FDS && nctx->earr[pin_fd].fd > 0) {
     tslot = nctx->earr[pin_fd].thr_id;
     log_debug("notify-pin: fd %d -> worker %d (pinned to fd %d)", fd, tslot, pin_fd);
   } else {
@@ -373,7 +388,7 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
 int
 notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen)
 {
-  return __notify_add_ent(ctx, fd, type, priv, gen, -1);
+  return __notify_add_ent(ctx, fd, type, priv, gen, -1, -1);
 }
 
 /* Option A: register fd on the SAME notify worker as pin_fd (its owning
@@ -381,7 +396,46 @@ notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen)
 int
 notify_add_ent_pinned(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen, int pin_fd)
 {
-  return __notify_add_ent(ctx, fd, type, priv, gen, pin_fd);
+  return __notify_add_ent(ctx, fd, type, priv, gen, pin_fd, -1);
+}
+
+/* Register a listening socket on the listener shard. The connections it
+ * accepts are registered by the accept path as usual, so their relay
+ * ownership (fd modulo relay shards, or pinned) is unchanged. */
+int
+notify_add_ent_listener(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen)
+{
+  notify_ctx_t *nctx = ctx;
+
+  assert(ctx);
+  return __notify_add_ent(ctx, fd, type, priv, gen, -1, nctx->acc_thr);
+}
+
+/* The shard a fd is registered on, -1 when it is not registered. */
+int
+notify_ent_thr(void *ctx, int fd)
+{
+  notify_ctx_t *nctx = ctx;
+  int thr = -1;
+
+  if (!nctx || fd <= 0 || fd >= MAX_NOTIFY_FDS) {
+    return -1;
+  }
+  NOTI_LOCK(nctx);
+  if (nctx->earr[fd].fd > 0) {
+    thr = nctx->earr[fd].thr_id;
+  }
+  NOTI_UNLOCK(nctx);
+  return thr;
+}
+
+/* The listener shard's index (== the relay shard count). */
+int
+notify_listener_thr(void *ctx)
+{
+  notify_ctx_t *nctx = ctx;
+
+  return nctx ? nctx->acc_thr : -1;
 }
 
 int
@@ -544,6 +598,8 @@ notify_delete_ent_evict__(void *ctx, int fd)
 static int
 notify_delete_ent_evict__(void *ctx, int fd)
 {
+  (void)ctx;
+  (void)fd;
   return 0;
 }
 
@@ -790,7 +846,7 @@ notify_run(void *ctx, int thread)
     /* maintenance hook runs on every iteration, not just the timeout branch:
      * under sustained event load poll never returns 0, and the hook's work
      * (e.g. shaper refill/wake) must not starve behind traffic */
-    if (nctx->cbs.tick) {
+    if (nctx->cbs.tick && thread != nctx->acc_thr) {
       nctx->cbs.tick(thread);
     }
 
@@ -883,9 +939,11 @@ notify_run_worker(void *arg)
   g_llb_proxy_worker = 1;
   
 #ifdef HAVE_HTTP_TRACE
-  // Set worker ID for this thread (for ring buffer lookup)
-  extern void lxb_ring_set_worker_id(int worker_id);
-  lxb_ring_set_worker_id(targ->thrid);
+  /* Trace rings exist per relay shard; the listener shard has none. */
+  if (targ->thrid != ((notify_ctx_t *)targ->ctx)->acc_thr) {
+    extern void lxb_ring_set_worker_id(int worker_id);
+    lxb_ring_set_worker_id(targ->thrid);
+  }
 #endif
   
   notify_run(targ->ctx, targ->thrid);
@@ -900,9 +958,10 @@ notify_start(void *ctx)
   notify_thr_t *nthr;
   notify_ctx_t *nctx = ctx;
 
-  ptarr = calloc(1, nctx->n_thrs*sizeof(pthread_t));
+  /* the relay shards and, last, the listener shard */
+  ptarr = calloc(1, (nctx->n_thrs + 1)*sizeof(pthread_t));
 
-  for (i = 0; i < nctx->n_thrs; i++) {
+  for (i = 0; i < nctx->n_thrs + 1; i++) {
     nthr = calloc(1, sizeof(*nthr));
     assert(nthr);
 

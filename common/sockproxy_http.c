@@ -2955,7 +2955,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   if (arg->affinity_type > PROXY_AFFINITY_NONE) {
     fd_ctx->seltype = PROXY_SEL_STICKY;  // Enable sticky selection
   } 
-  if (notify_add_ent(proxy_struct->ns, lsd, NOTI_TYPE_IN|NOTI_TYPE_HUP, fd_ctx, fd_ctx->gen)) {
+  if (notify_add_ent_listener(proxy_struct->ns, lsd, NOTI_TYPE_IN|NOTI_TYPE_HUP,
+                              fd_ctx, fd_ctx->gen)) {
     log_error("sockproxy : %s:%u notify failed",
         inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport));
     PROXY_UNLOCK();
@@ -8453,7 +8454,12 @@ handle_url(llhttp_t *parser, const char *at, size_t length)
  * @param rkey: Reverse sockmap key (output parameter)
  * @param ep_sel: Endpoint selection data (output parameter)
  *
- * Returns: 0 on success (connection accepted), -1 to restart, 1 to continue loop
+ * Runs on the listener shard, which polls listening sockets only, so the
+ * TLS handshake and the registration below never hold up a relay worker.
+ *
+ * Returns: PROXY_ACCEPT_OK (accepted), PROXY_ACCEPT_NEXT (this connection
+ * dropped, try the next one), PROXY_ACCEPT_DONE (backlog drained or accept
+ * gated for this round), PROXY_ACCEPT_RESTART (restart the dispatch)
  */
 int
 handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
@@ -8491,7 +8497,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
                    "(blocked_total=%lu) — SYN held in listen backlog",
                    (unsigned long)cur, total_bound, (unsigned long)blk);
         }
-        return 1; // Continue the event loop; SYN stays queued in the backlog.
+        return PROXY_ACCEPT_DONE; // SYN stays queued in the backlog.
       }
     }
   }
@@ -8503,10 +8509,10 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   new_sd = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
 
   if (new_sd < 0) {
-    if (errno != EWOULDBLOCK) {
-      log_error("accept failed\n");
+    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+      log_error("accept failed %s", strerror(errno));
     }
-    return 1; // Continue processing other events
+    return PROXY_ACCEPT_DONE; // backlog drained, or an error poll re-reports
   }
 
   new_sd = get_mapped_proxy_fd(new_sd, 1);
@@ -8518,7 +8524,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       SSL_free(ssl);
     }
     close(new_sd);
-    return 1; // Continue
+    return PROXY_ACCEPT_NEXT;
   }
 
   proxy_sock_set_opts(new_sd, protocol);
@@ -8538,7 +8544,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       SSL_free(ssl);
       close(new_sd);
       ssl = NULL;
-      return 1; // Continue
+      return PROXY_ACCEPT_NEXT;
     }
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[SSL_HANDSHAKE_OK] fd=%d: SSL_accept succeeded, ssl=%p", new_sd, ssl);
@@ -8744,7 +8750,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     proxy_release_fd_ctx(npfe1, 0);
     pfe_recycle(npfe1);
     log_error("failed to add new_sd %d", new_sd);
-    return 1; // Continue
+    return PROXY_ACCEPT_NEXT;
   }
 
   // Setup backend path for certain protocols
@@ -8755,11 +8761,11 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     int sp_rc = setup_proxy_path(key, rkey, npfe1, NULL);
     if (sp_rc) {
       log_error("proxy setup failed %d - proto %d(sel %d)", fd, protocol, pfe->seltype);
-      return -1; // Restart
+      return PROXY_ACCEPT_RESTART;
     }
   }
 
-  return 0; // Success
+  return PROXY_ACCEPT_OK;
 }
 
 /* (R1): pd_setup_and_forward return contract — the dispatch+forward

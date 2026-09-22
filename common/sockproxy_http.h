@@ -51,7 +51,19 @@ void proxy_pdestroy(void *priv);
 /* Session housekeeping — expire idle sessions (called from proxy_notifier) */
 void cleanup_expired_sessions(void);
 
-/* Accept-path handler — called from proxy_notifier for NOTI_TYPE_IN on listeners */
+/* Accept-path handler — called from proxy_notifier for NOTI_TYPE_IN on listeners.
+ * Returns PROXY_ACCEPT_OK for an accepted connection, PROXY_ACCEPT_NEXT when
+ * this connection was dropped but the backlog may hold more, PROXY_ACCEPT_DONE
+ * when the backlog is drained (or accept is gated) for this poll round, and
+ * PROXY_ACCEPT_RESTART when the caller has to restart its dispatch. The
+ * listener's worker drains up to PROXY_ACCEPT_BATCH connections per readable
+ * event; poll is level-triggered, so a longer backlog is picked up again on
+ * the next round without starving the other listeners on the shard. */
+#define PROXY_ACCEPT_RESTART (-1)
+#define PROXY_ACCEPT_OK      0
+#define PROXY_ACCEPT_NEXT    1
+#define PROXY_ACCEPT_DONE    2
+#define PROXY_ACCEPT_BATCH   64
 int handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
                           struct llb_sockmap_key *key, struct llb_sockmap_key *rkey,
                           proxy_ep_sel_t *ep_sel);
