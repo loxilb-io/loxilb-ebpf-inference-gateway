@@ -55,6 +55,7 @@
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_conn.h"
+#include "sockproxy_connect.h"
 #include "sockproxy_cache.h"
 #include "sockproxy_lb.h"
 #include "sockproxy_routing.h"
@@ -389,6 +390,38 @@ proxy_defer_close_pending(void)
   return atomic_load(&defer_close_pending);
 }
 
+/* Backend legs whose connect is still in flight, kept so the health thread's
+ * fast tick can skip its walk while there are none. */
+static _Atomic int connect_pending_legs;
+
+void
+proxy_connect_pending_mark(proxy_fd_ent_t *pfe)
+{
+  if (!pfe || pfe->connect_pending) {
+    return;
+  }
+  pfe->connect_pending = 1;
+  atomic_fetch_add(&connect_pending_legs, 1);
+}
+
+/* Idempotent: the leg's completion, a teardown that reaches it first and the
+ * reaper all call this; whichever comes first counts. */
+void
+proxy_connect_pending_clear(proxy_fd_ent_t *pfe)
+{
+  if (!pfe || !pfe->connect_pending) {
+    return;
+  }
+  pfe->connect_pending = 0;
+  atomic_fetch_sub(&connect_pending_legs, 1);
+}
+
+int
+proxy_connect_pending_legs(void)
+{
+  return atomic_load(&connect_pending_legs);
+}
+
 /* proxy_sockmap_drop_accel — close the connections of one rule that the kernel
  * is currently accelerating, and report how many were closed.
  *
@@ -701,14 +734,36 @@ proxy_send_all(int fd, const void *buf, size_t len)
   return 0;
 }
 
+/* The listener's backend connect deadline in ms. The value rides proxy_arg
+ * (timeout_member_connect_ms), reached here via the client pfe's
+ * proxy_map_ent (pfe->head). It is L7-gated (has_l7_policy): the AI peer and
+ * every un-configured listener keep the historic 500ms literal byte-for-byte
+ * (Pitfall 3 — NOT Octavia's 5000ms). 0 ⇒ 500 even when an L7 policy is
+ * attached. */
 int
-proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
-                       void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
-                       const void *pp2hdr, int pp2len)
+proxy_ep_connect_deadline_ms(proxy_fd_ent_t *pfe)
 {
-  int fd, rc;
+  int connect_to_ms = 500;
+  proxy_map_ent_t *cnode = pfe ? (proxy_map_ent_t *)pfe->head : NULL;
+
+  if (cnode && cnode->has_l7_policy && cnode->arg_ptr &&
+      cnode->arg_ptr->timeout_member_connect_ms > 0) {
+    connect_to_ms = (int)cnode->arg_ptr->timeout_member_connect_ms;
+  }
+  return connect_to_ms;
+}
+
+/* Socket, options and the connect() of one backend leg. On
+ * PROXY_CONNECT_FAILED the socket is already closed and *fd_out is -1. */
+static proxy_connect_state_t
+proxy_ep_connect_start(uint32_t epip, uint16_t epport, uint8_t protocol,
+                       proxy_fd_ent_t *pfe, int deadline_ms, int *fd_out)
+{
+  int fd;
   struct sockaddr_in epaddr;
-  struct pollfd pfds = { 0 };
+  proxy_connect_state_t st;
+
+  *fd_out = -1;
 
   memset(&epaddr, 0, sizeof(epaddr));
   epaddr.sin_family = AF_INET;
@@ -725,7 +780,7 @@ proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
   fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, protocol);
   if (fd < 0) {
     log_error("proxy_setup_ep_connect: socket() failed: %s", strerror(errno));
-    return -1;
+    return PROXY_CONNECT_FAILED;
   }
 
   fd = get_mapped_proxy_fd(fd, 1);
@@ -748,50 +803,26 @@ proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
     }
   }
 
-  if (connect(fd, (struct sockaddr*)&epaddr, sizeof(epaddr)) < 0) {
-    if (errno != EINPROGRESS) {
-      log_error("connect failed %s:%u", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
-      close(fd);
-      return -1;
-    }
-
-    pfds.fd = fd;
-    pfds.events = POLLOUT|POLLERR;
-
-    /* per-listener backend connect timeout in ms. The value
-     * rides proxy_arg (timeout_member_connect_ms), reached here via the client pfe's
-     * proxy_map_ent (pfe->head). It is L7-gated (has_l7_policy): the AI peer and every
- * un-configured listener keep the historic 500ms literal byte-for-byte (
-     * Pitfall 3 — NOT Octavia's 5000ms). 0 ⇒ 500 even when an L7 policy is attached. */
-    int connect_to_ms = 500;
-    {
-      proxy_map_ent_t *cnode = pfe ? (proxy_map_ent_t *)pfe->head : NULL;
-      if (cnode && cnode->has_l7_policy && cnode->arg_ptr &&
-          cnode->arg_ptr->timeout_member_connect_ms > 0) {
-        connect_to_ms = (int)cnode->arg_ptr->timeout_member_connect_ms;
-      }
-    }
-
-    rc = poll(&pfds, 1, connect_to_ms);
-    if (rc < 0) {
-      log_error("connect poll %s:%u(%s)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport), strerror(errno));
-      close(fd);
-      return -1;
-    }
-
-    if (rc == 0) {
-      log_error("connect %s:%u(timedout)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
-      close(fd);
-      return -1;
-    }
-
-    if (pfds.revents & POLLERR) {
-      log_error("connect %s:%u(errors)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
-      close(fd);
-      return -1;
-    }
+  st = proxy_connect_start(fd, &epaddr, deadline_ms);
+  if (st == PROXY_CONNECT_FAILED) {
+    log_error("connect failed %s:%u", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
+    close(fd);
+    return st;
   }
 
+  *fd_out = fd;
+  return st;
+}
+
+/* Everything that follows a completed handshake: the PROXY protocol header,
+ * then the backend TLS handshake. The tail of the synchronous connect, and
+ * the part of an asynchronous one that runs from the writable event. Returns
+ * the fd, or -1 with the fd closed. */
+static int
+proxy_ep_connect_finish_leg(int fd, uint32_t epip, uint16_t epport,
+                            void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
+                            const void *pp2hdr, int pp2len)
+{
   /* PROXY protocol v2 header must be the FIRST bytes on the backend connection,
    * before any client payload and before the (optional) backend TLS handshake,
    * since PROXY protocol is a layer below TLS. Sending here on the freshly
@@ -854,6 +885,83 @@ proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
 #endif
   
   return fd;
+}
+
+int
+proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
+                       void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
+                       const void *pp2hdr, int pp2len)
+{
+  int fd;
+  proxy_connect_state_t st;
+
+  st = proxy_ep_connect_start(epip, epport, protocol, pfe, 0, &fd);
+  if (st == PROXY_CONNECT_FAILED) {
+    return -1;
+  }
+
+  if (st == PROXY_CONNECT_PENDING) {
+    /* The calling thread waits for the handshake: see sockproxy_connect.h
+     * for the callers that need this, and proxy_setup_ep_connect_async for
+     * the relay path, which does not. */
+    if (proxy_connect_wait(fd, proxy_ep_connect_deadline_ms(pfe))) {
+      if (errno == ETIMEDOUT) {
+        log_error("connect %s:%u(timedout)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
+      } else {
+        log_error("connect %s:%u(errors)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
+      }
+      close(fd);
+      return -1;
+    }
+  }
+
+  return proxy_ep_connect_finish_leg(fd, epip, epport, ssl_ctx, ssl, pfe, pp2hdr, pp2len);
+}
+
+/* The relay path's connect: never waits for the handshake. Returns the fd
+ * with *pending set while the handshake is in flight; the caller registers
+ * it for POLLOUT and completes the leg with proxy_setup_ep_connect_complete
+ * from the writable event. A connect that completes at once (a local
+ * backend) returns a finished leg with *pending clear, the PROXY header
+ * already sent. Plaintext backends only: a TLS backend's handshake is driven
+ * synchronously and keeps the synchronous connect. -1 on failure. */
+int
+proxy_setup_ep_connect_async(uint32_t epip, uint16_t epport, uint8_t protocol,
+                             proxy_fd_ent_t *pfe, const void *pp2hdr, int pp2len,
+                             int *pending)
+{
+  int fd;
+  proxy_connect_state_t st;
+
+  *pending = 0;
+  st = proxy_ep_connect_start(epip, epport, protocol, pfe,
+                              proxy_ep_connect_deadline_ms(pfe), &fd);
+  if (st == PROXY_CONNECT_FAILED) {
+    return -1;
+  }
+  if (st == PROXY_CONNECT_PENDING) {
+    *pending = 1;
+    return fd;
+  }
+  return proxy_ep_connect_finish_leg(fd, epip, epport, NULL, NULL, pfe, pp2hdr, pp2len);
+}
+
+/* Second half of proxy_setup_ep_connect_async, from the leg's writable or
+ * error event: the connect result, then the PROXY header that has to open
+ * the stream. 0 when the leg is ready for payload, else an errno; the fd is
+ * left to the caller either way. */
+int
+proxy_setup_ep_connect_complete(int fd, const void *pp2hdr, int pp2len)
+{
+  int err = proxy_connect_finish(fd);
+
+  if (err) {
+    return err;
+  }
+  if (pp2hdr && pp2len > 0 && proxy_send_all(fd, pp2hdr, (size_t)pp2len)) {
+    return errno ? errno : EPIPE;
+  }
+  return 0;
 }
 
 int
@@ -989,8 +1097,8 @@ static proxy_fd_ent_t *pfe_pool_free;   /* freelist head, linked via ->next */
 static unsigned long   pfe_pool_total;  /* shells ever created (high-water)  */
 static unsigned long   pfe_pool_live;   /* shells currently checked out      */
 
-proxy_fd_ent_t *
-pfe_alloc(void)
+static proxy_fd_ent_t *
+pfe_alloc_ex(int with_rcvbuf)
 {
   proxy_fd_ent_t *pfe;
   uint64_t gen;
@@ -1051,10 +1159,11 @@ pfe_alloc(void)
   }
 
   /* B-split: 1MB receive buffer on the heap. calloc to preserve the zero-init
-   * semantics of the previously-inline array. */
-  pfe->rcvbuf = calloc(1, SP_SOCK_MSG_LEN);
-  if (!pfe->rcvbuf) {
-    log_error("pfe_alloc: rcvbuf OOM");
+   * semantics of the previously-inline array. A leg whose connect is still
+   * in flight takes the shell without it (pfe_alloc_bare) and attaches the
+   * buffer once connected (pfe_rcvbuf_alloc): a backend that is slow to
+   * accept would otherwise hold a megabyte per pending leg for nothing. */
+  if (with_rcvbuf && pfe_rcvbuf_alloc(pfe)) {
     pfe_recycle(pfe);   /* return the shell to the pool (rcvbuf already NULL) */
     return NULL;
   }
@@ -1064,6 +1173,32 @@ pfe_alloc(void)
   pfe->park_ep_idx = -1;
 
   return pfe;
+}
+
+proxy_fd_ent_t *
+pfe_alloc(void)
+{
+  return pfe_alloc_ex(1);
+}
+
+proxy_fd_ent_t *
+pfe_alloc_bare(void)
+{
+  return pfe_alloc_ex(0);
+}
+
+int
+pfe_rcvbuf_alloc(proxy_fd_ent_t *pfe)
+{
+  if (pfe->rcvbuf) {
+    return 0;
+  }
+  pfe->rcvbuf = calloc(1, SP_SOCK_MSG_LEN);
+  if (!pfe->rcvbuf) {
+    log_error("pfe_alloc: rcvbuf OOM");
+    return -1;
+  }
+  return 0;
 }
 
 void
@@ -1358,6 +1493,7 @@ void
 proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
 {
   proxy_destroy_xmitcache(fd_ent);
+  proxy_connect_pending_clear(fd_ent);
 
 #ifdef HAVE_DP_GPU_ROUTING
   // P1.3/P3.5: Decrement CHWBL/WRR_HASH load counter when connection closes

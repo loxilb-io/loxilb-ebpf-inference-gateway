@@ -1035,8 +1035,20 @@ pd_fallback_normal:
         epport = tepval->eps[sel].xport;
         epprotocol = tepval->eps[sel].protocol;
         
-        ep_sel->ep_cfds[0].ep_cfd = proxy_setup_ep_connect(epip, epport, (uint8_t)epprotocol,
-                                                           ssl_ctx, ssl, pfe, pp2hdr, pp2len);
+        /* The relay path leaves the handshake in flight and wires the leg
+         * from its writable event; anything that needs the socket connected
+         * here (a TLS backend, the P/D machines, a caller that did not opt
+         * in) keeps the synchronous connect. */
+        ep_sel->ep_cfds[0].connect_pending = 0;
+        if (pfe && pfe->connect_async_ok && !ssl_ctx && !tepval->pd_disagg_enabled) {
+          ep_sel->ep_cfds[0].ep_cfd =
+              proxy_setup_ep_connect_async(epip, epport, (uint8_t)epprotocol, pfe,
+                                           pp2hdr, pp2len,
+                                           &ep_sel->ep_cfds[0].connect_pending);
+        } else {
+          ep_sel->ep_cfds[0].ep_cfd = proxy_setup_ep_connect(epip, epport, (uint8_t)epprotocol,
+                                                             ssl_ctx, ssl, pfe, pp2hdr, pp2len);
+        }
 
         /* Same-EP reconnect on transient connect failure (affinity-bearing
          * services only — pd_connect_retry_budget returns 0 for plain LB, so
@@ -1291,8 +1303,13 @@ pd_fallback_normal:
 
 pd_failover_ok: /* NORMAL success path falls through this label too — the
                  * goto above only skips the connect-failure handling block. */
-        // P2 Task 2.3: Record connection success for circuit breaker
-        circuit_breaker_record_success(tepval, sel);
+        // P2 Task 2.3: Record connection success for circuit breaker. A
+        // connect still in flight has not succeeded yet: its writable event
+        // records the outcome (a success here would reset the failure count
+        // ahead of every refusal and the breaker could never trip).
+        if (!ep_sel->ep_cfds[0].connect_pending) {
+          circuit_breaker_record_success(tepval, sel);
+        }
 
         *seltype = 0;
         *rid = tepval->_id;

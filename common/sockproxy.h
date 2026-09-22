@@ -982,6 +982,20 @@ struct proxy_fd_ent {
    * two are otherwise identical, since shutdown(SHUT_WR) and close() both arrive
    * as recv()==0. */
   uint8_t resp_outstanding;
+  /* A backend connect left in flight (sockproxy_connect.h). On the BACKEND
+   * leg connect_pending is set from the connect() until the writable event
+   * completes the leg; the PROXY protocol header that has to open the
+   * stream waits in connect_pp2 until then, and connect_start_ms with
+   * connect_deadline_ms bound the wait for the health thread's backstop.
+   * On the CLIENT, connect_wait is set while its reads are paused for the
+   * leg, connect_async_ok while its caller can hold the request. */
+  uint8_t connect_pending;
+  uint8_t connect_wait;
+  uint8_t connect_async_ok;
+  uint8_t connect_pp2_len;
+  uint8_t connect_pp2[28];
+  uint32_t connect_deadline_ms;
+  uint64_t connect_start_ms;
 
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
@@ -1861,6 +1875,14 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
  * close). Distinct positive sentinel so it never collides with the -1 error path. */
 #ifndef PD_SETUP_PARKED
 #define PD_SETUP_PARKED (2)
+#endif
+/* A FOURTH outcome of setup_proxy_path: the backend leg is allocated, linked
+ * and registered for its writable event, and the client fd is EPOLLIN-paused
+ * holding the request. The caller keeps the fd and forwards nothing; the
+ * writable event completes the leg and forwards the held request
+ * (proxy_backend_connect_event). */
+#ifndef SP_SETUP_CONNECTING
+#define SP_SETUP_CONNECTING (3)
 #endif
 int pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                       uint32_t excluded_mask);

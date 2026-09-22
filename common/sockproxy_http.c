@@ -6742,6 +6742,179 @@ mtls_validate_client_cn(SSL *ssl, proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
 }
 #endif /* HAVE_MTLS */
 
+/* The per-connection acceleration decisions once BOTH legs are connected:
+ * kTLS offload on either side, then the sockmap or peer_map pairing of the
+ * pair. Split out of setup_proxy_path because a leg whose connect was left
+ * in flight runs this from its writable event instead: the kernel refuses a
+ * socket that is not yet established for sockmap, and the backend's tuple is
+ * not known before the handshake completes. */
+static void
+setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
+                      proxy_fd_ent_t *npfe2, proxy_map_ent_t *ent,
+                      proxy_epval_t *tepval, int protocol, int epprotocol)
+{
+  int ep_cfd = npfe2->fd;
+  void *ssl = npfe2->ssl;
+
+  // Sockmap offload configuration:
+  // - HTTP→HTTP (plaintext): Sockmap enabled (zero-copy kernel forwarding)
+  // - HTTPS→HTTP (TLS termination): Sockmap disabled (kTLS only)
+  // - HTTPS→HTTPS (TLS transit): Sockmap disabled (kTLS only)
+  // - HTTP→HTTPS (TLS origination): Sockmap disabled
+  //
+  // Rationale: Only HTTP→HTTP is supported for simplicity and reliability.
+  // kTLS provides sufficient performance for HTTPS scenarios without sockmap complexity.
+
+  int sockmap_eligible = 0;
+  int ktls_client_enabled __attribute__((unused)) = 0;
+  int ktls_backend_enabled __attribute__((unused)) = 0;
+
+  if (protocol == IPPROTO_TCP && epprotocol == IPPROTO_TCP) {
+    // Case 1: HTTP→HTTP (plaintext only) - SOCKMAP ENABLED
+    if (!pfe->ssl && !ssl) {
+      sockmap_eligible = 1;
+    }
+    // Case 2: HTTPS→HTTP (TLS termination) - SOCKMAP DISABLED, kTLS ONLY
+    else if (pfe->ssl && !ssl && g_ktls_cfg.enabled) {
+      // Try to enable kTLS on client side for hardware-accelerated decryption
+      if (ktls_try_offload(pfe->ssl, pfe->fd, 0 /* server side */) == 0) {
+        ktls_client_enabled = 1;
+        pfe->ktls_enabled = 1;
+      } else if (ktls_is_active(pfe->fd)) {
+        ktls_client_enabled = 1;
+        pfe->ktls_enabled = 1;
+      }
+    }
+    // Case 3: HTTPS→HTTPS (TLS transit) - SOCKMAP DISABLED, kTLS ONLY
+    else if (pfe->ssl && ssl && g_ktls_cfg.enabled) {
+      // Try to enable kTLS on client side
+      if (ktls_try_offload(pfe->ssl, pfe->fd, 0 /* server side */) == 0) {
+        ktls_client_enabled = 1;
+        pfe->ktls_enabled = 1;
+      } else if (ktls_is_active(pfe->fd)) {
+        ktls_client_enabled = 1;
+        pfe->ktls_enabled = 1;
+      }
+
+      // Try to enable kTLS on backend side
+      if (ktls_try_offload(ssl, ep_cfd, 1 /* client side */) == 0) {
+        ktls_backend_enabled = 1;
+      } else if (ktls_is_active(ep_cfd)) {
+        ktls_backend_enabled = 1;
+      }
+    }
+
+    // Register to sockmap ONLY for HTTP→HTTP plaintext.
+    // HAVE_SOCKOPS builds populate the sockhash from the kernel sockops
+    // callbacks; userspace must not re-register the same sockets into the
+    // shared map (BPF_NOEXIST collisions). Pairing is expressed via peer_map
+    // below instead.
+#if !defined(HAVE_SOCKOPS)
+    if (sockmap_eligible && proxy_struct->sockmap_cb && ent->val.sockmap_en &&
+        !proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
+      int ret1 = proxy_struct->sockmap_cb(rkey, pfe->fd, 1);
+      int ret2 = proxy_struct->sockmap_cb(key, ep_cfd, 1);
+      if (ret1 != 0 || ret2 != 0) {
+        if (ret1 == 0) {
+          proxy_struct->sockmap_cb(rkey, pfe->fd, 0);
+        }
+        if (ret2 == 0) {
+          proxy_struct->sockmap_cb(key, ep_cfd, 0);
+        }
+        log_error("Sockmap: Registration failed! client_ret=%d, backend_ret=%d", ret1, ret2);
+      }
+    }
+#endif
+  }
+
+
+  // Check if kTLS was enabled on backend connection
+  if (ssl && ktls_is_active(ep_cfd)) {
+    npfe2->ktls_enabled = 1;
+  } else {
+    npfe2->ktls_enabled = 0;
+  }
+
+#if defined(HAVE_SOCKOPS)
+  uint8_t sockmap_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
+
+  /* Second gate on the pairing, per connection. The control plane refuses a
+   * sockMapMode on a rule whose data plane rewrites bytes on every request —
+   * a declared apikey_auth (an explicit "disabled" included, which still
+   * strips X-Api-Key) or an attached L7 policy — but that check runs when the
+   * rule is written, and an L7 policy can be attached while connections are
+   * already live. Acceleration would then skip l7_inject_req_headers_h1 and
+   * ai_strip_upstream_api_key from the second keep-alive request on, carrying
+   * the tenant's key upstream and leaving a client-supplied X-Forwarded-For
+   * unrewritten. Declining the pair here costs a rule that should never have
+   * been accelerated its acceleration, and nothing else: the connection stays
+   * on the userspace relay, which is exactly the byte path it needs. */
+  if (sockmap_mode && proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
+    log_debug("Sockmap: not pairing fd=%d/%d, the rule rewrites every request "
+             "(l7_policy=%u); staying on the userspace relay",
+             pfe->fd, ep_cfd, ent->has_l7_policy);
+    sockmap_mode = 0;
+  }
+
+  if (sockmap_eligible && proxy_struct->peer_map_cb && proxy_struct->verdict_map_cb &&
+      sockmap_mode) {
+    /* sockmap_en is a directional mode:
+     *   1 = both, 2 = request-only, 3 = response-only.
+     * The request direction ([client]=backend) lets the sk_skb verdict
+     * redirect client ingress straight to the backend; the response
+     * direction ([backend]=client) redirects backend ingress to the client.
+     * Install only the entries that the mode asks for; the other direction
+     * stays on the userspace proxy path.
+     * key  = backend socket tuple as seen from the client side (self=client)
+     * rkey = client socket tuple as seen from the backend side (self=backend)
+     *
+     * An installed entry does nothing until its socket is also added to
+     * sock_verdict_map (sockops no longer adds it; see llb_kern_sockmap.c).
+     * The backend socket is added right away: the request has not been sent
+     * yet, so no response byte can be in userspace or on the way. The client
+     * socket is added by proxy_peer_map_activate_req once userspace has handed
+     * the backend every client byte it holds, so later client bytes cannot
+     * overtake the request that is still being forwarded. */
+    uint8_t dir = sockmap_mode;
+    int do_req = (dir == 1 || dir == 2);
+    int do_resp = (dir == 1 || dir == 3);
+    int ret1 = do_req ? proxy_struct->peer_map_cb(key, rkey, 1, NULL) : 0;
+    int ret2 = do_resp ? proxy_struct->peer_map_cb(rkey, key, 1, NULL) : 0;
+
+    if (ret1 != 0 || ret2 != 0) {
+      if (do_req && ret1 == 0) {
+        proxy_struct->peer_map_cb(key, NULL, 0, NULL);
+      }
+      if (do_resp && ret2 == 0) {
+        proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
+      }
+      log_error("Sockmap: peer_map registration failed! mode=%u client_ret=%d, backend_ret=%d",
+                dir, ret1, ret2);
+    } else {
+      if (do_req) {
+        proxy_skmap_snapshot_store(&npfe2->peer_map_client_key, key);
+        npfe2->peer_map_req_installed = 1;
+        npfe2->peer_map_req_pending = 1;
+      }
+      if (do_resp) {
+        proxy_skmap_snapshot_store(&npfe2->peer_map_backend_key, rkey);
+        int vret = proxy_struct->verdict_map_cb(rkey, ep_cfd, 1);
+        if (vret == 0) {
+          npfe2->peer_map_resp_installed = 1;
+          npfe2->peer_map_resp_verdict = 1;
+        } else {
+          proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
+          log_error("Sockmap: sock_verdict_map add failed for backend fd=%d (%d), "
+                    "response direction stays on the userspace relay", ep_cfd, vret);
+        }
+      }
+      npfe2->peer_map_pair_installed =
+          (npfe2->peer_map_req_installed || npfe2->peer_map_resp_installed) ? 1 : 0;
+    }
+  }
+#endif
+}
+
 static int
 setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const char *flt_url)
 {
@@ -6756,6 +6929,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
   proxy_map_ent_t *ent;
   void *ssl = NULL;
   int retry = 0;
+  int connecting_legs = 0;
 
   ent = pfe->head;
   assert(ent);
@@ -6889,11 +7063,18 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
   for (j = 0; j < n_eps; j++) {
     int ep_cfd = ep_sel.ep_cfds[j].ep_cfd;
     int ep_num = ep_sel.ep_cfds[j].ep_num;
+    int connecting = ep_sel.ep_cfds[j].connect_pending;
     if (ep_cfd < 0) {
       assert(0);
     }
 
-    if (proxy_skmap_key_from_fd(ep_cfd, rkey, &epprotocol)) {
+    /* A leg still connecting has no peer tuple yet and cannot be paired or
+     * offloaded: its writable event does that (proxy_backend_connect_event). */
+    if (connecting) {
+      epprotocol = IPPROTO_TCP;
+      memset(rkey, 0, sizeof(*rkey));
+      connecting_legs++;
+    } else if (proxy_skmap_key_from_fd(ep_cfd, rkey, &epprotocol)) {
       log_error("skmap key from ep_cfd failed");
       proxy_destroy_eps(pfe->fd, &ep_sel);
       if (ssl) {
@@ -6915,80 +7096,13 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       return -1;
     }
 
-    proxy_log("connected", rkey);
-
-    // Sockmap offload configuration:
-    // - HTTP→HTTP (plaintext): Sockmap enabled (zero-copy kernel forwarding)
-    // - HTTPS→HTTP (TLS termination): Sockmap disabled (kTLS only)
-    // - HTTPS→HTTPS (TLS transit): Sockmap disabled (kTLS only)
-    // - HTTP→HTTPS (TLS origination): Sockmap disabled
-    //
-    // Rationale: Only HTTP→HTTP is supported for simplicity and reliability.
-    // kTLS provides sufficient performance for HTTPS scenarios without sockmap complexity.
-
-    int sockmap_eligible = 0;
-    int ktls_client_enabled __attribute__((unused)) = 0;
-    int ktls_backend_enabled __attribute__((unused)) = 0;
-
-    if (protocol == IPPROTO_TCP && epprotocol == IPPROTO_TCP) {
-      // Case 1: HTTP→HTTP (plaintext only) - SOCKMAP ENABLED
-      if (!pfe->ssl && !ssl) {
-        sockmap_eligible = 1;
-      }
-      // Case 2: HTTPS→HTTP (TLS termination) - SOCKMAP DISABLED, kTLS ONLY
-      else if (pfe->ssl && !ssl && g_ktls_cfg.enabled) {
-        // Try to enable kTLS on client side for hardware-accelerated decryption
-        if (ktls_try_offload(pfe->ssl, pfe->fd, 0 /* server side */) == 0) {
-          ktls_client_enabled = 1;
-          pfe->ktls_enabled = 1;
-        } else if (ktls_is_active(pfe->fd)) {
-          ktls_client_enabled = 1;
-          pfe->ktls_enabled = 1;
-        }
-      }
-      // Case 3: HTTPS→HTTPS (TLS transit) - SOCKMAP DISABLED, kTLS ONLY
-      else if (pfe->ssl && ssl && g_ktls_cfg.enabled) {
-        // Try to enable kTLS on client side
-        if (ktls_try_offload(pfe->ssl, pfe->fd, 0 /* server side */) == 0) {
-          ktls_client_enabled = 1;
-          pfe->ktls_enabled = 1;
-        } else if (ktls_is_active(pfe->fd)) {
-          ktls_client_enabled = 1;
-          pfe->ktls_enabled = 1;
-        }
-
-        // Try to enable kTLS on backend side
-        if (ktls_try_offload(ssl, ep_cfd, 1 /* client side */) == 0) {
-          ktls_backend_enabled = 1;
-        } else if (ktls_is_active(ep_cfd)) {
-          ktls_backend_enabled = 1;
-        }
-      }
-
-      // Register to sockmap ONLY for HTTP→HTTP plaintext.
-      // HAVE_SOCKOPS builds populate the sockhash from the kernel sockops
-      // callbacks; userspace must not re-register the same sockets into the
-      // shared map (BPF_NOEXIST collisions). Pairing is expressed via peer_map
-      // below instead.
-#if !defined(HAVE_SOCKOPS)
-      if (sockmap_eligible && proxy_struct->sockmap_cb && ent->val.sockmap_en &&
-          !proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
-        int ret1 = proxy_struct->sockmap_cb(rkey, pfe->fd, 1);
-        int ret2 = proxy_struct->sockmap_cb(key, ep_cfd, 1);
-        if (ret1 != 0 || ret2 != 0) {
-          if (ret1 == 0) {
-            proxy_struct->sockmap_cb(rkey, pfe->fd, 0);
-          }
-          if (ret2 == 0) {
-            proxy_struct->sockmap_cb(key, ep_cfd, 0);
-          }
-          log_error("Sockmap: Registration failed! client_ret=%d, backend_ret=%d", ret1, ret2);
-        }
-      }
-#endif
+    if (!connecting) {
+      proxy_log("connected", rkey);
     }
 
-    npfe2 = pfe_alloc();   /* D2 root fix: pooled pfe shell */
+    /* D2 root fix: pooled pfe shell. A leg still connecting takes it without
+     * the receive buffer, which is attached when the handshake completes. */
+    npfe2 = connecting ? pfe_alloc_bare() : pfe_alloc();
     assert(npfe2);
     npfe2->stype = PROXY_SOCK_ACTIVE;
     npfe2->fd = ep_cfd;
@@ -7056,13 +7170,6 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->head = ent;
     npfe2->ssl = ssl;
 
-    // Check if kTLS was enabled on backend connection
-    if (ssl && ktls_is_active(ep_cfd)) {
-      npfe2->ktls_enabled = 1;
-    } else {
-      npfe2->ktls_enabled = 0;
-    }
-
     // Initialize cache tracking for backend connection
     npfe2->cache_count = 0;
     npfe2->cache_total_size = 0;
@@ -7073,84 +7180,20 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe2->qos_was_parked = 0;
     npfe2->qos_park_seen_ts = 0;
 
-#if defined(HAVE_SOCKOPS)
-    uint8_t sockmap_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
-
-    /* Second gate on the pairing, per connection. The control plane refuses a
-     * sockMapMode on a rule whose data plane rewrites bytes on every request —
-     * a declared apikey_auth (an explicit "disabled" included, which still
-     * strips X-Api-Key) or an attached L7 policy — but that check runs when the
-     * rule is written, and an L7 policy can be attached while connections are
-     * already live. Acceleration would then skip l7_inject_req_headers_h1 and
-     * ai_strip_upstream_api_key from the second keep-alive request on, carrying
-     * the tenant's key upstream and leaving a client-supplied X-Forwarded-For
-     * unrewritten. Declining the pair here costs a rule that should never have
-     * been accelerated its acceleration, and nothing else: the connection stays
-     * on the userspace relay, which is exactly the byte path it needs. */
-    if (sockmap_mode && proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
-      log_debug("Sockmap: not pairing fd=%d/%d, the rule rewrites every request "
-               "(l7_policy=%u); staying on the userspace relay",
-               pfe->fd, ep_cfd, ent->has_l7_policy);
-      sockmap_mode = 0;
-    }
-
-    if (sockmap_eligible && proxy_struct->peer_map_cb && proxy_struct->verdict_map_cb &&
-        sockmap_mode) {
-      /* sockmap_en is a directional mode:
-       *   1 = both, 2 = request-only, 3 = response-only.
-       * The request direction ([client]=backend) lets the sk_skb verdict
-       * redirect client ingress straight to the backend; the response
-       * direction ([backend]=client) redirects backend ingress to the client.
-       * Install only the entries that the mode asks for; the other direction
-       * stays on the userspace proxy path.
-       * key  = backend socket tuple as seen from the client side (self=client)
-       * rkey = client socket tuple as seen from the backend side (self=backend)
-       *
-       * An installed entry does nothing until its socket is also added to
-       * sock_verdict_map (sockops no longer adds it; see llb_kern_sockmap.c).
-       * The backend socket is added right away: the request has not been sent
-       * yet, so no response byte can be in userspace or on the way. The client
-       * socket is added by proxy_peer_map_activate_req once userspace has handed
-       * the backend every client byte it holds, so later client bytes cannot
-       * overtake the request that is still being forwarded. */
-      uint8_t dir = sockmap_mode;
-      int do_req = (dir == 1 || dir == 2);
-      int do_resp = (dir == 1 || dir == 3);
-      int ret1 = do_req ? proxy_struct->peer_map_cb(key, rkey, 1, NULL) : 0;
-      int ret2 = do_resp ? proxy_struct->peer_map_cb(rkey, key, 1, NULL) : 0;
-
-      if (ret1 != 0 || ret2 != 0) {
-        if (do_req && ret1 == 0) {
-          proxy_struct->peer_map_cb(key, NULL, 0, NULL);
-        }
-        if (do_resp && ret2 == 0) {
-          proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
-        }
-        log_error("Sockmap: peer_map registration failed! mode=%u client_ret=%d, backend_ret=%d",
-                  dir, ret1, ret2);
-      } else {
-        if (do_req) {
-          proxy_skmap_snapshot_store(&npfe2->peer_map_client_key, key);
-          npfe2->peer_map_req_installed = 1;
-          npfe2->peer_map_req_pending = 1;
-        }
-        if (do_resp) {
-          proxy_skmap_snapshot_store(&npfe2->peer_map_backend_key, rkey);
-          int vret = proxy_struct->verdict_map_cb(rkey, ep_cfd, 1);
-          if (vret == 0) {
-            npfe2->peer_map_resp_installed = 1;
-            npfe2->peer_map_resp_verdict = 1;
-          } else {
-            proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
-            log_error("Sockmap: sock_verdict_map add failed for backend fd=%d (%d), "
-                      "response direction stays on the userspace relay", ep_cfd, vret);
-          }
-        }
-        npfe2->peer_map_pair_installed =
-            (npfe2->peer_map_req_installed || npfe2->peer_map_resp_installed) ? 1 : 0;
+    if (connecting) {
+      /* Linked and registered like any other leg, so a client teardown in
+       * the meantime releases it the ordinary way; the writable event
+       * completes it and sends the PROXY header it carries. */
+      npfe2->connect_pp2_len = (uint8_t)pp2len;
+      if (pp2len > 0) {
+        memcpy(npfe2->connect_pp2, pp2buf, (size_t)pp2len);
       }
+      npfe2->connect_deadline_ms = (uint32_t)proxy_ep_connect_deadline_ms(pfe);
+      npfe2->connect_start_ms = proxy_mono_ms();
+      proxy_connect_pending_mark(npfe2);
+    } else {
+      setup_proxy_leg_accel(key, rkey, pfe, npfe2, ent, tepval, protocol, epprotocol);
     }
-#endif
 
     proxy_conn_list_add(ent, npfe2, "backend");
     /* In use before the notifier can hand the leg's first event, and with it
@@ -7171,7 +7214,8 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
        * the cross-thread pfe use-after-free wedge). Not P/D-specific — covers
        * every proxied connection's client+backend pair. */
       if (notify_add_ent_pinned(proxy_struct->ns, ep_cfd,
-          NOTI_TYPE_IN|NOTI_TYPE_HUP, npfe2, npfe2->gen, npfe1->fd) == 0)  {
+          connecting ? (NOTI_TYPE_OUT|NOTI_TYPE_HUP) : (NOTI_TYPE_IN|NOTI_TYPE_HUP),
+          npfe2, npfe2->gen, npfe1->fd) == 0)  {
         break;
       }
       ep_cfd = get_mapped_proxy_fd(ep_cfd, 0);
@@ -7232,6 +7276,18 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     }
   }
 #endif
+
+  if (connecting_legs) {
+    /* The request stays in rcvbuf and the client's reads pause until the
+     * leg's writable event completes it (EPOLLIN-pause, HUP-only: the form
+     * the admission park uses). */
+    if (!pfe->read_paused) {
+      pfe->read_paused = 1;
+      notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+    }
+    pfe->connect_wait = 1;
+    return SP_SETUP_CONNECTING;
+  }
 
   return 0;
 }
@@ -8777,6 +8833,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 #define SP_FWD_RESTART  (-1) /* error — caller returns -1 (restart/close) */
 #define SP_FWD_PARKED    2   /* held/suspended — caller keeps fd, does NOT forward/close */
 #define SP_FWD_NOBACKEND 1   /* setup ok but rfd[0]<=0 — caller falls through (no forward) */
+#define SP_FWD_CONNECTING 3  /* leg connecting — caller keeps fd; the writable event forwards */
 
 static int pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                                 struct llb_sockmap_key *key,
@@ -8820,11 +8877,17 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     log_trace("[KA_FIX] fd=%d forwarding on kept backend leg fd=%d",
               pfe->fd, pfe->rfd[0]);
   } else {
-    // Setup backend connection
+    // Setup backend connection. The request is framed and held in rcvbuf,
+    // so the leg may be wired from the connect's writable event: the client
+    // pauses until then and this forward runs from that event instead
+    // (proxy_backend_connect_event re-enters here on the kept leg).
+    pfe->connect_async_ok = 1;
     int sp_rc = setup_proxy_path(key, rkey, pfe, phurl);
+    pfe->connect_async_ok = 0;
     /* parked = held/suspended. Keep the fd, do NOT forward
      * to a backend (there is none yet), do NOT close. resumes it. */
     if (sp_rc == PD_SETUP_PARKED) return SP_FWD_PARKED;
+    if (sp_rc == SP_SETUP_CONNECTING) return SP_FWD_CONNECTING;
     if (sp_rc) {
       return SP_FWD_RESTART; // Restart
     }
@@ -9350,9 +9413,10 @@ pd_resume_parked(int fd)
   log_debug("[PD_ADMISSION] fd=%d RESUME (owner worker) — re-driving dispatch", fd);
 
   int fwd_rc = pd_setup_and_forward(fd, pfe, &key, &rkey, phurl);
-  if (fwd_rc == SP_FWD_PARKED) {
-    /* Still all-capped — re-parked (held again). Nothing more to do; the next
-     * slot-free will wake us again. */
+  if (fwd_rc == SP_FWD_PARKED || fwd_rc == SP_FWD_CONNECTING) {
+    /* Still all-capped — re-parked (held again), or held for the backend
+     * leg's connect: nothing more to do here, the next slot-free wake or
+     * the leg's writable event drives it on. */
     return;
   }
   if (fwd_rc == SP_FWD_RESTART) {
@@ -9364,6 +9428,105 @@ pd_resume_parked(int fd)
   }
   /* SP_FWD_DONE / SP_FWD_NOBACKEND: dispatched (or setup ok, awaiting backend) —
    * normal relay proceeds on this owner worker. */
+}
+
+/* The writable or error event of a backend leg whose connect setup_proxy_path
+ * left in flight. Runs on the worker that owns both legs (the leg was pinned
+ * to the client's worker), the thread that would have run the rest of the
+ * setup had the connect been synchronous, and consumes the event whole.
+ *
+ * Connected: the PROXY header goes first, then the acceleration decisions
+ * the setup deferred, then the leg switches to relay events, the client's
+ * reads resume and the request it held is forwarded on the kept leg through
+ * pd_setup_and_forward: the tail a synchronous setup would have run.
+ *
+ * Failed (refused, the handshake deadline, the backstop's shutdown): the
+ * endpoint's circuit breaker records the failure, the client gets the 502 a
+ * refused synchronous connect gave it, and the leg's ordinary destroy path
+ * tears the pair down. */
+int
+proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
+{
+  proxy_fd_ent_t *client = pfe->n_rfd > 0 ? pfe->rfd_ent[0] : NULL;
+  proxy_map_ent_t *ent = (proxy_map_ent_t *)pfe->head;
+  proxy_epval_t *epv = client ? (proxy_epval_t *)client->epv : NULL;
+  smap_key_t key = { 0 };
+  smap_key_t rkey = { 0 };
+  int protocol = 0;
+  int epprotocol = 0;
+  int err;
+
+  proxy_connect_pending_clear(pfe);
+
+  err = proxy_setup_ep_connect_complete(fd, pfe->connect_pp2_len ? pfe->connect_pp2 : NULL,
+                                        pfe->connect_pp2_len);
+  if (err == 0 && (type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {
+    /* No socket error but the leg is gone: the backstop's shutdown. */
+    err = ETIMEDOUT;
+  }
+  if (err == 0 && (!client || client->fd <= 0 ||
+                   proxy_skmap_key_from_fd(client->fd, &key, &protocol) ||
+                   proxy_skmap_key_from_fd(fd, &rkey, &epprotocol))) {
+    err = ENOTCONN;
+  }
+  if (err == 0 && pfe_rcvbuf_alloc(pfe)) {
+    err = ENOMEM;
+  }
+
+  if (err) {
+    if (epv && client->ep_num >= 0 && client->ep_num < epv->n_eps) {
+      log_error("connect %s:%u(%s)",
+                inet_ntoa(*(struct in_addr *)&epv->eps[client->ep_num].xip),
+                ntohs(epv->eps[client->ep_num].xport), strerror(err));
+      circuit_breaker_record_failure(epv, client->ep_num);
+    } else {
+      log_error("connect backend fd=%d(%s)", fd, strerror(err));
+    }
+    if (client && client->fd > 0) {
+      static const char lb_502[] =
+          "HTTP/1.1 502 Bad Gateway\r\n"
+          "Content-Type: application/json\r\n"
+          "Connection: close\r\n"
+          "\r\n"
+          "{\"error\":\"backend_unreachable\","
+          "\"detail\":\"the selected backend endpoint did not accept the connection\"}\r\n";
+      send(client->fd, lb_502, sizeof(lb_502) - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+      client->connect_wait = 0;
+    }
+    if (!(type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {
+      /* A pending error without a HUP in the event: run the leg's destroy
+       * here; with a HUP the dispatcher runs it after we return. */
+      notify_delete_ent(proxy_struct->ns, fd, 0);
+    }
+    return 0;
+  }
+
+  proxy_log("connected", &rkey);
+  if (epv && client->ep_num >= 0 && client->ep_num < epv->n_eps) {
+    circuit_breaker_record_success(epv, client->ep_num);
+  }
+  setup_proxy_leg_accel(&key, &rkey, client, pfe, ent, epv, protocol, epprotocol);
+
+  /* Relay events from here on; same priv, so the mask is updated in place. */
+  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+
+  client->connect_wait = 0;
+  client->read_paused = 0;
+  notify_add_ent(proxy_struct->ns, client->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
+                 client, client->gen);
+
+  /* The held request rides the leg just wired: no re-selection. */
+  client->ka_keep_leg = 1;
+  {
+    const char *phurl = client->http_hvok ? client->host_url : NULL;
+    int fwd_rc = pd_setup_and_forward(client->fd, client, &key, &rkey, phurl);
+    if (fwd_rc == SP_FWD_RESTART) {
+      log_error("[CONNECT] fd=%d: forward on the completed leg failed — closing",
+                client->fd);
+      notify_delete_ent(proxy_struct->ns, client->fd, 0);
+    }
+  }
+  return 0;
 }
 
 /*
@@ -10161,6 +10324,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             {
               int fwd_rc = pd_setup_and_forward(fd, pfe, key, rkey, phurl);
               if (fwd_rc == SP_FWD_PARKED)  return 0;   /* held — parked admission */
+              if (fwd_rc == SP_FWD_CONNECTING) return 0; /* held — the leg's writable event forwards */
               if (fwd_rc == SP_FWD_RESTART) return -1;  /* error — restart/close */
               if (fwd_rc == SP_FWD_DONE)    break;      /* forwarded — wait for backend */
               /* SP_FWD_NOBACKEND: setup ok but rfd[0]<=0 — fall through to `continue`. */

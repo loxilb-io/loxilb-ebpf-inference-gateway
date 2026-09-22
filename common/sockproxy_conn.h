@@ -41,6 +41,19 @@ void proxy_sock_set_opts(int fd, uint8_t protocol);
 int proxy_setup_ep_connect(uint32_t epip, uint16_t epport, uint8_t protocol,
                            void *ssl_ctx, void **ssl, proxy_fd_ent_t *pfe,
                            const void *pp2hdr, int pp2len);
+/* The relay path's connect: never waits for the handshake
+ * (sockproxy_connect.h). *pending set ⇒ register the fd for POLLOUT and
+ * finish the leg with proxy_setup_ep_connect_complete from that event. */
+int proxy_setup_ep_connect_async(uint32_t epip, uint16_t epport, uint8_t protocol,
+                                 proxy_fd_ent_t *pfe, const void *pp2hdr, int pp2len,
+                                 int *pending);
+int proxy_setup_ep_connect_complete(int fd, const void *pp2hdr, int pp2len);
+int proxy_ep_connect_deadline_ms(proxy_fd_ent_t *pfe);
+/* Legs whose connect is in flight: marked when registered for the writable
+ * event, cleared on completion or teardown, whichever comes first. */
+void proxy_connect_pending_mark(proxy_fd_ent_t *pfe);
+void proxy_connect_pending_clear(proxy_fd_ent_t *pfe);
+int proxy_connect_pending_legs(void);
 
 /* Listening socket initialization */
 int proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol);

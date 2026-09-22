@@ -48,6 +48,7 @@
 #include "sockproxy_routing.h"
 #include "sockproxy_lb.h"
 #include "sockproxy_health.h"
+#include "sockproxy_malloc.h"
 #include "sockproxy_ssl.h"
 #include "sockproxy_trace.h"
 #include "sockproxy_json.h"
@@ -211,6 +212,12 @@ proxy_notifier(int fd, notify_type_t type, void *priv, uint64_t gen)
   ent = pfe->head;
   if (ent->val.sched_free) {
     return 0;
+  }
+
+  /* A backend leg whose connect is still in flight: its first event is the
+   * handshake's outcome, not relay traffic. Consumed whole. */
+  if (pfe->connect_pending) {
+    return proxy_backend_connect_event(fd, pfe, (int)type);
   }
 
   // Periodic session cleanup
@@ -458,6 +465,13 @@ restart:
            * and the read path then consumes tail + EOF and closes
            * gracefully. */
           notify_disarm_ent(proxy_struct->ns, fd);
+        } else if (pfe->connect_wait) {
+          /* A client holding its request for a backend connect half-closed:
+           * it is owed the response. Disarm the level-triggered RDHUP and
+           * keep the fd; the resume re-arms EPOLLIN and the read path then
+           * meets the EOF behind a request in flight, which defers the
+           * close until the response is done (proxy_sock_read_err). */
+          notify_disarm_ent(proxy_struct->ns, fd);
         } else {
           /* A paused CLIENT (parked upload / admission park) half-closed:
            * nothing is owed to a departing client — keep the historic
@@ -670,6 +684,26 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
 {
   int startfd = PROXY_START_MAPFD;
   notify_cbs_t cbs = { 0 };
+  const char *mmap_env = getenv(PROXY_MALLOC_MMAP_THRESHOLD_ENV);
+  long mmap_thr;
+
+  /* Before the first receive buffer is allocated: keep them private
+   * mappings so a connection burst does not leave the heap at its
+   * high-water mark (sockproxy_malloc.h). */
+  if (proxy_malloc_mmap_threshold(mmap_env) < 0) {
+    log_warn("allocator: %s='%s' is not a byte count, using the default",
+             PROXY_MALLOC_MMAP_THRESHOLD_ENV, mmap_env);
+  }
+  mmap_thr = proxy_malloc_tune(mmap_env);
+  if (mmap_thr < 0) {
+    log_warn("allocator: mmap threshold pin refused, leaving it dynamic");
+  } else if (mmap_thr == 0) {
+    log_info("allocator: mmap threshold left dynamic (%s=0)",
+             PROXY_MALLOC_MMAP_THRESHOLD_ENV);
+  } else {
+    log_info("allocator: mmap threshold pinned at %ld bytes", mmap_thr);
+  }
+
   cbs.notify = proxy_notifier;
   cbs.pdestroy = proxy_pdestroy;
   /* (R1): owner-worker resume hook for the bounded admission layer. The
