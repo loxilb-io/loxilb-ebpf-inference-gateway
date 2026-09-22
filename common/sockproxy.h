@@ -1010,7 +1010,14 @@ struct proxy_fd_ent {
   int peer_map_resp_verdict;     // 1 if the backend socket is in sock_verdict_map
   int peer_map_req_pending;      // request entry installed, client socket not added yet (proxy_peer_map_activate_req)
 
+  /* The rule's connection list (sockproxy_fdlist.h). Readers walk `next`;
+   * `prev` and the rule mark are the list's own, so that an insert and an
+   * unlink touch only this shell and its neighbours. The mark is the rule
+   * whose list the shell is on, NULL while it is on none; it survives the
+   * pool, so a shell recycled while linked cannot be inserted twice. */
   struct proxy_fd_ent *next;
+  struct proxy_fd_ent *prev;
+  struct proxy_map_ent *fdlist_rule;
   void *head;
   void *ssl;
   void *epv;
@@ -1028,6 +1035,7 @@ struct proxy_fd_ent {
   uint64_t ntb;
   uint64_t ntp;
   size_t rcv_off;
+  size_t rcv_hwm;     // Furthest byte this user wrote into rcvbuf (sockproxy_rcvbuf.h)
   size_t parsed_off;  // How much of rcvbuf has been parsed
   int http_pok;
   int http_hok;
@@ -1370,6 +1378,23 @@ struct proxy_fd_ent {
                                       // reset boundary like the fields it supersedes.
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
+
+/* The receive buffer is recycled (sockproxy_rcvbuf.h): its next user gets the
+ * span this one wrote zeroed, and nothing more, so every site that writes
+ * into rcvbuf past the current offset records how far it got. */
+static inline void
+pfe_rcv_note_len(proxy_fd_ent_t *pfe, size_t len)
+{
+  if (len > pfe->rcv_hwm) {
+    pfe->rcv_hwm = len;
+  }
+}
+
+static inline void
+pfe_rcv_note(proxy_fd_ent_t *pfe)
+{
+  pfe_rcv_note_len(pfe, pfe->rcv_off);
+}
 
 /* True for a response status that was supposed to carry a usage object: a
  * successful completion, and nothing else.

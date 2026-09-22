@@ -163,6 +163,7 @@ proxy_fd_ent_t *pfe_alloc(void);
  * connected (0, or -1 on OOM with the shell untouched). */
 proxy_fd_ent_t *pfe_alloc_bare(void);
 int pfe_rcvbuf_alloc(proxy_fd_ent_t *pfe);
+void proxy_rcvbuf_cache_setup(const char *env);
 void pfe_recycle(proxy_fd_ent_t *pfe);
 /* : read-only snapshot of the pfe-pool high-water gauges for the
  * bounded-footprint soak (live = shells checked out now; total = shells ever made).
@@ -186,6 +187,10 @@ int proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type);
  * the rest so they re-select instead of stranding until the max-park reap. */
 void pd_parked_drain_ep(proxy_epval_t *tepval, int ep_index, const char *why);
 void proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe);
+/* PROXY_LOCK held. Put a shell on a rule's connection list; -1 and a log
+ * line when the shell is on a list already (the insert is refused). `what`
+ * names the leg in that line. */
+int proxy_fdlist_link(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, const char *what);
 
 /* =========================================================================
  * sockproxy HA state-sync event bridge (CGO C → Go).

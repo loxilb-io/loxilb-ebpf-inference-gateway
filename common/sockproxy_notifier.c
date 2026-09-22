@@ -49,6 +49,7 @@
 #include "sockproxy_lb.h"
 #include "sockproxy_health.h"
 #include "sockproxy_malloc.h"
+#include "sockproxy_rcvbuf.h"
 #include "sockproxy_ssl.h"
 #include "sockproxy_trace.h"
 #include "sockproxy_json.h"
@@ -703,6 +704,7 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
   } else {
     log_info("allocator: mmap threshold pinned at %ld bytes", mmap_thr);
   }
+  proxy_rcvbuf_cache_setup(getenv(RCVBUF_CACHE_ENV));
 
   cbs.notify = proxy_notifier;
   cbs.pdestroy = proxy_pdestroy;

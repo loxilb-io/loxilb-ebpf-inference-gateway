@@ -414,9 +414,7 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   proxy_map_ent_t *ent = (proxy_map_ent_t *)client_pfe->head;
   if (ent) {
     PROXY_LOCK();
-    decode_pfe->next = ent->val.fdlist;
-    ent->val.fdlist = decode_pfe;
-    ent->val.nfds++;
+    proxy_fdlist_link(ent, decode_pfe, "decode");
     PROXY_UNLOCK();
 
     /* Option A: pin the decode backend fd to the CLIENT fd's notify
@@ -667,9 +665,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
       proxy_map_ent_t *hent = (proxy_map_ent_t *)client_pfe->head;
       if (hent) {
         PROXY_LOCK();
-        bpfe->next = hent->val.fdlist;
-        hent->val.fdlist = bpfe;
-        hent->val.nfds++;
+        proxy_fdlist_link(hent, bpfe, "prefill");
         PROXY_UNLOCK();
         /* Option-A pinning: relay + teardown for the new leg serialize on the
          * client fd's worker, like every other backend leg. */
@@ -780,6 +776,7 @@ pd_seq_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
         /* Replace body in rcvbuf */
         memcpy(pfe->rcvbuf + hdr_len, prefill_buf, prefill_body_len);
         pfe->rcv_off = hdr_len + prefill_body_len;
+        pfe_rcv_note(pfe);
         pfe->pd_prefill_body_len = prefill_body_len;
 
         /* 3. Allocate prefill response buffer (64KB cap) */

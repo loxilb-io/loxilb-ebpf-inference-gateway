@@ -518,9 +518,7 @@ pd_sg_dual_dispatch(proxy_fd_ent_t *client_pfe)
       proxy_map_ent_t *ent = (proxy_map_ent_t *)client_pfe->head;
       if (ent) {
         PROXY_LOCK();
-        decode_pfe->next = ent->val.fdlist;
-        ent->val.fdlist = decode_pfe;
-        ent->val.nfds++;
+        proxy_fdlist_link(ent, decode_pfe, "decode");
         PROXY_UNLOCK();
         notify_add_ent_pinned(proxy_struct->ns, ep_cfd,
                               NOTI_TYPE_IN|NOTI_TYPE_HUP, decode_pfe,
@@ -879,12 +877,8 @@ pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
     }
 
     PROXY_LOCK();
-    drain_pfe->next = hent->val.fdlist;
-    hent->val.fdlist = drain_pfe;
-    hent->val.nfds++;
-    decode_pfe->next = hent->val.fdlist;
-    hent->val.fdlist = decode_pfe;
-    hent->val.nfds++;
+    proxy_fdlist_link(hent, drain_pfe, "prefill drain");
+    proxy_fdlist_link(hent, decode_pfe, "decode");
     PROXY_UNLOCK();
     notify_add_ent_pinned(proxy_struct->ns, p_cfd,
                           NOTI_TYPE_IN|NOTI_TYPE_HUP, drain_pfe,
@@ -1022,6 +1016,7 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
       pfe->pd_prefill_body_len = sg_len;
       pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
                                SP_SOCK_MSG_LEN, sg_len);
+      pfe_rcv_note(pfe);
       pfe->pd_sg_active = 1;
       pfe->pd_sg_room = sg_room;
       pfe->pd_phase_start_ts = time(NULL);

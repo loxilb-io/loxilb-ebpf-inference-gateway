@@ -56,6 +56,7 @@
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
+#include "sockproxy_fdlist.h"
 #include "sockproxy_metrics.h"
 #include "sockproxy_routing.h"
 #include "sockproxy_json.h"
@@ -1266,6 +1267,7 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 
         // Update rcv_off in the source buffer
         ent->rcv_off = len;
+        pfe_rcv_note(ent);
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         // Show masked body after application (first 200 chars)
@@ -2943,10 +2945,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   fd_ctx = pfe_alloc();   /* D2 root fix: pooled pfe shell + heap rcvbuf */
   assert(fd_ctx);
 
-  node->val.fdlist = fd_ctx;
-  node->val.nfds++;
   fd_ctx->head = node;
-  pfe_trace_op("ins", node, fd_ctx);
+  proxy_fdlist_link(node, fd_ctx, "listener");
   fd_ctx->stype = PROXY_SOCK_LISTEN;
   fd_ctx->fd = lsd;
   fd_ctx->seltype = arg->select;
@@ -4391,116 +4391,52 @@ proxy_selftests()
 }
 
 
-/* Is `pfe` already linked in `ent`'s connection list? Bounded walk. */
-static int
-proxy_fdlist_contains(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe)
-{
-  proxy_fd_ent_t *p = ent->val.fdlist;
-  long guard = (long)ent->val.nfds + 64;
-  while (p && guard-- > 0) {
-    if (p == pfe) return 1;
-    p = p->next;
-  }
-  return 0;
-}
-
-static int
+/* PROXY_LOCK held. */
+int
 proxy_fdlist_link(proxy_map_ent_t *ent, proxy_fd_ent_t *pfe, const char *what)
 {
-  if (proxy_fdlist_contains(ent, pfe)) {
-    /* A shell that is still linked was recycled without an unlink; linking
-     * it again would close the list into a cycle. */
-    log_error("[FDLIST] %s shell %p (fd=%d gen=%lu) is already linked in rule %p — insert refused",
-              what, (void *)pfe, pfe->fd, (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed), (void *)ent);
+  if (fdlist_link(ent, pfe) < 0) {
+    /* A shell that is still on a list was recycled without an unlink; linking
+     * it again would close that list into a cycle. */
+    log_error("[FDLIST] %s shell %p (fd=%d gen=%lu) is still linked in rule %p — insert into rule %p refused",
+              what, (void *)pfe, pfe->fd, (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed),
+              (void *)pfe->fdlist_rule, (void *)ent);
     pfe_trace_op("ins-refused", ent, pfe);
     return -1;
   }
-  pfe->next = ent->val.fdlist;
-  ent->val.fdlist = pfe;
-  ent->val.nfds++;
   pfe_trace_op("ins", ent, pfe);
   return 0;
 }
 
-/* Cut a cycle in `ent`'s fdlist (Floyd), logging the node that closes it. */
-static void
-proxy_fdlist_cut_cycle(proxy_map_ent_t *ent)
-{
-  proxy_fd_ent_t *slow = ent->val.fdlist, *fast = ent->val.fdlist;
-  while (fast && fast->next) {
-    slow = slow->next; fast = fast->next->next;
-    if (slow == fast) break;
-  }
-  if (!fast || !fast->next) return;   /* no cycle */
-  /* find the entry node of the cycle, then the node whose next closes it */
-  slow = ent->val.fdlist;
-  while (slow != fast) { slow = slow->next; fast = fast->next; }
-  proxy_fd_ent_t *entry = slow, *last = entry;
-  while (last->next != entry) last = last->next;
-  log_error("[FDLIST] cycle in rule %p: node %p (fd=%d odir=%d used=%d n_rfd=%d head=%p) is reached twice; "
-            "%p->next (fd=%d odir=%d used=%d) closed the loop — cut",
-            (void *)ent, (void *)entry, entry->fd, entry->odir, entry->used, entry->n_rfd, (void *)entry->head,
-            (void *)last, last->fd, last->odir, last->used);
-  last->next = NULL;
-}
-
+/* PROXY_LOCK held. Unlink one shell from `ent`'s connection list, or with
+ * match_pfe NULL empty the list and detach every shell from the rule. */
 void
 proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe)
 {
-  proxy_fd_ent_t *fd_ent;
-  proxy_fd_ent_t *pfd_ent = NULL;
+  proxy_fd_ent_t *pfe = match_pfe;
 
   if (!ent) return;
 
-  fd_ent = ent->val.fdlist;
-
-  if (match_pfe == NULL) {
-    while (fd_ent) {
-      fd_ent->head = NULL;
-      fd_ent = fd_ent->next;
-      ent->val.nfds--;
+  if (pfe == NULL) {
+    for (pfe = ent->val.fdlist; pfe; pfe = pfe->next) {
+      pfe->head = NULL;
     }
-    ent->val.fdlist = NULL;
-  } else {
-    /* Bounded: nfds is maintained under the same lock, so a walk that goes
-     * far beyond it means the list is corrupt (a cycle) — say so and stop
-     * instead of spinning under PROXY_LOCK until the watchdog aborts. */
-    long guard = (long)ent->val.nfds + 4096;
-    while (fd_ent && guard-- > 0) {
-      if (fd_ent == match_pfe) {
-        if (pfd_ent) {
-          pfd_ent->next = fd_ent->next;
-        } else {
-          ent->val.fdlist = fd_ent->next;
-        }
-        ent->val.nfds--;
-        pfe_trace_op("unl", ent, fd_ent);
-        break;
-      }
-      if (fd_ent->next == fd_ent) {
-        log_error("[FDLIST] self-linked node %p (fd=%d) in rule %p while unlinking %p — cut",
-                  (void *)fd_ent, fd_ent->fd, (void *)ent, match_pfe);
-        fd_ent->next = NULL;
-        break;
-      }
-      pfd_ent = fd_ent;
-      fd_ent = fd_ent->next;
-    }
-    if (guard <= 0) {
-      log_error("[FDLIST] walk of rule %p exceeded nfds=%u by 4096 while unlinking %p — list corrupt",
-                (void *)ent, ent->val.nfds, match_pfe);
-      proxy_fdlist_cut_cycle(ent);
-      pfe_trace_op("cut", ent, match_pfe);
-    } else if (!fd_ent) {
-      /* The node to unlink is not in the list its head names: it was never
-       * linked, or the list lost it. Say so; the pool guards catch the rest. */
-      proxy_fd_ent_t *m = match_pfe;
-      pfe_trace_op("miss", ent, m);
-      log_error("[FDLIST] unlink miss: shell %p (fd=%d odir=%d used=%d gen=%lu head=%p) not found in rule %p (nfds=%u)",
-                (void *)m, m->fd, m->odir, m->used, (unsigned long)atomic_load_explicit(&m->gen, memory_order_relaxed),
-                (void *)m->head, (void *)ent, ent->val.nfds);
-    }
+    fdlist_clear(ent);
+    return;
   }
+
+  if (fdlist_unlink(ent, pfe) < 0) {
+    /* The node to unlink is not on the list its head names: it was never
+     * linked, or it is on another rule's list. Say so; the pool guards
+     * catch the rest. */
+    pfe_trace_op("miss", ent, pfe);
+    log_error("[FDLIST] unlink miss: shell %p (fd=%d odir=%d used=%d gen=%lu head=%p on=%p) is not on rule %p (nfds=%u)",
+              (void *)pfe, pfe->fd, pfe->odir, pfe->used,
+              (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed),
+              (void *)pfe->head, (void *)pfe->fdlist_rule, (void *)ent, ent->val.nfds);
+    return;
+  }
+  pfe_trace_op("unl", ent, pfe);
 }
 
 int
@@ -8945,6 +8881,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
             pfe->rcv_off = ug_hdr_len + ug_new_len;
             pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
                                      SP_SOCK_MSG_LEN, ug_new_len);
+            pfe_rcv_note(pfe);
             log_debug("[AI_USAGE_INJECT] fd=%d body %zu -> %zu bytes",
                      pfe->fd, ug_body_len, ug_new_len);
           }
@@ -9038,6 +8975,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 #endif
     }
     pfe->rcv_off = new_len;
+    pfe_rcv_note(pfe);
 
     /* NEW L7-gated request-header
      * injection — ALWAYS-overwrite X-Forwarded-For (real TCP peer IP) +
@@ -9051,6 +8989,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       if (l7node && l7node->has_l7_policy) {
         pfe->rcv_off = l7_inject_req_headers_h1(pfe, l7node, pfe->rcvbuf,
                                                 pfe->rcv_off, SP_SOCK_MSG_LEN, fd);
+        pfe_rcv_note(pfe);
       }
     }
 
@@ -9089,6 +9028,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
         /* Update Content-Length for rewritten prefill body */
         pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
                                  SP_SOCK_MSG_LEN, pfe->pd_prefill_body_len);
+        pfe_rcv_note(pfe);
         /* R2 [FRAME_MISMATCH] instrument (log-only): rewritten prefill CL site.
          * decl_cl uses the rewritten body len so candidate-2
          * (CL-rewrite divergence) is distinguishable from the
@@ -9119,6 +9059,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                                             pfe->vllm_request_id);
       if (rc_inj == 0) {
         pfe->rcv_off = inject_len;
+        pfe_rcv_note(pfe);
         pfe->request_id_injected = 1;
       }
     }
@@ -9649,6 +9590,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
     int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, rd_want);
     int saved_errno = errno;  // Save errno immediately after recv()
+    if (rc > 0) {
+      pfe_rcv_note_len(pfe, pfe->rcv_off + (size_t)rc);
+    }
 
     if (qos_b) {
       if (rc > 0) {
@@ -10485,7 +10429,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         if (pfe->rcv_off == 0 && rc > 10 &&
             memcmp(pfe->rcvbuf, "HTTP/", 5) == 0) {
           // This is the start of an HTTP response - log headers
-          char *header_end = strstr((char *)pfe->rcvbuf, "\r\n\r\n");
+          char *header_end = memmem(pfe->rcvbuf, (size_t)rc, "\r\n\r\n", 4);
           if (header_end) {
             size_t header_len = (header_end + 4) - (char *)pfe->rcvbuf;
             char headers[2048];
