@@ -850,18 +850,24 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
  * proxy_sockmap_l7_rewrites_requests — whether this rule's data plane changes
  * bytes on every request, which a direction handed to the kernel would skip.
  *
- * Two declarations put that work on the relay path:
+ * Three declarations put that work on the relay path:
  *   - an attached L7 policy (has_l7_policy): X-Forwarded-For is overwritten,
  *     X-Forwarded-Port/-Proto are added, and the insertHeaders SET/ADD/REMOVE
  *     operations are applied, on every request; a Set-Cookie can be injected on
  *     every response;
  *   - a declared apikey_auth, an explicit "disabled" INCLUDED: the gateway owns
  *     the X-Api-Key namespace and strips the header before dispatch on every
- *     request (ai_security_should_strip_api_key).
+ *     request (ai_security_should_strip_api_key);
+ *   - AI-gateway mode (ai_gw_mode, derived from the rule's streaming or
+ *     disaggregation setting): every request re-enters the parser for the
+ *     admission gate, gets a request id and the usage flag injected, and every
+ *     response is read for its usage object and stream end. Both directions
+ *     are byte paths the gateway owns.
  *
- * The control plane refuses a sockMapMode on such a rule, but that check runs
- * when the rule is written and an L7 policy can be attached while connections
- * are already live. This is the per-connection backstop; declining the pair
+ * This is the same predicate the control plane applies when it refuses a
+ * sockMapMode on such a rule (sockMapPerRequestL7); that check runs when the
+ * rule is written, and an L7 policy can be attached while connections are
+ * already live. This is the per-connection backstop; declining the pair
  * leaves the connection on the userspace relay, which is the byte path such a
  * rule needs.
  */
@@ -869,10 +875,15 @@ static int
 proxy_sockmap_l7_rewrites_requests(proxy_map_ent_t *ent, proxy_epval_t *epv)
 {
   uint8_t apikey_auth;
+  uint8_t ai_gw_mode;
 
   if (!ent)
     return 0;
   if (ent->has_l7_policy)
+    return 1;
+  ai_gw_mode = epv ? epv->ai_gw_mode :
+               (ent->val.ephash ? ent->val.ephash->ai_gw_mode : 0);
+  if (ai_gw_mode)
     return 1;
   apikey_auth = epv ? epv->apikey_auth :
                 (ent->val.ephash ? ent->val.ephash->apikey_auth : 0);
