@@ -27,10 +27,13 @@
 
 /* ---- JSON helper stubs (sockproxy_json.h) ------------------------------- */
 
+static int extract_model_calls;
+
 int
 extract_model_field(const char *body, size_t len, char *out, size_t cap)
 {
   (void)len;
+  extract_model_calls++;
   if (body && cap > 3) {
     strcpy(out, "m1");
     return 0;
@@ -85,8 +88,13 @@ int
 llb_ai_validate_key(char *raw_key, char *model, ai_gw_decision_t *result)
 {
   validate_key_calls++;
-  (void)raw_key;
   (void)model;
+  /* The real validator refuses a missing key with the 401 shape. */
+  if (raw_key[0] == '\0') {
+    result->decision = 1;
+    strcpy(result->error_code, "invalid_api_key");
+    return -1;
+  }
   strcpy(result->key_id, "key-1");
   strcpy(result->tenant_id, "tenant-1");
   /* API keys map to no user today: user_id stays "". */
@@ -151,6 +159,7 @@ reset_stubs(void)
 {
   validate_key_calls = 0;
   validate_bearer_calls = 0;
+  extract_model_calls = 0;
   memset(&rl_stub, 0, sizeof(rl_stub));
   memset(&rs_stub, 0, sizeof(rs_stub));
 }
@@ -269,6 +278,110 @@ test_keyless_probes_shared_bucket_only_with_ident(void)
   assert(strcmp(rl_stub.svc, "10.0.0.1:2040") == 0);
 }
 
+/* ---- streamed dispatch: the gate on a bounded prefix ---------------------- */
+
+/* A streamed request hands the gate only its routing prefix. The model must
+ * come from the prefix extraction the caller already did (a whole-document
+ * parse of a truncated body is meaningless), and the claim must be sized
+ * from the declared length: the prefix shows the first bytes of the
+ * messages array, the length shows all of them. */
+static void
+test_prefix_only_sizes_reservation_from_declared_length(void)
+{
+  static const char prefix[] = "{\"model\":\"m1\",\"messages\":[{\"role\":\"u";
+  ai_gw_req_ctx_t req = {
+    .api_key = "sk-abc",
+    .body = prefix,
+    .body_len = sizeof(prefix) - 1,
+    .prefix_model = "m1",
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .prefix_only = 1,
+    .declared_content_length = 40000,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(extract_model_calls == 0);              /* prefix is not a document */
+  assert(strcmp(res.effective_model, "m1") == 0);
+  assert(rl_stub.calls == 1 && strcmp(rl_stub.model, "m1") == 0);
+  assert(rs_stub.calls == 1);
+  assert(rs_stub.prompt_est == 10000);           /* 40000 bytes / 4 */
+  assert(rs_stub.max_tokens == 32);              /* still read from the prefix */
+  assert(res.reserved_toks == 10032 && res.res_epoch == 77);
+
+  /* The larger of the two estimates wins: a declared length smaller than
+   * what the prefix already implies does not shrink the claim. */
+  reset_stubs();
+  req.declared_content_length = 8;               /* 2 tokens < the stub's 7 */
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(rs_stub.calls == 1 && rs_stub.prompt_est == 7);
+}
+
+/* No body and no declared length: the credential and rate ladder still
+ * run, the model falls back to the header, and NOTHING is reserved. This
+ * is the shape of a non-JSON upload (no prompt to size) and of the caller
+ * that is about to refuse an unresolvable request itself. */
+static void
+test_prefix_only_without_length_reserves_nothing(void)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "sk-abc",
+    .hdr_model = "m-hdr",
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .prefix_only = 1,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(validate_key_calls == 1);
+  assert(rl_stub.calls == 1 && strcmp(rl_stub.model, "m-hdr") == 0);
+  assert(rs_stub.calls == 0);
+  assert(res.reserved_toks == 0 && res.res_epoch == 0);
+  assert(strcmp(res.effective_model, "m-hdr") == 0);
+
+  /* No model anywhere is still admitted with an empty resolution: the
+   * caller decides what an unresolvable model means for its framing. */
+  reset_stubs();
+  req.hdr_model = "";
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(res.effective_model[0] == '\0');
+  assert(rs_stub.calls == 0);
+}
+
+/* A streamed request with no credential is refused on the credential
+ * stage exactly like a buffered one, and refusal reserves nothing. */
+static void
+test_prefix_only_missing_credential_is_refused(void)
+{
+  static const char prefix[] = "{\"model\":\"m1\",\"messages\":[";
+  ai_gw_req_ctx_t req = {
+    .api_key = "",
+    .body = prefix,
+    .body_len = sizeof(prefix) - 1,
+    .prefix_model = "m1",
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .prefix_only = 1,
+    .declared_content_length = 900000,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.verdict == AI_GW_ADMIT_DENY);
+  assert(res.stage == AI_GW_STAGE_AUTH);
+  assert(res.http_status == 401);
+  assert(strcmp(res.error_code, "invalid_api_key") == 0);
+  assert(rl_stub.calls == 0 && rs_stub.calls == 0);
+}
+
 static void
 test_svc_ident_format(void)
 {
@@ -292,7 +405,11 @@ main(void)
   test_jwt_arm_forwards_user_and_service();
   test_apikey_arm_forwards_key_and_service();
   test_keyless_probes_shared_bucket_only_with_ident();
+  test_prefix_only_sizes_reservation_from_declared_length();
+  test_prefix_only_without_length_reserves_nothing();
+  test_prefix_only_missing_credential_is_refused();
   test_svc_ident_format();
-  puts("PASS: identity-forwarding ABI transports user/key/service through the gate");
+  puts("PASS: identity-forwarding ABI transports user/key/service through the gate, "
+       "and a streamed prefix is gated on headers + declared length");
   return 0;
 }

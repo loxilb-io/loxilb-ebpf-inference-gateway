@@ -122,7 +122,7 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
    * to the earlier prefix extraction, then the header, only when the body
    * carries no model field. */
   char body_model[AI_GW_MODEL_LEN] = {0};
-  if (req->body && req->body_len > 0) {
+  if (req->body && req->body_len > 0 && !req->prefix_only) {
     extract_model_field(req->body, req->body_len, body_model, sizeof(body_model));
   }
   const char *body_bound = body_model[0] ? body_model : prefix_model;
@@ -244,9 +244,25 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
    * response — not a backend prefill whose tokens the latch only bills
    * afterwards. The claim and its window tag ride back to the caller for
    * the settle call. */
-  if (req->body && req->body_len > 0) {
-    int resv_prompt = estimate_prompt_tokens(req->body, req->body_len);
-    int resv_max = extract_max_tokens(req->body, req->body_len);
+  if ((req->body && req->body_len > 0) ||
+      (req->prefix_only && req->declared_content_length > 0)) {
+    int resv_prompt = 0;
+    int resv_max = 0;
+    if (req->body && req->body_len > 0) {
+      resv_prompt = estimate_prompt_tokens(req->body, req->body_len);
+      resv_max = extract_max_tokens(req->body, req->body_len);
+    }
+    /* A prefix shows at most the first bytes of the messages array; the
+     * declared length is the whole of it. Size the claim from the larger of
+     * the two so a streamed long-context request reserves what its bytes
+     * imply, exactly as its buffered sibling would. */
+    if (req->prefix_only && req->declared_content_length > 0) {
+      size_t from_bytes = req->declared_content_length / 4;
+      if (from_bytes > 100000000UL)
+        from_bytes = 100000000UL;
+      if ((int)from_bytes > resv_prompt)
+        resv_prompt = (int)from_bytes;
+    }
     if (resv_prompt > 0 || resv_max > 0) {
       ai_gw_decision_t rs_dec = {0};
       int64_t rs_epoch = 0;

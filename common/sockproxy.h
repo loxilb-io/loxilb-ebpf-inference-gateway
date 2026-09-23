@@ -128,13 +128,10 @@ void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
 #ifndef L7_HDR_VALUE_MAX
 #define L7_HDR_VALUE_MAX 256         // max stored header-value length (incl NUL)
 #endif
-// Header-completion deadline (ms) for every listener whose rule sets no
-// timeout_tcp_inspect_ms. 10s mirrors a conservative HAProxy `timeout
-// http-request`: long enough not to trip legitimate slow clients, short
-// enough to bound a slowloris hold. 0 disables the deadline.
-#ifndef L7_TCP_INSPECT_DEFAULT_MS
-#define L7_TCP_INSPECT_DEFAULT_MS 10000
-#endif
+// Header-completion deadline: L7_TCP_INSPECT_DEFAULT_MS and the resolution
+// rule (0 = default, never "off") live in sockproxy_hdr_deadline.h so a unit
+// can pin them without the proxy object graph.
+#include "sockproxy_hdr_deadline.h"
 
 // ============================================================================
 // PROMETHEUS METRICS: Global Stats (Forward Declaration)
@@ -1218,7 +1215,11 @@ struct proxy_fd_ent {
   uint8_t  ai_gw_denied;              // 1 = the AI gate refused this request (response already sent,
                                       // socket shut down). Read after llhttp_execute to keep a policy
                                       // denial out of the parse-error fallback, which relays the buffer
-                                      // raw to a backend -- the exact path a denial must never take. 
+                                      // raw to a backend -- the exact path a denial must never take.
+  uint8_t  ai_gw_stream_gated;        // 1 = the AI gate already admitted this STREAMED request at the
+                                      // dispatch site (the parser never completes a streamed body, so
+                                      // on_message_complete cannot run it). Cleared at the request
+                                      // boundary; keeps a re-entered dispatch from reserving twice.
 
   // SSE (Server-Sent Events) per-connection state 
   uint8_t  sse_mode;                  // SSE mode enabled for this rule: copied from proxy_epval_t at accept
@@ -1685,14 +1686,15 @@ struct proxy_arg {
 };
 typedef struct proxy_arg proxy_arg_t;
 
-/* Header-completion deadline of a listener in ms; 0 = disabled. */
+/* Header-completion deadline of a listener in ms. A rule that configures
+ * nothing (0) gets L7_TCP_INSPECT_DEFAULT_MS; no value disables the
+ * deadline (sockproxy_hdr_deadline.h). */
 static inline uint32_t
 proxy_hdr_deadline_ms(const proxy_map_ent_t *ent)
 {
-  if (ent && ent->arg_ptr && ent->arg_ptr->timeout_tcp_inspect_ms > 0) {
-    return ent->arg_ptr->timeout_tcp_inspect_ms;
-  }
-  return L7_TCP_INSPECT_DEFAULT_MS;
+  uint32_t configured = (ent && ent->arg_ptr) ?
+                        ent->arg_ptr->timeout_tcp_inspect_ms : 0;
+  return sp_hdr_deadline_resolve_ms(configured);
 }
 
 /* True once a client connection has been accumulating request headers for
