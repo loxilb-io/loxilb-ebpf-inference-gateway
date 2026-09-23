@@ -365,6 +365,18 @@ test_hdr_deadline: sockproxy_hdr_deadline_test.c sockproxy_hdr_deadline.h
 .PHONY: test_hdrdl
 test_hdrdl: test_hdr_deadline
 	./test_hdr_deadline
+# Clearing a pooled connection shell for reuse. The clear skips the
+# transfer-params buffer, so the unit has to prove both that everything around
+# it is zeroed and that the buffer itself is not -- a clear that quietly went
+# back to covering the whole shell passes the first half and fails the second.
+# Needs the real struct, so it carries the same include path and feature flags
+# as the objects that define it; it links nothing.
+test_pfe_clear: test_pfe_clear.c sockproxy_pfe_clear.h sockproxy.h
+	$(CC) $(CFLAGS) -Wextra -o $@ $< -I.
+
+.PHONY: test_pfec
+test_pfec: test_pfe_clear
+	./test_pfe_clear
 
 # Phase 87-01 (FIX-1/2/3/4): P/D streaming-completion connection-leak unit.
 # Standalone — includes only the pure sockproxy_pd_leak.h helpers (no sockproxy.c

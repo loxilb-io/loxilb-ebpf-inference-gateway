@@ -63,6 +63,7 @@
 #include "sockproxy_ktls.h"
 #include "sockproxy_mtls.h"
 #include "sockproxy_rcvbuf.h"
+#include "sockproxy_pfe_clear.h"
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_trace_event.h"
 #include "sockproxy_trace.h"
@@ -1207,12 +1208,12 @@ pfe_alloc_ex(int with_rcvbuf)
        * neighbours, instead of the list closing into a cycle. */
       struct proxy_fd_ent *next = pfe->next, *prev = pfe->prev;
       struct proxy_map_ent *rule = pfe->fdlist_rule;
-      memset(pfe, 0, sizeof(*pfe));
+      pfe_clear(pfe);
       pfe->next = next;
       pfe->prev = prev;
       pfe->fdlist_rule = rule;
     } else {
-      memset(pfe, 0, sizeof(*pfe));
+      pfe_clear(pfe);
     }
     atomic_store_explicit(&pfe->gen, gen, memory_order_relaxed);
   }
