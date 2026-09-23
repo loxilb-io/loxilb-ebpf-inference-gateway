@@ -195,6 +195,9 @@ typedef struct stream_mapping {
   int32_t client_stream_id;          // Stream ID on client-side connection
   int32_t backend_stream_id;         // Stream ID on backend connection
   int ep_idx;                        // Backend endpoint index
+  int load_held;                     // 1 while this mapping holds one bounded-load
+                                     // unit on (session epv, ep_idx); released exactly
+                                     // once when the mapping is freed (sockproxy_h2_load.h)
   time_t created_ts;                 // Mapping creation time
 
   // Response header collection (for backend → client forwarding). Holds the
