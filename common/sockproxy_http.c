@@ -6182,6 +6182,21 @@ proxy_sock_read(proxy_fd_ent_t *pfe, int fd, void *buf, size_t len)
   }
 }
 
+/* Lock order in here, for whatever is added next.
+ *
+ * This runs with nothing held: handle_client_data takes no lock and neither does
+ * the notifier around its calls. Everything below therefore acquires as a leaf,
+ * which is why the entry locks it takes cannot close a cycle.
+ *
+ * The invariant that keeps that true: PROXY_LOCK is always taken FIRST, and no
+ * entry lock may be live across taking it. Take an entry lock, finish with it,
+ * drop it. The global order is PROXY_LOCK -> entry, as proxy_pdestroy has it;
+ * an entry lock held while PROXY_LOCK is acquired inverts that and deadlocks
+ * against exactly that teardown, with nothing to show for it but the watchdog's
+ * "data plane WEDGED ~30s" half a minute later.
+ *
+ * Reaching across the pair is fine and already happens, as long as the reach is
+ * the only lock held at the time. */
 static int
 proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
 {
@@ -6271,8 +6286,11 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         if (pfe->odir == 0) {
           log_debug("[CRESP_OWED] fd=%d forwarded=%u completed=%u owed=%d "
                     "resp_outstanding=%u unframed=%u",
-                    pfe->fd, pfe->cresp_forwarded, pfe->cresp_completed,
-                    pfe->cresp_forwarded > pfe->cresp_completed ? 1 : 0,
+                    pfe->fd,
+                    atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed),
+                    atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed),
+                    atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed) >
+                      atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed) ? 1 : 0,
                     pfe->resp_outstanding, pfe->cresp_unframed);
         }
 
@@ -6324,15 +6342,13 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
           return 1;
         }
 
-        /* A response framed by nothing but this EOF is complete now. Taken
-         * under the client entry's lock because the other writer of that
-         * counter is the relay, which runs on the client's worker. Observation
-         * only; nothing reads the counters yet. */
+        /* A response framed by nothing but this EOF is complete now. No lock:
+         * the counter it touches is written only from this connection's backend
+         * worker — here and from the relay, which runs on that same worker and
+         * takes the client entry's lock for the client's fields, not for this
+         * one. Observation only; nothing reads the counters yet. */
         if (pfe->odir == 1 && pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
-          proxy_fd_ent_t *cl = pfe->rfd_ent[0];
-          PROXY_ENT_LOCK(cl);
-          cresp_note_backend_eof(cl);
-          PROXY_ENT_UNLOCK(cl);
+          cresp_note_backend_eof(pfe->rfd_ent[0]);
         }
 
         // Check if peer connection still has data to send
@@ -8069,6 +8085,61 @@ static int cresp_settings_inited;
 static llhttp_settings_t creq_settings;
 static int creq_settings_inited;
 
+/* The HEAD queue, written by both of a connection's workers: the client's when a
+ * request is framed, the backend's when the matching response's headers are.
+ * Packed into one word so each side can do its half with a compare-exchange and
+ * neither has to hold a lock. Saturates at 8 outstanding rather than wrapping. */
+static void
+cresp_head_push(proxy_fd_ent_t *pfe, int is_head)
+{
+  uint16_t cur = atomic_load_explicit(&pfe->cresp_head, memory_order_relaxed);
+
+  for (;;) {
+    uint8_t q = (uint8_t)(cur & 0xFF);
+    uint8_t n = (uint8_t)(cur >> 8);
+    uint16_t nxt;
+
+    if (n >= 8) {
+      return;                      /* deeper than the queue: lose the hint only */
+    }
+    if (is_head) {
+      q |= (uint8_t)(1u << n);
+    }
+    nxt = (uint16_t)q | (uint16_t)((n + 1) << 8);
+    if (atomic_compare_exchange_weak_explicit(&pfe->cresp_head, &cur, nxt,
+                                              memory_order_relaxed,
+                                              memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
+/* Takes the oldest bit. Returns 1 if that request was a HEAD, 0 if it was not or
+ * the queue is empty (deeper than 8 outstanding, where the hint was dropped). */
+static int
+cresp_head_pop(proxy_fd_ent_t *pfe)
+{
+  uint16_t cur = atomic_load_explicit(&pfe->cresp_head, memory_order_relaxed);
+
+  for (;;) {
+    uint8_t q = (uint8_t)(cur & 0xFF);
+    uint8_t n = (uint8_t)(cur >> 8);
+    int was_head;
+    uint16_t nxt;
+
+    if (n == 0) {
+      return 0;
+    }
+    was_head = q & 1;
+    nxt = (uint16_t)(q >> 1) | (uint16_t)((n - 1) << 8);
+    if (atomic_compare_exchange_weak_explicit(&pfe->cresp_head, &cur, nxt,
+                                              memory_order_relaxed,
+                                              memory_order_relaxed)) {
+      return was_head;
+    }
+  }
+}
+
 static int
 creq_on_message_complete(llhttp_t *parser)
 {
@@ -8077,19 +8148,14 @@ creq_on_message_complete(llhttp_t *parser)
   if (!pfe) {
     return 0;
   }
-  pfe->cresp_forwarded++;
+  atomic_fetch_add_explicit(&pfe->cresp_forwarded, 1, memory_order_relaxed);
   /* A response to HEAD carries no body however its Content-Length reads, and
    * llhttp in response mode cannot know the method. Queue the bit for the
-   * response framer. Saturates rather than wrapping; past 8 outstanding
-   * requests it only loses the hint. */
-  if (pfe->cresp_head_n < 8) {
-    if (parser->method == HTTP_HEAD) {
-      pfe->cresp_head_q |= (uint8_t)(1u << pfe->cresp_head_n);
-    }
-    pfe->cresp_head_n++;
-  }
-  log_debug("[CRESP_REQ] fd=%d request framed, forwarded=%u completed=%u",
-            pfe->fd, pfe->cresp_forwarded, pfe->cresp_completed);
+   * response framer. */
+  cresp_head_push(pfe, parser->method == HTTP_HEAD);
+  log_debug("[CRESP_REQ] fd=%d request framed, forwarded=%u completed=%u", pfe->fd,
+            atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed),
+            atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed));
   return 0;
 }
 
@@ -8146,14 +8212,9 @@ cresp_on_headers_complete(llhttp_t *parser)
 
   /* llhttp handles the body-less statuses itself; HEAD it cannot know about, so
    * the oldest outstanding request's bit says whether to skip the body. */
-  if (pfe->cresp_head_n > 0) {
-    int was_head = pfe->cresp_head_q & 1;
-    pfe->cresp_head_q >>= 1;
-    pfe->cresp_head_n--;
-    if (was_head) {
-      pfe->cresp_unframed = 0;
-      return 1;                      /* no body follows */
-    }
+  if (cresp_head_pop(pfe)) {
+    pfe->cresp_unframed = 0;
+    return 1;                        /* no body follows */
   }
   return 0;
 }
@@ -8164,7 +8225,7 @@ cresp_on_message_complete(llhttp_t *parser)
   proxy_fd_ent_t *pfe = parser->data;
 
   if (pfe) {
-    pfe->cresp_completed++;
+    atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
     pfe->cresp_unframed = 0;
   }
   return 0;
@@ -8219,7 +8280,7 @@ static void
 cresp_note_backend_eof(proxy_fd_ent_t *client)
 {
   if (client && client->cresp_parser_inited && client->cresp_unframed) {
-    client->cresp_completed++;
+    atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
     client->cresp_unframed = 0;
   }
 }

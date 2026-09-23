@@ -1012,13 +1012,23 @@ struct proxy_fd_ent {
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
   uint8_t  cresp_parser_inited;
   uint8_t  cresp_unframed;         // this response is delimited by the backend's EOF
-  uint32_t cresp_forwarded;        // requests handed to the backend
-  uint32_t cresp_completed;        // responses framed to completion
+  /* The two counters have one writer each — requests are framed on the client's
+   * worker, responses on the backend's — so a relaxed atomic is enough for each
+   * and no lock is needed to keep them whole.
+   *
+   * The HEAD queue is the one piece both workers write, and it is packed into a
+   * single word so they can do it with a compare-exchange instead. Taking this
+   * entry's lock on the client side would have worked, but that lock is held by
+   * the relay from the moment it starts a response until after it has sent it,
+   * so a read path that had no lock at all would have begun serialising against
+   * every send. */
+  _Atomic uint32_t cresp_forwarded;  // requests framed on this connection
+  _Atomic uint32_t cresp_completed;  // responses framed to completion
   /* llhttp in response mode cannot know the request method, so a HEAD response
-   * would be read as having the body its Content-Length promises. Queue one bit
-   * per outstanding request; pipelining (E-5) is why it is a queue. */
-  uint8_t  cresp_head_q;           // bitmap, oldest outstanding request in bit 0
-  uint8_t  cresp_head_n;           // how many bits are live
+   * would be read as having the body its Content-Length promises. One bit per
+   * outstanding request, oldest in bit 0; pipelining (E-5) is why it is a queue.
+   * Low byte is the bits, high byte how many are live. */
+  _Atomic uint16_t cresp_head;
 
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
