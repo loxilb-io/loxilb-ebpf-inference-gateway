@@ -7308,6 +7308,278 @@ handle_on_message_begin(llhttp_t* parser)
   return 0;
 }
 
+/* Write an AI-gateway refusal to the client and shut the socket down. The
+ * three wire shapes are the ones the inlined gate always produced: the
+ * {"error","retry_after"} body for rate/reserve refusals, the
+ * {"error","message"} body otherwise, Retry-After when the gate set one.
+ * Emission goes through the bounded local sender so a TLS-terminated
+ * listener answers with a TLS record, never plaintext on the raw fd. */
+static void
+sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
+                      int retry_body, const char *code, const char *msg)
+{
+  char resp_buf[640];
+  int n;
+  const char *status_line =
+    status == 400 ? "400 Bad Request" :
+    status == 401 ? "401 Unauthorized" :
+    status == 403 ? "403 Forbidden" :
+    status == 413 ? "413 Content Too Large" :
+    status == 429 ? "429 Too Many Requests" :
+                    "503 Service Unavailable";
+
+  if (retry_body) {
+    n = snprintf(resp_buf, sizeof(resp_buf),
+      "HTTP/1.1 %s\r\n"
+      "Content-Type: application/json\r\n"
+      "Retry-After: %d\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+      status_line, retry_after, code, retry_after);
+  } else if (retry_after > 0) {
+    n = snprintf(resp_buf, sizeof(resp_buf),
+      "HTTP/1.1 %s\r\n"
+      "Content-Type: application/json\r\n"
+      "Retry-After: %d\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+      status_line, retry_after, code, msg);
+  } else {
+    n = snprintf(resp_buf, sizeof(resp_buf),
+      "HTTP/1.1 %s\r\n"
+      "Content-Type: application/json\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+      status_line, code, msg);
+  }
+  if (n > 0 && n < (int)sizeof(resp_buf)) {
+    if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
+      log_error("[AIGateway] fd=%d failed to send complete bounded %d "
+                "refusal", pfe->fd, status);
+  } else {
+    shutdown(pfe->fd, SHUT_RDWR);
+  }
+}
+
+/* The H1 side of the AI admission gate: run ai_gw_admit on the request
+ * view the caller assembled, then apply the verdict to this connection.
+ * Two callers share it so one policy reaches every H1 request whatever
+ * its framing: handle_on_message_complete for a body the parser completed,
+ * and the streamed dispatch site for a body it never will (an oversized
+ * upload is forwarded from its first read, and message-complete does not
+ * fire for it before dispatch).
+ *
+ * Returns 0 when the request may proceed (admitted, or unmetered on a
+ * non-enforcing service) with the identity, model resolution, reservation
+ * and upstream-hygiene switches persisted on the connection; -1 when it
+ * was refused, the refusal already written and the client socket shut. */
+static int
+sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
+                  ai_gw_req_ctx_t *req, const char *site)
+{
+  char adm_svc_ident[64];
+  ai_gw_admit_result_t adm;
+
+  ai_gw_svc_ident(hent->key.xip, hent->key.xport,
+                  adm_svc_ident, sizeof(adm_svc_ident));
+  req->svc_ident = adm_svc_ident;
+  ai_gw_admit(req, &adm);
+  req->svc_ident = NULL;   /* borrowed from this frame */
+
+  if (adm.verdict == AI_GW_ADMIT_UNMETERED) {
+    /* Served, but neither authenticated nor attributable to a tenant.
+     * Report it so the operator can see the consequence of the default
+     * rather than infer it from a bill. The legacy model derivation
+     * also stays in force: pfe->effective_model is deliberately not
+     * written on non-enforcing services. */
+    char um_vip[INET6_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &hent->key.xip, um_vip, sizeof(um_vip));
+    llb_ai_record_unmetered(um_vip);
+    return 0;
+  }
+
+  if (adm.verdict == AI_GW_ADMIT_DENY) {
+    sp_h1_send_admit_deny(pfe, adm.http_status, adm.retry_after,
+                          adm.retry_body, adm.error_code, adm.error_msg);
+    switch (adm.stage) {
+    case AI_GW_STAGE_CONFLICT:
+      log_info("[AIGateway] fd=%d %s model conflict: tenant=%s X-Model=%s",
+               pfe->fd, site, adm.tenant_id, pfe->x_model_header);
+      break;
+    case AI_GW_STAGE_RATELIMIT:
+      log_info("[AIGateway] fd=%d %s rate-limited: key=%s tenant=%s error=%s retry=%d",
+               pfe->fd, site, adm.key_id, adm.tenant_id, adm.error_code,
+               adm.retry_after);
+      break;
+    case AI_GW_STAGE_RESERVE:
+      log_info("[AIGateway] fd=%d %s pre-admission denied: tenant=%s want=%u error=%s retry=%d",
+               pfe->fd, site, adm.tenant_id, adm.reserved_toks,
+               adm.error_code, adm.retry_after);
+      break;
+    default:
+      log_info("[AIGateway] fd=%d %s rejected: status=%d key=%.8s...",
+               pfe->fd, site, adm.http_status, pfe->x_api_key_raw);
+      break;
+    }
+    return -1;
+  }
+
+  /* Admitted. Persist the identity for SSE token accounting and
+   * metrics, the gate's model resolution for routing and
+   * response-phase consumers, the token reservation for the settle
+   * call, and the deciding arm's upstream-hygiene switches for
+   * the dispatch-time strip/inject. */
+  strncpy(pfe->tenant_id, adm.tenant_id, sizeof(pfe->tenant_id) - 1);
+  pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
+  strncpy(pfe->auth_user_id, adm.user_id, sizeof(pfe->auth_user_id) - 1);
+  pfe->auth_user_id[sizeof(pfe->auth_user_id) - 1] = '\0';
+  strncpy(pfe->auth_key_id, adm.key_id, sizeof(pfe->auth_key_id) - 1);
+  pfe->auth_key_id[sizeof(pfe->auth_key_id) - 1] = '\0';
+  pfe->auth_strip_authz = (adm.auth_flags & AI_GW_AUTHF_STRIP_AUTHZ) ? 1 : 0;
+  pfe->auth_fwd_identity = (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
+  pfe->auth_jwt_capable =
+    (hent->val.ephash->apikey_auth == 3 ||
+     hent->val.ephash->apikey_auth == 4) ? 1 : 0;
+  strncpy(pfe->effective_model, adm.effective_model,
+          sizeof(pfe->effective_model) - 1);
+  pfe->effective_model[sizeof(pfe->effective_model) - 1] = '\0';
+  if (adm.res_epoch != 0) {
+    pfe->usage_reserved_toks = adm.reserved_toks;
+    pfe->usage_res_epoch = adm.res_epoch;
+  }
+  return 0;
+}
+
+/* Fill the header-derived half of the gate's request view: credentials,
+ * the model hint, the rule's enforcement mode. Body fields stay zero for
+ * the caller to set. */
+static void
+sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
+                             const proxy_map_ent_t *hent,
+                             ai_gw_req_ctx_t *req)
+{
+  memset(req, 0, sizeof(*req));
+  req->api_key = pfe->x_api_key_raw;
+  req->bearer = pfe->bearer_raw;
+  req->bearer_oversize = pfe->bearer_oversize;
+  req->jwt_profile = hent->val.ephash->jwt_auth_profile;
+  req->prefix_model = pfe->prefix_key.model;
+  req->hdr_model = pfe->x_model_header;
+  req->auth_mode = hent->val.ephash->apikey_auth;
+}
+
+/* True when the rule's admission policy enforces a credential. Mirrors the
+ * gate's own reading of the wire value: 0 and 2 are the two DECLARED
+ * non-enforcing values, everything else enforces (fail-closed). */
+static inline int
+sp_h1_rule_enforces(const proxy_map_ent_t *hent)
+{
+  int mode = hent->val.ephash->apikey_auth;
+  return mode != 0 && mode != 2;
+}
+
+/* Gate a STREAMED request before its first backend byte.
+ *
+ * A request whose body will be relayed rather than buffered (Content-Length
+ * above the streaming threshold: any non-JSON body, or a JSON body above
+ * the inspect cap) is dispatched from the read that completed its headers.
+ * llhttp has not seen message-complete for it and never will before the
+ * backend does, so the gate in handle_on_message_complete cannot run — on
+ * an enforcing service the oversized request used to reach the backend
+ * with no credential check, no model authorization and no quota claim.
+ *
+ * The gate runs here on what the headers and the bounded body prefix
+ * provide: the credential, the model resolved from the prefix (or the
+ * X-Model header), and the declared body length, which sizes the token
+ * reservation in place of the messages array the prefix cannot show. A
+ * non-JSON body carries no prompt, so it reserves nothing from bytes.
+ *
+ * Returns 0 when dispatch may proceed and -1 when the request was refused
+ * (response written, socket shut). */
+static int
+sp_h1_pre_dispatch_admit(int fd, proxy_fd_ent_t *pfe)
+{
+  proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
+  ai_gw_req_ctx_t req;
+
+  if (pfe->odir != 0 || !hent || !hent->val.ephash ||
+      !hent->val.ephash->ai_gw_mode)
+    return 0;
+
+  sp_h1_admit_req_from_headers(pfe, hent, &req);
+  req.prefix_only = 1;
+  if (pfe->json_stream_route_pending) {
+    const uint8_t *route_body = NULL;
+    size_t route_body_len = 0;
+    int route_body_at_limit = 0;
+
+    if (sp_json_route_body_prefix(pfe->rcvbuf, pfe->rcv_off, &route_body,
+                                  &route_body_len,
+                                  &route_body_at_limit) == 0 &&
+        route_body_len > 0) {
+      req.body = (const char *)route_body;
+      req.body_len = route_body_len;
+    }
+    req.declared_content_length = pfe->http_content_length;
+  }
+
+  log_debug("[AIGateway] fd=%d streamed request gated before dispatch: "
+            "content_length=%zu prefix=%zu model='%s'",
+            fd, pfe->http_content_length, req.body_len,
+            pfe->prefix_key.model);
+  return sp_h1_admit_apply(pfe, hent, &req, "streamed");
+}
+
+/* An oversized JSON request whose top-level model did not appear inside
+ * the bounded routing prefix. On an enforcing service the model is what
+ * the credential is authorized against, so without it the request cannot
+ * be admitted at all: the credential is still checked first (an
+ * unauthenticated probe learns nothing but 401), then the request is
+ * refused 413 with zero backend bytes. Non-enforcing services keep the
+ * routing contract's 400 unchanged. Always ends the request: the response
+ * is written and the socket shut. */
+static void
+sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
+{
+  proxy_map_ent_t *hent = (proxy_map_ent_t *)pfe->head;
+
+  if (pfe->odir == 0 && hent && hent->val.ephash &&
+      hent->val.ephash->ai_gw_mode && sp_h1_rule_enforces(hent)) {
+    ai_gw_req_ctx_t req;
+    char msg[128];
+
+    sp_h1_admit_req_from_headers(pfe, hent, &req);
+    req.prefix_only = 1;          /* no body, no length: nothing is reserved */
+    req.prefix_model = "";
+    if (sp_h1_admit_apply(pfe, hent, &req, "streamed") != 0)
+      return;                     /* refused on the credential/rate ladder */
+
+    snprintf(msg, sizeof(msg),
+             "model must appear within the first %u body bytes",
+             SP_JSON_ROUTE_PREFIX_MAX);
+    sp_h1_send_admit_deny(pfe, 413, 0, 0,
+                          "request_too_large_for_admission", msg);
+    log_info("[AIGateway] fd=%d streamed request refused 413: no top-level "
+             "model within %u buffered body bytes (content_length=%zu)",
+             fd, SP_JSON_ROUTE_PREFIX_MAX, pfe->http_content_length);
+    return;
+  }
+
+  {
+    static const char model_late[] = SP_MODEL_REQUIRED_EARLY_RESPONSE;
+    if (proxy_send_local_response_and_shutdown(
+            pfe, model_late, sizeof(model_late) - 1) != 0)
+      log_error("[JSON_STREAM_MODEL] fd=%d failed to send "
+                "complete bounded 400 response", fd);
+    log_debug("[JSON_STREAM_MODEL] fd=%d no complete top-level "
+             "model within %u buffered body bytes", fd,
+             SP_JSON_ROUTE_PREFIX_MAX);
+  }
+}
+
 int
 handle_on_message_complete(llhttp_t* parser)
 {
@@ -7355,92 +7627,15 @@ handle_on_message_complete(llhttp_t* parser)
       /* One gate, shared across protocol parsers: every policy decision --
        * enforcement mode, credential validation, the body-first effective
        * model and its conflict rule, RPS, token reservation -- lives in
-       * ai_gw_admit (sockproxy_ai_admit.c). This caller owns only the H1
-       * response emission and the pfe wiring. */
-      char adm_svc_ident[64];
-      ai_gw_svc_ident(hent->key.xip, hent->key.xport,
-                      adm_svc_ident, sizeof(adm_svc_ident));
-      ai_gw_req_ctx_t adm_req = {
-        .api_key = pfe->x_api_key_raw,
-        .bearer = pfe->bearer_raw,
-        .bearer_oversize = pfe->bearer_oversize,
-        .jwt_profile = hent->val.ephash->jwt_auth_profile,
-        .body = gate_body,
-        .body_len = gate_body_len,
-        .prefix_model = pfe->prefix_key.model,
-        .hdr_model = pfe->x_model_header,
-        .auth_mode = hent->val.ephash->apikey_auth,
-        .svc_ident = adm_svc_ident,
-      };
-      ai_gw_admit_result_t adm;
-      ai_gw_admit(&adm_req, &adm);
-
-      if (adm.verdict == AI_GW_ADMIT_UNMETERED) {
-        /* Served, but neither authenticated nor attributable to a tenant.
-         * Report it so the operator can see the consequence of the default
-         * rather than infer it from a bill. The legacy model derivation
-         * also stays in force: pfe->effective_model is deliberately not
-         * written on non-enforcing services. */
-        char um_vip[INET6_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &hent->key.xip, um_vip, sizeof(um_vip));
-        llb_ai_record_unmetered(um_vip);
-      } else if (adm.verdict == AI_GW_ADMIT_DENY) {
-        char resp_buf[512];
-        int n;
-        const char *status_line =
-          adm.http_status == 400 ? "400 Bad Request" :
-          adm.http_status == 401 ? "401 Unauthorized" :
-          adm.http_status == 403 ? "403 Forbidden" :
-          adm.http_status == 429 ? "429 Too Many Requests" :
-                                   "503 Service Unavailable";
-        if (adm.retry_body) {
-          n = snprintf(resp_buf, sizeof(resp_buf),
-            "HTTP/1.1 %s\r\n"
-            "Content-Type: application/json\r\n"
-            "Retry-After: %d\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-            status_line, adm.retry_after, adm.error_code, adm.retry_after);
-        } else if (adm.retry_after > 0) {
-          n = snprintf(resp_buf, sizeof(resp_buf),
-            "HTTP/1.1 %s\r\n"
-            "Content-Type: application/json\r\n"
-            "Retry-After: %d\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-            status_line, adm.retry_after, adm.error_code, adm.error_msg);
-        } else {
-          n = snprintf(resp_buf, sizeof(resp_buf),
-            "HTTP/1.1 %s\r\n"
-            "Content-Type: application/json\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-            status_line, adm.error_code, adm.error_msg);
-        }
-        if (n > 0 && n < (int)sizeof(resp_buf))
-          send(pfe->fd, resp_buf, (size_t)n, MSG_NOSIGNAL);
-        shutdown(pfe->fd, SHUT_RDWR);
-        switch (adm.stage) {
-        case AI_GW_STAGE_CONFLICT:
-          log_info("[AIGateway] fd=%d model conflict: tenant=%s X-Model=%s",
-                   pfe->fd, adm.tenant_id, pfe->x_model_header);
-          break;
-        case AI_GW_STAGE_RATELIMIT:
-          log_info("[AIGateway] fd=%d rate-limited: key=%s tenant=%s error=%s retry=%d",
-                   pfe->fd, adm.key_id, adm.tenant_id, adm.error_code, adm.retry_after);
-          break;
-        case AI_GW_STAGE_RESERVE:
-          log_info("[AIGateway] fd=%d pre-admission denied: tenant=%s want=%u error=%s retry=%d",
-                   pfe->fd, adm.tenant_id, adm.reserved_toks, adm.error_code, adm.retry_after);
-          break;
-        default:
-          log_info("[AIGateway] fd=%d rejected: status=%d key=%.8s...",
-                   pfe->fd, adm.http_status, pfe->x_api_key_raw);
-          break;
-        }
+       * ai_gw_admit (sockproxy_ai_admit.c). The H1 response emission and
+       * the pfe wiring live in sp_h1_admit_apply, shared with the streamed
+       * dispatch site so a body this parser never completes is gated by
+       * the same code. */
+      ai_gw_req_ctx_t adm_req;
+      sp_h1_admit_req_from_headers(pfe, hent, &adm_req);
+      adm_req.body = gate_body;
+      adm_req.body_len = gate_body_len;
+      if (sp_h1_admit_apply(pfe, hent, &adm_req, "complete") != 0) {
         /* Deny: stop the parser. A bare `return` here once left an
          * INDETERMINATE errno for llhttp_execute, and whenever the garbage
          * value happened to be 0 a rejected request went to the backend
@@ -7450,30 +7645,6 @@ handle_on_message_complete(llhttp_t* parser)
          * loop tell a policy denial from malformed traffic. */
         pfe->ai_gw_denied = 1;
         return -1;
-      } else {
-        /* Admitted. Persist the identity for SSE token accounting and
-         * metrics, the gate's model resolution for routing and
-         * response-phase consumers, the token reservation for the settle
-         * call, and the deciding arm's upstream-hygiene switches for
-         * the dispatch-time strip/inject. */
-        strncpy(pfe->tenant_id, adm.tenant_id, sizeof(pfe->tenant_id) - 1);
-        pfe->tenant_id[sizeof(pfe->tenant_id) - 1] = '\0';
-        strncpy(pfe->auth_user_id, adm.user_id, sizeof(pfe->auth_user_id) - 1);
-        pfe->auth_user_id[sizeof(pfe->auth_user_id) - 1] = '\0';
-        strncpy(pfe->auth_key_id, adm.key_id, sizeof(pfe->auth_key_id) - 1);
-        pfe->auth_key_id[sizeof(pfe->auth_key_id) - 1] = '\0';
-        pfe->auth_strip_authz = (adm.auth_flags & AI_GW_AUTHF_STRIP_AUTHZ) ? 1 : 0;
-        pfe->auth_fwd_identity = (adm.auth_flags & AI_GW_AUTHF_FWD_IDENTITY) ? 1 : 0;
-        pfe->auth_jwt_capable =
-          (hent->val.ephash->apikey_auth == 3 ||
-           hent->val.ephash->apikey_auth == 4) ? 1 : 0;
-        strncpy(pfe->effective_model, adm.effective_model,
-                sizeof(pfe->effective_model) - 1);
-        pfe->effective_model[sizeof(pfe->effective_model) - 1] = '\0';
-        if (adm.res_epoch != 0) {
-          pfe->usage_reserved_toks = adm.reserved_toks;
-          pfe->usage_res_epoch = adm.res_epoch;
-        }
       }
     }
   }
@@ -9171,6 +9342,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->http_body_complete = 0;
     pfe->http_content_length = 0;
     pfe->is_streamable = 0;
+    pfe->ai_gw_stream_gated = 0;
     pfe->json_stream_route_pending = 0;
     pfe->json_stream_continue_sent = 0;
 
@@ -10028,16 +10200,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 if (proxy_send_local_100_continue(pfe) != 0)
                   return -1;
                 if (route_body_at_limit) {
-                  static const char model_late[] =
-                      SP_MODEL_REQUIRED_EARLY_RESPONSE;
-                  if (proxy_send_local_response_and_shutdown(
-                          pfe, model_late, sizeof(model_late) - 1) != 0)
-                    log_error("[JSON_STREAM_MODEL] fd=%d failed to send "
-                              "complete bounded 400 response", fd);
+                  sp_h1_stream_model_unresolvable(fd, pfe);
                   pfe->lb_err_body_sent = 1;
-                  log_debug("[JSON_STREAM_MODEL] fd=%d no complete top-level "
-                           "model within %u buffered body bytes", fd,
-                           SP_JSON_ROUTE_PREFIX_MAX);
                   return -1;
                 }
                 continue;
@@ -10072,6 +10236,25 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           if ((pfe->http_hok && pfe->http_body_complete && pfe->is_streamable) ||
               (pfe->http_pok && pfe->http_body_complete && !pfe->is_streamable)) {
             // Now we have the complete HTTP request (or early trigger for large streamable content)
+
+            /* Admission before the first backend byte, for the request
+             * shape the parser's own gate cannot see: a streamed body is
+             * dispatched here with http_pok still 0, so
+             * handle_on_message_complete (and the gate inside it) has not
+             * run. Every later step of this block — the kept-leg re-arm,
+             * selection, pd_setup_and_forward — assumes an admitted
+             * request, so the gate goes first. Once per request: a
+             * dispatch re-entered for the same request must not reserve
+             * twice. A body the parser DID complete (http_pok) was gated
+             * in the callback and is not gated again. */
+            if (pfe->is_streamable && !pfe->http_pok &&
+                !pfe->ai_gw_stream_gated) {
+              if (sp_h1_pre_dispatch_admit(fd, pfe) != 0) {
+                pfe->lb_err_body_sent = 1;
+                return -1;   /* refused: response sent, socket shut */
+              }
+              pfe->ai_gw_stream_gated = 1;
+            }
 
             // P0.2: Extract LLM prefix from JSON body
             // SKIP for streamable content - only inspect JSON/form data
@@ -10279,6 +10462,25 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             // With 1MB buffer, this gives 972KB usable space before overflow protection
             // Early backend connection (at 512KB) should prevent reaching this threshold
             if (pfe->rcv_off >= (SP_SOCK_MSG_LEN * 95 / 100)) {
+              /* On an AI-gateway service the client gets a deterministic
+               * answer before the reset: a chunked (or length-less) body
+               * that outgrows the buffer is refused 413, not cut mid-upload
+               * with no HTTP response. The buffered maximum is a documented
+               * contract of the service; a bare reset made it look like a
+               * network fault. Non-AI listeners keep the raw reset. */
+              proxy_map_ent_t *ovf_head = (proxy_map_ent_t *)pfe->head;
+              if (pfe->odir == 0 && ovf_head && ovf_head->val.ephash &&
+                  ovf_head->val.ephash->ai_gw_mode) {
+                sp_h1_send_admit_deny(pfe, 413, 0, 0, "request_body_too_large",
+                                      "request body exceeds the gateway's "
+                                      "buffered maximum; send a Content-Length");
+                pfe->lb_err_body_sent = 1;
+                log_info("[AIGateway] fd=%d request refused 413: %zu buffered "
+                         "bytes without a streamable Content-Length "
+                         "(content_length=%zu hok=%d)", fd, pfe->rcv_off,
+                         pfe->http_content_length, pfe->http_hok);
+                return -1;
+              }
               log_error("⚠️  BUFFER OVERFLOW: Request too large (%zu/%d bytes, 95%% full) - "
                        "Content-Length header missing or upload exceeds buffer capacity! fd=%d",
                        pfe->rcv_off, SP_SOCK_MSG_LEN, fd);
@@ -10350,6 +10552,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->http_hvok = 0;
           pfe->http_body_complete = 0;
           pfe->http_content_length = 0;
+          pfe->ai_gw_stream_gated = 0;
           pfe->json_stream_route_pending = 0;
           pfe->json_stream_continue_sent = 0;
           memset(&pfe->prefix_key, 0, sizeof(pfe->prefix_key));  // P0.2: Reset prefix

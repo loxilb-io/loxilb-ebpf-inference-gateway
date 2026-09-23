@@ -83,6 +83,19 @@ typedef struct ai_gw_req_ctx {
                               * selects the rule-scope QoS defaults row, and on
                               * non-enforcing services the opt-in per-VIP shared
                               * bucket (the only ladder arm keyless traffic has) */
+
+  /* Streamed dispatch: the request body is NOT complete when the gate runs.
+   * body/body_len then hold only the bounded routing prefix (or nothing,
+   * for a body the proxy never inspects), so the gate must not parse it as
+   * a whole document: the model comes from prefix_model/hdr_model, and the
+   * prompt-token reservation is sized from declared_content_length (bytes
+   * still to arrive, at the same 4-bytes-per-token bias the complete-body
+   * estimate uses) when that is larger than what the prefix shows. A zero
+   * declared_content_length with prefix_only set reserves nothing from
+   * bytes: the caller has no prompt to size (a non-JSON upload), or is
+   * about to refuse the request itself and must not leave a claim behind. */
+  int         prefix_only;
+  size_t      declared_content_length;
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {

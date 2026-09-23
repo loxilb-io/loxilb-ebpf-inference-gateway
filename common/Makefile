@@ -357,6 +357,15 @@ test_l7hdr_guard: sockproxy_l7hdr_guard_test.c sockproxy_l7hdr_guard.h
 test_l7hdr: test_l7hdr_guard
 	./test_l7hdr_guard
 
+# Header-completion deadline resolution: 0 means the product default, never
+# "disabled". Standalone — includes only the pure sockproxy_hdr_deadline.h.
+test_hdr_deadline: sockproxy_hdr_deadline_test.c sockproxy_hdr_deadline.h
+	$(CC) -Wall -Wextra -o $@ $< -I.
+
+.PHONY: test_hdrdl
+test_hdrdl: test_hdr_deadline
+	./test_hdr_deadline
+
 # Phase 87-01 (FIX-1/2/3/4): P/D streaming-completion connection-leak unit.
 # Standalone — includes only the pure sockproxy_pd_leak.h helpers (no sockproxy.c
 # machinery). -fsanitize=address detects over-reads in the bounded detector and
