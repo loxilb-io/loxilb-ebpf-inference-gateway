@@ -521,7 +521,7 @@ test_usage: test_usage_extract
 	./test_usage_extract
 
 # S07: exact CHWBL/WRR_HASH ring geometry and five-field runtime contract.
-test_chwbl_contract: test_chwbl_contract.c sockproxy_lb.c sockproxy_lb.h sockproxy_json.c sockproxy_json.h
+test_chwbl_contract: test_chwbl_contract.c sockproxy_lb.c sockproxy_lb.h sockproxy_json.c sockproxy_json.h sockproxy_h2_load.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -c -o sockproxy_lb_chwbl_test.o sockproxy_lb.c
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -c -o test_chwbl_contract.o test_chwbl_contract.c
 	$(CC) -o $@ test_chwbl_contract.o sockproxy_lb_chwbl_test.o \

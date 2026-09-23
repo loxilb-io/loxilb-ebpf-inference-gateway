@@ -58,6 +58,7 @@
 #include "sockproxy_connect.h"
 #include "sockproxy_cache.h"
 #include "sockproxy_lb.h"
+#include "sockproxy_h2_load.h"
 #include "sockproxy_routing.h"
 #include "sockproxy_ssl.h"
 #include "sockproxy_ktls.h"
@@ -1585,8 +1586,12 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   proxy_connect_pending_clear(fd_ent);
 
 #ifdef HAVE_DP_GPU_ROUTING
-  // P1.3/P3.5: Decrement CHWBL/WRR_HASH load counter when connection closes
-  if (fd_ent->epv && fd_ent->ep_num >= 0) {
+  /* Hand back the CHWBL/WRR_HASH unit this connection took when it routed.
+   * Only an HTTP/1.1 leg holds one: HTTP/2 legs account per stream mapping
+   * (sockproxy_h2_load.h) and have released everything by the time the
+   * session was cleaned up, so releasing here again would steal a unit from
+   * whichever connection still legitimately holds one on that endpoint. */
+  if (conn_holds_load_unit(fd_ent)) {
     proxy_epval_t *epv = (proxy_epval_t *)fd_ent->epv;
     chwbl_dec_runtime(epv, fd_ent->ep_num);
   }

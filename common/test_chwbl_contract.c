@@ -7,11 +7,22 @@
 #include "uthash.h"
 #include "log.h"
 #include "sockproxy_lb.h"
+#include "sockproxy_h2_load.h"
 
-/* Standalone test: retain production JSON extraction while stubbing logging. */
+/* Standalone test: retain production JSON extraction while stubbing logging.
+ * Error-level lines are counted: the selector runtime reports a load-counter
+ * underflow at that level, and the stream-unit cases below assert on it. */
+static int log_errors;
 void log_log(int level, const char *file, int line, const char *fmt, ...)
 {
-  (void)level; (void)file; (void)line; (void)fmt;
+  (void)file; (void)line; (void)fmt;
+  if (level >= LOG_ERROR)
+    log_errors++;
+}
+
+static uint32_t ep_load(const proxy_epval_t *epv, int ep)
+{
+  return atomic_load(&epv->chwbl_config->ep_loads[ep].active_conns);
 }
 
 #include "sockproxy_json.c"
@@ -109,6 +120,88 @@ int main(void)
   key.flags = PREFIX_HAS_CACHE_SALT;
   assert(chwbl_apply_hash_policy(&policy, &key) == -2);
 
+  /* HTTP/2 stream units. One unit per stream mapping on a bounded-load pool,
+   * released exactly once, and never a connection unit for an HTTP/2 leg. */
+  proxy_epval_t h2pool = epv;
+  h2pool.select = PROXY_SEL_CHWBL;
+  assert(chwbl_prepare_runtime(&h2pool, &arg, NULL) == 0);
+  assert(h2_load_units_active(&h2pool));
+  log_errors = 0;
+
+  enum { N_STREAMS = 50 };
+  int held[N_STREAMS];
+  for (int i = 0; i < N_STREAMS; i++) {
+    held[i] = h2_load_unit_take(&h2pool, 1);
+    assert(held[i] == 1);
+  }
+  assert(ep_load(&h2pool, 1) == N_STREAMS);
+  assert(ep_load(&h2pool, 0) == 0 && ep_load(&h2pool, 2) == 0);
+
+  /* The selector counts its pick as a connection unit; the HTTP/2 path hands
+   * that one straight back and takes the mapping's unit instead, so a stream
+   * costs exactly one. */
+  chwbl_inc_runtime(&h2pool, 1);              /* what the selector did */
+  chwbl_dec_runtime(&h2pool, 1);              /* what the H2 path does at once */
+  int extra = h2_load_unit_take(&h2pool, 1);  /* the mapping's unit */
+  assert(extra == 1 && ep_load(&h2pool, 1) == N_STREAMS + 1);
+  h2_load_unit_release(&h2pool, 1, &extra);
+  assert(extra == 0 && ep_load(&h2pool, 1) == N_STREAMS);
+
+  /* N closes bring the endpoint back to zero ... */
+  for (int i = 0; i < N_STREAMS; i++) {
+    h2_load_unit_release(&h2pool, 1, &held[i]);
+    assert(held[i] == 0);
+  }
+  assert(ep_load(&h2pool, 1) == 0);
+  assert(log_errors == 0);
+
+  /* ... and a second release of every mapping (stream close followed by
+   * session teardown) is a no-op: the counter stays at zero and nothing is
+   * reported as an underflow. */
+  for (int i = 0; i < N_STREAMS; i++)
+    h2_load_unit_release(&h2pool, 1, &held[i]);
+  assert(ep_load(&h2pool, 1) == 0);
+  assert(log_errors == 0);
+
+  /* The underflow report is live -- a raw release on an empty counter is
+   * what the guard above prevents. */
+  chwbl_dec_runtime(&h2pool, 1);
+  assert(ep_load(&h2pool, 1) == 0);
+  assert(log_errors == 1);
+  log_errors = 0;
+
+  /* A pool that keeps no units hands out none, so nothing is ever owed. */
+  proxy_epval_t rrpool = epv;
+  rrpool.select = PROXY_SEL_RR;
+  assert(!h2_load_units_active(&rrpool));
+  int none = h2_load_unit_take(&rrpool, 0);
+  assert(none == 0);
+  h2_load_unit_release(&rrpool, 0, &none);
+  assert(log_errors == 0);
+  assert(h2_load_unit_take(&h2pool, -1) == 0);
+  assert(h2_load_unit_take(&h2pool, MAX_PROXY_EP) == 0);
+
+  /* Connection ownership: an HTTP/1.1 leg that routed owns one unit; an
+   * HTTP/2 leg, whose units sit on its stream mappings, owns none even
+   * though it carries the same (epv, ep_num) for byte accounting. */
+  static proxy_fd_ent_t leg;
+  memset(&leg, 0, sizeof(leg));
+  leg.epv = &h2pool;
+  leg.ep_num = 1;
+  assert(conn_holds_load_unit(&leg) == 1);
+  leg.load_units_per_stream = 1;
+  assert(conn_holds_load_unit(&leg) == 0);
+  leg.load_units_per_stream = 0;
+  leg.ep_num = -1;
+  assert(conn_holds_load_unit(&leg) == 0);
+  leg.ep_num = 1;
+  leg.epv = NULL;
+  assert(conn_holds_load_unit(&leg) == 0);
+  assert(conn_holds_load_unit(NULL) == 0);
+
+  chwbl_release_runtime(&h2pool);
+
   puts("PASS: CHWBL/WRR_HASH ring contract");
+  puts("PASS: HTTP/2 stream-unit contract");
   return 0;
 }

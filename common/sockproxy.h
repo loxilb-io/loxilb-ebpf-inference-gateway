@@ -918,6 +918,11 @@ struct proxy_fd_ent {
   int n_rfd;
   int mode;
   int ep_num;
+  /* Set on every HTTP/2 leg (client-facing session and backend session alike):
+   * bounded-load units are held by its stream mappings, so the connection
+   * itself owns none and the teardown release must skip it. See
+   * conn_holds_load_unit() in sockproxy_h2_load.h. Cleared with the shell. */
+  int load_units_per_stream;
   int lsel;
   int protocol;
   int seltype;

@@ -31,6 +31,7 @@
 #include "sockproxy_pd.h"         /* dialect ops for usage extraction */
 #include "sockproxy_json.h"
 #include "sockproxy_lb.h"
+#include "sockproxy_h2_load.h"    /* per-stream bounded-load units */
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "sockproxy_l7hdr_guard.h" /* same field guard as the H1 splice */
 #include "notify.h"
@@ -1844,6 +1845,10 @@ proxy_h2_backend_on_stream_close_callback(nghttp2_session *session,
         }
       }
       HASH_DEL(backend_session->stream_map, mapping);
+#ifdef HAVE_DP_GPU_ROUTING
+      h2_load_unit_release((proxy_epval_t *)backend_session->epv,
+                           mapping->ep_idx, &mapping->load_held);
+#endif
 
       // Free allocated header storage
       if (mapping->response_headers) {
@@ -2291,6 +2296,12 @@ proxy_h2_backend_session_destroy(backend_h2_session_t *backend_session)
   stream_mapping_t *mapping, *tmp;
   HASH_ITER(hh, backend_session->stream_map, mapping, tmp) {
     HASH_DEL(backend_session->stream_map, mapping);
+#ifdef HAVE_DP_GPU_ROUTING
+    /* A mapping still here never saw its backend stream close: its unit is
+     * released now, with the session, or it would outlive the connection. */
+    h2_load_unit_release((proxy_epval_t *)backend_session->epv,
+                         mapping->ep_idx, &mapping->load_held);
+#endif
 
     // Free allocated header storage
     if (mapping->response_headers) {
@@ -2299,6 +2310,12 @@ proxy_h2_backend_session_destroy(backend_h2_session_t *backend_session)
         free((void *)mapping->response_headers[i].value);
       }
       free(mapping->response_headers);
+    }
+
+    /* The request data source is freed on the backend stream's close; a
+     * mapping torn down with the session never reached that close. */
+    if (mapping->data_source) {
+      free(mapping->data_source);
     }
 
     free(mapping);
@@ -2391,6 +2408,9 @@ proxy_setup_h2_session(proxy_fd_ent_t *pfe, int is_client)
   // METRICS: Track HTTP/2 session creation (TIER 1, Metric #4)
   atomic_fetch_add(&global_stats.h2_sessions, 1);
   pfe->protocol_version = 2;  // HTTP/2
+  /* Bounded-load units on this leg belong to its stream mappings from here
+   * on; the connection holds none (sockproxy_h2_load.h). */
+  pfe->load_units_per_stream = 1;
   
   // Initialize backpressure tracking (same pattern as HTTP/1.1 cache)
   pfe->h2_session->total_response_buffer_size = 0;
@@ -3828,8 +3848,19 @@ h2_have_tepval:
       proxy_h2_send_l7_synthetic(pfe, 400, NULL, NULL);
       return -1;
     }
-    if (policy_rc != 0)
+    if (policy_rc != 0) {
       ep_idx = -1;
+    } else {
+      /* The selector counted this pick as a CONNECTION unit, the way it does
+       * for HTTP/1.1. On HTTP/2 the unit is the stream mapping, taken below
+       * once the mapping exists and released when the mapping is freed; so
+       * hand the selector's unit straight back. Doing it here, rather than
+       * adopting it, keeps every failure exit between this point and the
+       * mapping (no healthy endpoint, connect refused, submit failed, ...)
+       * free of a release it would otherwise owe, and covers the healthy-
+       * endpoint fallback below moving ep_idx off the counted endpoint. */
+      chwbl_dec_runtime(tepval, ep_idx);
+    }
   }
   
   // P5: GPU-Aware routing (if enabled and no CHWBL match)
@@ -4144,6 +4175,7 @@ h2_have_tepval:
     backend_pfe->ep_num = ep_idx;             // Endpoint index INSIDE its pool —
     backend_pfe->epv = tepval;                // with epv this pair IS the slot's
                                               // reuse identity (see slot search)
+    backend_pfe->load_units_per_stream = 1;   // units live on the mappings, not here
     backend_pfe->stype = PROXY_SOCK_ACTIVE;   // Active connection
     backend_pfe->used = 1;                    // Mark as in use
     backend_pfe->backend_h2_session = backend_session;  // For event handler lookup
@@ -4337,12 +4369,13 @@ h2_have_tepval:
   mapping->data_source = data_src;  // Store for cleanup (NULL if no request body)
 
   HASH_ADD_INT(backend_session->stream_map, client_stream_id, mapping);
-  
+
 #ifdef HAVE_DP_GPU_ROUTING
-  // Update endpoint load (CRITICAL-4 FIX: Use atomic operations)
-  if (tepval->chwbl_config) {
-    atomic_fetch_add(&tepval->chwbl_config->ep_loads[ep_idx].active_conns, 1);
-  }
+  /* One bounded-load unit per stream mapping on a CHWBL/WRR_HASH pool,
+   * released when the mapping is freed (backend stream close or session
+   * teardown). The pool and endpoint the unit sits on are the backend
+   * session's, which is what the release sites read back. */
+  mapping->load_held = h2_load_unit_take(tepval, ep_idx);
 #endif
   
   if (h2_backend_flush(backend_session, pfe->rfd_ent[slot], backend_fd) < 0) {
