@@ -6291,7 +6291,8 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
                     atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed),
                     atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed) >
                       atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed) ? 1 : 0,
-                    pfe->resp_outstanding, pfe->cresp_unframed);
+                    pfe->resp_outstanding,
+                    atomic_load_explicit(&pfe->cresp_unframed, memory_order_relaxed));
         }
 
         /* A CLIENT that half-closed after a complete request is saying "that
@@ -6347,7 +6348,12 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
          * worker — here and from the relay, which runs on that same worker and
          * takes the client entry's lock for the client's fields, not for this
          * one. Observation only; nothing reads the counters yet. */
-        if (pfe->odir == 1 && pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
+        /* The same two exclusions the feed makes: a leg whose bytes never reach
+         * the client must not consume the flag a client-facing leg set, or a
+         * response the client never saw is counted as delivered. */
+        if (pfe->odir == 1 && pfe->n_rfd > 0 && pfe->rfd_ent[0] &&
+            !pfe->pd_sg_drain &&
+            pfe->rfd_ent[0]->pd_phase != PD_PHASE_PREFILL_WAITING) {
           cresp_note_backend_eof(pfe->rfd_ent[0]);
         }
 
@@ -8208,12 +8214,14 @@ cresp_on_headers_complete(llhttp_t *parser)
   /* A response with neither Content-Length nor chunked framing runs until the
    * backend closes, so its completion arrives as that EOF rather than from
    * llhttp. Record it now, while the flags are the ones for this message. */
-  pfe->cresp_unframed = (parser->flags & (F_CONTENT_LENGTH | F_CHUNKED)) ? 0 : 1;
+  atomic_store_explicit(&pfe->cresp_unframed,
+                        (parser->flags & (F_CONTENT_LENGTH | F_CHUNKED)) ? 0 : 1,
+                        memory_order_relaxed);
 
   /* llhttp handles the body-less statuses itself; HEAD it cannot know about, so
    * the oldest outstanding request's bit says whether to skip the body. */
   if (cresp_head_pop(pfe)) {
-    pfe->cresp_unframed = 0;
+    atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
     return 1;                        /* no body follows */
   }
   return 0;
@@ -8226,7 +8234,7 @@ cresp_on_message_complete(llhttp_t *parser)
 
   if (pfe) {
     atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
-    pfe->cresp_unframed = 0;
+    atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
   }
   return 0;
 }
@@ -8279,9 +8287,15 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
 static void
 cresp_note_backend_eof(proxy_fd_ent_t *client)
 {
-  if (client && client->cresp_parser_inited && client->cresp_unframed) {
+  if (!client || !client->cresp_parser_inited) {
+    return;
+  }
+  /* Take the flag, then count. The exchange is what makes this safe to run
+   * without the entry lock the framer holds: only the caller that actually
+   * clears it counts the completion, so two legs closing cannot count one
+   * response twice. */
+  if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
-    client->cresp_unframed = 0;
   }
 }
 

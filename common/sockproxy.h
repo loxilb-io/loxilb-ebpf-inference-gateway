@@ -1011,7 +1011,14 @@ struct proxy_fd_ent {
 
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
   uint8_t  cresp_parser_inited;
-  uint8_t  cresp_unframed;         // this response is delimited by the backend's EOF
+  /* Set by the response framer under this entry's lock, consumed by the backend
+   * leg's EOF without it, so it is atomic and the consumer takes it with an
+   * exchange: whoever clears it is the one that counts the completion. A
+   * connection with one backend leg would not need that, since feed and EOF are
+   * then the same fd on the same worker, but a P/D client has a prefill leg and
+   * a decode leg on different fds, and this codebase shards those to different
+   * notify workers. */
+  _Atomic uint8_t cresp_unframed;  // this response is delimited by the backend's EOF
   /* The two counters have one writer each — requests are framed on the client's
    * worker, responses on the backend's — so a relaxed atomic is enough for each
    * and no lock is needed to keep them whole.
