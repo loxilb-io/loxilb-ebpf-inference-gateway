@@ -96,6 +96,15 @@ typedef struct ai_gw_req_ctx {
    * about to refuse the request itself and must not leave a claim behind. */
   int         prefix_only;
   size_t      declared_content_length;
+
+  /* Correlation, filled by the caller before the gate: the request ID that
+   * the refusal, the completion and the settle records of this request all
+   * carry (minted, or adopted from the client, before admission so a
+   * refused request has one too), and the relay worker deciding it
+   * (notify_worker_id(); -1 when the caller is not a worker). The gate
+   * hands both to the refusal record; it decides nothing on them. */
+  const char *request_id;
+  int         producer_id;
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {
@@ -130,6 +139,14 @@ typedef struct ai_gw_admit_result {
 } ai_gw_admit_result_t;
 
 int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);
+
+/* Write a fresh request ID into buf: 32 lowercase hex digits shaped as a
+ * UUID v4, from a per-thread generator that needs neither the trace ring
+ * nor a trace-enabled build (the ring's generator returns zero in the
+ * default build, which would hand every request the same ID). buf is
+ * always NUL-terminated; len must cover AI_GW_REQUEST_ID_HEX + 1. */
+#define AI_GW_REQUEST_ID_HEX 32
+void ai_gw_mint_request_id(char *buf, size_t len);
 
 /* Format the service identity the QoS ladder keys rule-scope state on:
  * "VIP:port" from the rule key's network-order IPv4 address and port —

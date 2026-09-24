@@ -932,17 +932,31 @@ notify_run(void *ctx, int thread)
  * swallowed by the Go runtime → ~30s lock-wedge. */
 extern __thread volatile sig_atomic_t g_llb_proxy_worker;
 
+/* Which notify worker this thread is. Set once at worker start, outside any
+ * build-time feature guard, so a consumer that attributes work to the
+ * emitting thread (the audit producer sequence) can rely on it in every
+ * build; the trace ring consumes the same identity below instead of owning
+ * it. -1 on a thread that is not a notify worker. */
+__thread int sp_worker_id = -1;
+
+int
+notify_worker_id(void)
+{
+  return sp_worker_id;
+}
+
 static void *
 notify_run_worker(void *arg)
 {
   notify_thr_t *targ = arg;
   g_llb_proxy_worker = 1;
+  sp_worker_id = targ->thrid;
   
 #ifdef HAVE_HTTP_TRACE
   /* Trace rings exist per relay shard; the listener shard has none. */
   if (targ->thrid != ((notify_ctx_t *)targ->ctx)->acc_thr) {
     extern void lxb_ring_set_worker_id(int worker_id);
-    lxb_ring_set_worker_id(targ->thrid);
+    lxb_ring_set_worker_id(sp_worker_id);
   }
 #endif
   

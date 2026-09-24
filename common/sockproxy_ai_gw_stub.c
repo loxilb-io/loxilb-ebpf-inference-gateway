@@ -18,8 +18,9 @@
  * sockproxy_ai_gw_stub.c — AI Gateway CGO bridge stubs for C-only builds.
  *
  * The real implementations of llb_ai_validate_key, llb_ai_ratelimit_check,
- * llb_ai_ratelimit_update, llb_ai_record_request, llb_ai_stream_start,
- * llb_ai_stream_end, llb_ai_token_quota_consume and llb_ai_pd_record
+ * llb_ai_ratelimit_update, llb_ai_record_request, llb_ai_record_deny,
+ * llb_ai_stream_start, llb_ai_stream_end, llb_ai_token_quota_consume and
+ * llb_ai_pd_record
  * live in pkg/loxinet/ai_gateway_dp.go and are only
  * available when the binary is linked with the Go CGO runtime.
  *
@@ -109,7 +110,9 @@ llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int burst)
 __attribute__((weak)) void
 llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                       int64_t latency_ms, int prompt_tokens, int complet_tokens,
-                      int stream_start, int stream_end, char *error_code)
+                      int stream_start, int stream_end, char *error_code,
+                      char *request_id, char *user_id, char *key_id,
+                      char *svc_ident, int is_stream, int producer_id)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
@@ -120,6 +123,31 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
     (void)complet_tokens;
     (void)stream_start;
     (void)stream_end;
+    (void)error_code;
+    (void)request_id;
+    (void)user_id;
+    (void)key_id;
+    (void)svc_ident;
+    (void)is_stream;
+    (void)producer_id;
+}
+
+__attribute__((weak)) void
+llb_ai_record_deny(char *request_id, int producer_id,
+                   char *svc_ident, char *model_name,
+                   char *tenant_id, char *key_id, char *user_id,
+                   int stage, int http_status, char *error_code)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)request_id;
+    (void)producer_id;
+    (void)svc_ident;
+    (void)model_name;
+    (void)tenant_id;
+    (void)key_id;
+    (void)user_id;
+    (void)stage;
+    (void)http_status;
     (void)error_code;
 }
 
@@ -146,7 +174,8 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                            char *user_id, char *key_id, char *svc_ident,
                            int prompt_tokens, int complet_tokens,
                            int estimated, int reserved_toks,
-                           int64_t res_epoch, ai_gw_decision_t *result)
+                           int64_t res_epoch, char *request_id,
+                           int producer_id, ai_gw_decision_t *result)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
@@ -159,6 +188,8 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
     (void)estimated;
     (void)reserved_toks;
     (void)res_epoch;
+    (void)request_id;
+    (void)producer_id;
     (void)result;
     return 0;  /* allow — no quota enforcement in C-only debug builds */
 }

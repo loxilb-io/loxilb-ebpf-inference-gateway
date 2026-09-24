@@ -71,6 +71,9 @@ int notify_add_ent_listener(void *ctx, int fd, notify_type_t type, void *priv, u
 /* The shard `fd` is registered on (-1 when not registered), and the listener
  * shard's index (== n_thrs). */
 int notify_ent_thr(void *ctx, int fd);
+/* The notify worker index of the calling thread, or -1 when the caller is
+ * not a notify worker (a listener, health or Go runtime thread). */
+int notify_worker_id(void);
 int notify_listener_thr(void *ctx);
 /* (R1): which notify worker owns `fd` (its `fd % n_thrs` shard, or the
  * pinned thr_id if registered). Returns -1 if ctx invalid. Lets the slot-freeing

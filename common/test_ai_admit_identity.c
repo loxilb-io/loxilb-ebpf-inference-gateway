@@ -61,6 +61,22 @@ extract_max_tokens(const char *body, size_t len)
 
 static int validate_key_calls;
 static int validate_bearer_calls;
+/* Forced outcome of the API-key arm: 0 = validate, otherwise the decision
+ * the arm refuses with (2 = model refused for a known tenant). */
+static int validate_key_decision;
+static struct {
+  int  calls;
+  char request_id[64];
+  int  producer_id;
+  char svc[64];
+  char model[128];
+  char tenant[128];
+  char key[64];
+  char user[128];
+  int  stage;
+  int  http_status;
+  char error_code[64];
+} deny_stub;
 
 static struct {
   int  calls;
@@ -97,8 +113,33 @@ llb_ai_validate_key(char *raw_key, char *model, ai_gw_decision_t *result)
   }
   strcpy(result->key_id, "key-1");
   strcpy(result->tenant_id, "tenant-1");
+  if (validate_key_decision != 0) {
+    /* The credential validated and named its tenant; the refusal is the
+     * arm's decision (a model this key may not use). */
+    result->decision = validate_key_decision;
+    return -1;
+  }
   /* API keys map to no user today: user_id stays "". */
   return 0;
+}
+
+void
+llb_ai_record_deny(char *request_id, int producer_id,
+                   char *svc_ident, char *model_name,
+                   char *tenant_id, char *key_id, char *user_id,
+                   int stage, int http_status, char *error_code)
+{
+  deny_stub.calls++;
+  snprintf(deny_stub.request_id, sizeof(deny_stub.request_id), "%s", request_id);
+  deny_stub.producer_id = producer_id;
+  snprintf(deny_stub.svc, sizeof(deny_stub.svc), "%s", svc_ident);
+  snprintf(deny_stub.model, sizeof(deny_stub.model), "%s", model_name);
+  snprintf(deny_stub.tenant, sizeof(deny_stub.tenant), "%s", tenant_id);
+  snprintf(deny_stub.key, sizeof(deny_stub.key), "%s", key_id);
+  snprintf(deny_stub.user, sizeof(deny_stub.user), "%s", user_id);
+  deny_stub.stage = stage;
+  deny_stub.http_status = http_status;
+  snprintf(deny_stub.error_code, sizeof(deny_stub.error_code), "%s", error_code);
 }
 
 int
@@ -159,7 +200,9 @@ reset_stubs(void)
 {
   validate_key_calls = 0;
   validate_bearer_calls = 0;
+  validate_key_decision = 0;
   extract_model_calls = 0;
+  memset(&deny_stub, 0, sizeof(deny_stub));
   memset(&rl_stub, 0, sizeof(rl_stub));
   memset(&rs_stub, 0, sizeof(rs_stub));
 }
@@ -399,6 +442,168 @@ test_svc_ident_format(void)
   assert(strncmp(tiny, "10.10.1", 7) == 0);
 }
 
+/* ---- refusal records and the request ID ---------------------------------- */
+
+static void
+test_allow_records_no_refusal(void)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "k",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .request_id = "req-allow",
+    .producer_id = 2,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == 0);
+  assert(res.verdict == AI_GW_ADMIT_ALLOW);
+  assert(deny_stub.calls == 0);
+}
+
+static void
+test_missing_credential_refusal_is_recorded_with_its_key(void)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .request_id = "req-401",
+    .producer_id = 3,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.verdict == AI_GW_ADMIT_DENY);
+  assert(deny_stub.calls == 1);
+  assert(strcmp(deny_stub.request_id, "req-401") == 0);
+  assert(deny_stub.producer_id == 3);
+  assert(strcmp(deny_stub.svc, "10.0.0.1:2040") == 0);
+  assert(strcmp(deny_stub.model, "m1") == 0);   /* named before refusing */
+  assert(deny_stub.stage == AI_GW_STAGE_AUTH);
+  assert(deny_stub.http_status == 401);
+  assert(strcmp(deny_stub.error_code, "invalid_api_key") == 0);
+  /* Refused before any identity resolved: nothing is invented. */
+  assert(deny_stub.tenant[0] == '\0' && deny_stub.key[0] == '\0');
+}
+
+static void
+test_model_refusal_keeps_the_tenant_it_validated(void)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "k",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .request_id = "req-403",
+    .producer_id = 1,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  validate_key_decision = 2;
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(res.verdict == AI_GW_ADMIT_DENY);
+  assert(res.http_status == 403);
+  assert(strcmp(res.error_code, "model_not_allowed") == 0);
+  /* The credential validated: the refusal names who was refused. */
+  assert(strcmp(res.tenant_id, "tenant-1") == 0);
+  assert(strcmp(res.key_id, "key-1") == 0);
+  assert(deny_stub.calls == 1);
+  assert(strcmp(deny_stub.tenant, "tenant-1") == 0);
+  assert(strcmp(deny_stub.key, "key-1") == 0);
+  assert(deny_stub.http_status == 403);
+  assert(strcmp(deny_stub.request_id, "req-403") == 0);
+}
+
+static void
+test_rate_limit_refusal_is_recorded_after_identity(void)
+{
+  ai_gw_req_ctx_t req = {
+    .api_key = "k",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 1,
+    .svc_ident = "10.0.0.1:2040",
+    .request_id = "req-429",
+    .producer_id = 0,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  rl_stub.rc = -1;
+  rl_stub.decision = 3;
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(deny_stub.calls == 1);
+  assert(deny_stub.stage == AI_GW_STAGE_RATELIMIT);
+  assert(deny_stub.http_status == 429);
+  assert(strcmp(deny_stub.tenant, "tenant-1") == 0);
+  assert(strcmp(deny_stub.error_code, "rate_limit_exceeded") == 0);
+  assert(deny_stub.producer_id == 0);
+}
+
+static void
+test_keyless_bucket_refusal_is_recorded(void)
+{
+  ai_gw_req_ctx_t req = {
+    .auth_mode = 0,
+    .svc_ident = "10.0.0.1:2040",
+    .request_id = "req-keyless",
+    .producer_id = 1,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  rl_stub.rc = -1;
+  rl_stub.decision = 3;
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(deny_stub.calls == 1);
+  assert(deny_stub.stage == AI_GW_STAGE_RATELIMIT);
+  assert(strcmp(deny_stub.request_id, "req-keyless") == 0);
+  assert(deny_stub.tenant[0] == '\0');
+}
+
+static int
+is_hex_lower(const char *s, size_t n)
+{
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+      return 0;
+  }
+  return 1;
+}
+
+static void
+test_minted_request_ids_are_unique_and_uuid_shaped(void)
+{
+  char a[AI_GW_REQUEST_ID_HEX + 1];
+  char b[AI_GW_REQUEST_ID_HEX + 1];
+  char c[8];
+
+  ai_gw_mint_request_id(a, sizeof(a));
+  ai_gw_mint_request_id(b, sizeof(b));
+  assert(strlen(a) == AI_GW_REQUEST_ID_HEX);
+  assert(strlen(b) == AI_GW_REQUEST_ID_HEX);
+  assert(is_hex_lower(a, AI_GW_REQUEST_ID_HEX));
+  assert(strcmp(a, b) != 0);
+  /* Never the all-zero ID a zeroed generator would produce. */
+  assert(strcmp(a, "00000000000040008000000000000000") != 0);
+  /* UUID v4 shape: version nibble and variant nibble. */
+  assert(a[12] == '4');
+  assert(a[16] == '8' || a[16] == '9' || a[16] == 'a' || a[16] == 'b');
+  /* A short buffer is truncated and still terminated. */
+  ai_gw_mint_request_id(c, sizeof(c));
+  assert(strlen(c) == sizeof(c) - 1);
+}
+
 int
 main(void)
 {
@@ -409,6 +614,12 @@ main(void)
   test_prefix_only_without_length_reserves_nothing();
   test_prefix_only_missing_credential_is_refused();
   test_svc_ident_format();
+  test_allow_records_no_refusal();
+  test_missing_credential_refusal_is_recorded_with_its_key();
+  test_model_refusal_keeps_the_tenant_it_validated();
+  test_rate_limit_refusal_is_recorded_after_identity();
+  test_keyless_bucket_refusal_is_recorded();
+  test_minted_request_ids_are_unique_and_uuid_shaped();
   puts("PASS: identity-forwarding ABI transports user/key/service through the gate, "
        "and a streamed prefix is gated on headers + declared length");
   return 0;

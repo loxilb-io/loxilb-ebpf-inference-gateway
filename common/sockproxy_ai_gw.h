@@ -178,12 +178,47 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *   error_code:     for 429 responses, the specific denial reason from
  *                   ai_gw_decision_t ("rate_limit_exceeded", "tenant_quota_exceeded",
  *                   "token_quota_exceeded"); pass "" for non-429 responses
+ *   request_id:     the request's correlation key, the one its admission and
+ *                   settle carried ("" when the request had none)
+ *   user_id:        per-user identity from the deciding credential arm ("")
+ *   key_id:         key identifier from the deciding credential arm ("")
+ *   svc_ident:      "VIP:port" of the rule ("" when unknown)
+ *   is_stream:      1 when the response was an SSE stream, 0 otherwise
+ *   producer_id:    notify_worker_id() of the calling thread; -1 when unknown
  *
  * Returns void.
  */
 extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                                   int64_t latency_ms, int prompt_tokens, int complet_tokens,
-                                  int stream_start, int stream_end, char *error_code);
+                                  int stream_start, int stream_end, char *error_code,
+                                  char *request_id, char *user_id, char *key_id,
+                                  char *svc_ident, int is_stream, int producer_id);
+
+/*
+ * llb_ai_record_deny – record one request refused at the admission gate.
+ *
+ * Called once per refusal, from the gate's single verdict frame, for every
+ * deny arm (credential, model authorization, model conflict, rate limit,
+ * token reservation) on both protocol paths. The identity fields carry what
+ * the deciding arm resolved before refusing: a refused model names its
+ * tenant, an unknown credential names nothing. The credential itself is
+ * never passed.
+ *
+ * Parameters:
+ *   request_id:   the request's correlation key, minted or adopted before
+ *                 the gate ("" only when the caller had none)
+ *   producer_id:  notify_worker_id() of the deciding thread; -1 when unknown
+ *   svc_ident:    "VIP:port" of the rule ("" when unknown)
+ *   model_name:   the model the request named ("" when none)
+ *   tenant_id, key_id, user_id: identity resolved before the refusal
+ *   stage:        ai_gw_admit_stage_t of the refusing arm
+ *   http_status:  the status the caller answers with
+ *   error_code:   the refusal's error code (NUL-terminated)
+ */
+extern void llb_ai_record_deny(char *request_id, int producer_id,
+                               char *svc_ident, char *model_name,
+                               char *tenant_id, char *key_id, char *user_id,
+                               int stage, int http_status, char *error_code);
 
 /*
  * llb_ai_stream_start – record the opening of an SSE stream.
@@ -271,6 +306,7 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                                       int prompt_tokens, int complet_tokens,
                                       int estimated, int reserved_toks,
                                       int64_t res_epoch,
+                                      char *request_id, int producer_id,
                                       ai_gw_decision_t *result);
 
 /*

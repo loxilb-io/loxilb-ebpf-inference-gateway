@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -161,6 +161,9 @@ sockproxy_ai_security.o: sockproxy_ai_security.c sockproxy_ai_security.h sockpro
 
 sockproxy_ai_admit.o: sockproxy_ai_admit.c sockproxy_ai_admit.h sockproxy_ai_gw.h \
                       sockproxy_json.h sockproxy.h sockproxy_internal.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_ai_bench.o: sockproxy_ai_bench.c sockproxy_ai_bench.h sockproxy_ai_gw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 notify.o: notify.c notify.h
