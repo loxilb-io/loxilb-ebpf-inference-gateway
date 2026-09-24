@@ -51,6 +51,7 @@
 #include "llb_dpapi.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy_ai_security.h"
+#include "sockproxy_sockmap_gate.h"
 #include "sockproxy.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
@@ -848,47 +849,60 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
 }
 
 /*
- * proxy_sockmap_l7_rewrites_requests — whether this rule's data plane changes
- * bytes on every request, which a direction handed to the kernel would skip.
+ * proxy_sockmap_owned_dirs — which directions of a connection this rule's
+ * data plane owns, so the pairing can leave them on the userspace relay
+ * (sockproxy_sockmap_gate.h has the table).
  *
- * Three declarations put that work on the relay path:
- *   - an attached L7 policy (has_l7_policy): X-Forwarded-For is overwritten,
- *     X-Forwarded-Port/-Proto are added, and the insertHeaders SET/ADD/REMOVE
- *     operations are applied, on every request; a Set-Cookie can be injected on
- *     every response;
- *   - a declared apikey_auth, an explicit "disabled" INCLUDED: the gateway owns
- *     the X-Api-Key namespace and strips the header before dispatch on every
- *     request (ai_security_should_strip_api_key);
- *   - AI-gateway mode (ai_gw_mode, derived from the rule's streaming or
- *     disaggregation setting): every request re-enters the parser for the
- *     admission gate, gets a request id and the usage flag injected, and every
- *     response is read for its usage object and stream end. Both directions
- *     are byte paths the gateway owns.
- *
- * This is the same predicate the control plane applies when it refuses a
- * sockMapMode on such a rule (sockMapPerRequestL7); that check runs when the
- * rule is written, and an L7 policy can be attached while connections are
- * already live. This is the per-connection backstop; declining the pair
- * leaves the connection on the userspace relay, which is the byte path such a
- * rule needs.
+ * The control plane applies the same split when it accepts or refuses a
+ * sockMapMode (sockMapPerRequestL7Dirs); that check runs when the rule is
+ * written, and an L7 policy can be attached while connections are already
+ * live. This is the per-connection backstop. It used to answer for the
+ * connection as a whole, which left a service that declares api_key_auth on
+ * the relay in BOTH directions after the control plane had accepted its
+ * response-only mode: the rule showed "response" in its readback, its port sat
+ * in the portset, and no response byte was ever redirected.
  */
-static int
+static void
+proxy_sockmap_owned_dirs(proxy_map_ent_t *ent, proxy_epval_t *epv,
+                         int *own_req, int *own_resp)
+{
+  sockmap_gate_in_t in = { 0 };
+  uint8_t apikey_auth;
+
+  *own_req = 0;
+  *own_resp = 0;
+  if (!ent)
+    return;
+  in.has_l7_policy = ent->has_l7_policy ? 1 : 0;
+  if (epv) {
+    in.sse_mode = epv->sse_mode;
+    in.pd_disagg_mode = epv->pd_disagg_enabled;
+    in.ai_gw_mode = epv->ai_gw_mode;
+    apikey_auth = epv->apikey_auth;
+  } else if (ent->val.ephash) {
+    in.sse_mode = ent->val.ephash->sse_mode;
+    in.pd_disagg_mode = ent->val.ephash->pd_disagg_enabled;
+    in.ai_gw_mode = ent->val.ephash->ai_gw_mode;
+    apikey_auth = ent->val.ephash->apikey_auth;
+  } else {
+    apikey_auth = 0;
+  }
+  in.strips_api_key = ai_security_should_strip_api_key(apikey_auth) ? 1 : 0;
+  sockmap_gate_owned_dirs(&in, own_req, own_resp);
+}
+
+/*
+ * proxy_sockmap_l7_rewrites_requests — whether this rule's data plane owns
+ * any direction. The build without sockops registers both sockets of a pair
+ * or neither, so an owned direction on either side declines the pair.
+ */
+static int __attribute__((unused))
 proxy_sockmap_l7_rewrites_requests(proxy_map_ent_t *ent, proxy_epval_t *epv)
 {
-  uint8_t apikey_auth;
-  uint8_t ai_gw_mode;
+  int own_req, own_resp;
 
-  if (!ent)
-    return 0;
-  if (ent->has_l7_policy)
-    return 1;
-  ai_gw_mode = epv ? epv->ai_gw_mode :
-               (ent->val.ephash ? ent->val.ephash->ai_gw_mode : 0);
-  if (ai_gw_mode)
-    return 1;
-  apikey_auth = epv ? epv->apikey_auth :
-                (ent->val.ephash ? ent->val.ephash->apikey_auth : 0);
-  return ai_security_should_strip_api_key(apikey_auth) ? 1 : 0;
+  proxy_sockmap_owned_dirs(ent, epv, &own_req, &own_resp);
+  return own_req || own_resp;
 }
 
 /*
@@ -6774,22 +6788,31 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
 #if defined(HAVE_SOCKOPS)
   uint8_t sockmap_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
 
-  /* Second gate on the pairing, per connection. The control plane refuses a
-   * sockMapMode on a rule whose data plane rewrites bytes on every request —
-   * a declared apikey_auth (an explicit "disabled" included, which still
-   * strips X-Api-Key) or an attached L7 policy — but that check runs when the
-   * rule is written, and an L7 policy can be attached while connections are
-   * already live. Acceleration would then skip l7_inject_req_headers_h1 and
-   * ai_strip_upstream_api_key from the second keep-alive request on, carrying
-   * the tenant's key upstream and leaving a client-supplied X-Forwarded-For
-   * unrewritten. Declining the pair here costs a rule that should never have
-   * been accelerated its acceleration, and nothing else: the connection stays
-   * on the userspace relay, which is exactly the byte path it needs. */
-  if (sockmap_mode && proxy_sockmap_l7_rewrites_requests(ent, tepval)) {
-    log_debug("Sockmap: not pairing fd=%d/%d, the rule rewrites every request "
-             "(l7_policy=%u); staying on the userspace relay",
-             pfe->fd, ep_cfd, ent->has_l7_policy);
-    sockmap_mode = 0;
+  /* Second gate on the pairing, per connection and per direction. The control
+   * plane accepts or refuses a sockMapMode by the same split when the rule is
+   * written, but an L7 policy can be attached while connections are already
+   * live, and a direction paired past its declaration would skip
+   * l7_inject_req_headers_h1 and ai_strip_upstream_api_key from the second
+   * keep-alive request on, carrying the tenant's key upstream and leaving a
+   * client-supplied X-Forwarded-For unrewritten. Taking an owned direction
+   * away costs nothing the rule was entitled to: that direction stays on the
+   * userspace relay, which is exactly the byte path it needs. The other
+   * direction is kept, so a service that declares api_key_auth and nothing
+   * else pairs its responses while every request still reaches the admission
+   * gate. */
+  if (sockmap_mode) {
+    int own_req, own_resp;
+    uint8_t asked = sockmap_mode;
+
+    proxy_sockmap_owned_dirs(ent, tepval, &own_req, &own_resp);
+    sockmap_mode = sockmap_gate_reduce(asked, own_req, own_resp);
+    if (sockmap_mode != asked) {
+      log_debug("Sockmap: pairing fd=%d/%d with mode %u instead of %u, the rule owns "
+                "the %s direction (l7_policy=%u); it stays on the userspace relay",
+                pfe->fd, ep_cfd, sockmap_mode, asked,
+                own_req && own_resp ? "request and response" : own_req ? "request" : "response",
+                ent->has_l7_policy);
+    }
   }
 
   if (sockmap_eligible && proxy_struct->peer_map_cb && proxy_struct->verdict_map_cb &&
