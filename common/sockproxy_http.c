@@ -482,20 +482,11 @@ generate_vllm_request_id(proxy_fd_ent_t *pfe,
                          const char *prefill_ep,
                          const char *decode_ep)
 {
-  uint64_t hi, lo;
-
-  /* Reuse xorshift64* PRNG from lxb_ring (non-crypto, uniqueness only) */
-  hi = lxb_gen_trace_id_part();
-  lo = lxb_gen_trace_id_part();
-
-  /* Set UUID v4 version bits (version=4 in bits 12-15 of hi) */
-  hi = (hi & ~((uint64_t)0xF << 12)) | ((uint64_t)0x4 << 12);
-  /* Set variant bits (variant=10xx in bits 62-63 of lo) */
-  lo = (lo & ~((uint64_t)0x3 << 62)) | ((uint64_t)0x2 << 62);
-
-  char uuid_buf[33];
-  snprintf(uuid_buf, sizeof(uuid_buf), "%016llx%016llx",
-           (unsigned long long)hi, (unsigned long long)lo);
+  /* The generator is the admission layer's own: the trace ring's returns
+   * zero in a build without tracing, which handed every request the same
+   * ID. Non-crypto; uniqueness is all a correlation key needs. */
+  char uuid_buf[AI_GW_REQUEST_ID_HEX + 1];
+  ai_gw_mint_request_id(uuid_buf, sizeof(uuid_buf));
 
   if (prefill_ep && decode_ep) {
     snprintf(pfe->vllm_request_id, sizeof(pfe->vllm_request_id),
@@ -1799,7 +1790,9 @@ skip_deferred_masking:
                                      ns_svc_ident,
                                      up, uc, 0,
                                      (int)rfd_ent->usage_reserved_toks,
-                                     rfd_ent->usage_res_epoch, NULL);
+                                     rfd_ent->usage_res_epoch,
+                                     (char *)rfd_ent->vllm_request_id,
+                                     notify_worker_id(), NULL);
           /* Settled: the admission claim is spent. Zero it so no later
            * consume on this connection can release it a second time. */
           rfd_ent->usage_reserved_toks = 0;
@@ -1834,10 +1827,16 @@ skip_deferred_masking:
                                   rfd_ent->metric_req_start_ns) / 1000000ULL);
       }
       const char *ai_ns_model = proxy_effective_model(rfd_ent);
+      char ai_ns_svc_ident[64];
+      proxy_pfe_svc_ident(rfd_ent, ai_ns_svc_ident, sizeof(ai_ns_svc_ident));
       llb_ai_record_request((char *)rfd_ent->tenant_id, (char *)ai_ns_model,
                             (int)rfd_ent->metric_response_status, ai_ns_lat_ms,
                             rfd_ent->usage_prompt_toks,
-                            rfd_ent->usage_complet_toks, 0, 0, "");
+                            rfd_ent->usage_complet_toks, 0, 0, "",
+                            (char *)rfd_ent->vllm_request_id,
+                            (char *)rfd_ent->auth_user_id,
+                            (char *)rfd_ent->auth_key_id,
+                            ai_ns_svc_ident, 0, notify_worker_id());
       rfd_ent->metric_ai_recorded = 1;
       log_debug("[AI_NONSSE_RECORDED] client_fd=%d backend_fd=%d model=%s status=%u",
                rfd_ent->fd, ent->fd, ai_ns_model,
@@ -1982,7 +1981,9 @@ skip_deferred_masking:
                                    sse_svc_ident,
                                    sse_tok_p, sse_tok_c, sse_estimated,
                                    (int)rfd_ent->usage_reserved_toks,
-                                   rfd_ent->usage_res_epoch, NULL);
+                                   rfd_ent->usage_res_epoch,
+                                   (char *)rfd_ent->vllm_request_id,
+                                   notify_worker_id(), NULL);
         /* Settled: zero the claim so a spurious second [DONE] or a later
          * non-stream consume on this connection cannot double-release. */
         rfd_ent->usage_reserved_toks = 0;
@@ -1996,8 +1997,14 @@ skip_deferred_masking:
         int sse_status = rfd_ent->metric_response_status > 0
                              ? (int)rfd_ent->metric_response_status
                              : 200;
+        char sse_rec_svc_ident[64];
+        proxy_pfe_svc_ident(rfd_ent, sse_rec_svc_ident, sizeof(sse_rec_svc_ident));
         llb_ai_record_request((char *)sse_tenant, (char *)sse_model, sse_status,
-                              latency_ms, sse_tok_p, sse_tok_c, 0, 0, "");
+                              latency_ms, sse_tok_p, sse_tok_c, 0, 0, "",
+                              (char *)rfd_ent->vllm_request_id,
+                              (char *)rfd_ent->auth_user_id,
+                              (char *)rfd_ent->auth_key_id,
+                              sse_rec_svc_ident, 1, notify_worker_id());
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         log_debug("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
@@ -4689,6 +4696,7 @@ typedef struct {
   char    user[128];
   char    key[64];
   char    svc_ident[64];
+  char    request_id[256];
   int     reserved;
   int64_t res_epoch;
 } proxy_resv_rel_t;
@@ -4789,6 +4797,7 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     snprintf(r->user, sizeof(r->user), "%s", pfe->auth_user_id);
     snprintf(r->key, sizeof(r->key), "%s", pfe->auth_key_id);
     proxy_pfe_svc_ident(pfe, r->svc_ident, sizeof(r->svc_ident));
+    snprintf(r->request_id, sizeof(r->request_id), "%s", pfe->vllm_request_id);
     /* Zero under the lock: nothing may release this claim twice. */
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
@@ -5376,7 +5385,8 @@ proxy_pdestroy(void *priv)
     proxy_resv_rel_t *r = &settles.resv[ri];
     llb_ai_token_quota_consume(r->tenant, r->model, r->user, r->key,
                                r->svc_ident, 0, 0, 0,
-                               r->reserved, r->res_epoch, NULL);
+                               r->reserved, r->res_epoch,
+                               r->request_id, notify_worker_id(), NULL);
     log_debug("[AI_TOKENS] released %d unspent reserved tokens on teardown "
              "tenant=%s", r->reserved, r->tenant);
   }
@@ -5421,10 +5431,13 @@ proxy_pdestroy(void *priv)
     h2_inflight_settle_t *e = &settles.h2[hi];
     llb_ai_token_quota_consume(e->tenant, e->model, e->user, e->key,
                                e->svc_ident, e->prompt_toks, e->complet_toks,
-                               0, e->reserved_toks, e->res_epoch, NULL);
+                               0, e->reserved_toks, e->res_epoch,
+                               e->request_id, notify_worker_id(), NULL);
     if (e->status > 0) {
       llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
-                            e->prompt_toks, e->complet_toks, 0, 0, "");
+                            e->prompt_toks, e->complet_toks, 0, 0, "",
+                            e->request_id, e->user, e->key, e->svc_ident,
+                            0, notify_worker_id());
       /* Recorded as completed with no usage object to read — the H2 twin of
        * the H1 report above. Inside the status guard on purpose: a stream
        * with no backend status never completed a response, so it is a
@@ -7285,7 +7298,9 @@ handle_on_message_begin(llhttp_t* parser)
                                  (char *)pfe->auth_key_id,
                                  rel_svc_ident,
                                  0, 0, 0, (int)pfe->usage_reserved_toks,
-                                 pfe->usage_res_epoch, NULL);
+                                 pfe->usage_res_epoch,
+                                 (char *)pfe->vllm_request_id,
+                                 notify_worker_id(), NULL);
     }
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
@@ -7409,6 +7424,15 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   ai_gw_svc_ident(hent->key.xip, hent->key.xport,
                   adm_svc_ident, sizeof(adm_svc_ident));
   req->svc_ident = adm_svc_ident;
+  /* The request ID exists before the gate decides, so a refusal carries the
+   * same key its completion and settle would have. A client-supplied
+   * X-Request-Id was adopted at header capture; anything else is minted
+   * here and injected upstream at dispatch. Cleared with the rest of the
+   * request state at the keep-alive boundary. */
+  if (pfe->vllm_request_id[0] == '\0')
+    generate_vllm_request_id(pfe, NULL, NULL);
+  req->request_id = pfe->vllm_request_id;
+  req->producer_id = notify_worker_id();
   ai_gw_admit(req, &adm);
   req->svc_ident = NULL;   /* borrowed from this frame */
 

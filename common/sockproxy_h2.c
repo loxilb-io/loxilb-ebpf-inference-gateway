@@ -270,7 +270,8 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                              stream->auth_user_id, stream->auth_key_id,
                              stream->svc_ident, up, uc, 0,
                              (int)stream->usage_reserved_toks,
-                             stream->usage_res_epoch, NULL);
+                             stream->usage_res_epoch,
+                             stream->request_id, notify_worker_id(), NULL);
   stream->usage_reserved_toks = 0;
   stream->usage_res_epoch = 0;
 
@@ -299,7 +300,10 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   int status = stream->metric_response_status;
   if (status > 0) {
     llb_ai_record_request(stream->tenant_id, stream->effective_model, status,
-                          latency_ms, up, uc, 0, 0, "");
+                          latency_ms, up, uc, 0, 0, "",
+                          stream->request_id, stream->auth_user_id,
+                          stream->auth_key_id, stream->svc_ident, 0,
+                          notify_worker_id());
 
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
@@ -384,6 +388,7 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
     snprintf(e->user, sizeof(e->user), "%s", stream->auth_user_id);
     snprintf(e->key, sizeof(e->key), "%s", stream->auth_key_id);
     snprintf(e->svc_ident, sizeof(e->svc_ident), "%s", stream->svc_ident);
+    snprintf(e->request_id, sizeof(e->request_id), "%s", stream->request_id);
     e->prompt_toks = up;
     e->complet_toks = uc;
     e->reserved_toks = (int)stream->usage_reserved_toks;
@@ -689,6 +694,10 @@ proxy_h2_on_header_callback(nghttp2_session *session,
   } else if (HEADER_MATCHES("x-conversation-id")) {
     snprintf(stream->conversation_id, sizeof(stream->conversation_id), "%.*s", (int)valuelen, value);
     stream->has_conv_id = 1;
+  } else if (HEADER_MATCHES("x-request-id")) {
+    /* Adopted as the stream's correlation key, as the H1 parser adopts it;
+     * a stream without one is given an ID at the gate. */
+    snprintf(stream->request_id, sizeof(stream->request_id), "%.*s", (int)valuelen, value);
   } else if (HEADER_MATCHES("x-api-key")) {
     /* Credentials are stream state, never connection state: concurrent H2
      * streams may carry different tenants.  An oversized value is cleared so
@@ -3509,6 +3518,11 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       ai_gw_svc_ident(ent->key.xip, ent->key.xport,
                       adm_svc_ident, sizeof(adm_svc_ident));
 
+    /* The request ID exists before the gate decides, so a refusal carries
+     * the same key its completion and settle would have. */
+    if (stream->request_id[0] == '\0')
+      ai_gw_mint_request_id(stream->request_id, sizeof(stream->request_id));
+
     ai_gw_req_ctx_t adm_req = {
       .api_key = stream->x_api_key_raw,
       .bearer = stream->bearer_raw,
@@ -3520,6 +3534,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .hdr_model = stream->x_model_header,
       .auth_mode = ent->val.ephash->apikey_auth,
       .svc_ident = adm_svc_ident,
+      .request_id = stream->request_id,
+      .producer_id = notify_worker_id(),
     };
     ai_gw_admit_result_t adm;
     ai_gw_admit(&adm_req, &adm);

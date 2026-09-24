@@ -133,6 +133,9 @@ typedef struct proxy_h2_stream {
   char     effective_model[128];     // the gate's body-first model resolution
   char     svc_ident[64];            // "VIP:port" captured at admission — teardown paths
                                      // must not chase the rule head after it may be gone
+  char     request_id[256];          // correlation key shared by this stream's refusal,
+                                     // completion and settle records: the client's
+                                     // x-request-id when it sent one, else minted at the gate
   uint8_t  auth_strip_authz;         // upstream hygiene switches, parity with the H1 splice
   uint8_t  auth_fwd_identity;
   uint8_t  auth_jwt_capable;
@@ -413,6 +416,7 @@ typedef struct h2_inflight_settle {
   char    user[128];
   char    key[64];
   char    svc_ident[64];
+  char    request_id[256];
   int     prompt_toks;
   int     complet_toks;
   int     reserved_toks;

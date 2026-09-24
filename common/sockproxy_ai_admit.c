@@ -38,6 +38,9 @@
 #include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
 #include <arpa/inet.h>
 
 #include "xxhash.h"
@@ -78,8 +81,78 @@ set_deny(ai_gw_admit_result_t *res, ai_gw_admit_stage_t stage, int status,
   snprintf(res->error_msg, sizeof(res->error_msg), "%s", msg);
 }
 
+/* Per-thread xorshift64* state for request IDs. Seeded lazily from the
+ * clocks, the thread and a process-wide salt, so two workers started in
+ * the same nanosecond still diverge. */
+static __thread uint64_t mint_state;
+static _Atomic uint64_t mint_salt;
+
+static uint64_t
+mint_next(void)
+{
+  if (mint_state == 0) {
+    struct timespec mono, wall;
+    uint64_t s;
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    clock_gettime(CLOCK_REALTIME, &wall);
+    s = ((uint64_t)wall.tv_sec << 32) ^ (uint64_t)wall.tv_nsec;
+    s ^= ((uint64_t)mono.tv_nsec << 20) ^ (uint64_t)pthread_self();
+    s += atomic_fetch_add(&mint_salt, 0x9E3779B97F4A7C15ULL) +
+         0x9E3779B97F4A7C15ULL;
+    /* splitmix64 finaliser: spreads a poor seed over all 64 bits. */
+    s ^= s >> 30; s *= 0xBF58476D1CE4E5B9ULL;
+    s ^= s >> 27; s *= 0x94D049BB133111EBULL;
+    s ^= s >> 31;
+    mint_state = s ? s : 0x123456789ABCDEF0ULL;
+  }
+  uint64_t x = mint_state;
+  x ^= x >> 12;
+  x ^= x << 25;
+  x ^= x >> 27;
+  mint_state = x;
+  return x * 0x2545F4914F6CDD1DULL;
+}
+
+void
+ai_gw_mint_request_id(char *buf, size_t len)
+{
+  if (!buf || len == 0)
+    return;
+  uint64_t hi = mint_next();
+  uint64_t lo = mint_next();
+  /* UUID v4 shape: version nibble in hi, variant bits in lo. */
+  hi = (hi & ~((uint64_t)0xF << 12)) | ((uint64_t)0x4 << 12);
+  lo = (lo & ~((uint64_t)0x3 << 62)) | ((uint64_t)0x2 << 62);
+  snprintf(buf, len, "%016llx%016llx",
+           (unsigned long long)hi, (unsigned long long)lo);
+}
+
+static int ai_gw_admit_decide(const ai_gw_req_ctx_t *req,
+                              ai_gw_admit_result_t *res);
+
 int
 ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
+{
+  int rc = ai_gw_admit_decide(req, res);
+
+  /* Every refusal is reported here, at the verdict, whatever arm produced
+   * it: the arms all return through this one frame, so an arm added to the
+   * decision cannot refuse a request unrecorded. The record carries the
+   * identity the arm resolved (empty when it refused before resolving one)
+   * and the correlation the caller supplied. */
+  if (res->verdict == AI_GW_ADMIT_DENY) {
+    llb_ai_record_deny((char *)(req->request_id ? req->request_id : ""),
+                       req->producer_id,
+                       (char *)(req->svc_ident ? req->svc_ident : ""),
+                       res->effective_model, res->tenant_id, res->key_id,
+                       res->user_id, (int)res->stage, res->http_status,
+                       res->error_code);
+  }
+  return rc;
+}
+
+static int
+ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
 {
   memset(res, 0, sizeof(*res));
 
@@ -127,6 +200,9 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
   }
   const char *body_bound = body_model[0] ? body_model : prefix_model;
   const char *model = body_bound[0] ? body_bound : hdr_model;
+  /* Resolved before any arm can refuse, so a refusal names the model the
+   * request asked for; the ALLOW path writes the same value again below. */
+  snprintf(res->effective_model, sizeof(res->effective_model), "%s", model);
 
   /* Stage 1: validate the credential → 401 (missing/invalid), 403 (model
    * denied), 503 (store cannot answer). The store outage is deliberately
@@ -188,6 +264,12 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
       set_deny(res, AI_GW_STAGE_AUTH, 403, 0, 0, "model_not_allowed",
                jwt_arm ? "Model not permitted for this token"
                        : "Model not permitted for this API key");
+      /* The credential validated and named its tenant; only the model was
+       * refused. Carry the identity so the refusal is attributable, as the
+       * CONFLICT arm below already does. */
+      snprintf(res->tenant_id, sizeof(res->tenant_id), "%s", key_dec.tenant_id);
+      snprintf(res->key_id, sizeof(res->key_id), "%s", key_dec.key_id);
+      snprintf(res->user_id, sizeof(res->user_id), "%s", key_dec.user_id);
     } else {
       set_deny(res, AI_GW_STAGE_AUTH, 401, 0, 0, deny_code,
                jwt_arm ? "Missing or invalid bearer token"
