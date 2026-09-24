@@ -357,6 +357,15 @@ test_l7hdr_guard: sockproxy_l7hdr_guard_test.c sockproxy_l7hdr_guard.h
 test_l7hdr: test_l7hdr_guard
 	./test_l7hdr_guard
 
+# The per-direction sockmap gate: which directions a service's declarations
+# own, and the mode a connection may still be paired with. Pure header.
+test_sockmap_gate: test_sockmap_gate.c sockproxy_sockmap_gate.h
+	$(CC) -Wall -Wextra -o $@ $< -I.
+
+.PHONY: test_smgate
+test_smgate: test_sockmap_gate
+	./test_sockmap_gate
+
 # Header-completion deadline resolution: 0 means the product default, never
 # "disabled". Standalone — includes only the pure sockproxy_hdr_deadline.h.
 test_hdr_deadline: sockproxy_hdr_deadline_test.c sockproxy_hdr_deadline.h

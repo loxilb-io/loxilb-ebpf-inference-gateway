@@ -39,6 +39,9 @@ jobs:
       - name: Header-field guard (bytes between a header value and the wire)
         run: make -C common test_l7hdr
 
+      - name: Per-direction sockmap gate (what a declaration owns, what still pairs)
+        run: make -C common test_smgate
+
       - name: HTTP/2 upstream header hygiene
         run: make -C common test_aisec
 
