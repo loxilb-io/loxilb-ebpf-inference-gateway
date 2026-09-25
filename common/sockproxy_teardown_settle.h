@@ -75,16 +75,35 @@ teardown_owes_resv_rel(const teardown_conn_t *c)
 }
 
 /*
+ * The connection's last response was seen but never recorded. A successful
+ * response's completion waits for its usage object, because the counts belong
+ * in the record; the per-request boundary writes it when request N+1 proves
+ * response N finished. The last response on a connection is followed by
+ * nothing, so without this it would never be written at all.
+ */
+static inline int
+teardown_owes_completion(const teardown_conn_t *c)
+{
+  return c && c->odir == 0 && c->ai_gw_mode && !c->metric_ai_recorded &&
+         c->metric_response_status != 0;
+}
+
+/*
  * The connection's last response completed with no readable usage object. The
  * per-request boundary reports that for every response a request N+1 follows;
  * the last one is followed by nothing, so without this the common
  * single-request shape would never report at all.
+ *
+ * Deliberately NOT gated on the record having already been written: the
+ * completion above is owed on this same sweep and is emitted just before
+ * this, so requiring it first would make the pair depend on its own order.
+ * What it does require is a 2xx that nothing charged, which is the
+ * accounting hole itself.
  */
 static inline int
 teardown_owes_usage_missing(const teardown_conn_t *c)
 {
-  return c && c->odir == 0 && c->ai_gw_mode && c->metric_ai_recorded &&
-         !c->usage_consumed &&
+  return c && c->odir == 0 && c->ai_gw_mode && !c->usage_consumed &&
          teardown_status_is_2xx(c->metric_response_status);
 }
 
@@ -137,7 +156,8 @@ static inline int
 teardown_conn_owes_settle(int shape, const teardown_conn_t *c)
 {
   (void)shape;   /* the shape decides the walk set, never the settle */
-  return teardown_owes_resv_rel(c) || teardown_owes_usage_missing(c) ||
+  return teardown_owes_resv_rel(c) || teardown_owes_completion(c) ||
+         teardown_owes_usage_missing(c) ||
          teardown_owes_h2_collect(c) || teardown_owes_stream_end(c);
 }
 

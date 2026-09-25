@@ -172,6 +172,52 @@ proxy_usage_went_unreported(const proxy_fd_ent_t *pfe)
          proxy_status_is_2xx(pfe->metric_response_status);
 }
 
+/* A response whose status was seen but whose completion has not been written
+ * yet. A successful response's record waits for the usage object to be read,
+ * because the counts belong in it; this says the wait is over and nothing
+ * came. */
+static int
+proxy_owes_completion(const proxy_fd_ent_t *pfe)
+{
+  return pfe && pfe->odir == 0 && pfe->ai_gw_mode &&
+         !pfe->metric_ai_recorded && pfe->metric_response_status != 0;
+}
+
+/* Write the completion record for a non-streamed response, exactly once.
+ *
+ * The record and the token settle are two halves of one request and must
+ * agree, so this runs where the counts are known: at the settle for a
+ * response that carried a usage object, and at the boundary that proves none
+ * is coming for one that did not. Emitting it the moment the response headers
+ * landed — which is what it used to do — meant a body split across segments
+ * had its counts read after the record naming them was already written, and
+ * the trail then held a completion claiming nothing was spent beside a settle
+ * charging the real amount. HTTP/2 settles in one place for the same reason
+ * (proxy_h2_settle_stream). */
+static void
+proxy_ai_record_completion(proxy_fd_ent_t *pfe)
+{
+  char svc_ident[64];
+  int64_t lat_ms = 0;
+
+  if (!proxy_owes_completion(pfe))
+    return;
+
+  if (pfe->metric_req_start_ns > 0) {
+    lat_ms = (int64_t)((get_timestamp_ns() - pfe->metric_req_start_ns) /
+                       1000000ULL);
+  }
+  proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
+  llb_ai_record_request((char *)pfe->tenant_id,
+                        (char *)proxy_effective_model(pfe),
+                        (int)pfe->metric_response_status, lat_ms,
+                        pfe->usage_prompt_toks, pfe->usage_complet_toks,
+                        0, 0, "", (char *)proxy_request_id(pfe),
+                        (char *)pfe->auth_user_id, (char *)pfe->auth_key_id,
+                        svc_ident, 0, notify_worker_id());
+  pfe->metric_ai_recorded = 1;
+}
+
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
     size_t needle_len = strlen(needle);
     if (needle_len == 0) return haystack;
@@ -1798,6 +1844,10 @@ skip_deferred_masking:
           rfd_ent->usage_reserved_toks = 0;
           rfd_ent->usage_res_epoch = 0;
           rfd_ent->usage_consumed = 1;
+          /* The counts are in hand, so the completion record is written here
+           * rather than back at the response headers: charge, then record,
+           * with one set of numbers between them. */
+          proxy_ai_record_completion(rfd_ent);
           log_debug("[AI_TOKENS] client_fd=%d prompt=%d completion=%d (non-stream)",
                    rfd_ent->fd, up, uc);
         }
@@ -1813,33 +1863,28 @@ skip_deferred_masking:
      * the SSE sniff above did NOT activate a stream, record the request exactly
      * once. metric_ai_recorded guards against the [DONE] path (which also sets
      * it) and against re-firing on later packets of the same response; status +
-     * TTFB latency were captured by the L7-metrics block above. Token counts
-     * come from the accounting block above when the body carried usage in
-     * this same segment (0 when it arrives later — the quota still charges,
-     * only this metric misses the counts). */
+     * TTFB latency were captured by the L7-metrics block above.
+     *
+     * A SUCCESSFUL response is recorded at its settle instead, not here: its
+     * usage object may still be in a later segment, and a record written
+     * before the counts are read would report nothing spent for a request the
+     * settle beside it charges in full. If the usage arrived in this same
+     * segment the settle above has already recorded it, and the guard below
+     * sees it done. If it never arrives, the boundary that proves so — the
+     * next request on the connection, or the teardown — records it there.
+     *
+     * Everything else is recorded here and now, because nothing is waited
+     * for: an error carries no usage object by design, which is the common
+     * JSON error shape an OpenAI-compatible backend returns even for a
+     * streaming request. */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
         rfd_ent->ai_gw_mode && !rfd_ent->metric_ai_recorded &&
         !rfd_ent->sse_active && rfd_ent->metric_response_status != 0 &&
+        !proxy_status_is_2xx(rfd_ent->metric_response_status) &&
         memmem(msg, len, "\r\n\r\n", 4) != NULL) {
-      int64_t ai_ns_lat_ms = 0;
-      if (rfd_ent->metric_req_start_ns > 0) {
-        ai_ns_lat_ms = (int64_t)((get_timestamp_ns() -
-                                  rfd_ent->metric_req_start_ns) / 1000000ULL);
-      }
-      const char *ai_ns_model = proxy_effective_model(rfd_ent);
-      char ai_ns_svc_ident[64];
-      proxy_pfe_svc_ident(rfd_ent, ai_ns_svc_ident, sizeof(ai_ns_svc_ident));
-      llb_ai_record_request((char *)rfd_ent->tenant_id, (char *)ai_ns_model,
-                            (int)rfd_ent->metric_response_status, ai_ns_lat_ms,
-                            rfd_ent->usage_prompt_toks,
-                            rfd_ent->usage_complet_toks, 0, 0, "",
-                            (char *)proxy_request_id(rfd_ent),
-                            (char *)rfd_ent->auth_user_id,
-                            (char *)rfd_ent->auth_key_id,
-                            ai_ns_svc_ident, 0, notify_worker_id());
-      rfd_ent->metric_ai_recorded = 1;
+      proxy_ai_record_completion(rfd_ent);
       log_debug("[AI_NONSSE_RECORDED] client_fd=%d backend_fd=%d model=%s status=%u",
-               rfd_ent->fd, ent->fd, ai_ns_model,
+               rfd_ent->fd, ent->fd, proxy_effective_model(rfd_ent),
                (unsigned)rfd_ent->metric_response_status);
     }
 
@@ -4701,9 +4746,24 @@ typedef struct {
   int64_t res_epoch;
 } proxy_resv_rel_t;
 
+/* The connection's last response, copied out so it can be reported after the
+ * lock drops: the pfe may be recycled by then. It carries two things that
+ * both belong to that one response — the completion record, when the
+ * response never got one because its usage object never came, and the
+ * accounting report for a 2xx nothing charged. */
 typedef struct {
   char tenant[128];
   char model[MAX_MODEL_LEN];
+  char user[128];
+  char key[64];
+  char svc_ident[64];
+  char request_id[256];
+  int  status;
+  int64_t latency_ms;
+  int  prompt_toks;
+  int  complet_toks;
+  int  owes_record;    /* the completion record was deferred and is owed */
+  int  owes_missing;   /* a 2xx completed and nothing charged it */
 } proxy_umiss_t;
 
 typedef struct {
@@ -4807,15 +4867,31 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
   /* Last response on this connection, finished with no readable usage object.
    * Identity is copied here because the pfe may be recycled by the time this
    * is emitted. */
-  if (teardown_owes_usage_missing(&v) &&
+  if ((teardown_owes_completion(&v) || teardown_owes_usage_missing(&v)) &&
       proxy_settle_grow((void **)&b->umiss, &b->c_umiss, b->n_umiss,
                         sizeof(*b->umiss))) {
     const char *um_model = proxy_effective_model(pfe);
     proxy_umiss_t *u = &b->umiss[b->n_umiss++];
     memset(u, 0, sizeof(*u));
+    u->owes_record  = teardown_owes_completion(&v);
+    u->owes_missing = teardown_owes_usage_missing(&v);
     snprintf(u->tenant, sizeof(u->tenant), "%s", pfe->tenant_id);
     snprintf(u->model, sizeof(u->model), "%s", um_model ? um_model : "");
-    pfe->metric_ai_recorded = 0;   /* reported once */
+    snprintf(u->user, sizeof(u->user), "%s", pfe->auth_user_id);
+    snprintf(u->key, sizeof(u->key), "%s", pfe->auth_key_id);
+    snprintf(u->request_id, sizeof(u->request_id), "%s",
+             proxy_request_id(pfe));
+    proxy_pfe_svc_ident(pfe, u->svc_ident, sizeof(u->svc_ident));
+    u->status       = (int)pfe->metric_response_status;
+    u->prompt_toks  = pfe->usage_prompt_toks;
+    u->complet_toks = pfe->usage_complet_toks;
+    if (pfe->metric_req_start_ns > 0) {
+      u->latency_ms = (int64_t)((get_timestamp_ns() -
+                                 pfe->metric_req_start_ns) / 1000000ULL);
+    }
+    /* Claimed under the lock: whatever this entry owes, it owes once. */
+    pfe->metric_ai_recorded = 1;
+    pfe->usage_consumed = 1;
   }
 
   /* A stream still open at teardown. The orderly close ends it when the
@@ -5393,12 +5469,25 @@ proxy_pdestroy(void *priv)
   }
   free(settles.resv);
 
-  /* Deferred missing-usage reports (collected above under PROXY_LOCK). Charge
-   * nothing — each records that a response completed with no usage object to
-   * read, which is the counter's stated contract for every completed response,
-   * streamed or not. */
+  /* The connection's last response (collected above under PROXY_LOCK). It
+   * may owe its completion record — nothing followed it to prove its usage
+   * object was never coming — and it may owe the accounting report for a 2xx
+   * nothing charged. Record first, then report: the report is about a
+   * response the trail has by then named, which is the order the per-request
+   * boundary keeps. Neither charges anything. */
   for (int ui = 0; ui < settles.n_umiss; ui++) {
     proxy_umiss_t *u = &settles.umiss[ui];
+    if (u->owes_record) {
+      llb_ai_record_request(u->tenant, u->model, u->status, u->latency_ms,
+                            u->prompt_toks, u->complet_toks, 0, 0, "",
+                            u->request_id, u->user, u->key, u->svc_ident,
+                            0, notify_worker_id());
+      log_debug("[AI_NONSSE_RECORDED] on teardown tenant=%s model=%s status=%d",
+               u->tenant, u->model, u->status);
+    }
+    if (!u->owes_missing) {
+      continue;
+    }
     /* CONNECTION_CLOSE, not RESPONSE_COMPLETE: this fired because the
      * connection went away. The 2xx status was seen, but nothing here proves
      * the exchange finished — a client that took the headers and cut lands on
@@ -7310,6 +7399,10 @@ handle_on_message_begin(llhttp_t* parser)
      * the counter is labelled with request N's tenant and model, not with
      * whatever request N+1 turns out to be. Reporting only; nothing is
      * charged, exactly as on the connection-teardown twin in proxy_pdestroy. */
+    /* Request N+1 on this connection proves response N finished. If its
+     * completion is still owed, no usage object is coming — write it now,
+     * with the counts it has, before the identity below is cleared. */
+    proxy_ai_record_completion(pfe);
     if (proxy_usage_went_unreported(pfe)) {
       /* RESPONSE_COMPLETE — the strongest of the three boundaries. Reaching
        * this reset means the client sent request N+1 on this connection, so
