@@ -1791,7 +1791,7 @@ skip_deferred_masking:
                                      up, uc, 0,
                                      (int)rfd_ent->usage_reserved_toks,
                                      rfd_ent->usage_res_epoch,
-                                     (char *)rfd_ent->vllm_request_id,
+                                     (char *)proxy_request_id(rfd_ent),
                                      notify_worker_id(), NULL);
           /* Settled: the admission claim is spent. Zero it so no later
            * consume on this connection can release it a second time. */
@@ -1833,7 +1833,7 @@ skip_deferred_masking:
                             (int)rfd_ent->metric_response_status, ai_ns_lat_ms,
                             rfd_ent->usage_prompt_toks,
                             rfd_ent->usage_complet_toks, 0, 0, "",
-                            (char *)rfd_ent->vllm_request_id,
+                            (char *)proxy_request_id(rfd_ent),
                             (char *)rfd_ent->auth_user_id,
                             (char *)rfd_ent->auth_key_id,
                             ai_ns_svc_ident, 0, notify_worker_id());
@@ -1982,7 +1982,7 @@ skip_deferred_masking:
                                    sse_tok_p, sse_tok_c, sse_estimated,
                                    (int)rfd_ent->usage_reserved_toks,
                                    rfd_ent->usage_res_epoch,
-                                   (char *)rfd_ent->vllm_request_id,
+                                   (char *)proxy_request_id(rfd_ent),
                                    notify_worker_id(), NULL);
         /* Settled: zero the claim so a spurious second [DONE] or a later
          * non-stream consume on this connection cannot double-release. */
@@ -2001,7 +2001,7 @@ skip_deferred_masking:
         proxy_pfe_svc_ident(rfd_ent, sse_rec_svc_ident, sizeof(sse_rec_svc_ident));
         llb_ai_record_request((char *)sse_tenant, (char *)sse_model, sse_status,
                               latency_ms, sse_tok_p, sse_tok_c, 0, 0, "",
-                              (char *)rfd_ent->vllm_request_id,
+                              (char *)proxy_request_id(rfd_ent),
                               (char *)rfd_ent->auth_user_id,
                               (char *)rfd_ent->auth_key_id,
                               sse_rec_svc_ident, 1, notify_worker_id());
@@ -4797,7 +4797,8 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     snprintf(r->user, sizeof(r->user), "%s", pfe->auth_user_id);
     snprintf(r->key, sizeof(r->key), "%s", pfe->auth_key_id);
     proxy_pfe_svc_ident(pfe, r->svc_ident, sizeof(r->svc_ident));
-    snprintf(r->request_id, sizeof(r->request_id), "%s", pfe->vllm_request_id);
+    snprintf(r->request_id, sizeof(r->request_id), "%s",
+             proxy_request_id(pfe));
     /* Zero under the lock: nothing may release this claim twice. */
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
@@ -7299,7 +7300,7 @@ handle_on_message_begin(llhttp_t* parser)
                                  rel_svc_ident,
                                  0, 0, 0, (int)pfe->usage_reserved_toks,
                                  pfe->usage_res_epoch,
-                                 (char *)pfe->vllm_request_id,
+                                 (char *)proxy_request_id(pfe),
                                  notify_worker_id(), NULL);
     }
     pfe->usage_reserved_toks = 0;
@@ -8892,6 +8893,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->vllm_request_id[0] = '\0';
   npfe1->has_vllm_request_id = 0;
   npfe1->request_id_injected = 0;
+  npfe1->resp_request_id[0] = '\0';
 
   /* C-7: Frontend socket keepalive — override TCP_KEEPIDLE on the client-facing
    * socket so that aggressive cloud NAT tables on the client side also stay alive.
@@ -9416,6 +9418,13 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->custom_session_header_value[0] = '\0';
     pfe->has_custom_session_header = 0;
     pfe->x_model_header[0] = '\0';  // Reset X-Model header for next request
+
+    /* Snapshot the correlation key BEFORE the reset below clears it, for the
+     * same reason resp_model is snapshotted above: this request has only been
+     * forwarded, and its response-phase consumers — the completion record, the
+     * token settle, the teardown release — all run after this point and
+     * resolve the key via proxy_request_id() → resp_request_id. */
+    proxy_request_id_snapshot(pfe);
 
     // Reset vLLM request ID for next request on keep-alive connection
     pfe->vllm_request_id[0] = '\0';
@@ -10610,10 +10619,14 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->custom_session_header_value[0] = '\0';
           pfe->has_custom_session_header = 0;
 
-          // Reset vLLM request ID on parse error
+          // Reset vLLM request ID on parse error. The snapshot goes with it:
+          // this request was never forwarded, so no response record can be
+          // owed one, and leaving the previous request's key behind would
+          // let a later settle name the wrong request.
           pfe->vllm_request_id[0] = '\0';
           pfe->has_vllm_request_id = 0;
           pfe->request_id_injected = 0;
+          pfe->resp_request_id[0] = '\0';
 
           // TRUNCATION FIX: also clear stale SSE/streaming state on the parse-error reset
           // path (same omission as the success-path keep-alive reset above).

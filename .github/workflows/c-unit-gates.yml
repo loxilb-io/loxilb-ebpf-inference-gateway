@@ -48,6 +48,9 @@ jobs:
       - name: Admission-gate identity transport and the keyless shared bucket
         run: make -C common test_aiident
 
+      - name: The correlation key that joins a request's records across its keep-alive reset
+        run: make -C common test_ridjoin
+
       # Built in both include orders: conversation_mapping_t embeds a
       # CONV_POOL_KEY_MAX array, so a key size that moved with include order
       # would give that struct two layouts with no compiler diagnostic.
