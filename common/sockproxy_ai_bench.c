@@ -67,8 +67,8 @@ bench_thread(void *arg)
 
   for (uint64_t i = 0; i < b->iters; i++) {
     uint64_t t0 = now_ns();
-    llb_ai_record_request(tenant, model, 200, 12, 40, 8, 0, 0, none,
-                          request_id, user, key, svc, 0, sp_worker_id);
+    llb_ai_audit_emit_only(tenant, model, 200, 12, 40, 8, none,
+                           request_id, user, key, svc, 0, sp_worker_id);
     b->samples[i] = now_ns() - t0;
   }
   return NULL;
