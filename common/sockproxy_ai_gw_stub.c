@@ -21,7 +21,8 @@
  * llb_ai_ratelimit_update, llb_ai_record_request, llb_ai_record_deny,
  * llb_ai_stream_start, llb_ai_stream_end, llb_ai_token_quota_consume and
  * llb_ai_pd_record
- * live in pkg/loxinet/ai_gateway_dp.go and are only
+ * live in pkg/loxinet/ai_gateway_dp.go, llb_ai_audit_emit_only lives in
+ * pkg/loxinet/ai_gateway_bench.go, and all of them are only
  * available when the binary is linked with the Go CGO runtime.
  *
  * Every stub is defined __attribute__((weak)) and the object is archived
@@ -43,6 +44,7 @@
 #include <stdint.h>
 #include "log.h"
 #include "sockproxy_ai_gw.h"
+#include "sockproxy_ai_bench.h"
 
 #define AI_GW_STUB_TRIPWIRE(fn_flag)                                        \
     do {                                                                    \
@@ -123,6 +125,29 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
     (void)complet_tokens;
     (void)stream_start;
     (void)stream_end;
+    (void)error_code;
+    (void)request_id;
+    (void)user_id;
+    (void)key_id;
+    (void)svc_ident;
+    (void)is_stream;
+    (void)producer_id;
+}
+
+__attribute__((weak)) void
+llb_ai_audit_emit_only(char *tenant_id, char *model_name, int status_code,
+                       int64_t latency_ms, int prompt_tokens, int complet_tokens,
+                       char *error_code, char *request_id, char *user_id,
+                       char *key_id, char *svc_ident, int is_stream,
+                       int producer_id)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)tenant_id;
+    (void)model_name;
+    (void)status_code;
+    (void)latency_ms;
+    (void)prompt_tokens;
+    (void)complet_tokens;
     (void)error_code;
     (void)request_id;
     (void)user_id;
