@@ -1382,6 +1382,14 @@ struct proxy_fd_ent {
                                       // other per-request captures in handle_on_message_begin
                                       // and snapshotted into resp_model at the keep-alive
                                       // reset boundary like the fields it supersedes.
+
+  char     resp_request_id[256];      // Request-ID snapshot taken at the keep-alive request-reset
+                                      // boundary, the twin of resp_model above. vllm_request_id is
+                                      // cleared for the next request as soon as this one is
+                                      // forwarded, which is BEFORE its response comes back, so
+                                      // response-phase consumers (completion records, token
+                                      // settles, teardown releases) must read the correlation key
+                                      // here or they would report a request they cannot name.
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 
@@ -1441,6 +1449,35 @@ proxy_effective_model(const proxy_fd_ent_t *pfe)
     return pfe->prefix_key.model;
   }
   return pfe->resp_model;
+}
+
+/* Take the correlation key across the keep-alive request-reset boundary.
+ * Called from the reset itself, immediately before vllm_request_id is cleared
+ * for the next request on the connection. */
+static inline void
+proxy_request_id_snapshot(proxy_fd_ent_t *pfe)
+{
+  strncpy(pfe->resp_request_id, pfe->vllm_request_id,
+          sizeof(pfe->resp_request_id) - 1);
+  pfe->resp_request_id[sizeof(pfe->resp_request_id) - 1] = '\0';
+}
+
+/* Correlation key for response-phase consumers: the live request field first
+ * (pre-reset paths, and the gate's own frame), then the resp_request_id
+ * snapshot. Returns "" for a request that never had one — a connection that
+ * was torn down before any request head was parsed.
+ *
+ * The three records of one request — its completion, its token settle and a
+ * refusal — are joinable only by this key, so a consumer reading the live
+ * field directly reports null for every request that got as far as being
+ * forwarded. */
+static inline const char *
+proxy_request_id(const proxy_fd_ent_t *pfe)
+{
+  if (pfe->vllm_request_id[0] != '\0') {
+    return pfe->vllm_request_id;
+  }
+  return pfe->resp_request_id;
 }
 
 /* D2 root fix (pfe pool + generation, B-split) — implemented in sockproxy_conn.c.

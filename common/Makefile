@@ -278,6 +278,19 @@ test_request_id: test_request_id.c
 test_rid: test_request_id
 	./test_request_id
 
+# The correlation key that joins a request's completion, its token settle and
+# any refusal. The key is cleared at the keep-alive reset the moment a request
+# is forwarded, which is before every one of those consumers runs, so the unit
+# pins the snapshot that carries it across and carries its own red twin (the
+# pre-fix rule, which read the live field). Needs the real struct, so it takes
+# the same include path and feature flags as the objects that define it.
+test_request_id_join: test_request_id_join.c sockproxy.h
+	$(CC) $(CFLAGS) -Wextra -o $@ $< -I.
+
+.PHONY: test_ridjoin
+test_ridjoin: test_request_id_join
+	./test_request_id_join
+
 # US-503/US-504/US-510: P/D body rewriting and worker selection unit tests (standalone)
 # -fsanitize=address detects buffer overflows and use-after-free in JSON rewriting
 test_pd_rewriter: test_pd_rewriter.c sockproxy_pd.c
@@ -675,7 +688,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
+	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
