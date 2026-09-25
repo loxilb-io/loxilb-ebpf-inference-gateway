@@ -114,11 +114,30 @@ main(void)
       .metric_ai_recorded = 1, .metric_response_status = 200,
   };
 
-  /* Nothing owed: the claim was already settled by the stream's own close. */
+  /* Nothing owed: the claim was already settled by the stream's own close,
+   * and settling a response records it — the charge and the completion are
+   * written together, so a settled response is a recorded one. */
   teardown_conn_t settled = {
       .odir = 0, .ai_gw_mode = 1, .usage_reserved_toks = 1030,
       .usage_consumed = 1, .has_tenant = 1, .has_h2_session = 0,
+      .metric_ai_recorded = 1, .metric_response_status = 200,
+  };
+
+  /* A response the client never followed with another request: its status
+   * was seen, but its completion record waits for a usage object that never
+   * came, so the teardown is the only boundary left to write it. */
+  teardown_conn_t unrecorded = {
+      .odir = 0, .ai_gw_mode = 1, .usage_reserved_toks = 0,
+      .usage_consumed = 1, .has_tenant = 1, .has_h2_session = 0,
       .metric_ai_recorded = 0, .metric_response_status = 200,
+  };
+
+  /* The same, on an error response: no usage was ever expected, so the
+   * record was written when the headers landed and nothing is owed. */
+  teardown_conn_t recorded_error = {
+      .odir = 0, .ai_gw_mode = 1, .usage_reserved_toks = 0,
+      .usage_consumed = 1, .has_tenant = 1, .has_h2_session = 0,
+      .metric_ai_recorded = 1, .metric_response_status = 500,
   };
 
   /* A backend leg holds no admission claim of its own. */
@@ -159,6 +178,8 @@ main(void)
   check("h2 streams in flight",    TEARDOWN_CONN, &h2_inflight, 1, 0);
   check("2xx with no usage object",TEARDOWN_CONN, &umiss,       1, 0);
   check("already settled",         TEARDOWN_CONN, &settled,     0, 0);
+  check("a response never recorded", TEARDOWN_CONN, &unrecorded,  1, 0);
+  check("an error already recorded", TEARDOWN_CONN, &recorded_error, 0, 0);
   check("backend leg",             TEARDOWN_CONN, &backend,     0, 0);
   check("admitted with no tenant", TEARDOWN_CONN, &no_tenant,   0, 0);
   check("stream still open",       TEARDOWN_CONN, &stream_open, 1, 1);
@@ -172,6 +193,8 @@ main(void)
    * agree. Kept so the suite says where the rules genuinely coincide rather
    * than only where they differ. */
   check("already settled",         TEARDOWN_LISTENER, &settled,     0, 0);
+  check("a response never recorded", TEARDOWN_LISTENER, &unrecorded,  1, 1);
+  check("an error already recorded", TEARDOWN_LISTENER, &recorded_error, 0, 0);
   check("backend leg",             TEARDOWN_LISTENER, &backend,     0, 0);
   check("admitted with no tenant", TEARDOWN_LISTENER, &no_tenant,   0, 0);
   check("stream still open",       TEARDOWN_LISTENER, &stream_open, 1, 1);
