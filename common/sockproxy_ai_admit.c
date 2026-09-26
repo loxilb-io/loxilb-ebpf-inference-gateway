@@ -151,6 +151,23 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
   return rc;
 }
 
+void
+ai_gw_record_capacity_deny(const char *request_id, int producer_id,
+                           const char *svc_ident, const char *model,
+                           const char *tenant_id, const char *key_id,
+                           const char *user_id, int http_status,
+                           const char *error_code)
+{
+  llb_ai_record_deny((char *)(request_id ? request_id : ""), producer_id,
+                     (char *)(svc_ident ? svc_ident : ""),
+                     (char *)(model ? model : ""),
+                     (char *)(tenant_id ? tenant_id : ""),
+                     (char *)(key_id ? key_id : ""),
+                     (char *)(user_id ? user_id : ""),
+                     (int)AI_GW_STAGE_CAPACITY, http_status,
+                     (char *)(error_code ? error_code : ""));
+}
+
 static int
 ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
 {

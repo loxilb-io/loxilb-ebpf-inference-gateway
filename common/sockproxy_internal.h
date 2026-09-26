@@ -170,6 +170,27 @@ void pfe_recycle(proxy_fd_ent_t *pfe);
  * Lock-guarded, never mutates. NULL out-params are skipped. */
 void pfe_pool_snapshot(unsigned long *live, unsigned long *total);
 void pd_cleanup(proxy_fd_ent_t *fd_ent);
+
+/* Local responses on the client socket, TLS-aware and bounded
+ * (sockproxy_http.c). Every overload or refusal answer the proxy writes
+ * itself goes through these, never a raw send(): on a TLS listener a raw
+ * send() puts plaintext inside the TLS stream. */
+int proxy_send_local_response(proxy_fd_ent_t *pfe, const void *buf, size_t len);
+int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
+                                           const void *buf, size_t len);
+void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
+                           int retry_body, const char *code, const char *msg);
+void sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
+                              const char *msg, uint32_t inflight, uint32_t limit);
+
+/* Capacity admission at the HTTP/1 dispatch site (sockproxy_http.c). Each
+ * returns 0 to proceed; -1 means the request was refused, the response
+ * written and the socket shut. The endpoint gate returns the endpoint the
+ * unit landed on, which may differ from the selector's pick. */
+int sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval);
+int sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel);
+int sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role);
+int sp_fc_normal_eligible(void *ctx, int ep);
 /* (R1): owner-worker resume of a parked client fd. Registered as
  * notify_cbs.resume and invoked ON THE PARKED FD'S OWNER WORKER (via notify_wake_worker)
  * when a prefill slot frees. Re-arms EPOLLIN, reconstructs the dispatch from the pfe

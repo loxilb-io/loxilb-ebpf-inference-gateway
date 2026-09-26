@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -162,6 +162,9 @@ sockproxy_ai_security.o: sockproxy_ai_security.c sockproxy_ai_security.h sockpro
 sockproxy_ai_admit.o: sockproxy_ai_admit.c sockproxy_ai_admit.h sockproxy_ai_gw.h \
                       sockproxy_json.h sockproxy.h sockproxy_internal.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_fc.o: sockproxy_fc.c sockproxy_fc.h
+	$(CC) $(CFLAGS) -c sockproxy_fc.c -o sockproxy_fc.o
 
 sockproxy_ai_bench.o: sockproxy_ai_bench.c sockproxy_ai_bench.h sockproxy_ai_gw.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -352,6 +355,17 @@ test_ai_admit_identity: test_ai_admit_identity.c sockproxy_ai_admit.c sockproxy_
 .PHONY: test_aiident
 test_aiident: test_ai_admit_identity
 	./test_ai_admit_identity
+
+# Capacity admission gate: ceilings hold under contention, units come back
+# exactly once, two legs of one request count one service unit, a moved leg
+# never over-admits, observe admits and counts, off touches nothing. Pure
+# module — no proxy object graph, no link library beyond pthread.
+test_fc_gate: test_fc_gate.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_gate.c sockproxy_fc.c -I. -lpthread
+
+.PHONY: test_fc
+test_fc: test_fc_gate
+	./test_fc_gate
 
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
@@ -688,7 +702,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
+	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

@@ -216,6 +216,10 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
                         (char *)pfe->auth_user_id, (char *)pfe->auth_key_id,
                         svc_ident, 0, notify_worker_id());
   pfe->metric_ai_recorded = 1;
+  /* The response is complete: the backend's work for this request is done
+   * and its capacity unit goes back before the connection idles on
+   * keep-alive. */
+  fc_permit_release(&pfe->fc);
 }
 
 static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
@@ -336,7 +340,7 @@ proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
   return -1;
 }
 
-static int
+int
 proxy_send_local_response(proxy_fd_ent_t *pfe, const void *buf, size_t len)
 {
   return sp_send_all_bounded(proxy_send_local_once, pfe, buf, len,
@@ -357,7 +361,7 @@ proxy_shutdown_local(void *ctx)
   return shutdown(pfe->fd, SHUT_RDWR);
 }
 
-static int
+int
 proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
                                        const void *buf, size_t len)
 {
@@ -2051,6 +2055,7 @@ skip_deferred_masking:
                               (char *)rfd_ent->auth_key_id,
                               sse_rec_svc_ident, 1, notify_worker_id());
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
+        fc_permit_release(&rfd_ent->fc);  /* the stream ended: its capacity unit goes back */
         log_debug("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
         /* Step 6: Reset sse_active AFTER llb_ai_stream_end (idempotent)
@@ -2704,6 +2709,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * Mirror placement with the other P/D locks; FIFOs are zero-init by the
          * tepval calloc, untouched when LLB_PD_QUEUE_DEPTH_PER_EP is 0 (default-off). */
         pthread_mutex_init(&tepval->pd_parked_lock, NULL);
+        fc_state_init(&tepval->fc);
         /* allocate radix trie for Tier 1 cache affinity */
         if (tepval->pd_cache_aware_mode) {
           tepval->pd_trie = pd_trie_create();
@@ -3158,6 +3164,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   pthread_rwlock_init(&tepval->pd_session_lock, NULL);
   /* bounded backpressured admission — per-EP parked FIFO lock. */
   pthread_mutex_init(&tepval->pd_parked_lock, NULL);
+  fc_state_init(&tepval->fc);
   /* allocate radix trie for Tier 1 cache affinity */
   if (tepval->pd_cache_aware_mode) {
     tepval->pd_trie = pd_trie_create();
@@ -4555,6 +4562,11 @@ cleanup_failed_ssl_connection(proxy_fd_ent_t *pfe)
 void
 pd_cleanup(proxy_fd_ent_t *fd_ent)
 {
+  /* The capacity permit of the request this connection served: this is the
+   * teardown owner, so this release is the one that always runs. Idempotent
+   * with the response-complete and keep-alive sites. */
+  fc_permit_release(&fd_ent->fc);
+
   /* RES-03: Log pd_phase on teardown for debugging disconnects */
   if (fd_ent->pd_phase != PD_PHASE_NONE) {
     log_debug("pd_cleanup: fd=%d pd_phase=%d prefill_ep=%d decode_ep=%d",
@@ -7378,6 +7390,10 @@ handle_on_message_begin(llhttp_t* parser)
      * The release runs BEFORE the identity clears below — the claim is
      * request N's and must be handed back to request N's user/key buckets,
      * not to whatever request N+1 later authenticates as. */
+    /* Request N's capacity unit, if its response-complete site never ran
+     * (a response cut short is still torn down through pd_cleanup; this
+     * covers a keep-alive boundary reached with the permit still held). */
+    fc_permit_release(&pfe->fc);
     if (pfe->ai_gw_mode && pfe->usage_reserved_toks &&
         pfe->tenant_id[0] != '\0') {
       char rel_svc_ident[64];
@@ -7446,7 +7462,7 @@ handle_on_message_begin(llhttp_t* parser)
  * {"error","message"} body otherwise, Retry-After when the gate set one.
  * Emission goes through the bounded local sender so a TLS-terminated
  * listener answers with a TLS record, never plaintext on the raw fd. */
-static void
+void
 sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                       int retry_body, const char *code, const char *msg)
 {
@@ -7494,6 +7510,159 @@ sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
   } else {
     shutdown(pfe->fd, SHUT_RDWR);
   }
+}
+
+/* A capacity refusal: the request passed policy and there is no room for it.
+ * 429 carries Retry-After and the admission headers an upstream router reads
+ * (inflight, queued, limit); 503 says no healthy endpoint has capacity at
+ * all. Emitted through the bounded TLS-aware sender like every refusal. */
+void
+sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
+                         const char *msg, uint32_t inflight, uint32_t limit)
+{
+  char resp_buf[768];
+  int n;
+
+  if (status == 503) {
+    n = snprintf(resp_buf, sizeof(resp_buf),
+      "HTTP/1.1 503 Service Unavailable\r\n"
+      "Content-Type: application/json\r\n"
+      "Retry-After: 1\r\n"
+      "X-Loxilb-Admission-Inflight: %u\r\n"
+      "X-Loxilb-Admission-Queued: 0\r\n"
+      "X-Loxilb-Admission-Limit: %u\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+      inflight, limit, code, msg ? msg : "");
+  } else {
+    n = snprintf(resp_buf, sizeof(resp_buf),
+      "HTTP/1.1 429 Too Many Requests\r\n"
+      "Content-Type: application/json\r\n"
+      "Retry-After: 1\r\n"
+      "X-Loxilb-Admission-Inflight: %u\r\n"
+      "X-Loxilb-Admission-Queued: 0\r\n"
+      "X-Loxilb-Admission-Limit: %u\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"%s\",\"retry_after\":1,\"jitter_hint_ms\":250}\r\n",
+      inflight, limit, code);
+  }
+  if (n > 0 && n < (int)sizeof(resp_buf)) {
+    if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
+      log_error("[AIGateway] fd=%d failed to send complete bounded %d "
+                "capacity refusal", pfe->fd, status);
+  } else {
+    shutdown(pfe->fd, SHUT_RDWR);
+  }
+  pfe->lb_err_body_sent = 1;
+}
+
+/* ---- capacity admission at the HTTP/1 dispatch site -------------------------
+ *
+ * The policy gate (ai_gw_admit) ran at message-complete and left the identity
+ * on the connection. The pool, and with it the ceilings, is only known once
+ * endpoint setup has resolved it, so the capacity permit is taken there: the
+ * service unit before any selector runs, the endpoint unit after the pick and
+ * before the connect. Every refusal is answered on the client socket and
+ * recorded on the audit trail with the identity the policy gate resolved. */
+
+_Static_assert(FC_MAX_EP == MAX_PROXY_EP, "fc endpoint table mirrors MAX_PROXY_EP");
+
+/* An endpoint that may take a normal-role unit: a normal-role member that is
+ * up and not circuit-broken. Shared with the HTTP/2 site. */
+int
+sp_fc_normal_eligible(void *ctx, int ep)
+{
+  proxy_epval_t *tepval = ctx;
+
+  if (!tepval || ep < 0 || ep >= tepval->n_eps)
+    return 0;
+  if (tepval->ep_role[ep] != 0 || tepval->eps[ep].inv)
+    return 0;
+  return is_endpoint_healthy(tepval, ep);
+}
+
+static void
+sp_fc_h1_shed(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v, int role)
+{
+  char svc_ident[64];
+  int status = (v == FC_NO_CAPACITY) ? 503 : 429;
+  const char *code = (v == FC_NO_CAPACITY) ? "admission_no_capacity"
+                                           : "admission_capacity";
+  const char *msg = (v == FC_NO_CAPACITY) ? "no healthy endpoint has capacity"
+                                          : "";
+  uint32_t inflight = fc_inflight(&tepval->fc);
+  uint32_t limit = fc_limit_for(&tepval->fc, role);
+
+  proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
+  sp_h1_send_capacity_deny(pfe, status, code, msg, inflight, limit);
+  ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
+                             svc_ident, proxy_effective_model(pfe),
+                             pfe->tenant_id, pfe->auth_key_id,
+                             pfe->auth_user_id, status, code);
+  log_info("[AIGateway] fd=%d capacity refused: status=%d code=%s role=%d "
+           "inflight=%u limit=%u tenant=%s model=%s",
+           pfe->fd, status, code, role, inflight, limit, pfe->tenant_id,
+           proxy_effective_model(pfe));
+  /* Whatever the service level granted before the refusal goes back now:
+   * the teardown that follows would do it too, but a refused request must
+   * not hold a unit for even the length of its own close. */
+  fc_permit_release(&pfe->fc);
+}
+
+int
+sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
+{
+  if (!pfe || !tepval || pfe->odir != 0)
+    return 0;
+  /* A permit left over from an earlier request on this connection (its
+   * release site never ran) is handed back before the new one is taken, so
+   * a keep-alive connection can never accumulate units. */
+  fc_permit_release(&pfe->fc);
+  if (fc_active(&tepval->fc) &&
+      !fc_is_inference_request(pfe->http_is_post, pfe->request_path)) {
+    fc_bypass(&tepval->fc, &pfe->fc);
+    return 0;
+  }
+  if (fc_service_acquire(&tepval->fc, &pfe->fc) == FC_SHED) {
+    sp_fc_h1_shed(pfe, tepval, FC_SHED, -1);
+    return -1;
+  }
+  return 0;
+}
+
+int
+sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel)
+{
+  fc_verdict_t v = FC_ADMIT;
+  int ep;
+
+  if (!pfe || !tepval || pfe->odir != 0)
+    return sel;
+  if (pfe->fc.state != FC_P_EXECUTING)
+    return sel;                          /* off, bypassed, or already refused */
+  if (pfe->fc.ep[FC_ROLE_PREFILL] >= 0 || pfe->fc.ep[FC_ROLE_DECODE] >= 0)
+    return sel;                          /* a P/D request: its role legs hold the units */
+  ep = fc_ep_acquire_any(&tepval->fc, &pfe->fc, FC_ROLE_NORMAL, sel,
+                         tepval->n_eps, sp_fc_normal_eligible, tepval, &v);
+  if (ep < 0) {
+    sp_fc_h1_shed(pfe, tepval, v, FC_ROLE_NORMAL);
+    return -1;
+  }
+  return ep;
+}
+
+int
+sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role)
+{
+  if (!pfe || !tepval || pfe->odir != 0 || pfe->fc.state != FC_P_EXECUTING)
+    return 0;
+  if (fc_ep_acquire(&tepval->fc, &pfe->fc, ep, role) == FC_SHED) {
+    sp_fc_h1_shed(pfe, tepval, FC_SHED, role);
+    return -1;
+  }
+  return 0;
 }
 
 /* The H1 side of the AI admission gate: run ai_gw_admit on the request
@@ -8709,6 +8878,9 @@ handle_url(llhttp_t *parser, const char *at, size_t length)
     strncpy(pfe->request_path, at, length);
     pfe->request_path[length] = '\0';
     pfe->http_path_ok = 1;  // Mark that we have the path
+    /* Capacity permits apply to inference POSTs only; the method is read
+     * here, where llhttp has it, for every request on the connection. */
+    pfe->http_is_post = (parser->method == HTTP_POST) ? 1 : 0;
 
     // Store HTTP method for trace events (method is reliably available here)
     // This must be done during URL parsing before parser state is cleared
@@ -9125,6 +9297,16 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
 #endif
     log_trace("[KA_FIX] fd=%d forwarding on kept backend leg fd=%d",
               pfe->fd, pfe->rfd[0]);
+    /* A kept leg is a transport, never a permit: this request takes its
+     * own service and endpoint units before a byte rides the leg. A
+     * refusal is answered on the client socket and closes the connection
+     * (the leg goes with it). */
+    if (pfe->epv && ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
+      proxy_epval_t *ka_epv = (proxy_epval_t *)pfe->epv;
+      if (sp_fc_h1_gate_service(pfe, ka_epv) != 0 ||
+          sp_fc_h1_gate_role(pfe, ka_epv, pfe->ep_num, FC_ROLE_NORMAL) != 0)
+        return SP_FWD_RESTART;
+    }
   } else {
     // Setup backend connection. The request is framed and held in rcvbuf,
     // so the leg may be wired from the connect's writable event: the client
