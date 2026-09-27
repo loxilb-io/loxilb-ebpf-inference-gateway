@@ -1128,6 +1128,21 @@ struct proxy_fd_ent {
   char     resp_origin_ip[L7_HOP_TEXT_MAX];
   uint8_t  resp_trusted_hops;
 
+  // The socket peer of this client connection, in text, captured once when
+  // the connection was accepted. It is a property of the CONNECTION and
+  // cannot change over its life, so unlike everything above it is not reset
+  // per request and needs no snapshot.
+  //
+  // It is captured at accept rather than where the header splice already
+  // reads it, because the splice runs only on a listener with an L7 policy
+  // attached while every AI-gateway record wants the address its request
+  // arrived from. It is the `client_ip` an audit record reports, and the
+  // value the trusted-hop count disambiguates a derived origin against:
+  // without it an origin that resolved back to the peer and a client that
+  // connected directly are the same row. Empty only when getpeername failed
+  // or the peer is not IPv4.
+  char     l7_peer_ip[L7_HOP_TEXT_MAX];
+
   // Header-completion deadline anchor (slowloris guard), every listener.
   // HTTP/1.1: set on the first byte of a request's headers, cleared once
   // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2: set

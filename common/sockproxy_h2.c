@@ -303,8 +303,10 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                           latency_ms, up, uc, 0, 0, "",
                           stream->request_id, stream->auth_user_id,
                           stream->auth_key_id, stream->svc_ident, 0,
-                          notify_worker_id());
-
+                          notify_worker_id(),
+                          pfe ? pfe->l7_peer_ip : "",
+                          stream->l7_origin_ip,
+                          (int)stream->l7_trusted_hops);
 
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
@@ -390,6 +392,12 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
     snprintf(e->key, sizeof(e->key), "%s", stream->auth_key_id);
     snprintf(e->svc_ident, sizeof(e->svc_ident), "%s", stream->svc_ident);
     snprintf(e->request_id, sizeof(e->request_id), "%s", stream->request_id);
+    /* Copied here, under the lock, exactly as the identity above: the record
+     * is emitted once PROXY_LOCK is dropped, by which time this stream has
+     * been freed and its connection may have been too. */
+    snprintf(e->client_ip, sizeof(e->client_ip), "%s", pfe->l7_peer_ip);
+    snprintf(e->origin_ip, sizeof(e->origin_ip), "%s", stream->l7_origin_ip);
+    e->trusted_hops = (int)stream->l7_trusted_hops;
     e->prompt_toks = up;
     e->complet_toks = uc;
     e->reserved_toks = (int)stream->usage_reserved_toks;
@@ -3554,6 +3562,13 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .svc_ident = adm_svc_ident,
       .request_id = stream->request_id,
       .producer_id = notify_worker_id(),
+      /* The gate runs BEFORE the header splice, so no origin has been
+       * derived for this stream yet and "" says so rather than claiming the
+       * peer. The peer itself is known from the moment the connection was
+       * accepted. */
+      .client_ip = pfe ? pfe->l7_peer_ip : "",
+      .origin_ip = stream->l7_origin_ip,
+      .trusted_hops = (int)stream->l7_trusted_hops,
     };
     ai_gw_admit_result_t adm;
     ai_gw_admit(&adm_req, &adm);

@@ -450,6 +450,14 @@ typedef struct h2_inflight_settle {
   int     usage_missing;
   int64_t res_epoch;
   int64_t latency_ms;
+  /* Where the request came from. Copied under the lock with the identity
+   * above and for the same reason: this settles after PROXY_LOCK is dropped,
+   * when the stream and its connection may both be gone. The origin is the
+   * STREAM's, not the connection's — see the per-stream chain in
+   * proxy_h2_stream_t. */
+  char    client_ip[L7_HOP_TEXT_MAX];
+  char    origin_ip[L7_HOP_TEXT_MAX];
+  int     trusted_hops;
 } h2_inflight_settle_t;
 
 /*

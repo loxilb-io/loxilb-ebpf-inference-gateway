@@ -76,6 +76,9 @@ static struct {
   int  stage;
   int  http_status;
   char error_code[64];
+  char client_ip[46];
+  char origin_ip[46];
+  int  trusted_hops;
 } deny_stub;
 
 static struct {
@@ -127,7 +130,8 @@ void
 llb_ai_record_deny(char *request_id, int producer_id,
                    char *svc_ident, char *model_name,
                    char *tenant_id, char *key_id, char *user_id,
-                   int stage, int http_status, char *error_code)
+                   int stage, int http_status, char *error_code,
+                   char *client_ip, char *origin_ip, int trusted_hops)
 {
   deny_stub.calls++;
   snprintf(deny_stub.request_id, sizeof(deny_stub.request_id), "%s", request_id);
@@ -140,6 +144,9 @@ llb_ai_record_deny(char *request_id, int producer_id,
   deny_stub.stage = stage;
   deny_stub.http_status = http_status;
   snprintf(deny_stub.error_code, sizeof(deny_stub.error_code), "%s", error_code);
+  snprintf(deny_stub.client_ip, sizeof(deny_stub.client_ip), "%s", client_ip);
+  snprintf(deny_stub.origin_ip, sizeof(deny_stub.origin_ip), "%s", origin_ip);
+  deny_stub.trusted_hops = trusted_hops;
 }
 
 int
@@ -475,6 +482,12 @@ test_missing_credential_refusal_is_recorded_with_its_key(void)
     .svc_ident = "10.0.0.1:2040",
     .request_id = "req-401",
     .producer_id = 3,
+    /* The gate runs before the header splice, so a refused request has its
+     * peer but no derived origin — and "" says so rather than claiming the
+     * peer, which is the distinction the hop count exists to keep. */
+    .client_ip = "203.0.113.5",
+    .origin_ip = "",
+    .trusted_hops = 0,
   };
   ai_gw_admit_result_t res;
 
@@ -483,6 +496,11 @@ test_missing_credential_refusal_is_recorded_with_its_key(void)
   assert(res.verdict == AI_GW_ADMIT_DENY);
   assert(deny_stub.calls == 1);
   assert(strcmp(deny_stub.request_id, "req-401") == 0);
+  /* The refusal carries where the request came from, through the same one
+   * verdict frame every deny arm returns through. */
+  assert(strcmp(deny_stub.client_ip, "203.0.113.5") == 0);
+  assert(deny_stub.origin_ip[0] == '\0');
+  assert(deny_stub.trusted_hops == 0);
   assert(deny_stub.producer_id == 3);
   assert(strcmp(deny_stub.svc, "10.0.0.1:2040") == 0);
   assert(strcmp(deny_stub.model, "m1") == 0);   /* named before refusing */
@@ -534,6 +552,11 @@ test_rate_limit_refusal_is_recorded_after_identity(void)
     .svc_ident = "10.0.0.1:2040",
     .request_id = "req-429",
     .producer_id = 0,
+    /* This one arrived through two hops of ours, and the walk resolved it to
+     * a client the chain named rather than to the peer. */
+    .client_ip = "198.51.100.9",
+    .origin_ip = "203.0.113.5",
+    .trusted_hops = 2,
   };
   ai_gw_admit_result_t res;
 
@@ -546,6 +569,11 @@ test_rate_limit_refusal_is_recorded_after_identity(void)
   assert(deny_stub.http_status == 429);
   assert(strcmp(deny_stub.tenant, "tenant-1") == 0);
   assert(strcmp(deny_stub.error_code, "rate_limit_exceeded") == 0);
+  /* A different arm, the same attribution: it rides the verdict frame, so
+   * an arm added to the decision cannot refuse a request unattributed. */
+  assert(strcmp(deny_stub.client_ip, "198.51.100.9") == 0);
+  assert(strcmp(deny_stub.origin_ip, "203.0.113.5") == 0);
+  assert(deny_stub.trusted_hops == 2);
   assert(deny_stub.producer_id == 0);
 }
 

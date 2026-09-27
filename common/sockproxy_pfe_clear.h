@@ -59,6 +59,11 @@ _Static_assert(offsetof(proxy_fd_ent_t, l7_inbound_hops) < PFE_SKIP_OFF ||
 _Static_assert(offsetof(proxy_fd_ent_t, resp_origin_ip) < PFE_SKIP_OFF ||
                offsetof(proxy_fd_ent_t, resp_origin_ip) >= PFE_SKIP_END,
                "resp_origin_ip must lie outside the skipped span");
+/* Likewise the peer: a shell reused by a new connection would otherwise
+ * report the previous connection's client as this one's. */
+_Static_assert(offsetof(proxy_fd_ent_t, l7_peer_ip) < PFE_SKIP_OFF ||
+               offsetof(proxy_fd_ent_t, l7_peer_ip) >= PFE_SKIP_END,
+               "l7_peer_ip must lie outside the skipped span");
 
 static inline void
 pfe_clear(proxy_fd_ent_t *pfe)
