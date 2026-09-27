@@ -51,6 +51,14 @@ jobs:
       - name: The correlation key that joins a request's records across its keep-alive reset
         run: make -C common test_ridjoin
 
+      - name: Which forwarded hop a request is attributed to
+        run: make -C common test_l7tr
+
+      # Links the policy translation unit, so it also catches a header struct
+      # whose fields moved out from under the request path.
+      - name: What a listener puts on the wire, and the origin it records
+        run: make -C common test_l7or
+
       # Built in both include orders: conversation_mapping_t embeds a
       # CONV_POOL_KEY_MAX array, so a key size that moved with include order
       # would give that struct two layouts with no compiler diagnostic.
