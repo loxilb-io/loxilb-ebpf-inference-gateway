@@ -16,6 +16,7 @@
 #include "jsmn.h"
 
 #include "sockproxy_qos.h"  /* Tier-1 byte-shaper config + bucket (proxy_map_ent members) */
+#include "sockproxy_l7trust.h"  /* trusted-proxy ranges + hop list (proxy_map_ent members) */
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
@@ -780,6 +781,21 @@ typedef struct proxy_map_ent {
   void   *l7_routes;                // ordered l7_route_t[] (opaque here; cast in the engine)
   int     n_l7_routes;              // number of routes in l7_routes
 
+  // The ranges this listener's own upstreams occupy, and so the only peers
+  // whose forwarding chain says anything we did not already know. They live
+  // per listener, beside the policy that already decides header rewriting,
+  // because one node can be the edge on one listener and sit behind another
+  // load balancer on the next: a single node-wide setting would extend the
+  // same trust to a listener facing an untrusted network. Stored BY VALUE and
+  // bounded, so there is no allocation and nothing to free; they are attached
+  // by proxy_attach_l7_trusted_ranges and dropped when the policy is detached.
+  //
+  // Empty is the default and means the listener trusts nothing: an inbound
+  // chain is replaced rather than extended and the socket peer is the origin,
+  // which is byte-for-byte the behaviour of a listener at the edge.
+  uint8_t            l7_n_trusted_ranges;
+  l7_trusted_range_t l7_trusted_ranges[L7_MAX_TRUSTED_RANGES];
+
   // (gap-fix): scratch "resolved sub-pool" used by l7_resolve_pool to
   // forward a matched L7 route to a SPECIFIC subset of the service's endpoints
   // (the route's backendRefs[].ep, honoring weights) instead of the whole pool.
@@ -1079,6 +1095,38 @@ struct proxy_fd_ent {
     char value[L7_HDR_VALUE_MAX];
   } l7_headers[L7_MAX_CAPTURED_HEADERS];
   uint16_t n_l7_headers;        // count of populated l7_headers slots (<= cap)
+
+  // Where this request came from, derived once by l7_derive_origin from the
+  // inbound forwarding chain and the listener's trusted ranges. Empty means
+  // the derivation did not run for this request, which a reader must not
+  // confuse with "the origin is the peer": the count below distinguishes them
+  // only once the address is present. l7_trusted_hops is how many hops of ours
+  // the walk stepped past, so an origin equal to the peer can be told apart
+  // from a chain that resolved back to the peer, and a change in the depth of
+  // the topology in front of us shows up as a number that moves.
+  char     l7_origin_ip[L7_HOP_TEXT_MAX];
+  uint8_t  l7_trusted_hops;
+
+  // The forwarding chain this request arrived with, captured as it is parsed
+  // and kept as the normalised hop list the attribution walks - so the chain is
+  // parsed once, by the one parser, and the rule that governs an overflowing
+  // chain governs it here too.
+  //
+  // It is NOT read back out of l7_headers[] above: that store belongs to the
+  // CONNECTION, accumulating every request's headers and refusing more once
+  // full, so a lookup there answers a reused keep-alive connection's second
+  // request with the FIRST request's chain. This is per-request state and is
+  // cleared at the keep-alive boundary with the other per-request captures.
+  l7_hop_list_t l7_inbound_hops;
+
+  // The origin carried across the keep-alive request-reset boundary, the twin
+  // of resp_request_id: the reset runs once the request has been FORWARDED,
+  // while the consumers that report the request run in its response phase,
+  // after that point. The live fields above are cleared there so the next
+  // request cannot inherit them; these hold the answer for the request that is
+  // still being answered. Read them through proxy_origin_ip(), never directly.
+  char     resp_origin_ip[L7_HOP_TEXT_MAX];
+  uint8_t  resp_trusted_hops;
 
   // Header-completion deadline anchor (slowloris guard), every listener.
   // HTTP/1.1: set on the first byte of a request's headers, cleared once
@@ -1491,8 +1539,91 @@ void pfe_recycle(proxy_fd_ent_t *pfe);
 void pfe_pool_selftest(void);   /* validation-only pool+gen invariant proof */
 #endif
 
+/* Take the origin across the keep-alive request-reset boundary, for the same
+ * reason proxy_request_id_snapshot exists: the boundary runs once the request
+ * has been forwarded, and the consumers that report it run in its response
+ * phase, after that point. Called from the reset, immediately before the live
+ * fields are cleared. */
+static inline void
+l7_origin_snapshot(struct proxy_fd_ent *pfe)
+{
+  if (!pfe)
+    return;
+  strncpy(pfe->resp_origin_ip, pfe->l7_origin_ip,
+          sizeof(pfe->resp_origin_ip) - 1);
+  pfe->resp_origin_ip[sizeof(pfe->resp_origin_ip) - 1] = '\0';
+  pfe->resp_trusted_hops = pfe->l7_trusted_hops;
+}
+
+/* Drop the forwarding chain and what was derived from it, so the NEXT request
+ * on the connection cannot inherit them: behind a proxy of ours an inherited
+ * origin is a plausible address rather than an obviously wrong one, so nothing
+ * downstream would question it. Call l7_origin_snapshot first — the request
+ * being cleared here has only been forwarded, not yet reported. A helper
+ * rather than assignments at the boundary so the clearing can be tested where
+ * the boundary itself cannot be. */
+static inline void
+l7_origin_reset(struct proxy_fd_ent *pfe)
+{
+  if (!pfe)
+    return;
+  memset(&pfe->l7_inbound_hops, 0, sizeof(pfe->l7_inbound_hops));
+  pfe->l7_origin_ip[0] = '\0';
+  pfe->l7_trusted_hops = 0;
+}
+
+/* The origin for a consumer that may run either side of the reset boundary:
+ * the live field while the request is still in its request phase, the snapshot
+ * afterwards. Mirrors proxy_effective_model / proxy_request_id. Returns "" when
+ * no origin was derived for this request at all, which a caller must not read
+ * as "the origin was the peer" — nothing was decided. */
+static inline const char *
+proxy_origin_ip(const proxy_fd_ent_t *pfe)
+{
+  if (pfe->l7_origin_ip[0] != '\0')
+    return pfe->l7_origin_ip;
+  return pfe->resp_origin_ip;
+}
+
+/* The trusted-hop count belonging to whichever address proxy_origin_ip returns.
+ * The two must be read as a pair: the count is what tells an origin equal to
+ * the peer apart from a chain that resolved back to it. */
+static inline uint8_t
+proxy_origin_trusted_hops(const proxy_fd_ent_t *pfe)
+{
+  if (pfe->l7_origin_ip[0] != '\0')
+    return pfe->l7_trusted_hops;
+  return pfe->resp_trusted_hops;
+}
+
 // ============================================================================
-// L7 POLICY: bounded generic header capture helpers 
+// The inbound forwarding chain, captured per request.
+// ----------------------------------------------------------------------------
+// Called for every parsed header from both the H1 and the H2 path, and does
+// nothing for all but the chain header. Chain header lines are APPENDED to the
+// one hop list in the order they arrived (RFC 7230), never replaced: a later
+// line replacing an earlier one - or being refused because the list is full -
+// would drop the RIGHT end of the chain, and the right end is what our own hops
+// wrote. A client could then fill the list with a long chain of its own and push
+// the real hop out, choosing what it is attributed to. Overflow therefore drops
+// the LEFT end, which l7_hop_list_append_n does.
+static inline void
+l7_capture_inbound_chain(struct proxy_fd_ent *pfe,
+                         const char *name, size_t namelen,
+                         const char *value, size_t valuelen)
+{
+  static const char xff[] = "X-Forwarded-For";
+
+  if (!pfe || !name || !value || valuelen == 0)
+    return;
+  if (namelen != sizeof(xff) - 1 || strncasecmp(name, xff, namelen) != 0)
+    return;
+
+  l7_hop_list_append_n(value, valuelen, &pfe->l7_inbound_hops);
+}
+
+// ============================================================================
+// L7 POLICY: bounded generic header capture helpers
 // ----------------------------------------------------------------------------
 // Append a (name, value) pair into the per-connection fixed-capacity store.
 // Both the H1 parse path (handle_header_val, sockproxy_http.c) and the H2 parse
@@ -1510,8 +1641,12 @@ l7_store_header_n(struct proxy_fd_ent *pfe,
 
   if (!pfe || !name)
     return;
+  /* The forwarding chain is captured per REQUEST, before the store's bound:
+   * the store is per-connection and stops accepting once it is full, and this
+   * capture must survive both. */
+  l7_capture_inbound_chain(pfe, name, namelen, value, valuelen);
   if (pfe->n_l7_headers >= L7_MAX_CAPTURED_HEADERS)
-    return;  // bounded: overflow dropped 
+    return;  // bounded: overflow dropped
 
   nl = (namelen < (size_t)(L7_HDR_NAME_MAX - 1)) ? namelen : (size_t)(L7_HDR_NAME_MAX - 1);
   vl = (value && valuelen < (size_t)(L7_HDR_VALUE_MAX - 1)) ? valuelen

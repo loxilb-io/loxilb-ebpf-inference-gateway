@@ -329,6 +329,47 @@ int proxy_attach_l7_policy(struct proxy_ent *key, const l7_route_t *routes,
 int proxy_detach_l7_policy(struct proxy_ent *key);
 
 /*
+ * proxy_attach_l7_trusted_ranges — record which peers on this listener are our
+ * own upstreams, and so whose forwarding chain may be believed. n_ranges == 0
+ * clears them, returning the listener to edge behaviour; detaching the policy
+ * clears them too. Ranges arrive already parsed and masked so that no text is
+ * parsed on the request path. Separate from proxy_attach_l7_policy rather than
+ * more parameters on it, so that the two halves of this feature can land in
+ * their two repositories independently and in either order.
+ * Returns 0, or negative for an unknown listener or too many ranges.
+ *
+ * Ranges take effect only where the header splice runs, which is gated on an
+ * L7 policy being attached: on a listener with ranges and NO policy they are
+ * inert, because such a listener rewrites no headers at all and so has nothing
+ * to read a chain for. That is why they ride the policy rather than standing on
+ * their own.
+ */
+int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
+                                   const l7_trusted_range_t *ranges,
+                                   int n_ranges);
+
+/*
+ * l7_derive_origin — decide which address this request came from and record it
+ * on `pfe` (l7_origin_ip, l7_trusted_hops). On a listener with no trusted
+ * ranges that is the socket peer with no hops stepped past; otherwise it is the
+ * right-most hop of the inbound chain that is not inside the listener's ranges,
+ * falling back to the peer when every hop is. The chain it walks is
+ * `pfe->l7_inbound_hops`, captured as the request was parsed, so nothing is
+ * parsed here.
+ *
+ * l7_apply_req_filters calls this, so it runs wherever the header splice runs:
+ * on a listener with an L7 policy attached, for a request the splice does not
+ * decline (it declines a non-HTTP buffer, one with no header terminator, and a
+ * chunked body, whose boundaries a splice would corrupt). Anywhere else there
+ * is no derived origin and l7_origin_ip stays EMPTY to say so. A reader must
+ * not take that as "the origin is the peer" — nothing was decided — which is
+ * why the field is empty rather than prefilled with the peer. Read it through
+ * proxy_origin_ip(), paired with proxy_origin_trusted_hops().
+ */
+void l7_derive_origin(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
+                      const char *peer_ip);
+
+/*
  * l7_resolve_pool — map a FORWARD action's target pool to a tepval-equivalent
  * (proxy_epval_t *) so a FORWARD decision re-enters the EXISTING intra-pool
  * endpoint selector (CONTEXT — a plain pool, never the AI model engine).
@@ -406,15 +447,18 @@ typedef void (*l7_hdr_emit_fn)(void *ctx, int op, const char *name,
 /*
  * l7_apply_req_filters — emit the request-header op set for `pfe` on the
  * L7_Proxy peer `ent`. Emits, IN ORDER:
- * 1. SET X-Forwarded-For = `xff_ip` (the REAL TCP peer IP —, always
- *                                          overwrites any client-supplied XFF)
+ *   1. SET X-Forwarded-For — the inbound chain REPLACED by `xff_ip` (the real
+ *      TCP peer) on a listener with no trusted ranges, or the inbound chain
+ *      EXTENDED with `xff_ip` on one that has them; it also derives the
+ *      request's origin, see l7_derive_origin
  * 2. SET X-Forwarded-Port = `listener_port` (the listener port)
  *   3. SET X-Forwarded-Proto= `xfproto`  ("http"/"https" — actual client scheme)
  *   4. each insertHeaders op of the FIRST MATCHING route's hdr_filters[]
  * (validated; bounded by L7_MAX_HDR_FILTERS) —.
- * Invalid (control-char) names/values are SKIPPED (never emitted). The XFF/XFP/
- * XFProto trio uses SET semantics (strip-any-existing + add) so the client can
- * never spoof them. `xff_ip`/`xfproto` are caller-provided (the peer IP and
+ * Invalid (control-char) names/values are SKIPPED (never emitted). The trio uses
+ * SET semantics (strip-any-existing + add), so a client cannot spoof the port or
+ * the scheme, and cannot contribute to the chain on a listener at the edge.
+ * `xff_ip`/`xfproto` are caller-provided (the peer IP and
  * scheme are protocol/socket facts the applier does not own). This function does
  * NOT gate on has_l7_policy — the CALLER gates (mirrors the dispatch seam); it is
  * only ever invoked on the L7_Proxy peer.
