@@ -1505,6 +1505,11 @@ proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
       pthread_rwlock_destroy(&tepval->pd_trie_lock);
     }
 
+    /* Requests waiting in the pool's capacity queue are ended before the
+     * pool goes: a wait for a unit that will never be released is not a
+     * wait. The ring goes with it. */
+    sp_fc_drain_pool(tepval, SP_REAP_FC_DRAINED, 1);
+    fc_state_destroy(&tepval->fc);
     HASH_DEL(node->val.ephash, tepval);
 
     epcount = HASH_COUNT(node->val.ephash);

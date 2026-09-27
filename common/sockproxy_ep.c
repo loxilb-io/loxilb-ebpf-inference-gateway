@@ -583,8 +583,15 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
          * the client socket and ends the request before any backend byte.
          * Only AI-gateway pools take the gate, so a plain rule's dispatch
          * is byte for byte what it was. */
-        if (pfe && tepval->ai_gw_mode && sp_fc_h1_gate_service(pfe, tepval) != 0)
-          return -1;
+        if (pfe && tepval->ai_gw_mode) {
+          int fc_rc = sp_fc_h1_gate_service(pfe, tepval);
+          if (fc_rc == SP_FC_H1_QUEUED)
+            return PD_SETUP_PARKED;      /* parked: the caller suspends the client */
+          if (fc_rc == SP_FC_H1_KEPT)
+            return PD_SETUP_KEPT;        /* refused, answered, connection kept */
+          if (fc_rc != 0)
+            return -1;
+        }
 
         // Endpoint selection based on algorithm
         int algorithm_selection = -1;
@@ -821,8 +828,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
            * unit for this request, each a CAS under its own ceiling, taken
            * BEFORE the load counters move so a refusal leaves them untouched. */
           if (pfe &&
-              (sp_fc_h1_gate_role(pfe, tepval, pd_prefill, FC_ROLE_PREFILL) != 0 ||
-               sp_fc_h1_gate_role(pfe, tepval, pd_decode, FC_ROLE_DECODE) != 0))
+              (sp_fc_h1_gate_role(pfe, tepval, pd_prefill, FC_ROLE_PREFILL, 0) != 0 ||
+               sp_fc_h1_gate_role(pfe, tepval, pd_decode, FC_ROLE_DECODE, 0) != 0))
             return -1;
           /* INTG-06: Increment active_conns for selected EPs */
           atomic_fetch_add(&tepval->pd_ep_loads[pd_prefill].active_conns, 1);
@@ -1045,6 +1052,10 @@ pd_fallback_normal:
          * eligible endpoint with room, or the request is refused. */
         if (pfe && tepval->ai_gw_mode) {
           int fc_sel = sp_fc_h1_gate_endpoint(pfe, tepval, sel);
+          if (fc_sel == SP_FC_H1_QUEUED)
+            return PD_SETUP_PARKED;
+          if (fc_sel == SP_FC_H1_KEPT)
+            return PD_SETUP_KEPT;
           if (fc_sel < 0)
             return -1;
           if (fc_sel != sel) {

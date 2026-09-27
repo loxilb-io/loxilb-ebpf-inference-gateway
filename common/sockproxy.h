@@ -1854,6 +1854,12 @@ struct proxy_arg {
   uint8_t  pd_balance_abs_threshold;
   uint8_t  cb_enable;                  // per-endpoint circuit breaker (replaces pad_pd_cache_arg)
   uint32_t pd_session_ttl_sec;
+  // Capacity admission queue of the rule's pool: requests that may wait for
+  // a unit and the longest wait. 0 = the process default (LLB_FC_MAX_QUEUE_*)
+  // applies. The nat2proxy hop of the additive chain (dp_proxy_tacts ->
+  // proxy_arg -> proxy_add_entry, applied on create and on refresh).
+  uint32_t fc_max_queue_depth;
+  uint32_t fc_max_queue_wait_ms;
 
   // KV-Cache Exact Routing configuration 
   uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 
@@ -2126,6 +2132,13 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
  * close). Distinct positive sentinel so it never collides with the -1 error path. */
 #ifndef PD_SETUP_PARKED
 #define PD_SETUP_PARKED (2)
+#endif
+/* A further outcome: the capacity gate refused the request and the refusal
+ * was written, but the connection stays open for its next request (the
+ * body was fully buffered, nothing is left unread). The caller keeps the
+ * fd, forwards nothing and closes nothing. */
+#ifndef PD_SETUP_KEPT
+#define PD_SETUP_KEPT (7)
 #endif
 /* A FOURTH outcome of setup_proxy_path: the backend leg is allocated, linked
  * and registered for its writable event, and the client fd is EPOLLIN-paused

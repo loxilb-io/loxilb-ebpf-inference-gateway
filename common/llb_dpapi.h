@@ -1130,6 +1130,12 @@ struct dp_proxy_tacts {
   // fail-closed "no profile" arm (503), never as allow. Copied verbatim into
   // proxy_arg by llb_conv_nat2proxy; no Go mirror (cgo direct).
   uint8_t  jwt_auth_profile[64];      // empty ⇒ no Bearer arm on this rule
+  // Capacity admission queue of the rule's pool: requests that may wait for
+  // a unit and the longest wait in ms. 0 ⇒ the process default
+  // (LLB_FC_MAX_QUEUE_DEPTH / LLB_FC_MAX_QUEUE_WAIT_MS) applies. Copied
+  // verbatim into proxy_arg by llb_conv_nat2proxy; set from Go through cgo.
+  uint32_t fc_max_queue_depth;
+  uint32_t fc_max_queue_wait_ms;
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1175,21 +1181,25 @@ struct dp_proxy_tacts {
 // ABI guard updated for: +jwt_auth_profile(64) (8-aligned region): all four
 //   asserts shift by +64 (2848→2912, 2840→2904, 3624→3688, 3616→3680). Copied
 //   verbatim into proxy_arg by llb_conv_nat2proxy; no Go mirror (cgo direct).
+// ABI guard updated for: +fc_max_queue_depth(4)+fc_max_queue_wait_ms(4) = +8
+//   (8-aligned region): all four asserts shift by +8 (2912→2920, 2904→2912,
+//   3688→3696, 3680→3688). Set from Go through cgo (dpebpf_linux.go DpLBRuleMod),
+//   copied verbatim into proxy_arg by llb_conv_nat2proxy.
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2912,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2920,
               "dp_proxy_tacts ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2904,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2912,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// mTLS-enabled layout: 2912→3688 bytes, DPU slim 2904→3680 bytes.
+// mTLS-enabled layout: 2920→3696 bytes, DPU slim 2912→3688 bytes.
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3688,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3696,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3680,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3688,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */

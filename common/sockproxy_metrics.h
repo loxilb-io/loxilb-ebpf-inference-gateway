@@ -225,8 +225,9 @@ int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
  * ========================================================================= */
 #define PROXY_FC_STAT_MAX 256   /* pools reported per proxy_get_fc_stats call */
 #define PROXY_FC_ROLES 3
-#define PROXY_FC_REASONS 5
+#define PROXY_FC_REASONS 12     /* enum fc_reason: the decisions array grew with the queue reasons */
 #define PROXY_FC_POOL_LEN 64    /* pool key as exported; longer keys are cut */
+#define PROXY_FC_QWAIT_BUCKETS 8 /* queue wait histogram buckets (FC_QWAIT_BUCKETS) */
 
 typedef struct proxy_fc_svc_stat {
     uint32_t xip;                          /* service VIP, network byte order (v4) */
@@ -239,6 +240,14 @@ typedef struct proxy_fc_svc_stat {
     uint32_t ep_inflight[PROXY_FC_ROLES];  /* gauge: endpoint units held, summed per role */
     uint64_t decisions[PROXY_FC_REASONS];  /* counter per enum fc_reason */
     char     pool[PROXY_FC_POOL_LEN];      /* pool key ("host|path" or "host"), NUL-terminated */
+    /* The bounded queue. Tail-append, same three-way lockstep. */
+    uint32_t queued;                       /* gauge: requests waiting for a unit */
+    uint32_t max_queue_depth;              /* the depth in force, 0 = no waiting */
+    uint32_t max_queue_wait_ms;            /* the wait window in force */
+    uint32_t pad;
+    uint64_t qwait_bucket[PROXY_FC_QWAIT_BUCKETS]; /* histogram: waits in (bound[i-1], bound[i]] ms */
+    uint64_t qwait_sum_ms;                 /* histogram: summed wait of every resumed request */
+    uint64_t qwait_count;                  /* histogram: resumed requests */
 } proxy_fc_svc_stat_t;
 
 /*
@@ -254,6 +263,30 @@ int proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max);
  * (enum fc_anomaly: 0 underflow, 1 unknown_permit); 0 for any other kind.
  */
 uint64_t proxy_get_fc_anomaly(int kind);
+
+/*
+ * proxy_get_fc_state - the gate state of ONE rule's pool (the service key
+ * plus the pool key the rule's host, path prefix and model resolve to),
+ * for the configuration read-back. 0 with `out` filled, -1 when no such
+ * pool exists. Called by Go CGO off the hot path.
+ */
+struct proxy_ent;
+int proxy_get_fc_state(struct proxy_ent *key, const char *host_url,
+                       const char *path_prefix, const char *model_name,
+                       proxy_fc_svc_stat_t *out);
+
+/*
+ * proxy_get_fc_inflight_total - executing inference requests across every
+ * gated pool, for the maintenance drain read-back.
+ */
+uint64_t proxy_get_fc_inflight_total(void);
+
+/*
+ * proxy_fc_drain_set - enter (1) or leave (0) the process-wide drain: while
+ * set, new inference requests are refused and every pool's queue is ended.
+ * Executing requests finish on their own.
+ */
+void proxy_fc_drain_set(int on);
 
 /*
  * proxy_set_service_catalog - associate catalog_id with a service entry.

@@ -133,7 +133,7 @@ void llamafirewall_set_initialized(int initialized) { atomic_store(&g_llamafirew
 /* Service identity "VIP:port" for the QoS ladder, from the connection's
  * rule head. "" when the head is gone (teardown races) — the ladder treats
  * an empty ident as "no rule-scope state". */
-static void
+void
 proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len)
 {
   proxy_map_ent_t *hent = pfe ? (proxy_map_ent_t *)pfe->head : NULL;
@@ -2506,6 +2506,9 @@ static void qos_apply_stored_cfg(proxy_map_ent_t *ent);
 static void qos_service_teardown(proxy_ent_t *key);
 static int qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd);
 static int qos_resume_reader(int fd, proxy_fd_ent_t *pfe);
+static void sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
+                             const proxy_ent_t *key, int created);
+static int sp_fc_wake(int fd, uint64_t gen);
 
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
@@ -2589,6 +2592,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * peer_map gate in setup_proxy_path would otherwise keep the old mode. */
         ent->val.sockmap_en = arg->sockmap_en;
         tepval->sockmap_en = arg->sockmap_en;
+        /* The capacity queue's depth and wait follow a rule update the
+         * same way: they may change at runtime, entries waiting keep
+         * their order. */
+        sp_fc_apply_rule(tepval, arg, new_ent, 0);
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
@@ -2725,7 +2732,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * Mirror placement with the other P/D locks; FIFOs are zero-init by the
          * tepval calloc, untouched when LLB_PD_QUEUE_DEPTH_PER_EP is 0 (default-off). */
         pthread_mutex_init(&tepval->pd_parked_lock, NULL);
+        fc_set_wake_hook(sp_fc_wake);
         fc_state_init(&tepval->fc);
+        sp_fc_apply_rule(tepval, arg, new_ent, 1);
         /* allocate radix trie for Tier 1 cache affinity */
         if (tepval->pd_cache_aware_mode) {
           tepval->pd_trie = pd_trie_create();
@@ -3180,7 +3189,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   pthread_rwlock_init(&tepval->pd_session_lock, NULL);
   /* bounded backpressured admission — per-EP parked FIFO lock. */
   pthread_mutex_init(&tepval->pd_parked_lock, NULL);
+  fc_set_wake_hook(sp_fc_wake);
   fc_state_init(&tepval->fc);
+  sp_fc_apply_rule(tepval, arg, new_ent, 1);
   /* allocate radix trie for Tier 1 cache affinity */
   if (tepval->pd_cache_aware_mode) {
     tepval->pd_trie = pd_trie_create();
@@ -4111,6 +4122,21 @@ proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max)
 _Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc.h");
 _Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
 _Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
+_Static_assert(PROXY_FC_QWAIT_BUCKETS == FC_QWAIT_BUCKETS, "wait bucket count drifted from sockproxy_fc.h");
+
+static void
+sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
+{
+  st->queued = fc_queued(fc);
+  st->max_queue_depth = fc->cfg.max_queue_depth;
+  st->max_queue_wait_ms = fc->cfg.max_queue_wait_ms;
+  for (int b = 0; b < FC_QWAIT_BUCKETS; b++) {
+    st->qwait_bucket[b] = atomic_load_explicit(&fc->qwait_bucket[b],
+                                               memory_order_relaxed);
+  }
+  st->qwait_sum_ms = atomic_load_explicit(&fc->qwait_sum_ms, memory_order_relaxed);
+  st->qwait_count = atomic_load_explicit(&fc->qwait_count, memory_order_relaxed);
+}
 
 int
 proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
@@ -4164,12 +4190,164 @@ proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
       }
       strncpy(st->pool, tepval->ephash_key, sizeof(st->pool) - 1);
       st->pool[sizeof(st->pool) - 1] = '\0';
+      sp_fc_fill_queue_stat(fc, st);
       n++;
     }
   }
   PROXY_UNLOCK();
 
   return n;
+}
+
+int
+proxy_get_fc_state(struct proxy_ent *key, const char *host_url,
+                   const char *path_prefix, const char *model_name,
+                   proxy_fc_svc_stat_t *out)
+{
+  proxy_map_ent_t *ent;
+  proxy_epval_t *tepval = NULL;
+  char ephash_key[512];
+  int rc = -1;
+
+  if (!key || !out || !proxy_struct) {
+    return -1;
+  }
+  build_ephash_key(ephash_key, sizeof(ephash_key), host_url ? host_url : "",
+                   path_prefix ? path_prefix : "", model_name ? model_name : "");
+  memset(out, 0, sizeof(*out));
+
+  PROXY_RDLOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (!cmp_proxy_ent(&ent->key, key)) {
+      continue;
+    }
+    HASH_FIND_STR(ent->val.ephash, ephash_key, tepval);
+    if (tepval) {
+      const fc_state_t *fc = &tepval->fc;
+      int n_eps = tepval->n_eps > FC_MAX_EP ? FC_MAX_EP : tepval->n_eps;
+
+      out->xip = ent->key.xip;
+      out->xport = ntohs(ent->key.xport);
+      out->protocol = ent->key.protocol;
+      out->mode = fc->cfg.mode;
+      out->max_outstanding = fc->cfg.max_outstanding;
+      out->inflight = fc_inflight(fc);
+      for (int r = 0; r < FC_ROLES; r++) {
+        uint32_t sum = 0;
+
+        out->ep_cap[r] = fc->cfg.ep_cap[r];
+        for (int ep = 0; ep < n_eps; ep++) {
+          sum += fc_ep_inflight(fc, ep, r);
+        }
+        out->ep_inflight[r] = sum;
+      }
+      for (int d = 0; d < FC_R_COUNT; d++) {
+        out->decisions[d] = atomic_load_explicit(&fc->decisions[d],
+                                                 memory_order_relaxed);
+      }
+      strncpy(out->pool, tepval->ephash_key, sizeof(out->pool) - 1);
+      out->pool[sizeof(out->pool) - 1] = '\0';
+      sp_fc_fill_queue_stat(fc, out);
+      rc = 0;
+    }
+    break;
+  }
+  PROXY_UNLOCK();
+  return rc;
+}
+
+uint64_t
+proxy_get_fc_inflight_total(void)
+{
+  proxy_map_ent_t *ent;
+  proxy_epval_t *tepval, *tmp_epval;
+  uint64_t total = 0;
+
+  if (!proxy_struct) {
+    return 0;
+  }
+  PROXY_RDLOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
+      if (tepval->ai_gw_mode) {
+        total += fc_inflight(&tepval->fc);
+      }
+    }
+  }
+  PROXY_UNLOCK();
+  return total;
+}
+
+/* Every request waiting in the pool's queue is ended with `kind`. Each
+ * entry names an fd and the generation it was parked under; a connection
+ * that was recycled meanwhile is left alone. The response goes out on the
+ * connection's owner worker (sp_reap_request), later: when the pool itself
+ * is going away (`detach`) the connection's pointer to it is dropped here,
+ * so the response is built from the connection alone and never reads a
+ * destroyed pool. PROXY_LOCK held. */
+struct sp_fc_drain_ctx {
+  uint8_t kind;
+  uint8_t detach;
+};
+
+static void
+sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
+{
+  const struct sp_fc_drain_ctx *d = ctx;
+  uint64_t reg_gen = 0;
+  proxy_fd_ent_t *pfe;
+
+  pfe = (proxy_fd_ent_t *)notify_priv_of_fd(proxy_struct->ns, e->fd, &reg_gen);
+  if (!pfe || pfe->fd != e->fd || reg_gen != e->gen ||
+      atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen ||
+      pfe->fc.state != FC_P_QUEUED) {
+    return;
+  }
+  pfe->fc.state = FC_P_NONE;
+  if (d->detach) {
+    pfe->fc.fc = NULL;
+  }
+  pfe->pd_phase = PD_PHASE_ERROR;
+  sp_reap_request(pfe, d->kind);
+}
+
+void
+sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach)
+{
+  struct sp_fc_drain_ctx d = { .kind = kind, .detach = (uint8_t)(detach != 0) };
+
+  if (!tepval || !proxy_struct || !proxy_struct->ns) {
+    return;
+  }
+  fc_queue_drain(&tepval->fc, sp_fc_drain_cb, &d);
+}
+
+void
+proxy_fc_drain_set(int on)
+{
+  proxy_map_ent_t *ent;
+  proxy_epval_t *tepval, *tmp_epval;
+  uint8_t kind = SP_REAP_FC_DRAINED;
+  uint32_t drained = 0;
+
+  fc_drain_set(on);
+  if (!on || !proxy_struct) {
+    log_info("[AIGateway] capacity gate drain %s", on ? "on" : "off");
+    return;
+  }
+  PROXY_LOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
+      if (!tepval->ai_gw_mode) {
+        continue;
+      }
+      drained += fc_queued(&tepval->fc);
+      sp_fc_drain_pool(tepval, kind, 0);
+    }
+  }
+  PROXY_UNLOCK();
+  log_info("[AIGateway] capacity gate drain on: new inference requests are "
+           "refused, %u waiting request(s) ended", drained);
 }
 
 uint64_t
@@ -7182,6 +7360,11 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
              pfe->fd, pfe->park_ep_idx);
     return PD_SETUP_PARKED;
   }
+  /* Refused by the capacity gate with the connection kept: the response
+   * is written, the request state reset, nothing to wire. */
+  if (psep_rc == PD_SETUP_KEPT) {
+    return PD_SETUP_KEPT;
+  }
   if (psep_rc) {
     proxy_log_always("no endpoint", key);
 
@@ -7617,41 +7800,51 @@ sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
 /* A capacity refusal: the request passed policy and there is no room for it.
  * 429 carries Retry-After and the admission headers an upstream router reads
  * (inflight, queued, limit); 503 says no healthy endpoint has capacity at
- * all. Emitted through the bounded TLS-aware sender like every refusal. */
+ * all, or that the process is draining. Emitted through the bounded
+ * TLS-aware sender like every refusal. With `keep` the response is framed
+ * with its length and the connection stays open for the next request:
+ * under overload a refusal that closes turns into a reconnect storm. */
 void
 sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
-                         const char *msg, uint32_t inflight, uint32_t limit)
+                         const char *msg, uint32_t inflight, uint32_t queued,
+                         uint32_t limit, uint32_t retry_after, int keep)
 {
+  char body[256];
   char resp_buf[768];
-  int n;
+  const char *status_line = status == 503 ? "503 Service Unavailable"
+                                          : "429 Too Many Requests";
+  int blen, n;
 
   if (status == 503) {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 503 Service Unavailable\r\n"
-      "Content-Type: application/json\r\n"
-      "Retry-After: 1\r\n"
-      "X-Loxilb-Admission-Inflight: %u\r\n"
-      "X-Loxilb-Admission-Queued: 0\r\n"
-      "X-Loxilb-Admission-Limit: %u\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-      inflight, limit, code, msg ? msg : "");
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"message\":\"%s\",\"retry_after\":%u}\r\n",
+                    code, msg ? msg : "", retry_after);
   } else {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 429 Too Many Requests\r\n"
-      "Content-Type: application/json\r\n"
-      "Retry-After: 1\r\n"
-      "X-Loxilb-Admission-Inflight: %u\r\n"
-      "X-Loxilb-Admission-Queued: 0\r\n"
-      "X-Loxilb-Admission-Limit: %u\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"retry_after\":1,\"jitter_hint_ms\":250}\r\n",
-      inflight, limit, code);
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"retry_after\":%u,\"jitter_hint_ms\":250}\r\n",
+                    code, retry_after);
   }
+  if (blen < 0 || blen >= (int)sizeof(body)) {
+    blen = 0;
+    body[0] = '\0';
+  }
+  n = snprintf(resp_buf, sizeof(resp_buf),
+    "HTTP/1.1 %s\r\n"
+    "Content-Type: application/json\r\n"
+    "Content-Length: %d\r\n"
+    "Retry-After: %u\r\n"
+    "X-Loxilb-Admission-Inflight: %u\r\n"
+    "X-Loxilb-Admission-Queued: %u\r\n"
+    "X-Loxilb-Admission-Limit: %u\r\n"
+    "Connection: %s\r\n"
+    "\r\n"
+    "%s",
+    status_line, blen, retry_after, inflight, queued, limit,
+    keep ? "keep-alive" : "close", body);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
-    if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
+    int rc = keep ? proxy_send_local_response(pfe, resp_buf, (size_t)n)
+                  : proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n);
+    if (rc != 0)
       log_error("[AIGateway] fd=%d failed to send complete bounded %d "
                 "capacity refusal", pfe->fd, status);
   } else {
@@ -7685,20 +7878,126 @@ sp_fc_normal_eligible(void *ctx, int ep)
   return is_endpoint_healthy(tepval, ep);
 }
 
+/* Whether a refusal may leave this connection open for its next request:
+ * only when the whole request body sits in the buffer (the parser saw the
+ * message complete and nothing was streamed), so no unread bytes are left
+ * that the next parse would take for a new request. */
+static int
+sp_h1_refusal_keeps_connection(const proxy_fd_ent_t *pfe)
+{
+  return pfe->odir == 0 && !pfe->h2_session && pfe->http_body_complete &&
+         !pfe->is_streamable && !pfe->reap_resp;
+}
+
+/* Per-request state after a refusal that keeps the connection: what the
+ * post-forward keep-alive reset clears for the parser and the request
+ * captures, minus what belongs to a response in flight (there is none).
+ * The next request parses from a clean buffer; handle_on_message_begin
+ * clears the identity and hands back the token reservation when it comes. */
 static void
-sp_fc_h1_shed(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v, int role)
+sp_h1_kept_request_reset(proxy_fd_ent_t *pfe)
+{
+  pfe->rcv_off = 0;
+  pfe->parsed_off = 0;
+  pfe->http_pok = 0;
+  pfe->http_hok = 0;
+  pfe->http_hvok = 0;
+  pfe->http_body_complete = 0;
+  pfe->http_content_length = 0;
+  pfe->is_streamable = 0;
+  pfe->ai_gw_stream_gated = 0;
+  pfe->json_stream_route_pending = 0;
+  pfe->json_stream_continue_sent = 0;
+  pfe->effective_model[0] = '\0';
+  memset(&pfe->prefix_key, 0, sizeof(pfe->prefix_key));
+  pfe->has_conv_id = 0;
+  memset(pfe->conversation_id, 0, sizeof(pfe->conversation_id));
+  pfe->custom_session_header_value[0] = '\0';
+  pfe->has_custom_session_header = 0;
+  pfe->x_model_header[0] = '\0';
+  l7_origin_reset(pfe);
+  pfe->vllm_request_id[0] = '\0';
+  pfe->has_vllm_request_id = 0;
+  pfe->request_id_injected = 0;
+  pfe->lb_err_body_sent = 0;
+  pfe->ka_reparse = 0;
+  pfe->ka_keep_leg = 0;
+  llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
+}
+
+/* Park this connection until a unit frees: reads paused, HUP-only interest
+ * so a client that leaves is noticed, the request held in its buffer. The
+ * same suspension the prefill ring uses; pd_resume_parked lifts it. */
+static void
+sp_fc_h1_park(proxy_fd_ent_t *pfe)
+{
+  if (!pfe->read_paused) {
+    pfe->read_paused = 1;
+    notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+  }
+  pfe->pd_phase = PD_PHASE_PARKED;
+}
+
+/* The gate found no room (or the process drains): park the request when
+ * the pool queues and it may wait, else answer it. Returns SP_FC_H1_QUEUED,
+ * SP_FC_H1_KEPT or SP_FC_H1_REFUSED. */
+static int
+sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
+                int role, int may_wait)
 {
   char svc_ident[64];
-  int status = (v == FC_NO_CAPACITY) ? 503 : 429;
-  const char *code = (v == FC_NO_CAPACITY) ? "admission_no_capacity"
-                                           : "admission_capacity";
-  const char *msg = (v == FC_NO_CAPACITY) ? "no healthy endpoint has capacity"
-                                          : "";
-  uint32_t inflight = fc_inflight(&tepval->fc);
-  uint32_t limit = fc_limit_for(&tepval->fc, role);
+  fc_state_t *fc = &tepval->fc;
+  int status = 429;
+  const char *code = "admission_capacity";
+  const char *msg = "";
+  uint32_t inflight, queued, limit, retry_after = 1;
+  int woken = pfe->fc.woken;
+  int queue_full = 0;
+  int keep;
+
+  /* Whatever the service level granted before the refusal goes back now:
+   * the teardown that follows would do it too, but a refused request must
+   * not hold a unit for even the length of its own close, and a parked one
+   * holds nothing while it waits. */
+  fc_permit_release(&pfe->fc);
+
+  /* FC_QUEUE is the service gate's verdict with a depth in force; FC_SHED
+   * from an endpoint ceiling waits too when the pool queues. A request that
+   * may not wait here (a role leg, a stream) takes the refusal below. */
+  if ((v == FC_QUEUE || v == FC_SHED) && may_wait && fc_queue_enabled(fc) &&
+      !pfe->h2_session) {
+    if (fc_queue_push(fc, &pfe->fc, pfe->fd,
+                      atomic_load_explicit(&pfe->gen, memory_order_acquire),
+                      qos_now_ns(), woken) == 0) {
+      log_debug("[AIGateway] fd=%d parked: role=%d inflight=%u queued=%u "
+                "depth=%u%s", pfe->fd, role, fc_inflight(fc), fc_queued(fc),
+                fc->cfg.max_queue_depth, woken ? " (back at the head)" : "");
+      return SP_FC_H1_QUEUED;
+    }
+    queue_full = 1;
+    retry_after = fc_retry_after_s(fc);
+  }
+  if (v == FC_NO_CAPACITY) {
+    status = 503;
+    code = "admission_no_capacity";
+    msg = "no healthy endpoint has capacity";
+  } else if (v == FC_DRAINING) {
+    status = 503;
+    code = "gateway_draining";
+    msg = "the gateway is draining for maintenance";
+    retry_after = 5;
+    fc_count(fc, FC_R_DRAINING);
+  } else if (!queue_full) {
+    fc_count(fc, FC_R_CAPACITY_SHED);
+  }
+  inflight = fc_inflight(fc);
+  queued = fc_queued(fc);
+  limit = fc_limit_for(fc, role);
+  keep = may_wait && sp_h1_refusal_keeps_connection(pfe);
 
   proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
-  sp_h1_send_capacity_deny(pfe, status, code, msg, inflight, limit);
+  sp_h1_send_capacity_deny(pfe, status, code, msg, inflight, queued, limit,
+                           retry_after, keep);
   ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
                              svc_ident, proxy_effective_model(pfe),
                              pfe->tenant_id, pfe->auth_key_id,
@@ -7706,18 +8005,23 @@ sp_fc_h1_shed(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v, int ro
                              pfe->l7_peer_ip, proxy_origin_ip(pfe),
                              (int)proxy_origin_trusted_hops(pfe));
   log_info("[AIGateway] fd=%d capacity refused: status=%d code=%s role=%d "
-           "inflight=%u limit=%u tenant=%s model=%s",
-           pfe->fd, status, code, role, inflight, limit, pfe->tenant_id,
-           proxy_effective_model(pfe));
-  /* Whatever the service level granted before the refusal goes back now:
-   * the teardown that follows would do it too, but a refused request must
-   * not hold a unit for even the length of its own close. */
-  fc_permit_release(&pfe->fc);
+           "inflight=%u queued=%u limit=%u%s tenant=%s model=%s%s",
+           pfe->fd, status, code, role, inflight, queued, limit,
+           queue_full ? " (queue full)" : "", pfe->tenant_id,
+           proxy_effective_model(pfe), keep ? " (connection kept)" : "");
+  if (keep) {
+    sp_h1_kept_request_reset(pfe);
+    return SP_FC_H1_KEPT;
+  }
+  return SP_FC_H1_REFUSED;
 }
 
 int
 sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
 {
+  fc_verdict_t v;
+  int woken;
+
   if (!pfe || !tepval || pfe->odir != 0)
     return 0;
   /* The request already holds its permit: this is the same request driven
@@ -7729,6 +8033,10 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
    * took in between. */
   if (pfe->fc.state == FC_P_EXECUTING && pfe->fc.fc == &tepval->fc)
     return 0;
+  /* A request just woken from the pool's queue takes its unit ahead of
+   * newcomers, and goes back to the head when it finds none. */
+  woken = pfe->fc.state == FC_P_NONE && pfe->fc.fc == &tepval->fc &&
+          pfe->fc.woken;
   /* A permit left over from an earlier request on this connection (its
    * release site never ran) is handed back before the new one is taken, so
    * a keep-alive connection can never accumulate units. */
@@ -7738,11 +8046,11 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
     fc_bypass(&tepval->fc, &pfe->fc);
     return 0;
   }
-  if (fc_service_acquire(&tepval->fc, &pfe->fc) == FC_SHED) {
-    sp_fc_h1_shed(pfe, tepval, FC_SHED, -1);
-    return -1;
-  }
-  return 0;
+  v = fc_service_acquire_h1(&tepval->fc, &pfe->fc, woken);
+  if (v == FC_ADMIT)
+    return 0;
+  pfe->fc.woken = (uint8_t)woken;
+  return sp_fc_h1_refuse(pfe, tepval, v, -1, 1);
 }
 
 int
@@ -7759,23 +8067,96 @@ sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel)
     return sel;                          /* a P/D request: its role legs hold the units */
   ep = fc_ep_acquire_any(&tepval->fc, &pfe->fc, FC_ROLE_NORMAL, sel,
                          tepval->n_eps, sp_fc_normal_eligible, tepval, &v);
-  if (ep < 0) {
-    sp_fc_h1_shed(pfe, tepval, v, FC_ROLE_NORMAL);
-    return -1;
-  }
+  if (ep < 0)
+    return sp_fc_h1_refuse(pfe, tepval, v, FC_ROLE_NORMAL, 1);
   return ep;
 }
 
 int
-sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role)
+sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,
+                   int may_wait)
 {
   if (!pfe || !tepval || pfe->odir != 0 || pfe->fc.state != FC_P_EXECUTING)
     return 0;
-  if (fc_ep_acquire(&tepval->fc, &pfe->fc, ep, role) == FC_SHED) {
-    sp_fc_h1_shed(pfe, tepval, FC_SHED, role);
-    return -1;
-  }
+  if (fc_ep_acquire(&tepval->fc, &pfe->fc, ep, role) == FC_SHED)
+    return sp_fc_h1_refuse(pfe, tepval, FC_SHED, role, may_wait);
   return 0;
+}
+
+/* The queue's wake: the popped entry's connection is driven again on its
+ * owner worker through the resume ring, the path the prefill ring uses.
+ * Non-zero when the wake could not be queued; the entry then keeps its
+ * place. The generation is checked on the owner (pd_resume_parked). */
+static int
+sp_fc_wake(int fd, uint64_t gen)
+{
+  int owner;
+
+  (void)gen;
+  if (!proxy_struct || !proxy_struct->ns || fd <= 0)
+    return -1;
+  owner = notify_owner_thr(proxy_struct->ns, fd);
+  if (owner < 0)
+    return -1;
+  return notify_wake_worker(proxy_struct->ns, owner, fd) == 0 ? 0 : -1;
+}
+
+/* The rule's queue fields over the process defaults, on create and on every
+ * in-place refresh (a health update or a rule replace arrives the same
+ * way). A non-zero rule value replaces the environment's. Changes are
+ * applied to the live pool with the entries waiting kept in order. The
+ * depth is answered for: each waiting request parks a client connection
+ * holding about a megabyte of receive buffer, so a depth that could park
+ * more than half of the node's memory is said once, loudly, and left to the
+ * operator (connectionLimit and LLB_PD_MAX_TOTAL_INFLIGHT bound the
+ * connections themselves). */
+static void
+sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
+                 const proxy_ent_t *key, int created)
+{
+  fc_cfg_t cfg;
+  int changed;
+
+  if (!tepval || !arg)
+    return;
+  fc_cfg_from_env(&cfg);
+  cfg.mode = tepval->fc.cfg.mode;
+  cfg.max_outstanding = tepval->fc.cfg.max_outstanding;
+  for (int r = 0; r < FC_ROLES; r++)
+    cfg.ep_cap[r] = tepval->fc.cfg.ep_cap[r];
+  if (arg->fc_max_queue_depth)
+    cfg.max_queue_depth = arg->fc_max_queue_depth > FC_QUEUE_DEPTH_MAX
+                          ? FC_QUEUE_DEPTH_MAX : arg->fc_max_queue_depth;
+  if (arg->fc_max_queue_wait_ms)
+    cfg.max_queue_wait_ms = arg->fc_max_queue_wait_ms;
+  if (cfg.max_queue_depth > 0 && cfg.max_queue_wait_ms == 0)
+    cfg.max_queue_wait_ms = 5000;
+  changed = created || cfg.max_queue_depth != tepval->fc.cfg.max_queue_depth ||
+            cfg.max_queue_wait_ms != tepval->fc.cfg.max_queue_wait_ms;
+  if (!changed)
+    return;
+  fc_state_apply(&tepval->fc, &cfg);
+  if (cfg.max_queue_depth > 0 || !created) {
+    log_info("[AIGateway] %s:%u (%s) capacity queue: depth=%u wait=%ums mode=%s",
+             inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+             tepval->ephash_key, tepval->fc.cfg.max_queue_depth,
+             tepval->fc.cfg.max_queue_wait_ms, fc_mode_name(tepval->fc.cfg.mode));
+  }
+  {
+    uint64_t bytes = fc_queue_memory_bytes(tepval->fc.cfg.max_queue_depth);
+    uint64_t node = fc_node_memory_bytes();
+
+    if (bytes > 0 && node > 0 && bytes > node / 2) {
+      log_warn("[AIGateway] %s:%u (%s) fc_max_queue_depth=%u may park up to "
+               "%llu MiB of client receive buffers (about 1 MiB per waiting "
+               "request), more than half of this node's %llu MiB; bound the "
+               "connections with connectionLimit or LLB_PD_MAX_TOTAL_INFLIGHT",
+               inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+               tepval->ephash_key, tepval->fc.cfg.max_queue_depth,
+               (unsigned long long)(bytes >> 20),
+               (unsigned long long)(node >> 20));
+    }
+  }
 }
 
 /* The H1 side of the AI admission gate: run ai_gw_admit on the request
@@ -9398,6 +9779,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 #define SP_FWD_DONE      0   /* forwarded — caller breaks the read loop */
 #define SP_FWD_RESTART  (-1) /* error — caller returns -1 (restart/close) */
 #define SP_FWD_PARKED    2   /* held/suspended — caller keeps fd, does NOT forward/close */
+#define SP_FWD_KEPT      7   /* refused by the capacity gate, connection kept for its next request */
 #define SP_FWD_NOBACKEND 1   /* setup ok but rfd[0]<=0 — caller falls through (no forward) */
 #define SP_FWD_CONNECTING 3  /* leg connecting — caller keeps fd; the writable event forwards */
 
@@ -9448,8 +9830,20 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * (the leg goes with it). */
     if (pfe->epv && ((proxy_epval_t *)pfe->epv)->ai_gw_mode) {
       proxy_epval_t *ka_epv = (proxy_epval_t *)pfe->epv;
-      if (sp_fc_h1_gate_service(pfe, ka_epv) != 0 ||
-          sp_fc_h1_gate_role(pfe, ka_epv, pfe->ep_num, FC_ROLE_NORMAL) != 0)
+      int g = sp_fc_h1_gate_service(pfe, ka_epv);
+      if (g == 0)
+        g = sp_fc_h1_gate_role(pfe, ka_epv, pfe->ep_num, FC_ROLE_NORMAL, 1);
+      if (g == SP_FC_H1_QUEUED) {
+        /* Parked: the kept leg is let go so the resumed request selects
+         * afresh (the way the P/D boundary releases a stale leg), and the
+         * client is suspended until its turn. */
+        proxy_release_rfd_ctx(pfe);
+        sp_fc_h1_park(pfe);
+        return SP_FWD_PARKED;
+      }
+      if (g == SP_FC_H1_KEPT)
+        return SP_FWD_KEPT;
+      if (g != 0)
         return SP_FWD_RESTART;
     }
   } else {
@@ -9463,6 +9857,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     /* parked = held/suspended. Keep the fd, do NOT forward
      * to a backend (there is none yet), do NOT close. resumes it. */
     if (sp_rc == PD_SETUP_PARKED) return SP_FWD_PARKED;
+    if (sp_rc == PD_SETUP_KEPT) return SP_FWD_KEPT;
     if (sp_rc == SP_SETUP_CONNECTING) return SP_FWD_CONNECTING;
     if (sp_rc) {
       return SP_FWD_RESTART; // Restart
@@ -10004,6 +10399,20 @@ pd_resume_parked(int fd)
   pfe->read_paused = 0;
   notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
 
+  /* A request parked by the capacity gate: its turn came (a unit was
+   * released and its entry popped). The wait is recorded and the permit
+   * leaves the queue state marked woken, so the gate it re-runs below takes
+   * the unit ahead of newcomers. Ordered after the reaper's and the
+   * shaper's resumes above and before the prefill park below: a connection
+   * is in at most one of these states at a time. */
+  if (pfe->fc.state == FC_P_QUEUED) {
+    uint64_t q_now = qos_now_ns();
+    log_debug("[AIGateway] fd=%d woken after %llu ms in the queue", fd,
+              (unsigned long long)((q_now > pfe->fc.q_enqueue_ns ?
+                                    q_now - pfe->fc.q_enqueue_ns : 0) / 1000000ULL));
+    fc_queue_resumed(pfe->fc.fc, &pfe->fc, q_now);
+  }
+
   /* Clear park markers; the conn re-enters dispatch as a fresh request. pd_phase back
    * to NONE so pd_setup_and_forward's P/D entry block (gated on PD_PHASE_NONE) runs. */
   pfe->park_ep_idx   = -1;
@@ -10018,7 +10427,7 @@ pd_resume_parked(int fd)
   log_debug("[PD_ADMISSION] fd=%d RESUME (owner worker) — re-driving dispatch", fd);
 
   int fwd_rc = pd_setup_and_forward(fd, pfe, &key, &rkey, phurl);
-  if (fwd_rc == SP_FWD_PARKED || fwd_rc == SP_FWD_CONNECTING) {
+  if (fwd_rc == SP_FWD_PARKED || fwd_rc == SP_FWD_CONNECTING || fwd_rc == SP_FWD_KEPT) {
     /* Still all-capped — re-parked (held again), or held for the backend
      * leg's connect: nothing more to do here, the next slot-free wake or
      * the leg's writable event drives it on. */
@@ -10952,6 +11361,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             {
               int fwd_rc = pd_setup_and_forward(fd, pfe, key, rkey, phurl);
               if (fwd_rc == SP_FWD_PARKED)  return 0;   /* held — parked admission */
+              if (fwd_rc == SP_FWD_KEPT)    return 0;   /* refused, answered, connection kept */
               if (fwd_rc == SP_FWD_CONNECTING) return 0; /* held — the leg's writable event forwards */
               if (fwd_rc == SP_FWD_RESTART) return -1;  /* error — restart/close */
               if (fwd_rc == SP_FWD_DONE)    break;      /* forwarded — wait for backend */
@@ -11097,6 +11507,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           /* parked = held/suspended. Keep the fd, do NOT forward, do
            * NOT close. dequeues+resumes when a prefill slot frees. */
           if (sp_rc == PD_SETUP_PARKED) return 0;
+          if (sp_rc == PD_SETUP_KEPT) return 0;
           if (sp_rc) {
             return -1; // Restart
           }

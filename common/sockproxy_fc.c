@@ -16,10 +16,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <unistd.h>
 
 #include "sockproxy_fc.h"
 
 _Atomic uint64_t fc_anomaly_total[FC_A_COUNT];
+
+const uint32_t fc_qwait_bounds_ms[FC_QWAIT_BUCKETS] = {
+  10, 50, 100, 250, 500, 1000, 2500, 5000,
+};
 
 static const char *const fc_reason_names[FC_R_COUNT] = {
   [FC_R_ADMITTED] = "admitted",
@@ -27,12 +32,22 @@ static const char *const fc_reason_names[FC_R_COUNT] = {
   [FC_R_NO_HEALTHY_CAPACITY] = "no_healthy_capacity",
   [FC_R_OBSERVE_WOULD_SHED] = "observe_would_shed",
   [FC_R_BYPASS_NON_INFERENCE] = "bypass_non_inference",
+  [FC_R_QUEUED] = "queued",
+  [FC_R_QUEUE_FULL] = "queue_full",
+  [FC_R_QUEUE_TIMEOUT] = "queue_timeout",
+  [FC_R_CANCELLED] = "cancelled",
+  [FC_R_DRAINED] = "drained",
+  [FC_R_OBSERVE_WOULD_QUEUE] = "observe_would_queue",
+  [FC_R_DRAINING] = "draining",
 };
 
 static const char *const fc_anomaly_names[FC_A_COUNT] = {
   [FC_A_UNDERFLOW] = "underflow",
   [FC_A_UNKNOWN_PERMIT] = "unknown_permit",
 };
+
+static fc_wake_fn fc_wake_hook;
+static _Atomic int fc_drain_flag;
 
 const char *
 fc_reason_name(enum fc_reason reason)
@@ -73,7 +88,7 @@ fc_env_u32(const char *name, uint32_t dflt)
   if (!e || !*e)
     return dflt;
   n = strtol(e, &end, 10);
-  if (end == e || (end && *end) || n < 0 || n > 1000000)
+  if (end == e || (end && *end) || n < 0 || n > 100000000)
     return dflt;
   return (uint32_t)n;
 }
@@ -100,6 +115,83 @@ fc_cfg_from_env(fc_cfg_t *cfg)
     fc_env_u32("LLB_FC_PREFILL_MAX_INFLIGHT",
                fc_env_u32("LLB_PD_MAX_INFLIGHT_PER_EP", 0));
   cfg->ep_cap[FC_ROLE_DECODE] = fc_env_u32("LLB_FC_DECODE_MAX_INFLIGHT", 0);
+  cfg->max_queue_depth = fc_env_u32("LLB_FC_MAX_QUEUE_DEPTH", 0);
+  if (cfg->max_queue_depth > FC_QUEUE_DEPTH_MAX)
+    cfg->max_queue_depth = FC_QUEUE_DEPTH_MAX;
+  cfg->max_queue_wait_ms = fc_env_u32("LLB_FC_MAX_QUEUE_WAIT_MS", 0);
+  /* A depth with no wait window would park a request forever: the window
+   * defaults so the queue is always bounded in time as well as in size. */
+  if (cfg->max_queue_depth > 0 && cfg->max_queue_wait_ms == 0)
+    cfg->max_queue_wait_ms = 5000;
+}
+
+/* ---- the ring, lock held ------------------------------------------------ */
+
+static inline uint32_t
+fc_ring_wrap(const fc_queue_t *q, uint32_t i)
+{
+  return i >= q->cap ? i - q->cap : i;
+}
+
+/* Re-lay the live entries, in order, from slot 0 of `dst` (a fresh buffer,
+ * never the ring itself), then adopt it. Runs when the slots are used up by
+ * tombstones, or when the depth grows. The slot hints held by waiting
+ * permits go stale here; fc_ring_find falls back to a scan for them. */
+static void
+fc_ring_relayout(fc_queue_t *q, fc_queue_ent_t *dst, uint32_t dst_cap)
+{
+  uint32_t n = 0;
+  uint32_t i = q->head;
+
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+    if (e->live && n < dst_cap)
+      dst[n++] = *e;
+    i = fc_ring_wrap(q, i + 1);
+  }
+  free(q->ring);
+  q->ring = dst;
+  q->cap = dst_cap;
+  q->head = 0;
+  q->tail = n == dst_cap ? 0 : n;
+  q->used = n;
+  q->count = n;
+}
+
+static int
+fc_ring_compact(fc_queue_t *q)
+{
+  fc_queue_ent_t *scratch;
+
+  if (q->cap == 0)
+    return -1;
+  scratch = calloc(q->cap, sizeof(*scratch));
+  if (!scratch)
+    return -1;
+  fc_ring_relayout(q, scratch, q->cap);
+  return 0;
+}
+
+static int
+fc_ring_grow(fc_queue_t *q, uint32_t want)
+{
+  fc_queue_ent_t *ring;
+
+  if (want > FC_QUEUE_DEPTH_MAX)
+    want = FC_QUEUE_DEPTH_MAX;
+  if (want <= q->cap)
+    return 0;
+  ring = calloc(want, sizeof(*ring));
+  if (!ring)
+    return -1;
+  if (q->ring) {
+    fc_ring_relayout(q, ring, want);
+  } else {
+    q->ring = ring;
+    q->cap = want;
+    q->head = q->tail = q->used = q->count = 0;
+  }
+  return 0;
 }
 
 void
@@ -107,7 +199,15 @@ fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
 {
   if (!fc || !cfg)
     return;
+  pthread_mutex_lock(&fc->queue.lock);
   fc->cfg = *cfg;
+  if (fc->cfg.max_queue_depth > FC_QUEUE_DEPTH_MAX)
+    fc->cfg.max_queue_depth = FC_QUEUE_DEPTH_MAX;
+  if (fc->cfg.max_queue_depth > 0 && fc->cfg.max_queue_wait_ms == 0)
+    fc->cfg.max_queue_wait_ms = 5000;
+  if (fc->cfg.max_queue_depth > fc->queue.cap)
+    (void)fc_ring_grow(&fc->queue, fc->cfg.max_queue_depth);
+  pthread_mutex_unlock(&fc->queue.lock);
 }
 
 void
@@ -118,8 +218,24 @@ fc_state_init(fc_state_t *fc)
   if (!fc)
     return;
   memset(fc, 0, sizeof(*fc));
+  pthread_mutex_init(&fc->queue.lock, NULL);
   fc_cfg_from_env(&cfg);
   fc_state_apply(fc, &cfg);
+}
+
+void
+fc_state_destroy(fc_state_t *fc)
+{
+  if (!fc)
+    return;
+  pthread_mutex_lock(&fc->queue.lock);
+  free(fc->queue.ring);
+  fc->queue.ring = NULL;
+  fc->queue.cap = fc->queue.head = fc->queue.tail = 0;
+  fc->queue.used = fc->queue.count = 0;
+  atomic_store_explicit(&fc->queued, 0, memory_order_relaxed);
+  pthread_mutex_unlock(&fc->queue.lock);
+  pthread_mutex_destroy(&fc->queue.lock);
 }
 
 void
@@ -130,8 +246,14 @@ fc_permit_init(fc_permit_t *p)
   p->fc = NULL;
   p->state = FC_P_NONE;
   p->svc_held = 0;
+  p->woken = 0;
   for (int r = 0; r < FC_ROLES; r++)
     p->ep[r] = -1;
+  p->q_fd = -1;
+  p->q_slot = 0;
+  p->q_gen = 0;
+  p->q_enqueue_ns = 0;
+  p->q_deadline_ns = 0;
 }
 
 void
@@ -140,6 +262,18 @@ fc_count(fc_state_t *fc, enum fc_reason reason)
   if (!fc || (int)reason < 0 || reason >= FC_R_COUNT)
     return;
   atomic_fetch_add_explicit(&fc->decisions[reason], 1, memory_order_relaxed);
+}
+
+void
+fc_drain_set(int on)
+{
+  atomic_store_explicit(&fc_drain_flag, on ? 1 : 0, memory_order_release);
+}
+
+int
+fc_draining(void)
+{
+  return atomic_load_explicit(&fc_drain_flag, memory_order_acquire);
 }
 
 /* ---- classification ----------------------------------------------------- */
@@ -230,29 +364,58 @@ fc_bypass(fc_state_t *fc, fc_permit_t *p)
     fc_count(fc, FC_R_BYPASS_NON_INFERENCE);
 }
 
-fc_verdict_t
-fc_service_acquire(fc_state_t *fc, fc_permit_t *p)
+/* The service unit for a request that may (can_queue) or may not wait. */
+static fc_verdict_t
+fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken)
 {
+  int over = 0;
+
   fc_permit_init(p);
   p->fc = fc;
   if (!fc_active(fc)) {
     p->state = FC_P_BYPASS;
     return FC_ADMIT;
   }
-  if (fc_unit_take(&fc->inflight, fc->cfg.max_outstanding) != 0) {
+  if (fc->cfg.mode == FC_MODE_ENFORCE && fc_draining()) {
+    p->state = FC_P_NONE;
+    return FC_DRAINING;
+  }
+  /* A queue with someone in it: a newcomer waits behind them (or, on a
+   * path that cannot wait, is refused), whatever the counters say, so a
+   * unit freed for the head of the queue is not taken from under it. A
+   * woken request IS the head. */
+  if (fc->cfg.mode == FC_MODE_ENFORCE && fc_queue_enabled(fc) && !woken &&
+      fc_queued(fc) > 0)
+    over = 1;
+  if (!over && fc_unit_take(&fc->inflight, fc->cfg.max_outstanding) != 0)
+    over = 1;
+  if (over) {
     if (fc->cfg.mode == FC_MODE_ENFORCE) {
-      fc_count(fc, FC_R_CAPACITY_SHED);
       p->state = FC_P_NONE;
-      return FC_SHED;
+      return can_queue && fc_queue_enabled(fc) ? FC_QUEUE : FC_SHED;
     }
-    fc_count(fc, FC_R_OBSERVE_WOULD_SHED);
+    fc_count(fc, fc->cfg.max_queue_depth > 0 ? FC_R_OBSERVE_WOULD_QUEUE
+                                             : FC_R_OBSERVE_WOULD_SHED);
     fc_unit_take(&fc->inflight, 0);
   }
   p->svc_held = 1;
   p->state = FC_P_EXECUTING;
+  p->woken = (uint8_t)(woken ? 1 : 0);
   /* Not yet an admission: the endpoint unit decides. Counted when the
    * first endpoint unit lands on this permit. */
   return FC_ADMIT;
+}
+
+fc_verdict_t
+fc_service_acquire(fc_state_t *fc, fc_permit_t *p)
+{
+  return fc_service_acquire__(fc, p, 0, 0);
+}
+
+fc_verdict_t
+fc_service_acquire_h1(fc_state_t *fc, fc_permit_t *p, int woken)
+{
+  return fc_service_acquire__(fc, p, 1, woken);
 }
 
 int
@@ -278,11 +441,10 @@ fc_ep_acquire(fc_state_t *fc, fc_permit_t *p, int ep, int role)
   if (p->ep[role] == ep)
     return FC_ADMIT;              /* already held for this leg */
   if (fc_unit_take(&fc->ep_inflight[ep][role], fc->cfg.ep_cap[role]) != 0) {
-    if (fc->cfg.mode == FC_MODE_ENFORCE) {
-      fc_count(fc, FC_R_CAPACITY_SHED);
+    if (fc->cfg.mode == FC_MODE_ENFORCE)
       return FC_SHED;
-    }
-    fc_count(fc, FC_R_OBSERVE_WOULD_SHED);
+    fc_count(fc, fc->cfg.max_queue_depth > 0 ? FC_R_OBSERVE_WOULD_QUEUE
+                                             : FC_R_OBSERVE_WOULD_SHED);
     fc_unit_take(&fc->ep_inflight[ep][role], 0);
   }
   {
@@ -388,6 +550,8 @@ fc_release_role(fc_permit_t *p, int role)
 void
 fc_permit_release(fc_permit_t *p)
 {
+  fc_state_t *fc;
+
   if (!p)
     return;
   switch (p->state) {
@@ -395,6 +559,14 @@ fc_permit_release(fc_permit_t *p)
   case FC_P_RELEASED:
     return;
   case FC_P_BYPASS:
+    p->state = FC_P_RELEASED;
+    return;
+  case FC_P_QUEUED:
+    /* The request is gone while it waited: its entry leaves the queue
+     * without a wake. If a pop, the deadline or a drain took the entry
+     * first, that path owns the connection and this is a no-op. */
+    if (p->fc && fc_queue_take(p->fc, p))
+      fc_count(p->fc, FC_R_CANCELLED);
     p->state = FC_P_RELEASED;
     return;
   case FC_P_EXECUTING:
@@ -405,13 +577,279 @@ fc_permit_release(fc_permit_t *p)
   }
   for (int r = 0; r < FC_ROLES; r++)
     fc_release_role(p, r);
+  fc = p->fc;
   if (p->svc_held) {
-    if (p->fc)
-      fc_unit_give(&p->fc->inflight);
+    if (fc)
+      fc_unit_give(&fc->inflight);
     else
       atomic_fetch_add_explicit(&fc_anomaly_total[FC_A_UNKNOWN_PERMIT], 1,
                                 memory_order_relaxed);
     p->svc_held = 0;
   }
   p->state = FC_P_RELEASED;
+  /* The unit is back: the oldest waiting request gets its turn. After the
+   * state change so a wake that re-enters this permit finds it released. */
+  if (fc)
+    fc_queue_wake_one(fc);
+}
+
+/* ---- the queue ------------------------------------------------------------ */
+
+void
+fc_set_wake_hook(fc_wake_fn fn)
+{
+  fc_wake_hook = fn;
+}
+
+/* Lock held. Append or prepend one entry; -1 when no slot can be made. */
+static int
+fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
+               uint32_t *slot_out)
+{
+  uint32_t slot;
+
+  if (q->cap == 0)
+    return -1;
+  if (q->used >= q->cap) {
+    /* The slots are spent but live entries are fewer than the depth:
+     * tombstones fill the gap. Re-lay the live entries and try again. */
+    if (q->count >= q->cap || fc_ring_compact(q) != 0 || q->used >= q->cap)
+      return -1;
+  }
+  if (front) {
+    slot = q->head == 0 ? q->cap - 1 : q->head - 1;
+    q->head = slot;
+  } else {
+    slot = q->tail;
+    q->tail = fc_ring_wrap(q, q->tail + 1);
+  }
+  q->ring[slot] = *e;
+  q->ring[slot].live = 1;
+  q->used++;
+  q->count++;
+  if (slot_out)
+    *slot_out = slot;
+  return 0;
+}
+
+int
+fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
+              uint64_t now_ns, int front)
+{
+  fc_queue_ent_t e;
+  uint32_t slot = 0;
+  int rc = -1;
+
+  if (!fc || !p || fd < 0)
+    return -1;
+  e.fd = fd;
+  e.live = 1;
+  e.gen = gen;
+  e.enqueue_ns = now_ns;
+  e.deadline_ns = now_ns + (uint64_t)fc->cfg.max_queue_wait_ms * 1000000ULL;
+
+  pthread_mutex_lock(&fc->queue.lock);
+  if (fc_queue_enabled(fc) && fc->queue.count < fc->cfg.max_queue_depth)
+    rc = fc_ring_insert(&fc->queue, &e, front, &slot);
+  if (rc == 0)
+    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+  pthread_mutex_unlock(&fc->queue.lock);
+
+  if (rc != 0) {
+    fc_count(fc, FC_R_QUEUE_FULL);
+    return -1;
+  }
+  fc_permit_init(p);
+  p->fc = fc;
+  p->state = FC_P_QUEUED;
+  p->q_fd = fd;
+  p->q_slot = slot;
+  p->q_gen = gen;
+  p->q_enqueue_ns = e.enqueue_ns;
+  p->q_deadline_ns = e.deadline_ns;
+  fc_count(fc, FC_R_QUEUED);
+  return 0;
+}
+
+/* Lock held. Find the live entry for (fd, gen): the slot hint first, then
+ * the used span (the hint is stale after a re-layout). Returns the slot
+ * or UINT32_MAX. */
+static uint32_t
+fc_ring_find(const fc_queue_t *q, int fd, uint64_t gen, uint32_t hint)
+{
+  uint32_t i;
+
+  if (q->cap == 0)
+    return UINT32_MAX;
+  if (hint < q->cap && q->ring[hint].live && q->ring[hint].fd == fd &&
+      q->ring[hint].gen == gen)
+    return hint;
+  i = q->head;
+  for (uint32_t k = 0; k < q->used; k++) {
+    const fc_queue_ent_t *e = &q->ring[i];
+    if (e->live && e->fd == fd && e->gen == gen)
+      return i;
+    i = fc_ring_wrap(q, i + 1);
+  }
+  return UINT32_MAX;
+}
+
+int
+fc_queue_take(fc_state_t *fc, fc_permit_t *p)
+{
+  uint32_t slot;
+  int taken = 0;
+
+  if (!fc || !p || p->state != FC_P_QUEUED)
+    return 0;
+  pthread_mutex_lock(&fc->queue.lock);
+  slot = fc_ring_find(&fc->queue, p->q_fd, p->q_gen, p->q_slot);
+  if (slot != UINT32_MAX) {
+    fc->queue.ring[slot].live = 0;
+    fc->queue.count--;
+    taken = 1;
+    /* A tombstone at the head is dead weight: drop it now. */
+    while (fc->queue.used > 0 && !fc->queue.ring[fc->queue.head].live) {
+      fc->queue.head = fc_ring_wrap(&fc->queue, fc->queue.head + 1);
+      fc->queue.used--;
+    }
+    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+  }
+  pthread_mutex_unlock(&fc->queue.lock);
+  return taken;
+}
+
+/* Lock held. */
+static int
+fc_ring_pop(fc_queue_t *q, fc_queue_ent_t *out)
+{
+  while (q->used > 0) {
+    fc_queue_ent_t *e = &q->ring[q->head];
+    int live = e->live != 0;
+    if (live && out)
+      *out = *e;
+    e->live = 0;
+    q->head = fc_ring_wrap(q, q->head + 1);
+    q->used--;
+    if (live) {
+      q->count--;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int
+fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out)
+{
+  int rc;
+
+  if (!fc)
+    return 0;
+  pthread_mutex_lock(&fc->queue.lock);
+  rc = fc_ring_pop(&fc->queue, out);
+  atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+  pthread_mutex_unlock(&fc->queue.lock);
+  return rc;
+}
+
+static void
+fc_note_wait(fc_state_t *fc, uint64_t wait_ms)
+{
+  for (int i = 0; i < FC_QWAIT_BUCKETS; i++) {
+    if (wait_ms <= fc_qwait_bounds_ms[i]) {
+      atomic_fetch_add_explicit(&fc->qwait_bucket[i], 1, memory_order_relaxed);
+      break;
+    }
+  }
+  atomic_fetch_add_explicit(&fc->qwait_sum_ms, wait_ms, memory_order_relaxed);
+  atomic_fetch_add_explicit(&fc->qwait_count, 1, memory_order_relaxed);
+}
+
+void
+fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns)
+{
+  uint64_t wait_ms = 0;
+
+  if (!p || p->state != FC_P_QUEUED)
+    return;
+  if (fc && now_ns > p->q_enqueue_ns)
+    wait_ms = (now_ns - p->q_enqueue_ns) / 1000000ULL;
+  if (fc)
+    fc_note_wait(fc, wait_ms);
+  p->state = FC_P_NONE;
+  p->woken = 1;
+}
+
+void
+fc_queue_wake_one(fc_state_t *fc)
+{
+  fc_queue_ent_t e;
+
+  if (!fc || !fc_wake_hook)
+    return;
+  if (fc_queued(fc) == 0)
+    return;
+  if (!fc_queue_pop(fc, &e))
+    return;
+  if (fc_wake_hook(e.fd, e.gen) != 0) {
+    /* The owner could not be woken now: the request keeps its place at
+     * the head and the next released unit tries again. Its deadline is
+     * unchanged, so the wait stays bounded. */
+    pthread_mutex_lock(&fc->queue.lock);
+    (void)fc_ring_insert(&fc->queue, &e, 1, NULL);
+    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+    pthread_mutex_unlock(&fc->queue.lock);
+  }
+}
+
+void
+fc_queue_drain(fc_state_t *fc, fc_drain_fn fn, void *ctx)
+{
+  fc_queue_ent_t e;
+
+  if (!fc)
+    return;
+  while (fc_queue_pop(fc, &e)) {
+    fc_count(fc, FC_R_DRAINED);
+    if (fn)
+      fn(ctx, &e);
+  }
+}
+
+uint32_t
+fc_retry_after_s(const fc_state_t *fc)
+{
+  uint64_t n, sum, mean_ms, s;
+
+  if (!fc)
+    return 1;
+  n = atomic_load_explicit(&fc->qwait_count, memory_order_relaxed);
+  sum = atomic_load_explicit(&fc->qwait_sum_ms, memory_order_relaxed);
+  if (n == 0)
+    return 1;
+  mean_ms = sum / n;
+  s = (mean_ms + 999) / 1000;
+  if (s < 1)
+    s = 1;
+  if (s > 30)
+    s = 30;
+  return (uint32_t)s;
+}
+
+uint64_t
+fc_queue_memory_bytes(uint32_t depth)
+{
+  return (uint64_t)depth << 20;
+}
+
+uint64_t
+fc_node_memory_bytes(void)
+{
+  long pages = sysconf(_SC_PHYS_PAGES);
+  long psize = sysconf(_SC_PAGESIZE);
+
+  if (pages <= 0 || psize <= 0)
+    return 0;
+  return (uint64_t)pages * (uint64_t)psize;
 }

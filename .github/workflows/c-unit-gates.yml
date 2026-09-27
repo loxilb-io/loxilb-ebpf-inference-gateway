@@ -48,7 +48,7 @@ jobs:
       - name: Admission-gate identity transport and the keyless shared bucket
         run: make -C common test_aiident
 
-      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off)
+      - name: Capacity admission gate (ceilings, exactly-once release, role legs, observe/off) and its bounded queue (order, depth, cancel/deadline/drain exclusivity, resize)
         run: make -C common test_fc
 
       - name: The correlation key that joins a request's records across its keep-alive reset
