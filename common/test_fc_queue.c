@@ -400,12 +400,17 @@ test_tombstones_are_reclaimed(void)
 
 static int drained_fd[8];
 static int drained_n;
+static int drained_skip_fd = -1;
 
-static void
+/* Ends every entry but `drained_skip_fd`, whose connection has moved on. */
+static int
 note_drained(void *ctx, const fc_queue_ent_t *e)
 {
   (void)ctx;
+  if (e->fd == drained_skip_fd)
+    return 0;
   drained_fd[drained_n++] = e->fd;
+  return 1;
 }
 
 static void
@@ -445,6 +450,244 @@ test_drain_and_draining_flag(void)
   fc_permit_release(&late);
   fc_state_destroy(&fc);
   printf("  drain: waiting requests drained in order, newcomers refused while draining\n");
+}
+
+/* An entry whose connection moved on before the drain reached it is not a
+ * drained request: only the entries the callback ended are counted. */
+static void
+test_drain_counts_what_it_ended(void)
+{
+  fc_state_t fc;
+  fc_permit_t a, w1, w2, w3;
+  uint64_t now = MS(2);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  drained_n = 0;
+  drained_skip_fd = 3;
+  assert(h1_gate(&fc, &a, 1, 1, now, 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w2, 3, 1, now, 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w3, 4, 1, now, 0) == FC_QUEUE);
+  fc_queue_drain(&fc, note_drained, NULL);
+  assert(drained_n == 2 && drained_fd[0] == 2 && drained_fd[1] == 4);
+  assert(decisions(&fc, FC_R_DRAINED) == 2);
+  assert(fc_queued(&fc) == 0);
+  drained_skip_fd = -1;
+  fc_permit_release(&a);
+  fc_state_destroy(&fc);
+  printf("  drain: an entry whose connection had moved on was not counted drained\n");
+}
+
+/* ---- turns are never lost ---------------------------------------------------- */
+
+/* The woken request's client leaves between the wake and the resume: its
+ * teardown finds its entry already popped. The turn it was given goes to
+ * the next waiting request, or the pool would idle with requests waiting. */
+static void
+test_a_lost_turn_is_passed_on(void)
+{
+  fc_state_t fc;
+  fc_permit_t a, w1, w2;
+  uint64_t now = MS(6);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 1, now, 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w2, 3, 1, now, 0) == FC_QUEUE);
+  fc_permit_release(&a);
+  assert(woken_n == 1 && woken_fd[0] == 2);
+  assert(fc_queue_holds(&fc, &w1) == 0);          /* popped for its turn */
+  assert(fc_queue_holds(&fc, &w2) == 1);
+  fc_permit_release(&w1);                         /* gone before its resume */
+  assert(woken_n == 2 && woken_fd[1] == 3);
+  assert(decisions(&fc, FC_R_CANCELLED) == 0);    /* its entry was not taken */
+  fc_queue_resumed(&fc, &w2, now);
+  assert(h1_gate(&fc, &w2, 3, 1, now, 1) == FC_ADMIT);
+  fc_permit_release(&w2);
+  assert(fc_inflight(&fc) == 0 && fc_queued(&fc) == 0);
+  fc_state_destroy(&fc);
+  printf("  turns: a woken client that left passed its turn to the next waiter\n");
+}
+
+/* A wake is a turn only when the ceiling has a unit free. The periodic
+ * kick calls fc_queue_wake_one for every pool with waiting requests, so it
+ * must not pop anyone while the pool is full, and must give the turn again
+ * once a wake was lost with a unit free. */
+static void
+test_a_wake_needs_room(void)
+{
+  fc_state_t fc;
+  fc_permit_t a, w1;
+  uint64_t now = MS(7);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 1, now, 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 0) == FC_QUEUE);
+  fc_queue_wake_one(&fc);                         /* full: nobody is popped */
+  assert(woken_n == 0 && fc_queued(&fc) == 1);
+  wake_refuse = 1;
+  fc_permit_release(&a);                          /* the wake is lost */
+  assert(woken_n == 0 && fc_queued(&fc) == 1 && fc_inflight(&fc) == 0);
+  wake_refuse = 0;
+  fc_queue_wake_one(&fc);                         /* the kick gives it again */
+  assert(woken_n == 1 && woken_fd[0] == 2);
+  fc_queue_resumed(&fc, &w1, now);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 1) == FC_ADMIT);
+  fc_permit_release(&w1);
+  fc_state_destroy(&fc);
+  printf("  turns: no wake while full; a lost wake was given again once there was room\n");
+}
+
+/* A request that goes back to wait hands its unit back without waking
+ * anyone: the next waiter would meet the same ceiling. */
+static void
+test_release_nowake(void)
+{
+  fc_state_t fc;
+  fc_permit_t a, w1;
+  uint64_t now = MS(8);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 1, now, 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 0) == FC_QUEUE);
+  fc_permit_release_nowake(&a);
+  assert(woken_n == 0 && fc_inflight(&fc) == 0 && fc_queued(&fc) == 1);
+  assert(a.state == FC_P_RELEASED);
+  fc_permit_release_nowake(&a);                   /* idempotent */
+  assert(atomic_load(&fc_anomaly_total[FC_A_UNDERFLOW]) == 0);
+  fc_queue_wake_one(&fc);
+  assert(woken_n == 1 && woken_fd[0] == 2);
+  fc_queue_resumed(&fc, &w1, now);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 1) == FC_ADMIT);
+  fc_permit_release(&w1);
+  fc_state_destroy(&fc);
+  printf("  nowake: a unit handed back without a wake woke nobody\n");
+}
+
+/* The woken request that lost its unit goes back to the head even when
+ * newcomers filled the queue to its depth meanwhile: its entry left the
+ * queue only for its turn. */
+static void
+test_front_push_is_not_refused_at_depth(void)
+{
+  fc_state_t fc;
+  fc_permit_t a, w1, w2, n1, thief;
+  uint64_t now = MS(11);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 2, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 1, now, 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w2, 3, 1, now, 0) == FC_QUEUE);
+  fc_permit_release(&a);
+  assert(woken_n == 1 && woken_fd[0] == 2);
+  assert(h1_gate(&fc, &n1, 4, 1, now, 0) == FC_QUEUE);   /* back at depth */
+  assert(fc_queued(&fc) == 2);
+  fc_queue_resumed(&fc, &w1, now);
+  assert(h1_gate(&fc, &thief, 9, 1, now, 1) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 1) == FC_QUEUE);   /* not refused */
+  assert(fc_queued(&fc) == 3);
+  assert(decisions(&fc, FC_R_QUEUE_FULL) == 0);
+  fc_permit_release(&thief);
+  assert(woken_n == 2 && woken_fd[1] == 2);              /* still the head */
+  /* Its turn taken, the queue is back at its depth, which still binds
+   * newcomers. */
+  assert(fc_queued(&fc) == 2);
+  assert(h1_gate(&fc, &thief, 9, 1, now, 0) == FC_SHED);
+  assert(decisions(&fc, FC_R_QUEUE_FULL) == 1);
+  fc_queue_resumed(&fc, &w1, now);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 1) == FC_ADMIT);
+  fc_permit_release(&w1);
+  assert(woken_n == 3 && woken_fd[2] == 3);
+  fc_queue_resumed(&fc, &w2, now);
+  assert(h1_gate(&fc, &w2, 3, 1, now, 1) == FC_ADMIT);
+  fc_permit_release(&w2);
+  assert(woken_n == 4 && woken_fd[3] == 4);
+  fc_queue_resumed(&fc, &n1, now);
+  assert(h1_gate(&fc, &n1, 4, 1, now, 1) == FC_ADMIT);
+  fc_permit_release(&n1);
+  assert(fc_queued(&fc) == 0 && fc_inflight(&fc) == 0);
+  fc_state_destroy(&fc);
+  printf("  head: a woken loser went back to the head past a full queue\n");
+}
+
+/* A pool whose rule is gone: a worker that resolved it before the delete
+ * may still reach it. Nothing parks on it again, the lock stays usable, and
+ * a later apply does not bring the ring back. */
+static void
+test_a_dead_pool_takes_no_waiter(void)
+{
+  fc_state_t fc;
+  fc_permit_t a, w;
+  fc_cfg_t cfg;
+  uint64_t now = MS(12);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 1, now, 0) == FC_ADMIT);
+  fc_state_destroy(&fc);
+  assert(!fc_queue_enabled(&fc));
+  assert(fc_queue_push(&fc, &w, 2, 1, now, 0) == -1);
+  assert(w.state == FC_P_NONE);
+  assert(fc_queue_push(&fc, &w, 2, 1, now, 1) == -1);   /* nor at the head */
+  cfg = fc.cfg;
+  fc_state_apply(&fc, &cfg);
+  assert(fc.queue.cap == 0 && !fc_queue_enabled(&fc));
+  fc_permit_release(&a);
+  assert(woken_n == 0);
+  printf("  dead: a destroyed pool refused every push and stayed ringless\n");
+}
+
+/* A push publishes a permit that is already QUEUED: a drain on another
+ * thread that pops the entry the moment it appears must find it waiting. */
+#define STRESS_N 200000
+static fc_permit_t stress_permit[STRESS_N];
+static fc_state_t stress_fc;
+static _Atomic int stress_done;
+static _Atomic long stress_seen_not_queued;
+static _Atomic long stress_drained;
+
+static int
+stress_note(void *ctx, const fc_queue_ent_t *e)
+{
+  (void)ctx;
+  if (__atomic_load_n(&stress_permit[e->fd].state, __ATOMIC_RELAXED) != FC_P_QUEUED)
+    atomic_fetch_add(&stress_seen_not_queued, 1);
+  atomic_fetch_add(&stress_drained, 1);
+  return 1;
+}
+
+static void *
+stress_drainer(void *arg)
+{
+  (void)arg;
+  while (!atomic_load(&stress_done) || fc_queued(&stress_fc) > 0)
+    fc_queue_drain(&stress_fc, stress_note, NULL);
+  return NULL;
+}
+
+static void
+test_push_publishes_a_queued_permit(void)
+{
+  pthread_t t;
+  long pushed = 0;
+
+  pool_with(&stress_fc, FC_MODE_ENFORCE, 1, FC_QUEUE_DEPTH_MAX, 1000);
+  atomic_store(&stress_done, 0);
+  assert(pthread_create(&t, NULL, stress_drainer, NULL) == 0);
+  for (int i = 0; i < STRESS_N; i++)
+    if (fc_queue_push(&stress_fc, &stress_permit[i], i, 1, MS(1), 0) == 0)
+      pushed++;
+  atomic_store(&stress_done, 1);
+  pthread_join(t, NULL);
+  assert(atomic_load(&stress_drained) == pushed);
+  assert(atomic_load(&stress_seen_not_queued) == 0);
+  fc_state_destroy(&stress_fc);
+  printf("  publish: %ld entries drained concurrently, every permit already QUEUED\n", pushed);
 }
 
 /* ---- HTTP/2 never waits; observe counts what it would have done ------------- */
@@ -515,6 +758,9 @@ test_env_and_sizing(void)
   assert(cfg.mode == FC_MODE_ENFORCE);
   assert(cfg.max_queue_depth == FC_QUEUE_DEPTH_MAX);   /* bounded */
   assert(cfg.max_queue_wait_ms == 5000);               /* a depth always has a window */
+  setenv("LLB_FC_MAX_QUEUE_WAIT_MS", "99999999", 1);
+  fc_cfg_from_env(&cfg);
+  assert(cfg.max_queue_wait_ms == FC_QUEUE_WAIT_MS_MAX); /* an hour at most */
   setenv("LLB_FC_MAX_QUEUE_DEPTH", "16", 1);
   setenv("LLB_FC_MAX_QUEUE_WAIT_MS", "250", 1);
   fc_state_init(&fc);
@@ -553,6 +799,13 @@ main(void)
   test_resize_keeps_waiting_entries();
   test_tombstones_are_reclaimed();
   test_drain_and_draining_flag();
+  test_drain_counts_what_it_ended();
+  test_a_lost_turn_is_passed_on();
+  test_a_wake_needs_room();
+  test_release_nowake();
+  test_front_push_is_not_refused_at_depth();
+  test_a_dead_pool_takes_no_waiter();
+  test_push_publishes_a_queued_permit();
   test_h2_sheds_and_observe_counts();
   test_env_and_sizing();
   printf("test_fc_queue: all passed\n");

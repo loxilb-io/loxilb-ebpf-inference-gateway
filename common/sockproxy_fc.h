@@ -78,6 +78,10 @@
  * holding a receive buffer of about a megabyte while it waits. */
 #define FC_QUEUE_DEPTH_MAX 65536u
 
+/* The longest wait window a rule may declare, and the ceiling on the
+ * environment default: an hour. */
+#define FC_QUEUE_WAIT_MS_MAX 3600000u
+
 enum fc_role {
   FC_ROLE_NORMAL = 0,
   FC_ROLE_PREFILL = 1,
@@ -152,6 +156,7 @@ typedef struct fc_queue {
   uint32_t tail;
   uint32_t used;
   uint32_t count;
+  uint32_t dead;                 /* the pool's rule is gone: nothing may wait here again */
   pthread_mutex_t lock;
 } fc_queue_t;
 
@@ -208,7 +213,10 @@ void fc_state_init(fc_state_t *fc);
 /* Apply a configuration to a live pool. The queue ring grows to the new
  * depth when needed; entries already waiting are kept in order. */
 void fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg);
-/* Free the queue ring. The queue must have been drained first. */
+/* Free the queue ring and mark the pool dead, so a request still holding
+ * the pool can never park on it again. The queue must have been drained
+ * first. The lock is kept: the pool's memory outlives its rule, and a
+ * worker that resolved the pool before the delete may still take it. */
 void fc_state_destroy(fc_state_t *fc);
 
 static inline int
@@ -223,6 +231,20 @@ fc_queue_enabled(const fc_state_t *fc)
 {
   return fc != NULL && fc->cfg.mode == FC_MODE_ENFORCE &&
          fc->cfg.max_queue_depth > 0 && fc->queue.cap > 0;
+}
+
+/* Whether the service ceiling has a unit free. A read: the CAS in the gate
+ * is still the last word. */
+static inline int
+fc_has_room(const fc_state_t *fc)
+{
+  uint32_t cap;
+
+  if (!fc)
+    return 0;
+  cap = fc->cfg.max_outstanding;
+  return cap == 0 ||
+         atomic_load_explicit(&fc->inflight, memory_order_relaxed) < cap;
 }
 
 void fc_permit_init(fc_permit_t *p);
@@ -282,8 +304,15 @@ void fc_release_role(fc_permit_t *p, int role);
 /* Hand back everything the permit holds. Idempotent. A released service
  * unit pops one waiting request and wakes it through the hook below. A
  * QUEUED permit released this way is a cancellation: the entry is taken
- * out and counted, and nothing is woken. */
+ * out and counted, and nothing is woken. When its entry had already been
+ * popped, the turn it was given is passed to the next waiting request, so a
+ * client that leaves between its wake and its resume costs nobody a turn. */
 void fc_permit_release(fc_permit_t *p);
+
+/* The same, without waking anyone: for a request that goes back to wait
+ * for the same ceiling it just failed, where a wake would only hand the
+ * turn to a request that fails it too. */
+void fc_permit_release_nowake(fc_permit_t *p);
 
 void fc_count(fc_state_t *fc, enum fc_reason reason);
 
@@ -291,9 +320,12 @@ void fc_count(fc_state_t *fc, enum fc_reason reason);
 
 /* Park a request: push its fd and generation with an absolute deadline
  * `now_ns + max_queue_wait_ms`. `front` puts it at the head (a woken request
- * that lost its unit keeps its place). Returns 0 with the permit QUEUED and
- * the decision counted, -1 when the queue is at its depth (counted as
- * queue_full, the permit untouched). */
+ * that lost its unit keeps its place, even when newcomers filled the queue
+ * to its depth meanwhile: its own entry left the queue only for the turn).
+ * The permit is QUEUED before its entry can be seen by any other thread.
+ * Returns 0 with the permit QUEUED and the decision counted, -1 when the
+ * queue is at its depth or the pool is dead (counted as queue_full, the
+ * permit reset). */
 int fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
                   uint64_t now_ns, int front);
 
@@ -306,6 +338,10 @@ int fc_queue_take(fc_state_t *fc, fc_permit_t *p);
 /* Pop the oldest live entry. Returns 1 and fills *out, 0 when nothing waits. */
 int fc_queue_pop(fc_state_t *fc, fc_queue_ent_t *out);
 
+/* Whether the permit's entry is still waiting in the queue. A resume for a
+ * permit whose entry was never popped did not come from its turn. */
+int fc_queue_holds(fc_state_t *fc, const fc_permit_t *p);
+
 /* The woken request is back at its gate: the wait is recorded, the permit
  * leaves the QUEUED state and is marked woken. */
 void fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
@@ -316,13 +352,17 @@ void fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns);
 typedef int (*fc_wake_fn)(int fd, uint64_t gen);
 void fc_set_wake_hook(fc_wake_fn fn);
 
-/* Pop one waiting request and wake it. Called for every released service
- * unit; harmless on an empty queue. */
+/* Pop one waiting request and wake it, when the service ceiling has a unit
+ * free. Called for every released service unit, and once a second for every
+ * pool with waiting requests so a turn that was lost on the way (a wake that
+ * could not be delivered, a woken connection that is gone) is given again.
+ * Harmless on an empty queue. */
 void fc_queue_wake_one(fc_state_t *fc);
 
-/* Take every waiting request out, oldest first, counted as drained, and
- * hand each to `fn`. */
-typedef void (*fc_drain_fn)(void *ctx, const fc_queue_ent_t *ent);
+/* Take every waiting request out, oldest first, and hand each to `fn`,
+ * which returns non-zero when it ended a request (counted as drained) and
+ * zero for an entry whose connection had already moved on. */
+typedef int (*fc_drain_fn)(void *ctx, const fc_queue_ent_t *ent);
 void fc_queue_drain(fc_state_t *fc, fc_drain_fn fn, void *ctx);
 
 /* Process-wide drain for maintenance: while set, the gate refuses new

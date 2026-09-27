@@ -181,10 +181,11 @@ int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                            int retry_body, const char *code, const char *msg);
 /* `keep`: the refusal leaves the connection open for its next request (the
- * body was fully buffered); otherwise it closes. */
-void sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
-                              const char *msg, uint32_t inflight, uint32_t queued,
-                              uint32_t limit, uint32_t retry_after, int keep);
+ * body was fully buffered); otherwise it closes. Non-zero when the response
+ * was not written whole. */
+int sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
+                             const char *msg, uint32_t inflight, uint32_t queued,
+                             uint32_t limit, uint32_t retry_after, int keep);
 /* Service identity "VIP:port" from the connection's rule head ("" when the
  * head is gone). */
 void proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len);

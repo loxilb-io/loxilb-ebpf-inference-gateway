@@ -1283,6 +1283,24 @@ check_draining_endpoints(void)
     }
   }
 
+  /* Capacity-queue turns. A released unit wakes the oldest waiting request
+   * at once; this pass gives a turn again when that wake was lost on the
+   * way (the owner could not be woken, or the woken connection went away
+   * before it used the turn) and the pool has room with requests still
+   * waiting. Without it such a pool would idle while its queue ran into
+   * its deadlines. At most one wake per pool per pass. */
+  {
+    proxy_map_ent_t *k_node;
+    proxy_epval_t *k_ep, *k_tmp;
+
+    for (k_node = proxy_struct->head; k_node; k_node = k_node->next) {
+      HASH_ITER(hh, k_node->val.ephash, k_ep, k_tmp) {
+        if (k_ep->ai_gw_mode && fc_queued(&k_ep->fc) > 0)
+          fc_queue_wake_one(&k_ep->fc);
+      }
+    }
+  }
+
   /* (RESOLVED): graceful [DONE]-synthesis safety-net — the real
    * deliverable. Diagnosis: vLLM's P/D-disagg path FINISHES generation but omits
    * the closing "data: [DONE]" SSE chunk for ~2.5% of streams under concurrency

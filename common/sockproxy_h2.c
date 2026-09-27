@@ -2912,12 +2912,13 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 }
 
 /* A capacity refusal on one stream: the H2 twin of sp_h1_send_capacity_deny,
- * with the same admission headers an upstream router reads. */
+ * with the same admission headers an upstream router reads and the same
+ * Retry-After (5 s for a drain, 1 s otherwise: a stream never queues). */
 static int
 proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                             int status_code, const char *error_code,
                             const char *error_msg, uint32_t inflight,
-                            uint32_t queued, uint32_t limit)
+                            uint32_t queued, uint32_t limit, int retry_after)
 {
   char body[512];
   char inflight_str[16], queued_str[16], limit_str[16];
@@ -2945,7 +2946,8 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     { (uint8_t *)"x-loxilb-admission-limit", (uint8_t *)limit_str,
       24, strlen(limit_str), NGHTTP2_NV_FLAG_NONE },
   };
-  return h2_send_deny_frame(pfe, stream, status_code, 1, body, blen, extra, 3);
+  return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
+                            extra, 3);
 }
 
 /* ---- capacity admission at the HTTP/2 stream site ---------------------------
@@ -2977,7 +2979,7 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   else if (v == FC_DRAINING)
     fc_count(&tepval->fc, FC_R_DRAINING);
   proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
-                              limit);
+                              limit, v == FC_DRAINING ? 5 : 1);
   ai_gw_record_capacity_deny(stream->request_id, notify_worker_id(),
                              stream->svc_ident, stream->effective_model,
                              stream->tenant_id, stream->auth_key_id,

@@ -119,6 +119,8 @@ fc_cfg_from_env(fc_cfg_t *cfg)
   if (cfg->max_queue_depth > FC_QUEUE_DEPTH_MAX)
     cfg->max_queue_depth = FC_QUEUE_DEPTH_MAX;
   cfg->max_queue_wait_ms = fc_env_u32("LLB_FC_MAX_QUEUE_WAIT_MS", 0);
+  if (cfg->max_queue_wait_ms > FC_QUEUE_WAIT_MS_MAX)
+    cfg->max_queue_wait_ms = FC_QUEUE_WAIT_MS_MAX;
   /* A depth with no wait window would park a request forever: the window
    * defaults so the queue is always bounded in time as well as in size. */
   if (cfg->max_queue_depth > 0 && cfg->max_queue_wait_ms == 0)
@@ -203,9 +205,11 @@ fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
   fc->cfg = *cfg;
   if (fc->cfg.max_queue_depth > FC_QUEUE_DEPTH_MAX)
     fc->cfg.max_queue_depth = FC_QUEUE_DEPTH_MAX;
+  if (fc->cfg.max_queue_wait_ms > FC_QUEUE_WAIT_MS_MAX)
+    fc->cfg.max_queue_wait_ms = FC_QUEUE_WAIT_MS_MAX;
   if (fc->cfg.max_queue_depth > 0 && fc->cfg.max_queue_wait_ms == 0)
     fc->cfg.max_queue_wait_ms = 5000;
-  if (fc->cfg.max_queue_depth > fc->queue.cap)
+  if (!fc->queue.dead && fc->cfg.max_queue_depth > fc->queue.cap)
     (void)fc_ring_grow(&fc->queue, fc->cfg.max_queue_depth);
   pthread_mutex_unlock(&fc->queue.lock);
 }
@@ -233,9 +237,9 @@ fc_state_destroy(fc_state_t *fc)
   fc->queue.ring = NULL;
   fc->queue.cap = fc->queue.head = fc->queue.tail = 0;
   fc->queue.used = fc->queue.count = 0;
+  fc->queue.dead = 1;
   atomic_store_explicit(&fc->queued, 0, memory_order_relaxed);
   pthread_mutex_unlock(&fc->queue.lock);
-  pthread_mutex_destroy(&fc->queue.lock);
 }
 
 void
@@ -547,8 +551,8 @@ fc_release_role(fc_permit_t *p, int role)
   p->ep[role] = -1;
 }
 
-void
-fc_permit_release(fc_permit_t *p)
+static void
+fc_permit_release__(fc_permit_t *p, int wake)
 {
   fc_state_t *fc;
 
@@ -563,11 +567,19 @@ fc_permit_release(fc_permit_t *p)
     return;
   case FC_P_QUEUED:
     /* The request is gone while it waited: its entry leaves the queue
-     * without a wake. If a pop, the deadline or a drain took the entry
-     * first, that path owns the connection and this is a no-op. */
-    if (p->fc && fc_queue_take(p->fc, p))
-      fc_count(p->fc, FC_R_CANCELLED);
+     * without a wake. The deadline and a drain move the permit out of
+     * QUEUED when they take the entry, so a QUEUED permit whose entry is
+     * no longer there was popped for its turn: the wake is on its way to a
+     * connection that will not use it, and the turn goes to the next
+     * waiting request instead of being lost. */
+    fc = p->fc;
+    if (fc && fc_queue_take(fc, p)) {
+      fc_count(fc, FC_R_CANCELLED);
+      fc = NULL;
+    }
     p->state = FC_P_RELEASED;
+    if (fc && wake)
+      fc_queue_wake_one(fc);
     return;
   case FC_P_EXECUTING:
     break;
@@ -589,8 +601,20 @@ fc_permit_release(fc_permit_t *p)
   p->state = FC_P_RELEASED;
   /* The unit is back: the oldest waiting request gets its turn. After the
    * state change so a wake that re-enters this permit finds it released. */
-  if (fc)
+  if (fc && wake)
     fc_queue_wake_one(fc);
+}
+
+void
+fc_permit_release(fc_permit_t *p)
+{
+  fc_permit_release__(p, 1);
+}
+
+void
+fc_permit_release_nowake(fc_permit_t *p)
+{
+  fc_permit_release__(p, 0);
 }
 
 /* ---- the queue ------------------------------------------------------------ */
@@ -610,12 +634,20 @@ fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
 
   if (q->cap == 0)
     return -1;
-  if (q->used >= q->cap) {
-    /* The slots are spent but live entries are fewer than the depth:
-     * tombstones fill the gap. Re-lay the live entries and try again. */
-    if (q->count >= q->cap || fc_ring_compact(q) != 0 || q->used >= q->cap)
-      return -1;
+  if (q->used >= q->cap && q->count < q->cap) {
+    /* The slots are spent but live entries are fewer than the ring holds:
+     * tombstones fill the gap. Re-lay the live entries. */
+    (void)fc_ring_compact(q);
   }
+  if (q->used >= q->cap && front) {
+    /* A woken request going back to the head while newcomers filled the
+     * queue: its place is kept, so the ring grows by a slot or more. Only
+     * requests that were already counted in the depth come back this way. */
+    uint32_t more = q->cap / 8 > 16 ? q->cap / 8 : 16;
+    (void)fc_ring_grow(q, q->cap + more);
+  }
+  if (q->used >= q->cap)
+    return -1;
   if (front) {
     slot = q->head == 0 ? q->cap - 1 : q->head - 1;
     q->head = slot;
@@ -646,27 +678,35 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   e.live = 1;
   e.gen = gen;
   e.enqueue_ns = now_ns;
-  e.deadline_ns = now_ns + (uint64_t)fc->cfg.max_queue_wait_ms * 1000000ULL;
 
-  pthread_mutex_lock(&fc->queue.lock);
-  if (fc_queue_enabled(fc) && fc->queue.count < fc->cfg.max_queue_depth)
-    rc = fc_ring_insert(&fc->queue, &e, front, &slot);
-  if (rc == 0)
-    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
-  pthread_mutex_unlock(&fc->queue.lock);
-
-  if (rc != 0) {
-    fc_count(fc, FC_R_QUEUE_FULL);
-    return -1;
-  }
+  /* The permit is QUEUED before the entry is published: a drain or a
+   * deadline on another thread that pops the entry the moment the lock is
+   * dropped must find a waiting permit, not the one it replaces. */
   fc_permit_init(p);
   p->fc = fc;
   p->state = FC_P_QUEUED;
   p->q_fd = fd;
-  p->q_slot = slot;
   p->q_gen = gen;
-  p->q_enqueue_ns = e.enqueue_ns;
+  p->q_enqueue_ns = now_ns;
+
+  pthread_mutex_lock(&fc->queue.lock);
+  e.deadline_ns = now_ns + (uint64_t)fc->cfg.max_queue_wait_ms * 1000000ULL;
   p->q_deadline_ns = e.deadline_ns;
+  if (!fc->queue.dead && fc_queue_enabled(fc) &&
+      (front || fc->queue.count < fc->cfg.max_queue_depth))
+    rc = fc_ring_insert(&fc->queue, &e, front, &slot);
+  if (rc == 0) {
+    p->q_slot = slot;
+    atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
+  }
+  pthread_mutex_unlock(&fc->queue.lock);
+
+  if (rc != 0) {
+    fc_permit_init(p);
+    p->fc = fc;
+    fc_count(fc, FC_R_QUEUE_FULL);
+    return -1;
+  }
   fc_count(fc, FC_R_QUEUED);
   return 0;
 }
@@ -717,6 +757,19 @@ fc_queue_take(fc_state_t *fc, fc_permit_t *p)
   }
   pthread_mutex_unlock(&fc->queue.lock);
   return taken;
+}
+
+int
+fc_queue_holds(fc_state_t *fc, const fc_permit_t *p)
+{
+  int held;
+
+  if (!fc || !p || p->state != FC_P_QUEUED)
+    return 0;
+  pthread_mutex_lock(&fc->queue.lock);
+  held = fc_ring_find(&fc->queue, p->q_fd, p->q_gen, p->q_slot) != UINT32_MAX;
+  pthread_mutex_unlock(&fc->queue.lock);
+  return held;
 }
 
 /* Lock held. */
@@ -788,7 +841,7 @@ fc_queue_wake_one(fc_state_t *fc)
 
   if (!fc || !fc_wake_hook)
     return;
-  if (fc_queued(fc) == 0)
+  if (fc_queued(fc) == 0 || !fc_has_room(fc))
     return;
   if (!fc_queue_pop(fc, &e))
     return;
@@ -811,9 +864,8 @@ fc_queue_drain(fc_state_t *fc, fc_drain_fn fn, void *ctx)
   if (!fc)
     return;
   while (fc_queue_pop(fc, &e)) {
-    fc_count(fc, FC_R_DRAINED);
-    if (fn)
-      fn(ctx, &e);
+    if (!fn || fn(ctx, &e))
+      fc_count(fc, FC_R_DRAINED);
   }
 }
 

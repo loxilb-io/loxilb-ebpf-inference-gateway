@@ -15,6 +15,7 @@
  * See sockproxy_refactoring_plan.md §3.P7
  */
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* =========================================================================
@@ -240,7 +241,7 @@ typedef struct proxy_fc_svc_stat {
     uint32_t ep_inflight[PROXY_FC_ROLES];  /* gauge: endpoint units held, summed per role */
     uint64_t decisions[PROXY_FC_REASONS];  /* counter per enum fc_reason */
     char     pool[PROXY_FC_POOL_LEN];      /* pool key ("host|path" or "host"), NUL-terminated */
-    /* The bounded queue. Tail-append, same three-way lockstep. */
+    /* The bounded queue: same three-way lockstep, offsets pinned below. */
     uint32_t queued;                       /* gauge: requests waiting for a unit */
     uint32_t max_queue_depth;              /* the depth in force, 0 = no waiting */
     uint32_t max_queue_wait_ms;            /* the wait window in force */
@@ -249,6 +250,17 @@ typedef struct proxy_fc_svc_stat {
     uint64_t qwait_sum_ms;                 /* histogram: summed wait of every resumed request */
     uint64_t qwait_count;                  /* histogram: resumed requests */
 } proxy_fc_svc_stat_t;
+
+/* The Go collector reads this struct through cgo from its own copy of this
+ * definition, and its test links a stub with a third: all three pin the
+ * same layout, so a field moved in one without the others fails to build
+ * instead of shifting every counter after it. */
+_Static_assert(sizeof(proxy_fc_svc_stat_t) == 296, "proxy_fc_svc_stat_t size");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, decisions) == 40, "decisions offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 136, "pool offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 200, "queued offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_bucket) == 216, "qwait_bucket offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_count) == 288, "qwait_count offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every

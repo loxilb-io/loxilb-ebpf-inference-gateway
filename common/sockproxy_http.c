@@ -4290,7 +4290,7 @@ struct sp_fc_drain_ctx {
   uint8_t detach;
 };
 
-static void
+static int
 sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
 {
   const struct sp_fc_drain_ctx *d = ctx;
@@ -4301,7 +4301,7 @@ sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
   if (!pfe || pfe->fd != e->fd || reg_gen != e->gen ||
       atomic_load_explicit(&pfe->gen, memory_order_acquire) != e->gen ||
       pfe->fc.state != FC_P_QUEUED) {
-    return;
+    return 0;
   }
   pfe->fc.state = FC_P_NONE;
   if (d->detach) {
@@ -4309,6 +4309,7 @@ sp_fc_drain_cb(void *ctx, const fc_queue_ent_t *e)
   }
   pfe->pd_phase = PD_PHASE_ERROR;
   sp_reap_request(pfe, d->kind);
+  return 1;
 }
 
 void
@@ -7803,8 +7804,10 @@ sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
  * all, or that the process is draining. Emitted through the bounded
  * TLS-aware sender like every refusal. With `keep` the response is framed
  * with its length and the connection stays open for the next request:
- * under overload a refusal that closes turns into a reconnect storm. */
-void
+ * under overload a refusal that closes turns into a reconnect storm.
+ * Returns 0 when the whole response was written; on a partial write the
+ * connection cannot carry another response and the caller closes it. */
+int
 sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                          const char *msg, uint32_t inflight, uint32_t queued,
                          uint32_t limit, uint32_t retry_after, int keep)
@@ -7813,7 +7816,7 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
   char resp_buf[768];
   const char *status_line = status == 503 ? "503 Service Unavailable"
                                           : "429 Too Many Requests";
-  int blen, n;
+  int blen, n, rc = -1;
 
   if (status == 503) {
     blen = snprintf(body, sizeof(body),
@@ -7842,8 +7845,8 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     status_line, blen, retry_after, inflight, queued, limit,
     keep ? "keep-alive" : "close", body);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
-    int rc = keep ? proxy_send_local_response(pfe, resp_buf, (size_t)n)
-                  : proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n);
+    rc = keep ? proxy_send_local_response(pfe, resp_buf, (size_t)n)
+              : proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n);
     if (rc != 0)
       log_error("[AIGateway] fd=%d failed to send complete bounded %d "
                 "capacity refusal", pfe->fd, status);
@@ -7851,6 +7854,7 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     shutdown(pfe->fd, SHUT_RDWR);
   }
   pfe->lb_err_body_sent = 1;
+  return rc;
 }
 
 /* ---- capacity admission at the HTTP/1 dispatch site -------------------------
@@ -7958,8 +7962,11 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
   /* Whatever the service level granted before the refusal goes back now:
    * the teardown that follows would do it too, but a refused request must
    * not hold a unit for even the length of its own close, and a parked one
-   * holds nothing while it waits. */
-  fc_permit_release(&pfe->fc);
+   * holds nothing while it waits. Nobody is woken here: a request that
+   * parks again failed the ceiling a woken one would meet, so a wake would
+   * only pass the turn around the queue; one that is refused wakes the
+   * next waiting request below, once it is out of the way. */
+  fc_permit_release_nowake(&pfe->fc);
 
   /* FC_QUEUE is the service gate's verdict with a depth in force; FC_SHED
    * from an endpoint ceiling waits too when the pool queues. A request that
@@ -7993,11 +8000,19 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
   inflight = fc_inflight(fc);
   queued = fc_queued(fc);
   limit = fc_limit_for(fc, role);
-  keep = may_wait && sp_h1_refusal_keeps_connection(pfe);
+  /* Only a 429 keeps the connection: a 503 says this node has nothing for
+   * the client (no healthy capacity, or a drain moving traffic away), and a
+   * kept connection would bring the next request straight back. */
+  keep = status == 429 && may_wait && sp_h1_refusal_keeps_connection(pfe);
 
   proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
-  sp_h1_send_capacity_deny(pfe, status, code, msg, inflight, queued, limit,
-                           retry_after, keep);
+  if (sp_h1_send_capacity_deny(pfe, status, code, msg, inflight, queued, limit,
+                               retry_after, keep) != 0 && keep) {
+    /* A refusal cut short leaves the connection mid-response: it cannot
+     * carry the next request. */
+    shutdown(pfe->fd, SHUT_RDWR);
+    keep = 0;
+  }
   ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
                              svc_ident, proxy_effective_model(pfe),
                              pfe->tenant_id, pfe->auth_key_id,
@@ -8009,6 +8024,9 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
            pfe->fd, status, code, role, inflight, queued, limit,
            queue_full ? " (queue full)" : "", pfe->tenant_id,
            proxy_effective_model(pfe), keep ? " (connection kept)" : "");
+  /* This request is out of the way: whatever it handed back is the next
+   * waiting request's turn. */
+  fc_queue_wake_one(fc);
   if (keep) {
     sp_h1_kept_request_reset(pfe);
     return SP_FC_H1_KEPT;
@@ -10392,6 +10410,15 @@ pd_resume_parked(int fd)
 
   if (pfe->pd_phase != PD_PHASE_PARKED) {
     /* Already resumed/reaped/torn down by another edge — idempotent no-op. */
+    return;
+  }
+
+  /* A request waiting in the capacity queue is resumed only for its turn,
+   * and the queue pops an entry before it wakes the connection: an entry
+   * still waiting means this resume is not its turn. It stays parked as it
+   * is (reads paused, hang-up armed) until its turn, its deadline or its
+   * client's departure. */
+  if (pfe->fc.state == FC_P_QUEUED && fc_queue_holds(pfe->fc.fc, &pfe->fc)) {
     return;
   }
 

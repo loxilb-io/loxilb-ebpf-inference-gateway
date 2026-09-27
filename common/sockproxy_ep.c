@@ -1052,6 +1052,14 @@ pd_fallback_normal:
          * eligible endpoint with room, or the request is refused. */
         if (pfe && tepval->ai_gw_mode) {
           int fc_sel = sp_fc_h1_gate_endpoint(pfe, tepval, sel);
+          if (fc_sel < 0 && h2_load_units_active(tepval)) {
+            /* Bounded-load selectors counted the pick as a connection unit,
+             * and a request that parks, is refused or keeps its connection
+             * for the next one never reaches the endpoint: the unit goes
+             * back here (the connection's teardown cannot, its endpoint is
+             * not set yet). */
+            chwbl_dec_runtime(tepval, sel);
+          }
           if (fc_sel == SP_FC_H1_QUEUED)
             return PD_SETUP_PARKED;
           if (fc_sel == SP_FC_H1_KEPT)
