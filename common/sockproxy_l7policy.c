@@ -887,7 +887,7 @@ l7_store_origin(struct proxy_fd_ent *pfe, const char *origin, uint8_t skipped)
 
 void
 l7_derive_origin(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
-                 const char *peer_ip, l7_hop_list_t *hops_out)
+                 const char *peer_ip)
 {
   char origin[L7_HOP_TEXT_MAX];
   uint8_t skipped = 0;
@@ -895,9 +895,9 @@ l7_derive_origin(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
   if (!pfe || !ent)
     return;
 
-  l7_origin_for_listener(pfe->l7_inbound_chain,
+  l7_origin_for_listener(&pfe->l7_inbound_hops,
                          ent->l7_trusted_ranges, ent->l7_n_trusted_ranges,
-                         peer_ip, origin, sizeof(origin), &skipped, hops_out);
+                         peer_ip, origin, sizeof(origin), &skipped);
   l7_store_origin(pfe, origin, skipped);
 }
 
@@ -934,13 +934,13 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
    * well-formed, but validate anyway as defence-in-depth — a malformed one is
    * dropped, never spliced). */
   if (xff_ip && l7_hdr_value_valid(xff_ip)) {
-    l7_hop_list_t hops;
     char chain[L7_HDR_VALUE_MAX];
 
-    l7_derive_origin(pfe, ent, xff_ip, &hops);
+    l7_derive_origin(pfe, ent, xff_ip);
 
     if (ent->l7_n_trusted_ranges > 0 &&
-        l7_chain_append_peer(&hops, xff_ip, chain, sizeof(chain)) > 0 &&
+        l7_chain_append_peer(&pfe->l7_inbound_hops, xff_ip,
+                             chain, sizeof(chain)) > 0 &&
         l7_hdr_value_valid(chain))
       emit(ctx, L7HDR_SET, "X-Forwarded-For", chain);
     else

@@ -353,9 +353,9 @@ int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
  * on `pfe` (l7_origin_ip, l7_trusted_hops). On a listener with no trusted
  * ranges that is the socket peer with no hops stepped past; otherwise it is the
  * right-most hop of the inbound chain that is not inside the listener's ranges,
- * falling back to the peer when every hop is. `hops_out`, when given, receives
- * the normalised hop list so a caller that also forwards the chain does not
- * parse it twice.
+ * falling back to the peer when every hop is. The chain it walks is
+ * `pfe->l7_inbound_hops`, captured as the request was parsed, so nothing is
+ * parsed here.
  *
  * l7_apply_req_filters calls this, so it runs wherever the header splice runs:
  * on a listener with an L7 policy attached, for a request the splice does not
@@ -367,7 +367,7 @@ int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
  * proxy_origin_ip(), paired with proxy_origin_trusted_hops().
  */
 void l7_derive_origin(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
-                      const char *peer_ip, l7_hop_list_t *hops_out);
+                      const char *peer_ip);
 
 /*
  * l7_resolve_pool — map a FORWARD action's target pool to a tepval-equivalent

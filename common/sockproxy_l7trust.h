@@ -204,30 +204,37 @@ l7_hop_normalise(const char *begin, const char *end, char *out, size_t outlen)
   }
 }
 
-/* Fill `out` from the comma-separated chain in `text`. Returns the number of
- * hops retained. An empty or absent chain leaves an empty list, which the
- * attribution reads as "the peer is the origin". */
+/* Append the comma-separated chain in `text` (length-delimited, so a parser can
+ * hand over bytes that are not terminated) to `out`, WITHOUT clearing it, and
+ * return the number of hops it now holds.
+ *
+ * Appending rather than replacing is what makes several chain header lines one
+ * list in the order they arrived (RFC 7230). It matters beyond tidiness: a
+ * later line replacing an earlier one, or being refused because the buffer is
+ * full, would drop the RIGHT end of the chain - and the right end is the part
+ * our own hops wrote. A client could then fill the list with a long chain of
+ * its own and push the real hop out, choosing what it is attributed to. So
+ * overflow always sacrifices the LEFT end, here and everywhere else. */
 static inline uint8_t
-l7_hop_list_from_xff(const char *text, l7_hop_list_t *out)
+l7_hop_list_append_n(const char *text, size_t len, l7_hop_list_t *out)
 {
-  const char *p;
+  const char *p, *end;
 
   if (!out)
     return 0;
-  memset(out, 0, sizeof(*out));
-  if (!text)
-    return 0;
+  if (!text || len == 0)
+    return out->n_hops;
 
-  for (p = text; ; ) {
-    const char *comma = strchr(p, ',');
-    const char *end = comma ? comma : p + strlen(p);
+  for (p = text, end = text + len; ; ) {
+    const char *comma = (const char *)memchr(p, ',', (size_t)(end - p));
+    const char *stop = comma ? comma : end;
     char hop[L7_HOP_TEXT_MAX];
 
-    l7_hop_normalise(p, end, hop, sizeof(hop));
+    l7_hop_normalise(p, stop, hop, sizeof(hop));
     if (hop[0] != '\0') {
       if (out->n_hops == L7_MAX_HOPS) {
-        /* Keep the right-most hops: drop the left end, which is the end a
-         * client could have written, and record that we did. */
+        /* Drop the left-most hop to make room: it is the end a client could
+         * have written, and the end the walk reads last. */
         memmove(out->hop[0], out->hop[1],
                 (size_t)(L7_MAX_HOPS - 1) * L7_HOP_TEXT_MAX);
         out->n_hops = L7_MAX_HOPS - 1;
@@ -240,8 +247,22 @@ l7_hop_list_from_xff(const char *text, l7_hop_list_t *out)
     if (!comma)
       break;
     p = comma + 1;
+    if (p >= end)
+      break;
   }
   return out->n_hops;
+}
+
+/* Fill `out` from the comma-separated chain in `text`, discarding whatever it
+ * held. Returns the number of hops retained. An empty or absent chain leaves an
+ * empty list, which the attribution reads as "the peer is the origin". */
+static inline uint8_t
+l7_hop_list_from_xff(const char *text, l7_hop_list_t *out)
+{
+  if (!out)
+    return 0;
+  memset(out, 0, sizeof(*out));
+  return l7_hop_list_append_n(text, text ? strlen(text) : 0, out);
 }
 
 /* Attribute the request: the right-most hop in `hops` that is not inside
@@ -295,59 +316,21 @@ l7_attribute_origin(const l7_hop_list_t *hops,
   return 0;
 }
 
-/* Join another chain header line onto `dst`, which may be empty. Several chain
- * header lines are one list in the order they arrived (RFC 7230), so they are
- * joined rather than replaced: the chain's meaning rests on hops appending to
- * the right, and a later line replacing an earlier one would move which hop is
- * right-most and so change which hop a request is attributed to. A line that
- * would not fit leaves `dst` as it stands rather than cutting it, for the same
- * reason. Returns the resulting length. */
-static inline size_t
-l7_chain_join(char *dst, size_t dstlen, const char *value, size_t valuelen)
-{
-  size_t used, need;
-
-  if (!dst || dstlen == 0)
-    return 0;
-  used = strlen(dst);
-  if (!value || valuelen == 0)
-    return used;
-
-  need = valuelen + (used ? 2 : 0);
-  if (used + need >= dstlen)
-    return used;                 /* keep what we have rather than cut it */
-  if (used) {
-    dst[used++] = ',';
-    dst[used++] = ' ';
-  }
-  memcpy(dst + used, value, valuelen);
-  used += valuelen;
-  dst[used] = '\0';
-  return used;
-}
-
 /* The whole rule for one listener: which address a request arriving on it came
- * from, given the chain it arrived with and the ranges the listener trusts.
+ * from, given the hops it arrived with and the ranges the listener trusts.
  *
- * A listener told nothing about what sits in front of it does not read the
- * chain at all - the peer is the origin and no hop was stepped past. Reading a
- * chain a listener cannot vouch for would let whoever sent it choose the
+ * A listener told nothing about what sits in front of it does not consult the
+ * chain at all - the peer is the origin and no hop was stepped past. Believing
+ * a chain a listener cannot vouch for would let whoever sent it choose the
  * answer, so the emptiness of the range set is the whole gate.
  *
- * `hops_out`, when given, receives the normalised hop list, so a caller that
- * also forwards the chain does not parse it a second time. Returns 1 when the
- * answer came from the chain and 0 when it is the peer. */
+ * Returns 1 when the answer came from the chain and 0 when it is the peer. */
 static inline int
-l7_origin_for_listener(const char *inbound_chain,
+l7_origin_for_listener(const l7_hop_list_t *hops,
                        const l7_trusted_range_t *ranges, uint8_t n_ranges,
                        const char *peer_ip,
-                       char *out, size_t outlen, uint8_t *skipped,
-                       l7_hop_list_t *hops_out)
+                       char *out, size_t outlen, uint8_t *skipped)
 {
-  l7_hop_list_t local;
-  l7_hop_list_t *hops = hops_out ? hops_out : &local;
-
-  memset(hops, 0, sizeof(*hops));
   if (skipped)
     *skipped = 0;
   if (!out || outlen == 0)
@@ -361,7 +344,6 @@ l7_origin_for_listener(const char *inbound_chain,
     return 0;
   }
 
-  l7_hop_list_from_xff(inbound_chain, hops);
   return l7_attribute_origin(hops, ranges, n_ranges, peer_ip,
                              out, outlen, skipped);
 }

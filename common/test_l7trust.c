@@ -21,9 +21,9 @@
  *   - a listener told no ranges trusts nothing;
  *   - the chain passed upstream is the inbound chain plus the peer, and is
  *     dropped rather than truncated when it does not fit;
- *   - several chain header lines are joined in the order they arrived, so a
- *     later one cannot displace an earlier one and move which hop is
- *     right-most;
+ *   - several chain header lines APPEND to one list in the order they arrived,
+ *     and a line past the end of the list evicts from the LEFT, so a client
+ *     cannot push a trusted upstream's hop out with a long chain of its own;
  *   - and, as one listener applies all of it: told no ranges it does not read
  *     the chain at all, told its ranges it recovers the client the upstream
  *     recorded.
@@ -331,42 +331,53 @@ test_chain_append(void)
   }
 }
 
-/* Capturing the chain as it is parsed: several chain header lines are one list
- * in the order they arrived, so they are joined and not replaced. A client that
- * could make a later line replace an earlier one would move which hop is
- * right-most, and so choose what the request is attributed to. */
+/* Capturing the chain as it is parsed: several chain header lines append to one
+ * list in arrival order. A later line displacing an earlier one, or being
+ * refused because the list is full, would drop the RIGHT end - and a client
+ * could then fill the list with a long chain of its own and push the real hop
+ * out, choosing what it is attributed to. */
 static void
-test_chain_join(void)
+test_chain_append_lines(void)
 {
-  char dst[64];
+  l7_hop_list_t h;
+  int i;
 
-  dst[0] = '\0';
-  CHECK(l7_chain_join(dst, sizeof(dst), "203.0.113.5", 11) == 11 &&
-        strcmp(dst, "203.0.113.5") == 0,
+  memset(&h, 0, sizeof(h));
+  CHECK(l7_hop_list_append_n("203.0.113.5", 11, &h) == 1 &&
+        strcmp(h.hop[0], "203.0.113.5") == 0,
         "the first chain line is the chain so far");
 
-  CHECK(l7_chain_join(dst, sizeof(dst), "10.0.0.7", 8) == 21 &&
-        strcmp(dst, "203.0.113.5, 10.0.0.7") == 0,
-        "a second chain line is joined to the right of the first");
+  CHECK(l7_hop_list_append_n("10.0.0.7", 8, &h) == 2 &&
+        strcmp(h.hop[1], "10.0.0.7") == 0,
+        "a second chain line is appended to the right of the first");
 
-  CHECK(l7_chain_join(dst, sizeof(dst), "10.0.0.8", 8) == 31 &&
-        strcmp(dst, "203.0.113.5, 10.0.0.7, 10.0.0.8") == 0,
+  CHECK(l7_hop_list_append_n("10.0.0.8", 8, &h) == 3 &&
+        strcmp(h.hop[2], "10.0.0.8") == 0,
         "and a third to the right of that, in arrival order");
 
-  CHECK(l7_chain_join(dst, sizeof(dst), NULL, 0) == 31 &&
-        strcmp(dst, "203.0.113.5, 10.0.0.7, 10.0.0.8") == 0,
+  CHECK(l7_hop_list_append_n(NULL, 0, &h) == 3 && h.n_hops == 3,
         "an empty line changes nothing");
 
-  /* A line that does not fit leaves the chain as it stands: cutting it would
-   * move which hop is right-most, which is the one thing the walk relies on. */
-  {
-    char small[16];
-    small[0] = '\0';
-    l7_chain_join(small, sizeof(small), "203.0.113.5", 11);
-    CHECK(l7_chain_join(small, sizeof(small), "10.0.0.7", 8) == 11 &&
-          strcmp(small, "203.0.113.5") == 0,
-          "a line that does not fit leaves the chain as it stands");
+  /* The bytes handed over are length-delimited, not terminated: a parser gives
+   * us a slice of its own buffer. */
+  CHECK(l7_hop_list_append_n("198.51.100.9 and then some junk", 12, &h) == 4 &&
+        strcmp(h.hop[3], "198.51.100.9") == 0,
+        "only the bytes named are read, so an unterminated slice is safe");
+
+  /* Overflow across lines drops the LEFT end, so the hop a trusted upstream
+   * wrote in a later line cannot be pushed out by a long earlier one. */
+  memset(&h, 0, sizeof(h));
+  for (i = 0; i < L7_MAX_HOPS; i++) {
+    char one[32];
+    int n = snprintf(one, sizeof(one), "10.9.9.%d", i + 1);
+    l7_hop_list_append_n(one, (size_t)n, &h);
   }
+  CHECK(h.n_hops == L7_MAX_HOPS && !h.truncated, "the list fills exactly");
+  CHECK(l7_hop_list_append_n("203.0.113.5", 11, &h) == L7_MAX_HOPS &&
+        h.truncated &&
+        strcmp(h.hop[L7_MAX_HOPS - 1], "203.0.113.5") == 0 &&
+        strcmp(h.hop[0], "10.9.9.2") == 0,
+        "a line past the end evicts from the LEFT and keeps the newest hop");
 }
 
 /* The rule as one listener applies it, which is how the request path calls it. */
@@ -382,34 +393,34 @@ test_listener_rule(void)
 
   CHECK(n == 1, "the range set parses");
 
-  /* A listener at the edge: the chain is not read at all, whatever it says.
-   * This is the case that has to stay byte-for-byte what it was. */
-  CHECK(l7_origin_for_listener("1.2.3.4, 5.6.7.8", NULL, 0, "203.0.113.5",
-                               out, sizeof(out), &skipped, &hops) == 0 &&
-        strcmp(out, "203.0.113.5") == 0 && skipped == 0 && hops.n_hops == 0,
-        "told no ranges, a listener does not read the chain at all");
-
-  /* And the same listener does not even parse it, so a caller cannot forward
-   * what it never read. */
-  CHECK(hops.n_hops == 0, "and does not parse it, so nothing can forward it");
+  /* A listener at the edge does not consult the chain, whatever it says. This
+   * is the case that has to stay byte-for-byte what it was. */
+  l7_hop_list_from_xff("1.2.3.4, 5.6.7.8", &hops);
+  CHECK(l7_origin_for_listener(&hops, NULL, 0, "203.0.113.5",
+                               out, sizeof(out), &skipped) == 0 &&
+        strcmp(out, "203.0.113.5") == 0 && skipped == 0,
+        "told no ranges, a listener does not consult the chain at all");
 
   /* Behind one of ours: the chain is read and the client recovered. */
-  CHECK(l7_origin_for_listener("203.0.113.5, 10.0.0.7", r, n, "10.0.0.7",
-                               out, sizeof(out), &skipped, &hops) == 1 &&
-        strcmp(out, "203.0.113.5") == 0 && skipped == 1 && hops.n_hops == 2,
+  l7_hop_list_from_xff("203.0.113.5", &hops);
+  CHECK(l7_origin_for_listener(&hops, r, n, "10.0.0.7",
+                               out, sizeof(out), &skipped) == 1 &&
+        strcmp(out, "203.0.113.5") == 0 && skipped == 0,
         "told its ranges, it recovers the client the upstream recorded");
 
+  /* Two of ours in front, so the chain really does end in a hop of ours. */
+  l7_hop_list_from_xff("203.0.113.5, 10.0.0.6", &hops);
+  CHECK(l7_origin_for_listener(&hops, r, n, "10.0.0.7",
+                               out, sizeof(out), &skipped) == 1 &&
+        strcmp(out, "203.0.113.5") == 0 && skipped == 1,
+        "and steps past the hop between two of ours");
+
   /* A direct connection to a listener that does have ranges. */
-  CHECK(l7_origin_for_listener("", r, n, "203.0.113.5",
-                               out, sizeof(out), &skipped, &hops) == 0 &&
+  l7_hop_list_from_xff("", &hops);
+  CHECK(l7_origin_for_listener(&hops, r, n, "203.0.113.5",
+                               out, sizeof(out), &skipped) == 0 &&
         strcmp(out, "203.0.113.5") == 0 && skipped == 0,
         "a direct connection to such a listener is still the peer");
-
-  /* The hop list is optional. */
-  CHECK(l7_origin_for_listener("203.0.113.5, 10.0.0.7", r, n, "10.0.0.7",
-                               out, sizeof(out), &skipped, NULL) == 1 &&
-        strcmp(out, "203.0.113.5") == 0,
-        "the hop list is optional");
 }
 
 int
@@ -420,7 +431,7 @@ main(void)
   test_hop_list();
   test_attribution();
   test_chain_append();
-  test_chain_join();
+  test_chain_append_lines();
   test_listener_rule();
   printf("=== results: %d/%d passed ===\n", checks - failures, checks);
   return failures ? 1 : 0;

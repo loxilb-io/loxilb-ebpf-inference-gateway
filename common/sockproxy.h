@@ -1107,15 +1107,17 @@ struct proxy_fd_ent {
   char     l7_origin_ip[L7_HOP_TEXT_MAX];
   uint8_t  l7_trusted_hops;
 
-  // The forwarding chain this request arrived with, captured as it is parsed.
+  // The forwarding chain this request arrived with, captured as it is parsed
+  // and kept as the normalised hop list the attribution walks - so the chain is
+  // parsed once, by the one parser, and the rule that governs an overflowing
+  // chain governs it here too.
+  //
   // It is NOT read back out of l7_headers[] above: that store belongs to the
   // CONNECTION, accumulating every request's headers and refusing more once
-  // full, so on a reused keep-alive connection a lookup there answers with the
-  // FIRST request's chain. This is per-request state and is cleared at the
-  // keep-alive boundary with the other per-request captures. Several chain
-  // header lines are joined in the order they arrived, which is what makes the
-  // chain's left-to-right growth - and so the walk over it - meaningful.
-  char     l7_inbound_chain[L7_HDR_VALUE_MAX];
+  // full, so a lookup there answers a reused keep-alive connection's second
+  // request with the FIRST request's chain. This is per-request state and is
+  // cleared at the keep-alive boundary with the other per-request captures.
+  l7_hop_list_t l7_inbound_hops;
 
   // The origin carried across the keep-alive request-reset boundary, the twin
   // of resp_request_id: the reset runs once the request has been FORWARDED,
@@ -1565,7 +1567,7 @@ l7_origin_reset(struct proxy_fd_ent *pfe)
 {
   if (!pfe)
     return;
-  pfe->l7_inbound_chain[0] = '\0';
+  memset(&pfe->l7_inbound_hops, 0, sizeof(pfe->l7_inbound_hops));
   pfe->l7_origin_ip[0] = '\0';
   pfe->l7_trusted_hops = 0;
 }
@@ -1598,12 +1600,13 @@ proxy_origin_trusted_hops(const proxy_fd_ent_t *pfe)
 // The inbound forwarding chain, captured per request.
 // ----------------------------------------------------------------------------
 // Called for every parsed header from both the H1 and the H2 path, and does
-// nothing for all but the chain header. Several chain header lines are one
-// list in the order they arrived (RFC 7230), so they are JOINED rather than
-// overwritten: the chain's meaning rests on hops appending to the right, and a
-// later line replacing an earlier one would move which hop is right-most and
-// so change which hop the request is attributed to. A chain that would not fit
-// is left as it stands rather than cut, since a cut chain would do the same.
+// nothing for all but the chain header. Chain header lines are APPENDED to the
+// one hop list in the order they arrived (RFC 7230), never replaced: a later
+// line replacing an earlier one - or being refused because the list is full -
+// would drop the RIGHT end of the chain, and the right end is what our own hops
+// wrote. A client could then fill the list with a long chain of its own and push
+// the real hop out, choosing what it is attributed to. Overflow therefore drops
+// the LEFT end, which l7_hop_list_append_n does.
 static inline void
 l7_capture_inbound_chain(struct proxy_fd_ent *pfe,
                          const char *name, size_t namelen,
@@ -1616,8 +1619,7 @@ l7_capture_inbound_chain(struct proxy_fd_ent *pfe,
   if (namelen != sizeof(xff) - 1 || strncasecmp(name, xff, namelen) != 0)
     return;
 
-  l7_chain_join(pfe->l7_inbound_chain, sizeof(pfe->l7_inbound_chain),
-                value, valuelen);
+  l7_hop_list_append_n(value, valuelen, &pfe->l7_inbound_hops);
 }
 
 // ============================================================================

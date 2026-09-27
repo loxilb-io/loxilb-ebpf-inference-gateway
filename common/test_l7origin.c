@@ -256,7 +256,7 @@ test_per_request(void)
    * phase while the live fields are cleared for the next request. */
   l7_origin_snapshot(&pfe);
   l7_origin_reset(&pfe);
-  CHECK(pfe.l7_inbound_chain[0] == '\0' && pfe.l7_origin_ip[0] == '\0' &&
+  CHECK(pfe.l7_inbound_hops.n_hops == 0 && pfe.l7_origin_ip[0] == '\0' &&
         pfe.l7_trusted_hops == 0 && pfe.n_l7_headers > 0,
         "the boundary clears the request's chain and origin, not the connection's store");
   CHECK(strcmp(proxy_origin_ip(&pfe), "203.0.113.5") == 0,
@@ -409,6 +409,48 @@ test_ranges_and_policy(void)
   proxy_detach_l7_policy(&ent_a.key);
 }
 
+/* A chain that overflows the capture buffer must lose its LEFT end, never its
+ * right. The left is what a client can write; the right is what our own hops
+ * recorded. A client that can push the real hops out of the buffer by sending a
+ * long chain of its own choosing would choose what it is attributed to. */
+static void
+test_overflowing_chain_keeps_the_right_end(void)
+{
+  static const char *cidrs[] = { "10.0.0.0/8" };
+  proxy_fd_ent_t pfe;
+  proxy_map_ent_t ent;
+  char filler[512];
+  size_t used = 0;
+  int i;
+
+  memset(&ent, 0, sizeof(ent));
+  ent.l7_n_trusted_ranges = ranges_of(ent.l7_trusted_ranges, cidrs, 1);
+
+  /* A client-supplied line with MORE hops than the list holds, so the hop our
+   * own upstream records next can only be stored by evicting one of these. */
+  filler[0] = '\0';
+  for (i = 0; i < L7_MAX_HOPS + 2; i++) {
+    int n = snprintf(filler + used, sizeof(filler) - used, "%s1.1.1.%d",
+                     i ? ", " : "", i + 1);
+    if (n <= 0 || (size_t)n >= sizeof(filler) - used)
+      break;
+    used += (size_t)n;
+  }
+
+  memset(&pfe, 0, sizeof(pfe));
+  l7_store_header(&pfe, "X-Forwarded-For", filler);
+  CHECK(pfe.l7_inbound_hops.n_hops == L7_MAX_HOPS && pfe.l7_inbound_hops.truncated,
+        "the client alone can fill the hop list");
+
+  /* Our own upstream then records the real client in a second line. */
+  l7_store_header(&pfe, "X-Forwarded-For", "203.0.113.5");
+  n_ops = 0;
+  l7_apply_req_filters(&pfe, &ent, "10.0.0.7", 8080, "https", capture, NULL);
+
+  CHECK(strcmp(pfe.l7_origin_ip, "203.0.113.5") == 0,
+        "a client cannot push the real hop out of the list with a long chain");
+}
+
 /* The origin has to be readable on both sides of the reset boundary, because
  * the request is reported in its response phase - after the boundary has run.
  * This is the trap proxy_request_id_snapshot exists for, and the same one. */
@@ -458,6 +500,7 @@ main(void)
   test_trusting_listener();
   test_per_request();
   test_several_chain_lines();
+  test_overflowing_chain_keeps_the_right_end();
   test_snapshot_across_the_boundary();
   test_attach_ranges();
   test_ranges_and_policy();
