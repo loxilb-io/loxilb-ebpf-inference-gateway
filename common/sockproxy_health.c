@@ -50,6 +50,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_ai_admit.h"   /* the refusal record of a request ended while it waited */
 #include "sockproxy_conn.h"
 #include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
 #include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
@@ -209,6 +210,23 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n"
                    "\r\n"
                    "{\"error\":\"pd_idle_timeout\"}", 1, 0),
+  /* The two capacity-queue endings are formatted on the owner worker with
+   * the wait and the admission headers (sp_reap_finish); these are the
+   * plain fallbacks for a socket the reaper has to end itself. */
+  [SP_REAP_FC_QUEUE_TIMEOUT] =
+      SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Retry-After: 1\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"admission_queue_timeout\"}", 1, 0),
+  [SP_REAP_FC_DRAINED] =
+      SP_REAP_TEXT("HTTP/1.1 503 Service Unavailable\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Retry-After: 5\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"admission_drained\"}", 1, 0),
 };
 
 /* End a client this thread decided against, answering it first.
@@ -264,6 +282,15 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
   }
 }
 
+void
+sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind)
+{
+  if (!pfe || kind == SP_REAP_NONE || kind >= SP_REAP_KINDS) {
+    return;
+  }
+  pd_reap_respond(pfe, kind);
+}
+
 /* Owner-worker half of pd_reap_respond, reached through the resume ring
  * (pd_resume_parked). The text goes out through the bounded TLS-aware sender
  * on the thread that owns the socket, then the connection ends the way this
@@ -283,12 +310,64 @@ sp_reap_client_chunked(proxy_fd_ent_t *pfe)
   return leg && leg->is_chunked_response;
 }
 
+/* A request ended while it waited in the capacity queue (the deadline, or
+ * a drain): the response says how long it waited and what the pool looks
+ * like, and the refusal is recorded on the trail like every other decision
+ * of the gate. Returns the length written into `out`, 0 to use the plain
+ * text. */
+static size_t
+sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
+{
+  char svc_ident[64];
+  fc_state_t *fc = pfe->fc.fc;
+  struct timespec ts;
+  uint64_t now_ns, queued_ms = 0;
+  uint32_t inflight = fc_inflight(fc), queued = fc_queued(fc);
+  uint32_t limit = fc ? fc->cfg.max_outstanding : 0;
+  uint32_t retry_after = kind == SP_REAP_FC_DRAINED ? 5 : fc_retry_after_s(fc);
+  int status = kind == SP_REAP_FC_DRAINED ? 503 : 504;
+  const char *code = kind == SP_REAP_FC_DRAINED ? "admission_drained"
+                                                : "admission_queue_timeout";
+  int n;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  if (pfe->fc.q_enqueue_ns > 0 && now_ns > pfe->fc.q_enqueue_ns) {
+    queued_ms = (now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL;
+  }
+  n = snprintf(out, cap,
+               "HTTP/1.1 %s\r\n"
+               "Content-Type: application/json\r\n"
+               "Retry-After: %u\r\n"
+               "X-Loxilb-Admission-Inflight: %u\r\n"
+               "X-Loxilb-Admission-Queued: %u\r\n"
+               "X-Loxilb-Admission-Limit: %u\r\n"
+               "Connection: close\r\n"
+               "\r\n"
+               "{\"error\":\"%s\",\"queued_ms\":%llu,\"retry_after\":%u}\r\n",
+               status == 503 ? "503 Service Unavailable" : "504 Gateway Timeout",
+               retry_after, inflight, queued, limit, code,
+               (unsigned long long)queued_ms, retry_after);
+  proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
+  ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
+                             svc_ident, proxy_effective_model(pfe),
+                             pfe->tenant_id, pfe->auth_key_id,
+                             pfe->auth_user_id, status, code,
+                             pfe->l7_peer_ip, proxy_origin_ip(pfe),
+                             (int)proxy_origin_trusted_hops(pfe));
+  log_info("[AIGateway] fd=%d ended while queued: status=%d code=%s "
+           "queued_ms=%llu inflight=%u queued=%u tenant=%s model=%s",
+           pfe->fd, status, code, (unsigned long long)queued_ms, inflight,
+           queued, pfe->tenant_id, proxy_effective_model(pfe));
+  return (n > 0 && n < (int)cap) ? (size_t)n : 0;
+}
+
 void
 sp_reap_finish(proxy_fd_ent_t *pfe)
 {
   uint8_t kind = pfe->reap_resp;
   const sp_reap_text_t *t;
-  char framed[256];
+  char framed[512];
   const char *buf;
   size_t len;
 
@@ -299,6 +378,13 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
   t = &sp_reap_texts[kind];
   buf = t->text;
   len = t->len;
+  if (kind == SP_REAP_FC_QUEUE_TIMEOUT || kind == SP_REAP_FC_DRAINED) {
+    size_t fl = sp_reap_fc_format(pfe, kind, framed, sizeof(framed));
+    if (fl > 0) {
+      buf = framed;
+      len = fl;
+    }
+  }
   /* An event written into a response in progress is body bytes: on a chunked
    * relay the client decodes chunks, so the event goes out as the last chunk
    * followed by the terminator, or the client never sees an event at all. */
@@ -1153,6 +1239,64 @@ check_draining_endpoints(void)
           pfe = pfe_next;
         }
         mp_node = mp_node->next;
+      }
+    }
+  }
+
+  /* Capacity-queue deadlines. A request parked by the capacity gate sits
+   * in its pool's queue with an absolute deadline; nothing else on the
+   * request path times it, since its reads are paused and no backend leg
+   * exists. Whichever of the pop, the client's departure and this pass
+   * takes the entry out first owns what happens to the connection: the
+   * take here fails when its turn or its cancellation came first, and then
+   * nothing is done. The 504 and the teardown go through pd_reap_respond,
+   * written by the socket's owner worker. */
+  {
+    struct timespec _qts;
+    uint64_t q_now_ns;
+    proxy_map_ent_t *q_node = proxy_struct->head;
+
+    clock_gettime(CLOCK_MONOTONIC, &_qts);
+    q_now_ns = (uint64_t)_qts.tv_sec * 1000000000ULL + (uint64_t)_qts.tv_nsec;
+    while (q_node) {
+      proxy_fd_ent_t *pfe = q_node->val.fdlist;
+      while (pfe) {
+        proxy_fd_ent_t *pfe_next = pfe->next;
+
+        if (pfe->odir == 0 && pfe->fc.state == FC_P_QUEUED && pfe->fc.fc &&
+            pfe->fc.q_deadline_ns > 0 && q_now_ns >= pfe->fc.q_deadline_ns &&
+            fc_queue_take(pfe->fc.fc, &pfe->fc)) {
+          fc_count(pfe->fc.fc, FC_R_QUEUE_TIMEOUT);
+          log_info("[AIGateway] fd=%d queue deadline: waited %llu ms >= %u ms "
+                   "with the pool still full (inflight=%u queued=%u) — 504",
+                   pfe->fd,
+                   (unsigned long long)((q_now_ns - pfe->fc.q_enqueue_ns) / 1000000ULL),
+                   pfe->fc.fc->cfg.max_queue_wait_ms, fc_inflight(pfe->fc.fc),
+                   fc_queued(pfe->fc.fc));
+          pfe->fc.state = FC_P_NONE;
+          pfe->pd_phase = PD_PHASE_ERROR;
+          pd_reap_respond(pfe, SP_REAP_FC_QUEUE_TIMEOUT);
+        }
+        pfe = pfe_next;
+      }
+      q_node = q_node->next;
+    }
+  }
+
+  /* Capacity-queue turns. A released unit wakes the oldest waiting request
+   * at once; this pass gives a turn again when that wake was lost on the
+   * way (the owner could not be woken, or the woken connection went away
+   * before it used the turn) and the pool has room with requests still
+   * waiting. Without it such a pool would idle while its queue ran into
+   * its deadlines. At most one wake per pool per pass. */
+  {
+    proxy_map_ent_t *k_node;
+    proxy_epval_t *k_ep, *k_tmp;
+
+    for (k_node = proxy_struct->head; k_node; k_node = k_node->next) {
+      HASH_ITER(hh, k_node->val.ephash, k_ep, k_tmp) {
+        if (k_ep->ai_gw_mode && fc_queued(&k_ep->fc) > 0)
+          fc_queue_wake_one(&k_ep->fc);
       }
     }
   }

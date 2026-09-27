@@ -53,6 +53,7 @@ state_with(fc_state_t *fc, uint8_t mode, uint32_t max_out,
   fc_cfg_t cfg = {0};
 
   memset(fc, 0, sizeof(*fc));
+  pthread_mutex_init(&fc->queue.lock, NULL);
   cfg.mode = mode;
   cfg.max_outstanding = max_out;
   cfg.ep_cap[FC_ROLE_NORMAL] = cap_normal;
@@ -82,11 +83,15 @@ hammer(void *arg)
 
   for (int i = 0; i < ROUNDS; i++) {
     fc_permit_t p;
+    /* A refusal is counted by the site that writes it, as the dispatch
+     * sites do; an acquire that fails may still end in a wait. */
     if (fc_service_acquire(w->fc, &p) != FC_ADMIT) {
+      fc_count(w->fc, FC_R_CAPACITY_SHED);
       w->shed++;
       continue;
     }
     if (fc_ep_acquire(w->fc, &p, w->ep, FC_ROLE_NORMAL) != FC_ADMIT) {
+      fc_count(w->fc, FC_R_CAPACITY_SHED);
       w->shed++;
       fc_permit_release(&p);
       continue;

@@ -2912,15 +2912,16 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 }
 
 /* A capacity refusal on one stream: the H2 twin of sp_h1_send_capacity_deny,
- * with the same admission headers an upstream router reads. */
+ * with the same admission headers an upstream router reads and the same
+ * Retry-After (5 s for a drain, 1 s otherwise: a stream never queues). */
 static int
 proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                             int status_code, const char *error_code,
                             const char *error_msg, uint32_t inflight,
-                            uint32_t limit)
+                            uint32_t queued, uint32_t limit, int retry_after)
 {
   char body[512];
-  char inflight_str[16], queued_str[4] = "0", limit_str[16];
+  char inflight_str[16], queued_str[16], limit_str[16];
   int blen;
 
   if (status_code == 503) {
@@ -2935,6 +2936,7 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   if (blen < 0 || blen >= (int)sizeof(body))
     blen = 0;
   snprintf(inflight_str, sizeof(inflight_str), "%u", inflight);
+  snprintf(queued_str, sizeof(queued_str), "%u", queued);
   snprintf(limit_str, sizeof(limit_str), "%u", limit);
   nghttp2_nv extra[3] = {
     { (uint8_t *)"x-loxilb-admission-inflight", (uint8_t *)inflight_str,
@@ -2944,7 +2946,8 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     { (uint8_t *)"x-loxilb-admission-limit", (uint8_t *)limit_str,
       24, strlen(limit_str), NGHTTP2_NV_FLAG_NONE },
   };
-  return h2_send_deny_frame(pfe, stream, status_code, 1, body, blen, extra, 3);
+  return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
+                            extra, 3);
 }
 
 /* ---- capacity admission at the HTTP/2 stream site ---------------------------
@@ -2958,15 +2961,25 @@ static void
 sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
               proxy_epval_t *tepval, fc_verdict_t v, int role)
 {
-  int status = (v == FC_NO_CAPACITY) ? 503 : 429;
-  const char *code = (v == FC_NO_CAPACITY) ? "admission_no_capacity"
-                                           : "admission_capacity";
-  const char *msg = (v == FC_NO_CAPACITY) ? "no healthy endpoint has capacity"
-                                          : "";
+  int status = (v == FC_NO_CAPACITY || v == FC_DRAINING) ? 503 : 429;
+  const char *code = v == FC_NO_CAPACITY ? "admission_no_capacity"
+                   : v == FC_DRAINING ? "gateway_draining"
+                   : "admission_capacity";
+  const char *msg = v == FC_NO_CAPACITY ? "no healthy endpoint has capacity"
+                  : v == FC_DRAINING ? "the gateway is draining for maintenance"
+                  : "";
   uint32_t inflight = fc_inflight(&tepval->fc);
+  uint32_t queued = fc_queued(&tepval->fc);
   uint32_t limit = fc_limit_for(&tepval->fc, role);
 
-  proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, limit);
+  /* A stream never waits: over a ceiling is a refusal on the stream, and
+   * the decision is counted here, where it is written. */
+  if (v == FC_SHED)
+    fc_count(&tepval->fc, FC_R_CAPACITY_SHED);
+  else if (v == FC_DRAINING)
+    fc_count(&tepval->fc, FC_R_DRAINING);
+  proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
+                              limit, v == FC_DRAINING ? 5 : 1);
   ai_gw_record_capacity_deny(stream->request_id, notify_worker_id(),
                              stream->svc_ident, stream->effective_model,
                              stream->tenant_id, stream->auth_key_id,
@@ -2994,9 +3007,12 @@ sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     fc_bypass(&tepval->fc, &stream->fc);
     return 0;
   }
-  if (fc_service_acquire(&tepval->fc, &stream->fc) == FC_SHED) {
-    sp_fc_h2_shed(pfe, stream, tepval, FC_SHED, -1);
-    return -1;
+  {
+    fc_verdict_t v = fc_service_acquire(&tepval->fc, &stream->fc);
+    if (v == FC_SHED || v == FC_DRAINING) {
+      sp_fc_h2_shed(pfe, stream, tepval, v, -1);
+      return -1;
+    }
   }
   return 0;
 }

@@ -2923,6 +2923,11 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->pd_balance_abs_threshold = dat->pd_balance_abs_threshold;
   pval->pd_session_ttl_sec = dat->pd_session_ttl_sec;
 
+  // Capacity admission queue: the nat2proxy hop of the additive chain
+  // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry). 0 = process default.
+  pval->fc_max_queue_depth = dat->fc_max_queue_depth;
+  pval->fc_max_queue_wait_ms = dat->fc_max_queue_wait_ms;
+
   // Per-endpoint circuit breaker enable (opt-in per rule)
   pval->cb_enable = dat->cb_enable;
 

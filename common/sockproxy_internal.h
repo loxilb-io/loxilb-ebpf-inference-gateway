@@ -180,8 +180,15 @@ int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
                                            const void *buf, size_t len);
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                            int retry_body, const char *code, const char *msg);
-void sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
-                              const char *msg, uint32_t inflight, uint32_t limit);
+/* `keep`: the refusal leaves the connection open for its next request (the
+ * body was fully buffered); otherwise it closes. Non-zero when the response
+ * was not written whole. */
+int sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
+                             const char *msg, uint32_t inflight, uint32_t queued,
+                             uint32_t limit, uint32_t retry_after, int keep);
+/* Service identity "VIP:port" from the connection's rule head ("" when the
+ * head is gone). */
+void proxy_pfe_svc_ident(proxy_fd_ent_t *pfe, char *buf, size_t len);
 
 /* Responses the reaper thread owes a client it is ending (sockproxy_health.c).
  * The reaper never writes the socket itself: it records the kind on
@@ -196,18 +203,36 @@ enum sp_reap_resp {
   SP_REAP_PD_GRACEFUL_DONE,     /* SSE terminator the backend dropped; teardown */
   SP_REAP_PD_STREAM_TIMEOUT,    /* 502 pd_decode_stream_timeout; teardown */
   SP_REAP_PD_IDLE_TIMEOUT,      /* 504 pd_idle_timeout; teardown */
+  SP_REAP_FC_QUEUE_TIMEOUT,     /* 504 admission_queue_timeout; teardown */
+  SP_REAP_FC_DRAINED,           /* 503 admission_drained; teardown */
   SP_REAP_KINDS,
 };
 void sp_reap_finish(proxy_fd_ent_t *pfe);
+/* Hand a response of `kind` to the connection's owner worker and end the
+ * connection there (sockproxy_health.c; the reaper's own entry point). The
+ * caller holds PROXY_LOCK. */
+void sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind);
 
 /* Capacity admission at the HTTP/1 dispatch site (sockproxy_http.c). Each
- * returns 0 to proceed; -1 means the request was refused, the response
- * written and the socket shut. The endpoint gate returns the endpoint the
- * unit landed on, which may differ from the selector's pick. */
+ * returns 0 to proceed, or one of the outcomes below: REFUSED (the
+ * response written and the socket shut), QUEUED (the request was parked
+ * in the pool's queue: the caller suspends the connection and keeps it),
+ * KEPT (refused, the response written, the connection kept for its next
+ * request). The endpoint gate returns the endpoint the unit landed on,
+ * which may differ from the selector's pick, or one of the outcomes. The
+ * role gate takes `may_wait`: a prefill/decode leg never waits. */
+#define SP_FC_H1_REFUSED (-1)
+#define SP_FC_H1_QUEUED  (-2)
+#define SP_FC_H1_KEPT    (-3)
 int sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval);
 int sp_fc_h1_gate_endpoint(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int sel);
-int sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role);
+int sp_fc_h1_gate_role(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int ep, int role,
+                       int may_wait);
 int sp_fc_normal_eligible(void *ctx, int ep);
+/* End every request waiting in the pool's queue with a response of `kind`
+ * (SP_REAP_FC_DRAINED): the pool is going away, or the process drains.
+ * The caller holds PROXY_LOCK. */
+void sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach);
 /* (R1): owner-worker resume of a parked client fd. Registered as
  * notify_cbs.resume and invoked ON THE PARKED FD'S OWNER WORKER (via notify_wake_worker)
  * when a prefill slot frees. Re-arms EPOLLIN, reconstructs the dispatch from the pfe
