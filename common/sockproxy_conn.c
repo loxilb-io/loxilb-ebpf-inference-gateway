@@ -1621,6 +1621,14 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
   fd_ent->has_vllm_request_id = 0;
   fd_ent->request_id_injected = 0;
 
+  /* The capacity permit of the request this connection was serving. Every
+   * client leg passes through this teardown, so this release is the one that
+   * always runs; the response-complete and keep-alive sites come earlier and
+   * are idempotent with it. It does not live in pd_cleanup: the keep-alive
+   * reset calls that right after the request is forwarded, while the backend
+   * is still executing it, and a unit handed back there bounds nothing. */
+  fc_permit_release(&fd_ent->fc);
+
   // Reset P/D orchestration state and free buffers
   pd_cleanup(fd_ent);
 

@@ -183,6 +183,23 @@ void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
 void sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                               const char *msg, uint32_t inflight, uint32_t limit);
 
+/* Responses the reaper thread owes a client it is ending (sockproxy_health.c).
+ * The reaper never writes the socket itself: it records the kind on
+ * pfe->reap_resp and wakes the fd's owner worker, which emits the text through
+ * the senders above and ends the connection (sp_reap_finish). */
+enum sp_reap_resp {
+  SP_REAP_NONE = 0,
+  SP_REAP_SSE_CAP,              /* SSE error event: stream duration cap; shutdown */
+  SP_REAP_PD_PREFILL_TIMEOUT,   /* 504 pd_prefill_timeout; teardown */
+  SP_REAP_PD_DECODE_TIMEOUT,    /* 504 pd_decode_timeout; teardown */
+  SP_REAP_PD_PARK_TIMEOUT,      /* 504 pd_admission_park_timeout; teardown */
+  SP_REAP_PD_GRACEFUL_DONE,     /* SSE terminator the backend dropped; teardown */
+  SP_REAP_PD_STREAM_TIMEOUT,    /* 502 pd_decode_stream_timeout; teardown */
+  SP_REAP_PD_IDLE_TIMEOUT,      /* 504 pd_idle_timeout; teardown */
+  SP_REAP_KINDS,
+};
+void sp_reap_finish(proxy_fd_ent_t *pfe);
+
 /* Capacity admission at the HTTP/1 dispatch site (sockproxy_http.c). Each
  * returns 0 to proceed; -1 means the request was refused, the response
  * written and the socket shut. The endpoint gate returns the endpoint the

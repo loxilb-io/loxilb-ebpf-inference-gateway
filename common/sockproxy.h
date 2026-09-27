@@ -1299,6 +1299,9 @@ struct proxy_fd_ent {
 
   // P/D Disaggregation orchestration state 
   pd_phase_t pd_phase;               // Current P/D orchestration phase
+  uint8_t  reap_resp;                // enum sp_reap_resp: a response the reaper thread
+                                     // owes this client, emitted by the fd's owner
+                                     // worker (sp_reap_finish); 0 = none
   uint8_t  is_pd_decode_backend;     // 1=this pfe is a decode backend (not prefill or client)
   // bounded backpressured admission — park bookkeeping. When this
   // client is parked (all prefill EPs capped, FIFO has room), park_ep_idx is the

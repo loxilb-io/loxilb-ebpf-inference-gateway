@@ -2177,6 +2177,9 @@ skip_deferred_masking:
         const char *ns_model = proxy_effective_model(rfd_ent);
         llb_ai_pd_record((char *)ns_model, prefill_ms, decode_ms, pd_kv, 0);
         rfd_ent->pd_phase = PD_PHASE_COMPLETE;
+        /* The disaggregated response is complete: its capacity units go back
+         * here, not at the teardown of a connection that may stay open. */
+        fc_permit_release(&rfd_ent->fc);
         pd_cleanup(rfd_ent);
       }
     }
@@ -4087,6 +4090,84 @@ proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max)
   return n;
 }
 
+/* One row per model pool of every AI-gateway service, in every gate mode.
+ * Counters are exported raw, like the shaper's: a pool that is deleted and
+ * re-created starts from zero, which Prometheus reads as a counter reset.
+ * The per-role endpoint gauges are summed over the pool's endpoints here so
+ * the export carries no endpoint index (no per-endpoint series). */
+_Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc.h");
+_Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
+_Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
+
+int
+proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
+{
+  proxy_map_ent_t *ent;
+  proxy_epval_t *tepval, *tmp_epval;
+  int n = 0;
+
+  if (!out || max <= 0 || !proxy_struct) {
+    return 0;
+  }
+
+  memset(out, 0, (size_t)max * sizeof(*out));
+
+  PROXY_RDLOCK();
+  for (ent = proxy_struct->head; ent && n < max; ent = ent->next) {
+    HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
+      if (!tepval->ai_gw_mode) {
+        continue;
+      }
+      if (n >= max) {
+        break;
+      }
+
+      proxy_fc_svc_stat_t *st = &out[n];
+      const fc_state_t *fc = &tepval->fc;
+      int n_eps = tepval->n_eps;
+
+      if (n_eps > FC_MAX_EP) {
+        n_eps = FC_MAX_EP;
+      }
+
+      st->xip = ent->key.xip;
+      st->xport = ntohs(ent->key.xport);
+      st->protocol = ent->key.protocol;
+      st->mode = fc->cfg.mode;
+      st->max_outstanding = fc->cfg.max_outstanding;
+      st->inflight = fc_inflight(fc);
+      for (int r = 0; r < FC_ROLES; r++) {
+        uint32_t sum = 0;
+
+        st->ep_cap[r] = fc->cfg.ep_cap[r];
+        for (int ep = 0; ep < n_eps; ep++) {
+          sum += fc_ep_inflight(fc, ep, r);
+        }
+        st->ep_inflight[r] = sum;
+      }
+      for (int d = 0; d < FC_R_COUNT; d++) {
+        st->decisions[d] = atomic_load_explicit(&fc->decisions[d],
+                                                memory_order_relaxed);
+      }
+      strncpy(st->pool, tepval->ephash_key, sizeof(st->pool) - 1);
+      st->pool[sizeof(st->pool) - 1] = '\0';
+      n++;
+    }
+  }
+  PROXY_UNLOCK();
+
+  return n;
+}
+
+uint64_t
+proxy_get_fc_anomaly(int kind)
+{
+  if (kind < 0 || kind >= FC_A_COUNT) {
+    return 0;
+  }
+  return atomic_load_explicit(&fc_anomaly_total[kind], memory_order_relaxed);
+}
+
 // P2: Configure draining policy for a proxy service
 // This sets the draining behavior when endpoints are marked inactive
 // policy: 0=GRACEFUL, 1=TIMED, 2=IMMEDIATE
@@ -4562,11 +4643,6 @@ cleanup_failed_ssl_connection(proxy_fd_ent_t *pfe)
 void
 pd_cleanup(proxy_fd_ent_t *fd_ent)
 {
-  /* The capacity permit of the request this connection served: this is the
-   * teardown owner, so this release is the one that always runs. Idempotent
-   * with the response-complete and keep-alive sites. */
-  fc_permit_release(&fd_ent->fc);
-
   /* RES-03: Log pd_phase on teardown for debugging disconnects */
   if (fd_ent->pd_phase != PD_PHASE_NONE) {
     log_debug("pd_cleanup: fd=%d pd_phase=%d prefill_ep=%d decode_ep=%d",
@@ -7616,6 +7692,15 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
 {
   if (!pfe || !tepval || pfe->odir != 0)
     return 0;
+  /* The request already holds its permit: this is the same request driven
+   * again (a backend connect that completed asynchronously re-enters the
+   * dispatch), not a new one. A new request always passes the message-begin
+   * boundary first, which hands the previous permit back, so an executing
+   * permit here is this request's own; releasing and re-taking it would count
+   * the request admitted twice and could refuse it on a unit another request
+   * took in between. */
+  if (pfe->fc.state == FC_P_EXECUTING && pfe->fc.fc == &tepval->fc)
+    return 0;
   /* A permit left over from an earlier request on this connection (its
    * release site never ran) is handed back before the new one is taken, so
    * a keep-alive connection can never accumulate units. */
@@ -9825,6 +9910,14 @@ pd_resume_parked(int fd)
     return;
   }
 
+  /* A response the reaper thread owes this client (pd_reap_respond): it is
+   * written here, on the socket's owner, and the connection ends. Before the
+   * park gate, because the reaper ends parked clients too. */
+  if (pfe->reap_resp) {
+    sp_reap_finish(pfe);
+    return;
+  }
+
   /* Tier-1 shaper wake rides the same owner-worker resume path. A QoS park
    * never consumed the pending payload, so re-arming EPOLLIN is the whole
    * resume — level-triggered poll re-drives handle_client_data with a
@@ -9992,6 +10085,15 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                    struct llb_sockmap_key *key, struct llb_sockmap_key *rkey)
 {
   int j;
+
+  /* The reaper thread owes this client a response (pd_reap_respond) and has
+   * paused its reads without touching the poll set, so a readable event can
+   * reach this owner worker before the ring wake does. Either arrival writes
+   * the response here, on the owner; nothing more is read or dispatched. */
+  if (pfe->odir == 0 && pfe->reap_resp) {
+    sp_reap_finish(pfe);
+    return 0;
+  }
 
   // CRITICAL: Bidirectional backpressure check (inter-event check)
   // This runs BEFORE starting a new burst loop to prevent reading when destination is full
