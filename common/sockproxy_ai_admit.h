@@ -105,6 +105,17 @@ typedef struct ai_gw_req_ctx {
    * hands both to the refusal record; it decides nothing on them. */
   const char *request_id;
   int         producer_id;
+
+  /* Where the request came from, filled by the caller beside the correlation
+   * above and handed straight to the refusal record; the gate decides
+   * nothing on them. client_ip is the socket peer and is always known.
+   * origin_ip is normally "" here and that is not an omission: the gate runs
+   * BEFORE the header splice that derives an origin, so a refused request
+   * usually has no attribution beyond its peer, and "" says exactly that
+   * rather than claiming the peer. trusted_hops pairs with origin_ip. */
+  const char *client_ip;
+  const char *origin_ip;
+  int         trusted_hops;
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {

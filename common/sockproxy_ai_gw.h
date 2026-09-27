@@ -185,6 +185,20 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *   svc_ident:      "VIP:port" of the rule ("" when unknown)
  *   is_stream:      1 when the response was an SSE stream, 0 otherwise
  *   producer_id:    notify_worker_id() of the calling thread; -1 when unknown
+ *   client_ip:      the socket peer of the connection the request arrived on,
+ *                   in text ("" when not known). Nothing a client sends can
+ *                   change it
+ *   origin_ip:      the address the request is ATTRIBUTED to: the peer at the
+ *                   edge, or the right-most hop of the forwarding chain that
+ *                   is not one of our own upstreams, on a listener that names
+ *                   the ranges they occupy. "" means no attribution ran for
+ *                   this request, which a reader must NOT read as "the origin
+ *                   is the peer" — nothing was decided
+ *   trusted_hops:   how many hops of ours the attribution walk stepped past.
+ *                   Read as a pair with origin_ip: it is the only thing that
+ *                   tells an origin that resolved back to the peer apart from
+ *                   a client that connected directly, since both report
+ *                   origin_ip == client_ip. 0 when nothing was derived
  *
  * Returns void.
  */
@@ -192,7 +206,9 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
                                   int64_t latency_ms, int prompt_tokens, int complet_tokens,
                                   int stream_start, int stream_end, char *error_code,
                                   char *request_id, char *user_id, char *key_id,
-                                  char *svc_ident, int is_stream, int producer_id);
+                                  char *svc_ident, int is_stream, int producer_id,
+                                  char *client_ip, char *origin_ip,
+                                  int trusted_hops);
 
 /*
  * llb_ai_record_deny – record one request refused at the admission gate.
@@ -214,11 +230,20 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
  *   stage:        ai_gw_admit_stage_t of the refusing arm
  *   http_status:  the status the caller answers with
  *   error_code:   the refusal's error code (NUL-terminated)
+ *   client_ip, origin_ip, trusted_hops: where the request came from, with
+ *                 exactly the meanings llb_ai_record_request documents. A
+ *                 refusal is the record most likely to be read as "who did
+ *                 this", so it carries the same attribution a completion
+ *                 does. Note that the gate runs BEFORE the header splice, so
+ *                 on a refused request origin_ip is normally "" — not
+ *                 derived — while client_ip is always known
  */
 extern void llb_ai_record_deny(char *request_id, int producer_id,
                                char *svc_ident, char *model_name,
                                char *tenant_id, char *key_id, char *user_id,
-                               int stage, int http_status, char *error_code);
+                               int stage, int http_status, char *error_code,
+                               char *client_ip, char *origin_ip,
+                               int trusted_hops);
 
 /*
  * llb_ai_stream_start – record the opening of an SSE stream.

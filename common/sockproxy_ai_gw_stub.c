@@ -114,7 +114,8 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                       int64_t latency_ms, int prompt_tokens, int complet_tokens,
                       int stream_start, int stream_end, char *error_code,
                       char *request_id, char *user_id, char *key_id,
-                      char *svc_ident, int is_stream, int producer_id)
+                      char *svc_ident, int is_stream, int producer_id,
+                      char *client_ip, char *origin_ip, int trusted_hops)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)tenant_id;
@@ -132,6 +133,9 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
     (void)svc_ident;
     (void)is_stream;
     (void)producer_id;
+    (void)client_ip;
+    (void)origin_ip;
+    (void)trusted_hops;
 }
 
 __attribute__((weak)) void
@@ -161,7 +165,8 @@ __attribute__((weak)) void
 llb_ai_record_deny(char *request_id, int producer_id,
                    char *svc_ident, char *model_name,
                    char *tenant_id, char *key_id, char *user_id,
-                   int stage, int http_status, char *error_code)
+                   int stage, int http_status, char *error_code,
+                   char *client_ip, char *origin_ip, int trusted_hops)
 {
     AI_GW_STUB_TRIPWIRE(warned);
     (void)request_id;
@@ -173,6 +178,9 @@ llb_ai_record_deny(char *request_id, int producer_id,
     (void)user_id;
     (void)stage;
     (void)http_status;
+    (void)client_ip;
+    (void)origin_ip;
+    (void)trusted_hops;
     (void)error_code;
 }
 

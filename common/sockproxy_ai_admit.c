@@ -146,7 +146,10 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
                        (char *)(req->svc_ident ? req->svc_ident : ""),
                        res->effective_model, res->tenant_id, res->key_id,
                        res->user_id, (int)res->stage, res->http_status,
-                       res->error_code);
+                       res->error_code,
+                       (char *)(req->client_ip ? req->client_ip : ""),
+                       (char *)(req->origin_ip ? req->origin_ip : ""),
+                       req->trusted_hops);
   }
   return rc;
 }

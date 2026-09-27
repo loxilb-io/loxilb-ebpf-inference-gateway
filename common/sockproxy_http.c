@@ -214,7 +214,10 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
                         pfe->usage_prompt_toks, pfe->usage_complet_toks,
                         0, 0, "", (char *)proxy_request_id(pfe),
                         (char *)pfe->auth_user_id, (char *)pfe->auth_key_id,
-                        svc_ident, 0, notify_worker_id());
+                        svc_ident, 0, notify_worker_id(),
+                        (char *)pfe->l7_peer_ip,
+                        (char *)proxy_origin_ip(pfe),
+                        (int)proxy_origin_trusted_hops(pfe));
   pfe->metric_ai_recorded = 1;
 }
 
@@ -796,7 +799,14 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
 
   size_t cur = buflen;
   l7h1_emit_ctx_t ctx = { buf, &cur, bufsize };
-  l7_apply_req_filters(pfe, node,
+  /* This protocol forwards one request before it parses the next, so the
+   * request's chain and the address it is attributed to sit on the
+   * connection; the reset at the keep-alive boundary is what keeps them one
+   * request's. */
+  l7_origin_scope_t origin = { &pfe->l7_inbound_hops,
+                               pfe->l7_origin_ip, sizeof(pfe->l7_origin_ip),
+                               &pfe->l7_trusted_hops };
+  l7_apply_req_filters(pfe, node, &origin,
                        xff_ip[0] ? xff_ip : NULL, listener_port, xfproto,
                        l7h1_emit, &ctx);
   return cur;
@@ -2049,7 +2059,10 @@ skip_deferred_masking:
                               (char *)proxy_request_id(rfd_ent),
                               (char *)rfd_ent->auth_user_id,
                               (char *)rfd_ent->auth_key_id,
-                              sse_rec_svc_ident, 1, notify_worker_id());
+                              sse_rec_svc_ident, 1, notify_worker_id(),
+                              (char *)rfd_ent->l7_peer_ip,
+                              (char *)proxy_origin_ip(rfd_ent),
+                              (int)proxy_origin_trusted_hops(rfd_ent));
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         log_debug("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
                  rfd_ent->fd, ent->fd, sse_model, (long long)latency_ms);
@@ -4764,6 +4777,14 @@ typedef struct {
   int  complet_toks;
   int  owes_record;    /* the completion record was deferred and is owed */
   int  owes_missing;   /* a 2xx completed and nothing charged it */
+  /* Where the request came from, copied here for the same reason its
+   * identity is: this is emitted after PROXY_LOCK is dropped, when the pfe
+   * may already have been recycled, so the accessors must be called at
+   * COLLECTION time and their answers carried, never called at the emit
+   * site. */
+  char client_ip[L7_HOP_TEXT_MAX];
+  char origin_ip[L7_HOP_TEXT_MAX];
+  int  trusted_hops;
 } proxy_umiss_t;
 
 typedef struct {
@@ -4882,6 +4903,9 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     snprintf(u->request_id, sizeof(u->request_id), "%s",
              proxy_request_id(pfe));
     proxy_pfe_svc_ident(pfe, u->svc_ident, sizeof(u->svc_ident));
+    snprintf(u->client_ip, sizeof(u->client_ip), "%s", pfe->l7_peer_ip);
+    snprintf(u->origin_ip, sizeof(u->origin_ip), "%s", proxy_origin_ip(pfe));
+    u->trusted_hops = (int)proxy_origin_trusted_hops(pfe);
     u->status       = (int)pfe->metric_response_status;
     u->prompt_toks  = pfe->usage_prompt_toks;
     u->complet_toks = pfe->usage_complet_toks;
@@ -5481,7 +5505,8 @@ proxy_pdestroy(void *priv)
       llb_ai_record_request(u->tenant, u->model, u->status, u->latency_ms,
                             u->prompt_toks, u->complet_toks, 0, 0, "",
                             u->request_id, u->user, u->key, u->svc_ident,
-                            0, notify_worker_id());
+                            0, notify_worker_id(),
+                            u->client_ip, u->origin_ip, u->trusted_hops);
       log_debug("[AI_NONSSE_RECORDED] on teardown tenant=%s model=%s status=%d",
                u->tenant, u->model, u->status);
     }
@@ -5527,7 +5552,8 @@ proxy_pdestroy(void *priv)
       llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
                             e->prompt_toks, e->complet_toks, 0, 0, "",
                             e->request_id, e->user, e->key, e->svc_ident,
-                            0, notify_worker_id());
+                            0, notify_worker_id(),
+                            e->client_ip, e->origin_ip, e->trusted_hops);
       /* Recorded as completed with no usage object to read — the H2 twin of
        * the H1 report above. Inside the status guard on purpose: a stream
        * with no backend status never completed a response, so it is a
@@ -7595,8 +7621,11 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
 }
 
 /* Fill the header-derived half of the gate's request view: credentials,
- * the model hint, the rule's enforcement mode. Body fields stay zero for
- * the caller to set. */
+ * the model hint, the rule's enforcement mode, and where the request came
+ * from. Body fields stay zero for the caller to set.
+ *
+ * All three H1 gate sites build their view here, so the refusal record
+ * carries the same attribution from each of them. */
 static void
 sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
                              const proxy_map_ent_t *hent,
@@ -7610,6 +7639,13 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   req->prefix_model = pfe->prefix_key.model;
   req->hdr_model = pfe->x_model_header;
   req->auth_mode = hent->val.ephash->apikey_auth;
+  /* The gate runs before the header splice, so a refused request normally
+   * has no derived origin and proxy_origin_ip returns "" — which says "not
+   * derived" and must not be read as the peer. The peer is known from
+   * accept. */
+  req->client_ip = pfe->l7_peer_ip;
+  req->origin_ip = proxy_origin_ip(pfe);
+  req->trusted_hops = (int)proxy_origin_trusted_hops(pfe);
 }
 
 /* True when the rule's admission policy enforces a credential. Mirrors the
@@ -8683,7 +8719,8 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
   // re-storing those names here is harmless. `at`/`length` are NOT NUL-terminated
   // (llhttp), and pfe->last_header_name IS NUL-terminated (set in handle_header_field),
   // so use the length-aware helper. The store is bounded (overflow dropped).
-  l7_store_header_n(pfe, pfe->last_header_name, strlen(pfe->last_header_name),
+  l7_store_header_n(pfe, &pfe->l7_inbound_hops,
+                    pfe->last_header_name, strlen(pfe->last_header_name),
                     at, length);
 
 	return 0;
@@ -8878,6 +8915,27 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->head = ent;
   npfe1->ssl = ssl;
   npfe1->odir = 0;  // Client-facing connection
+
+  /* The address this connection came from, in text, for everything that
+   * reports a request on it. Captured HERE rather than where the header
+   * splice already reads it, because the splice runs only on a listener with
+   * an L7 policy attached while every record on this connection wants the
+   * address its request arrived from; and once, because a socket peer cannot
+   * change over the life of a connection.
+   *
+   * The family is checked rather than assumed: a peer that is not IPv4
+   * leaves the field EMPTY, which reads as "not known" and never as an
+   * address. That matches the attribution walk, which cannot place an IPv6
+   * hop in a range either. */
+  {
+    struct sockaddr_in cpeer;
+    socklen_t cplen = sizeof(cpeer);
+    if (getpeername(new_sd, (struct sockaddr *)&cpeer, &cplen) == 0 &&
+        cpeer.sin_family == AF_INET) {
+      inet_ntop(AF_INET, &cpeer.sin_addr, npfe1->l7_peer_ip,
+                sizeof(npfe1->l7_peer_ip));
+    }
+  }
 
   // Check if kTLS was enabled during SSL_accept
   if (ssl && ktls_is_active(new_sd)) {

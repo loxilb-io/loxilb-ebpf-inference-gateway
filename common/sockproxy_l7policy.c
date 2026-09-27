@@ -871,38 +871,43 @@ l7_first_matching_route(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent)
   return NULL;
 }
 
-/* Store what the walk decided on the request's own shell. */
+/* Store what the walk decided, wherever this request keeps it. */
 static void
-l7_store_origin(struct proxy_fd_ent *pfe, const char *origin, uint8_t skipped)
+l7_store_origin(const l7_origin_scope_t *scope, const char *origin,
+                uint8_t skipped)
 {
-  if (!pfe)
+  if (!scope)
     return;
-  pfe->l7_origin_ip[0] = '\0';
-  pfe->l7_trusted_hops = skipped;
+  if (scope->trusted_hops)
+    *scope->trusted_hops = skipped;
+  if (!scope->origin_ip || scope->origin_len == 0)
+    return;
+  scope->origin_ip[0] = '\0';
   if (origin && origin[0] != '\0') {
-    strncpy(pfe->l7_origin_ip, origin, sizeof(pfe->l7_origin_ip) - 1);
-    pfe->l7_origin_ip[sizeof(pfe->l7_origin_ip) - 1] = '\0';
+    strncpy(scope->origin_ip, origin, scope->origin_len - 1);
+    scope->origin_ip[scope->origin_len - 1] = '\0';
   }
 }
 
 void
-l7_derive_origin(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
+l7_derive_origin(const l7_origin_scope_t *scope, struct proxy_map_ent *ent,
                  const char *peer_ip)
 {
   char origin[L7_HOP_TEXT_MAX];
   uint8_t skipped = 0;
 
-  if (!pfe || !ent)
+  if (!scope || !ent)
     return;
 
-  l7_origin_for_listener(&pfe->l7_inbound_hops,
+  l7_origin_for_listener(scope->hops,
                          ent->l7_trusted_ranges, ent->l7_n_trusted_ranges,
                          peer_ip, origin, sizeof(origin), &skipped);
-  l7_store_origin(pfe, origin, skipped);
+  l7_store_origin(scope, origin, skipped);
 }
 
 void
 l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
+                     const l7_origin_scope_t *scope,
                      const char *xff_ip, uint16_t listener_port,
                      const char *xfproto,
                      l7_hdr_emit_fn emit, void *ctx)
@@ -936,10 +941,10 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
   if (xff_ip && l7_hdr_value_valid(xff_ip)) {
     char chain[L7_HDR_VALUE_MAX];
 
-    l7_derive_origin(pfe, ent, xff_ip);
+    l7_derive_origin(scope, ent, xff_ip);
 
     if (ent->l7_n_trusted_ranges > 0 &&
-        l7_chain_append_peer(&pfe->l7_inbound_hops, xff_ip,
+        l7_chain_append_peer(scope ? scope->hops : NULL, xff_ip,
                              chain, sizeof(chain)) > 0 &&
         l7_hdr_value_valid(chain))
       emit(ctx, L7HDR_SET, "X-Forwarded-For", chain);
