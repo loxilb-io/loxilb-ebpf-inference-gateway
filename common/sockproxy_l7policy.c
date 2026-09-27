@@ -871,6 +871,36 @@ l7_first_matching_route(struct proxy_fd_ent *pfe, proxy_map_ent_t *ent)
   return NULL;
 }
 
+/* Store what the walk decided on the request's own shell. */
+static void
+l7_store_origin(struct proxy_fd_ent *pfe, const char *origin, uint8_t skipped)
+{
+  if (!pfe)
+    return;
+  pfe->l7_origin_ip[0] = '\0';
+  pfe->l7_trusted_hops = skipped;
+  if (origin && origin[0] != '\0') {
+    strncpy(pfe->l7_origin_ip, origin, sizeof(pfe->l7_origin_ip) - 1);
+    pfe->l7_origin_ip[sizeof(pfe->l7_origin_ip) - 1] = '\0';
+  }
+}
+
+void
+l7_derive_origin(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
+                 const char *peer_ip, l7_hop_list_t *hops_out)
+{
+  char origin[L7_HOP_TEXT_MAX];
+  uint8_t skipped = 0;
+
+  if (!pfe || !ent)
+    return;
+
+  l7_origin_for_listener(pfe->l7_inbound_chain,
+                         ent->l7_trusted_ranges, ent->l7_n_trusted_ranges,
+                         peer_ip, origin, sizeof(origin), &skipped, hops_out);
+  l7_store_origin(pfe, origin, skipped);
+}
+
 void
 l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
                      const char *xff_ip, uint16_t listener_port,
@@ -884,13 +914,38 @@ l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
   if (!pfe || !ent || !emit)
     return;
 
-  /* (1)-(3) Always-overwrite X-Forwarded-* trio. SET semantics =
-   * strip-any-existing + add, so a client-supplied XFF can NEVER be trusted —
- * loxilb is the trust boundary. Each value is validated (the peer
-   * IP / scheme are loxilb-derived and well-formed, but validate anyway as
-   * defence-in-depth — a malformed one is dropped, never spliced). */
-  if (xff_ip && l7_hdr_value_valid(xff_ip))
-    emit(ctx, L7HDR_SET, "X-Forwarded-For", xff_ip);
+  /* (1) X-Forwarded-For, and with it the address this request is attributed
+   * to — this is where the inbound chain and the listener's trusted ranges are
+   * both in hand.
+   *
+   * Told nothing about what sits in front of it, a listener REPLACES the
+   * inbound chain with the socket peer: the peer is the only address we
+   * observed, an inbound chain is whatever the sender chose to write, and SET
+   * is strip-any-existing + add. That is a proxy at the edge of a network, and
+   * byte-for-byte what every listener did before trusted ranges existed.
+   *
+   * Told which ranges our own upstreams occupy, it EXTENDS the chain with the
+   * peer instead, exactly as each hop in a chain extends it, so the backend
+   * and any hop beyond us still see what the upstream recorded. A chain that
+   * will not fit is dropped back to the peer rather than forwarded cut, since
+   * a cut chain would move which hop is right-most for the next reader.
+   *
+   * Each value is validated (the peer IP / scheme are loxilb-derived and
+   * well-formed, but validate anyway as defence-in-depth — a malformed one is
+   * dropped, never spliced). */
+  if (xff_ip && l7_hdr_value_valid(xff_ip)) {
+    l7_hop_list_t hops;
+    char chain[L7_HDR_VALUE_MAX];
+
+    l7_derive_origin(pfe, ent, xff_ip, &hops);
+
+    if (ent->l7_n_trusted_ranges > 0 &&
+        l7_chain_append_peer(&hops, xff_ip, chain, sizeof(chain)) > 0 &&
+        l7_hdr_value_valid(chain))
+      emit(ctx, L7HDR_SET, "X-Forwarded-For", chain);
+    else
+      emit(ctx, L7HDR_SET, "X-Forwarded-For", xff_ip);
+  }
 
   snprintf(port_str, sizeof(port_str), "%u", (unsigned)listener_port);
   emit(ctx, L7HDR_SET, "X-Forwarded-Port", port_str);
@@ -1240,6 +1295,12 @@ int proxy_detach_l7_policy(struct proxy_ent *key)
   while (node) {
     if (cmp_proxy_ent(&node->key, key)) {
       l7_clear_attached(node);          /* regfree + free + clear has_l7_policy */
+      /* The trusted ranges go with the policy they ride. Left standing they
+       * would keep a listener extending inbound chains with no policy
+       * attached, which is the one state in which nothing would re-state what
+       * this listener is allowed to believe. */
+      node->l7_n_trusted_ranges = 0;
+      memset(node->l7_trusted_ranges, 0, sizeof(node->l7_trusted_ranges));
       PROXY_UNLOCK();
       return 0;
     }
@@ -1247,4 +1308,57 @@ int proxy_detach_l7_policy(struct proxy_ent *key)
   }
   PROXY_UNLOCK();
   return 0;
+}
+
+/*
+ * proxy_attach_l7_trusted_ranges — record which peers on this listener are our
+ * own upstreams, and so whose forwarding chain may be believed.
+ *
+ * A SEPARATE entry point rather than more parameters on proxy_attach_l7_policy:
+ * the two halves of this feature land in two repositories, and a signature
+ * change here would break the build of the half that has not landed yet. It
+ * also makes the two independent of each other's order — attaching a policy
+ * does not disturb ranges already recorded, and re-attaching ranges does not
+ * disturb the policy. Detaching the policy drops the ranges (above), which is
+ * the one coupling the trust boundary requires.
+ *
+ * n_ranges == 0 clears the ranges, returning the listener to edge behaviour.
+ * Ranges arrive already parsed and masked (l7_trust_parse_cidr) so no text is
+ * parsed on the request path. Returns 0, or negative when there is no such
+ * listener or more ranges than a listener holds.
+ */
+int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
+                                   const l7_trusted_range_t *ranges,
+                                   int n_ranges)
+{
+  proxy_map_ent_t *node;
+
+  if (!key || !proxy_struct)
+    return -1;
+  if (n_ranges < 0 || n_ranges > L7_MAX_TRUSTED_RANGES)
+    return -1;
+  if (n_ranges > 0 && !ranges)
+    return -1;
+
+  PROXY_LOCK();
+  node = proxy_struct->head;
+  while (node) {
+    if (cmp_proxy_ent(&node->key, key)) {
+      memset(node->l7_trusted_ranges, 0, sizeof(node->l7_trusted_ranges));
+      if (n_ranges > 0)
+        memcpy(node->l7_trusted_ranges, ranges,
+               (size_t)n_ranges * sizeof(*ranges));
+      /* The count is published LAST: the request path reads it to decide
+       * whether to read the ranges at all. */
+      node->l7_n_trusted_ranges = (uint8_t)n_ranges;
+      PROXY_UNLOCK();
+      return 0;
+    }
+    node = node->next;
+  }
+  PROXY_UNLOCK();
+
+  log_error("l7policy trusted ranges: NO PROXY SERVICE for xip=0x%08x xport=%u proto=%u",
+            (unsigned)key->xip, (unsigned)key->xport, (unsigned)key->protocol);
+  return -1;
 }

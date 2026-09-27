@@ -648,6 +648,17 @@ test_l7trust: test_l7trust.c sockproxy_l7trust.h
 test_l7tr: test_l7trust
 	./test_l7trust
 
+# What a listener puts on the wire and what it attributes: the emitted header
+# ops, the origin recorded on the request, and the entry point an operator's
+# trusted ranges arrive through. Links the policy unit and stubs its callouts.
+test_l7origin: test_l7origin.c sockproxy_l7policy.o sockproxy_l7trust.h
+	$(CC) -Wall -Wextra -o $@ test_l7origin.c sockproxy_l7policy.o \
+		-I. -I../headers -lcrypto -lpthread
+
+.PHONY: test_l7or
+test_l7or: test_l7origin
+	./test_l7origin
+
 # Listener shard: listening sockets register on the worker after the relay
 # shards; relay placement (fd modulo, pinned) is unchanged.
 test_notify_shard: test_notify_shard.c notify.c log.c notify.h
