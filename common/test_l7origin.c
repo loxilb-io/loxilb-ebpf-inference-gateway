@@ -119,6 +119,14 @@ emitted(const char *name)
   return NULL;
 }
 
+/* The HTTP/1.1 shape: one connection carries one request at a time, so the
+ * chain it arrived with and the address it is attributed to both live on the
+ * connection shell. HTTP/2 passes its stream's instead. */
+#define PFE_SCOPE(p) (&(l7_origin_scope_t){ &(p)->l7_inbound_hops,       \
+                                            (p)->l7_origin_ip,           \
+                                            sizeof((p)->l7_origin_ip),   \
+                                            &(p)->l7_trusted_hops })
+
 /* Run the applier over a fresh request carrying `chain`. */
 static void
 apply_with_chain(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
@@ -126,9 +134,9 @@ apply_with_chain(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 {
   memset(pfe, 0, sizeof(*pfe));
   if (chain)
-    l7_store_header(pfe, "X-Forwarded-For", chain);
+    l7_store_header(pfe, &pfe->l7_inbound_hops, "X-Forwarded-For", chain);
   n_ops = 0;
-  l7_apply_req_filters(pfe, ent, peer, 8080, "https", capture, NULL);
+  l7_apply_req_filters(pfe, ent, PFE_SCOPE(pfe), peer, 8080, "https", capture, NULL);
 }
 
 static uint8_t
@@ -245,9 +253,9 @@ test_per_request(void)
   ent.l7_n_trusted_ranges = ranges_of(ent.l7_trusted_ranges, cidrs, 1);
 
   memset(&pfe, 0, sizeof(pfe));
-  l7_store_header(&pfe, "X-Forwarded-For", "203.0.113.5");
+  l7_store_header(&pfe, &pfe.l7_inbound_hops, "X-Forwarded-For", "203.0.113.5");
   n_ops = 0;
-  l7_apply_req_filters(&pfe, &ent, "10.0.0.7", 8080, "https", capture, NULL);
+  l7_apply_req_filters(&pfe, &ent, PFE_SCOPE(&pfe), "10.0.0.7", 8080, "https", capture, NULL);
   CHECK(strcmp(pfe.l7_origin_ip, "203.0.113.5") == 0,
         "the first request on a connection is attributed to its own chain");
 
@@ -262,9 +270,9 @@ test_per_request(void)
   CHECK(strcmp(proxy_origin_ip(&pfe), "203.0.113.5") == 0,
         "and the forwarded request's origin is still readable after it");
 
-  l7_store_header(&pfe, "X-Forwarded-For", "198.51.100.9");
+  l7_store_header(&pfe, &pfe.l7_inbound_hops, "X-Forwarded-For", "198.51.100.9");
   n_ops = 0;
-  l7_apply_req_filters(&pfe, &ent, "10.0.0.7", 8080, "https", capture, NULL);
+  l7_apply_req_filters(&pfe, &ent, PFE_SCOPE(&pfe), "10.0.0.7", 8080, "https", capture, NULL);
   CHECK(strcmp(pfe.l7_origin_ip, "198.51.100.9") == 0 && pfe.l7_trusted_hops == 0,
         "the second request is attributed to ITS chain, not the first's");
   e = emitted("X-Forwarded-For");
@@ -274,7 +282,7 @@ test_per_request(void)
   /* A request that arrives with no chain after one that did must not inherit. */
   l7_origin_reset(&pfe);
   n_ops = 0;
-  l7_apply_req_filters(&pfe, &ent, "10.0.0.7", 8080, "https", capture, NULL);
+  l7_apply_req_filters(&pfe, &ent, PFE_SCOPE(&pfe), "10.0.0.7", 8080, "https", capture, NULL);
   CHECK(strcmp(pfe.l7_origin_ip, "10.0.0.7") == 0 && pfe.l7_trusted_hops == 0,
         "a request with no chain of its own does not inherit the previous one");
 }
@@ -292,10 +300,10 @@ test_several_chain_lines(void)
   ent.l7_n_trusted_ranges = ranges_of(ent.l7_trusted_ranges, cidrs, 1);
 
   memset(&pfe, 0, sizeof(pfe));
-  l7_store_header(&pfe, "X-Forwarded-For", "9.9.9.9");
-  l7_store_header(&pfe, "x-forwarded-for", "203.0.113.5");   /* case-insensitive */
+  l7_store_header(&pfe, &pfe.l7_inbound_hops, "X-Forwarded-For", "9.9.9.9");
+  l7_store_header(&pfe, &pfe.l7_inbound_hops, "x-forwarded-for", "203.0.113.5");   /* case-insensitive */
   n_ops = 0;
-  l7_apply_req_filters(&pfe, &ent, "10.0.0.7", 8080, "https", capture, NULL);
+  l7_apply_req_filters(&pfe, &ent, PFE_SCOPE(&pfe), "10.0.0.7", 8080, "https", capture, NULL);
   e = emitted("X-Forwarded-For");
   CHECK(e && strcmp(e->value, "9.9.9.9, 203.0.113.5, 10.0.0.7") == 0,
         "several chain lines are one list, in the order they arrived");
@@ -438,14 +446,14 @@ test_overflowing_chain_keeps_the_right_end(void)
   }
 
   memset(&pfe, 0, sizeof(pfe));
-  l7_store_header(&pfe, "X-Forwarded-For", filler);
+  l7_store_header(&pfe, &pfe.l7_inbound_hops, "X-Forwarded-For", filler);
   CHECK(pfe.l7_inbound_hops.n_hops == L7_MAX_HOPS && pfe.l7_inbound_hops.truncated,
         "the client alone can fill the hop list");
 
   /* Our own upstream then records the real client in a second line. */
-  l7_store_header(&pfe, "X-Forwarded-For", "203.0.113.5");
+  l7_store_header(&pfe, &pfe.l7_inbound_hops, "X-Forwarded-For", "203.0.113.5");
   n_ops = 0;
-  l7_apply_req_filters(&pfe, &ent, "10.0.0.7", 8080, "https", capture, NULL);
+  l7_apply_req_filters(&pfe, &ent, PFE_SCOPE(&pfe), "10.0.0.7", 8080, "https", capture, NULL);
 
   CHECK(strcmp(pfe.l7_origin_ip, "203.0.113.5") == 0,
         "a client cannot push the real hop out of the list with a long chain");
@@ -479,9 +487,9 @@ test_snapshot_across_the_boundary(void)
 
   /* The next request on the connection takes over the live fields, and the
    * reader must then answer with ITS origin, not the snapshot behind it. */
-  l7_store_header(&pfe, "X-Forwarded-For", "198.51.100.9");
+  l7_store_header(&pfe, &pfe.l7_inbound_hops, "X-Forwarded-For", "198.51.100.9");
   n_ops = 0;
-  l7_apply_req_filters(&pfe, &ent, "10.0.0.7", 8080, "https", capture, NULL);
+  l7_apply_req_filters(&pfe, &ent, PFE_SCOPE(&pfe), "10.0.0.7", 8080, "https", capture, NULL);
   CHECK(strcmp(proxy_origin_ip(&pfe), "198.51.100.9") == 0 &&
         proxy_origin_trusted_hops(&pfe) == 0,
         "once the next request derives its own, that is what is read");
@@ -493,6 +501,95 @@ test_snapshot_across_the_boundary(void)
         "a request that derived nothing reads empty, not as the peer");
 }
 
+/* A connection that carries several requests must attribute each from ITS OWN
+ * hops, and the two protocols need different things for that to hold.
+ *
+ * HTTP/1.1 parses and forwards one request before it looks at the next, so
+ * one list on the connection is enough as long as the keep-alive boundary
+ * clears it - which test_snapshot_across_the_boundary already pins.
+ *
+ * HTTP/2 has no such window. nghttp2_session_mem_recv parses every frame in
+ * the receive buffer, and only then does the caller walk the streams that
+ * became ready and forward them. Several requests are therefore PARSED
+ * before the first is SPLICED, so no clearing point exists that could make
+ * one list correct: whatever the boundary, by the time the first request is
+ * forwarded the list holds the last one parsed. Each request needs its own.
+ *
+ * The damaging case is deliberately NOT "a request gets another's hop
+ * appended after its own" - the walk reads from the right, so its own hop
+ * would still be reached first and the answer would still be right. It is a
+ * request whose chain is entirely OURS: the walk exhausts its own hops, keeps
+ * going left into the other request's, and lands on that sender's address. */
+static void
+test_requests_parsed_together_keep_their_own_chains(void)
+{
+  static const char *cidrs[] = { "10.0.0.0/8" };
+  proxy_fd_ent_t pfe;
+  proxy_map_ent_t ent;
+  l7_hop_list_t a_hops, b_hops, shared;
+  char a_origin[L7_HOP_TEXT_MAX], b_origin[L7_HOP_TEXT_MAX];
+  uint8_t a_skipped = 0, b_skipped = 0;
+  const emitted_t *e;
+
+  memset(&ent, 0, sizeof(ent));
+  ent.l7_n_trusted_ranges = ranges_of(ent.l7_trusted_ranges, cidrs, 1);
+  memset(&pfe, 0, sizeof(pfe));
+  memset(&a_hops, 0, sizeof(a_hops));
+  memset(&b_hops, 0, sizeof(b_hops));
+  memset(a_origin, 0, sizeof(a_origin));
+  memset(b_origin, 0, sizeof(b_origin));
+
+  l7_origin_scope_t a = { &a_hops, a_origin, sizeof(a_origin), &a_skipped };
+  l7_origin_scope_t b = { &b_hops, b_origin, sizeof(b_origin), &b_skipped };
+
+  /* PARSE PHASE - both requests' headers are read, neither is forwarded.
+   * Request A comes from a real client through one of ours; request B's
+   * chain is entirely ours. */
+  l7_store_header(&pfe, &a_hops, "X-Forwarded-For", "203.0.113.5, 10.0.0.6");
+  l7_store_header(&pfe, &b_hops, "X-Forwarded-For", "10.0.0.6");
+
+  /* SPLICE PHASE - now, and only now, each is forwarded in turn. */
+  n_ops = 0;
+  l7_apply_req_filters(&pfe, &ent, &a, "10.0.0.7", 8080, "https", capture, NULL);
+  CHECK(strcmp(a_origin, "203.0.113.5") == 0 && a_skipped == 1,
+        "a request forwarded after a later one was parsed is still attributed "
+        "to its own client");
+  e = emitted("X-Forwarded-For");
+  CHECK(e && strcmp(e->value, "203.0.113.5, 10.0.0.6, 10.0.0.7") == 0,
+        "and it forwards its own chain, extended with the peer");
+
+  n_ops = 0;
+  l7_apply_req_filters(&pfe, &ent, &b, "10.0.0.7", 8080, "https", capture, NULL);
+  CHECK(strcmp(b_origin, "10.0.0.7") == 0 && b_skipped == 1,
+        "the other request, whose chain is all ours, resolves to the peer "
+        "with its trusted hops counted");
+  e = emitted("X-Forwarded-For");
+  CHECK(e && strcmp(e->value, "10.0.0.6, 10.0.0.7") == 0,
+        "and it forwards its own chain too, not the other request's");
+
+  /* THE COUNTER-PROOF. One list for both requests - which is exactly what a
+   * connection-level list holds once the whole receive buffer is parsed -
+   * and the all-trusted request is attributed to the OTHER request's client.
+   * No clearing point rescues this: the parse of the second request is what
+   * filled the list, and it happened before the first was ever forwarded. */
+  memset(&shared, 0, sizeof(shared));
+  l7_store_header(&pfe, &shared, "X-Forwarded-For", "203.0.113.5, 10.0.0.6");
+  l7_store_header(&pfe, &shared, "X-Forwarded-For", "10.0.0.6");
+  {
+    char shared_origin[L7_HOP_TEXT_MAX] = {0};
+    uint8_t shared_skipped = 0;
+    l7_origin_scope_t sh = { &shared, shared_origin, sizeof(shared_origin),
+                             &shared_skipped };
+    n_ops = 0;
+    l7_apply_req_filters(&pfe, &ent, &sh, "10.0.0.7", 8080, "https",
+                         capture, NULL);
+    CHECK(strcmp(shared_origin, "203.0.113.5") == 0,
+          "sharing one list between them attributes the all-trusted request "
+          "to the other request's client - the defect a per-request chain "
+          "removes");
+  }
+}
+
 int
 main(void)
 {
@@ -502,6 +599,7 @@ main(void)
   test_several_chain_lines();
   test_overflowing_chain_keeps_the_right_end();
   test_snapshot_across_the_boundary();
+  test_requests_parsed_together_keep_their_own_chains();
   test_attach_ranges();
   test_ranges_and_policy();
   printf("=== results: %d/%d passed ===\n", checks - failures, checks);

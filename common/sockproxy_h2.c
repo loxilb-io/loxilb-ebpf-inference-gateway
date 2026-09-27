@@ -305,6 +305,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                           stream->auth_key_id, stream->svc_ident, 0,
                           notify_worker_id());
 
+
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
      * charged nothing and — without this — reported nothing either. Gated on a
@@ -731,7 +732,15 @@ proxy_h2_on_header_callback(nghttp2_session *session,
   // the store is bounded (overflow dropped). Distinct from stream->request_headers
   // below (that is the per-stream forward buffer; this is the per-connection
   // match-operand store consumed by the L7 engine).
-  l7_store_header_n(pfe, (const char *)name, namelen,
+  //
+  // The forwarding chain rides the same helper, and so is parsed by the one
+  // parser on both protocols — but it is captured into THIS STREAM's list,
+  // not the connection's. Requests are forwarded only once the whole receive
+  // buffer has been parsed, so a connection-level list would by then hold
+  // every request in that buffer, and the first one spliced would be given
+  // the last one's chain to carry and be attributed to its sender.
+  l7_store_header_n(pfe, &stream->l7_inbound_hops,
+                    (const char *)name, namelen,
                     (const char *)value, valuelen);
 
   // ============================================================================
@@ -3408,6 +3417,7 @@ l7h2_emit(void *vctx, int op, const char *name, const char *value)
  */
 static int
 proxy_h2_build_l7_req_headers(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
+                              proxy_h2_stream_t *stream,
                               const nghttp2_nv *orig, size_t n_orig, int fd,
                               nghttp2_nv **out_nv, size_t *out_n,
                               l7h2_emit_ctx_t *ctx_out)
@@ -3439,7 +3449,15 @@ proxy_h2_build_l7_req_headers(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   uint16_t listener_port = ntohs(ent->key.xport);
   const char *xfproto = (pfe->ssl != NULL || pfe->ktls_enabled) ? "https" : "http";
 
-  l7_apply_req_filters(pfe, ent,
+  /* The chain and the attributed address belong to THIS stream. Every
+   * request in one receive buffer is parsed before any of them is forwarded,
+   * so reading them off the connection here would splice and attribute this
+   * request with whichever request in that buffer was parsed last. */
+  l7_origin_scope_t origin = { &stream->l7_inbound_hops,
+                               stream->l7_origin_ip,
+                               sizeof(stream->l7_origin_ip),
+                               &stream->l7_trusted_hops };
+  l7_apply_req_filters(pfe, ent, &origin,
                        xff_ip[0] ? xff_ip : NULL, listener_port, xfproto,
                        l7h2_emit, ctx_out);
 
@@ -4265,8 +4283,9 @@ h2_have_tepval:
   int l7_hdr_built = 0;
   if (ent && ent->has_l7_policy) {
     size_t l7_n = 0;
-    if (proxy_h2_build_l7_req_headers(pfe, ent, headers, nheaders, pfe->fd,
-                                      &l7_headers_nv, &l7_n, &l7_hdr_ctx) == 0) {
+    if (proxy_h2_build_l7_req_headers(pfe, ent, stream, headers, nheaders,
+                                      pfe->fd, &l7_headers_nv, &l7_n,
+                                      &l7_hdr_ctx) == 0) {
       headers = l7_headers_nv;
       nheaders = l7_n;
       l7_hdr_built = 1;

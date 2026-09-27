@@ -796,7 +796,14 @@ l7_inject_req_headers_h1(proxy_fd_ent_t *pfe, proxy_map_ent_t *node,
 
   size_t cur = buflen;
   l7h1_emit_ctx_t ctx = { buf, &cur, bufsize };
-  l7_apply_req_filters(pfe, node,
+  /* This protocol forwards one request before it parses the next, so the
+   * request's chain and the address it is attributed to sit on the
+   * connection; the reset at the keep-alive boundary is what keeps them one
+   * request's. */
+  l7_origin_scope_t origin = { &pfe->l7_inbound_hops,
+                               pfe->l7_origin_ip, sizeof(pfe->l7_origin_ip),
+                               &pfe->l7_trusted_hops };
+  l7_apply_req_filters(pfe, node, &origin,
                        xff_ip[0] ? xff_ip : NULL, listener_port, xfproto,
                        l7h1_emit, &ctx);
   return cur;
@@ -8683,7 +8690,8 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
   // re-storing those names here is harmless. `at`/`length` are NOT NUL-terminated
   // (llhttp), and pfe->last_header_name IS NUL-terminated (set in handle_header_field),
   // so use the length-aware helper. The store is bounded (overflow dropped).
-  l7_store_header_n(pfe, pfe->last_header_name, strlen(pfe->last_header_name),
+  l7_store_header_n(pfe, &pfe->l7_inbound_hops,
+                    pfe->last_header_name, strlen(pfe->last_header_name),
                     at, length);
 
 	return 0;

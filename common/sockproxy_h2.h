@@ -18,6 +18,7 @@
 #include <time.h>
 #include <pthread.h>
 #include "uthash.h"
+#include "sockproxy_l7trust.h"   /* l7_hop_list_t on the per-stream request state */
 
 // Forward declarations
 struct proxy_fd_ent;
@@ -179,9 +180,29 @@ typedef struct proxy_h2_stream {
   char conversation_id[128];         // X-Conversation-ID header
   int has_conv_id;                   // Flag: conversation ID present
   
+  // The forwarding chain this REQUEST arrived with, and the address the
+  // attribution walk decided it came from. Per stream, not per connection,
+  // and that is the whole point: on this protocol one connection parses
+  // several requests before any of them is forwarded
+  // (nghttp2_session_mem_recv drains the whole receive buffer, and
+  // proxy_h2_handle_client_data only then walks the ready streams), so a
+  // single list on the connection holds every one of their chains by the
+  // time the first is read back. A request would be spliced with, and
+  // attributed to, another request's chain. HTTP/1.1 has no such window -
+  // it parses and forwards one request before the next - which is why the
+  // connection-level list there is sound.
+  //
+  // l7_origin_ip is EMPTY when no derivation ran for this stream, which a
+  // reader must not confuse with "the origin is the peer"; l7_trusted_hops
+  // is how many hops of ours the walk stepped past, and the two are read as
+  // a pair. Both are written at splice time, from the chain above.
+  l7_hop_list_t l7_inbound_hops;
+  char     l7_origin_ip[L7_HOP_TEXT_MAX];
+  uint8_t  l7_trusted_hops;
+
   // Backend association
   int backend_ep_idx;                // Which backend endpoint handles this stream (-1 = not assigned)
-  
+
   // Timing
   time_t created_ts;                 // Stream creation time
   time_t last_activity_ts;           // Last frame received/sent
