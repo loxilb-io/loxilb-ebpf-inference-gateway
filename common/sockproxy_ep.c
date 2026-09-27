@@ -33,6 +33,7 @@
 #include "notify.h"
 #include "sockproxy.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_h2_load.h"   /* bounded-load units follow a moved pick */
 #include "sockproxy_metrics.h"
 #include "sockproxy_cache.h"    /* cmp_proxy_ent */
 #include "sockproxy_conn.h"     /* proxy_setup_ep_connect */
@@ -493,8 +494,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "\r\n"
                       "{\"error\":\"no_route\","
                       "\"detail\":\"L7 FORWARD resolved no backend pool\"}\r\n";
-                  send(pfe->fd, l7_no_pool_resp, strlen(l7_no_pool_resp),
-                       MSG_DONTWAIT | MSG_NOSIGNAL);
+                  proxy_send_local_response(pfe, l7_no_pool_resp, strlen(l7_no_pool_resp));
                   pfe->lb_err_body_sent = 1;
                 }
                 return -1;
@@ -521,8 +521,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                        "{\"error\":\"model_unavailable\",\"model\":\"%s\","
                        "\"detail\":\"no backend pool for this model\"}\r\n",
                        effective_model);
-              send(pfe->fd, response_buf, strlen(response_buf),
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              proxy_send_local_response(pfe, response_buf, strlen(response_buf));
               log_info("[MODEL_ROUTING] 503 sent for model='%s' on fd=%d",
                        effective_model, pfe->fd);
               pfe->lb_err_body_sent = 1;
@@ -540,8 +539,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                   "\r\n"
                   "{\"error\":\"no_route\","
                   "\"detail\":\"no routing rule matched the request path\"}\r\n";
-              send(pfe->fd, no_route_resp, strlen(no_route_resp),
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              proxy_send_local_response(pfe, no_route_resp, strlen(no_route_resp));
               log_info("[PROXY_NO_ROUTE] 503 sent: no prefix match for path='%s' on fd=%d",
                        request_path ? request_path : "", pfe->fd);
               pfe->lb_err_body_sent = 1;
@@ -561,8 +559,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                     "\r\n"
                     "{\"error\":\"no_rules\","
                     "\"detail\":\"all routing rules have been removed for this service\"}\r\n";
-                send(pfe->fd, no_rule_resp, strlen(no_rule_resp),
-                     MSG_DONTWAIT | MSG_NOSIGNAL);
+                proxy_send_local_response(pfe, no_rule_resp, strlen(no_rule_resp));
                 log_info("[PROXY_NO_RULES] 503 sent on fd=%d (empty ephash)", pfe->fd);
               } else {
                 log_error("Default endpoint (ephash) is NULL!");
@@ -581,6 +578,14 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           break;
         }
         
+        /* Capacity admission, service level. The pool and its ceilings are
+         * known here and no selector has run yet; a refusal is answered on
+         * the client socket and ends the request before any backend byte.
+         * Only AI-gateway pools take the gate, so a plain rule's dispatch
+         * is byte for byte what it was. */
+        if (pfe && tepval->ai_gw_mode && sp_fc_h1_gate_service(pfe, tepval) != 0)
+          return -1;
+
         // Endpoint selection based on algorithm
         int algorithm_selection = -1;
 
@@ -606,7 +611,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "HTTP/1.1 400 Bad Request\r\n"
                       "Content-Type: application/json\r\nConnection: close\r\n\r\n"
                       "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
-                  send(pfe->fd, bad_salt, sizeof(bad_salt) - 1, MSG_NOSIGNAL);
+                  proxy_send_local_response(pfe, bad_salt, sizeof(bad_salt) - 1);
                   return -1;
                 }
                 if (policy_rc == 0)
@@ -675,7 +680,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                       "HTTP/1.1 400 Bad Request\r\n"
                       "Content-Type: application/json\r\nConnection: close\r\n\r\n"
                       "{\"error\":\"invalid_cache_salt\",\"detail\":\"cache_salt must be a non-empty JSON string of at most 63 bytes\"}\r\n";
-                  send(pfe->fd, bad_salt, sizeof(bad_salt) - 1, MSG_NOSIGNAL);
+                  proxy_send_local_response(pfe, bad_salt, sizeof(bad_salt) - 1);
                   return -1;
                 }
                 if (policy_rc == 0)
@@ -779,8 +784,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\r\n"
                 "{\"error\":\"pd_overloaded\","
                 "\"detail\":\"all prefill endpoints at in-flight capacity\"}\r\n";
-              send(pfe->fd, pd_429_resp, strlen(pd_429_resp),
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              proxy_send_local_response(pfe, pd_429_resp, strlen(pd_429_resp));
               pfe->lb_err_body_sent = 1;
             }
             return -1;
@@ -807,13 +811,19 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\","
                 "\"detail\":\"no healthy prefill or decode endpoint\"}\r\n";
-              send(pfe->fd, pd_503_resp, strlen(pd_503_resp),
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              proxy_send_local_response(pfe, pd_503_resp, strlen(pd_503_resp));
               pfe->lb_err_body_sent = 1;
             }
             return -1;
           }
 
+          /* Capacity admission, role level: one prefill unit and one decode
+           * unit for this request, each a CAS under its own ceiling, taken
+           * BEFORE the load counters move so a refusal leaves them untouched. */
+          if (pfe &&
+              (sp_fc_h1_gate_role(pfe, tepval, pd_prefill, FC_ROLE_PREFILL) != 0 ||
+               sp_fc_h1_gate_role(pfe, tepval, pd_decode, FC_ROLE_DECODE) != 0))
+            return -1;
           /* INTG-06: Increment active_conns for selected EPs */
           atomic_fetch_add(&tepval->pd_ep_loads[pd_prefill].active_conns, 1);
           atomic_fetch_add(&tepval->pd_ep_loads[pd_decode].active_conns, 1);
@@ -1020,8 +1030,7 @@ pd_fallback_normal:
                   "\r\n"
                   "{\"error\":\"no_healthy_backend\","
                   "\"detail\":\"all backend endpoints down or circuit-broken\"}\r\n";
-              send(pfe->fd, lb_all_down_503, strlen(lb_all_down_503),
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
+              proxy_send_local_response(pfe, lb_all_down_503, strlen(lb_all_down_503));
               pfe->lb_err_body_sent = 1;
             }
             return -1;  // No active endpoints available
@@ -1029,6 +1038,26 @@ pd_fallback_normal:
         } else {
           // Use algorithm-selected endpoint
           sel = algorithm_selection;
+        }
+
+        /* Capacity admission, endpoint level: the pick above is a preference,
+         * the unit is the decision. A pick over its ceiling moves to another
+         * eligible endpoint with room, or the request is refused. */
+        if (pfe && tepval->ai_gw_mode) {
+          int fc_sel = sp_fc_h1_gate_endpoint(pfe, tepval, sel);
+          if (fc_sel < 0)
+            return -1;
+          if (fc_sel != sel) {
+            /* Bounded-load selectors counted the original pick as a
+             * connection unit; the unit follows the request. */
+            if (h2_load_units_active(tepval)) {
+              chwbl_dec_runtime(tepval, sel);
+              chwbl_inc_runtime(tepval, fc_sel);
+            }
+            log_info("[AIGateway] fd=%d capacity moved the pick: ep[%d] -> ep[%d]",
+                     pfe->fd, sel, fc_sel);
+            sel = fc_sel;
+          }
         }
 
         epip = tepval->eps[sel].xip;
@@ -1208,7 +1237,7 @@ pd_fallback_normal:
                 "\r\n"
                 "{\"error\":\"pd_pool_unavailable\","
                 "\"detail\":\"all prefill endpoints unreachable\"}\r\n";
-              send(pfe->fd, pd_503, strlen(pd_503), MSG_DONTWAIT | MSG_NOSIGNAL); }
+              proxy_send_local_response(pfe, pd_503, strlen(pd_503)); }
             /* Clear EP indices so pd_cleanup() skips double-decrement */
             pfe->pd_prefill_ep_idx = -1;
             pfe->pd_decode_ep_idx  = -1;
@@ -1293,7 +1322,7 @@ pd_fallback_normal:
                   "\r\n"
                   "{\"error\":\"backend_unreachable\","
                   "\"detail\":\"no healthy backend endpoint accepted the connection\"}\r\n";
-              send(pfe->fd, lb_502, strlen(lb_502), MSG_DONTWAIT | MSG_NOSIGNAL);
+              proxy_send_local_response(pfe, lb_502, strlen(lb_502));
             }
             pfe->lb_err_body_sent = 1;
           }
@@ -1671,7 +1700,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
                   "\r\n"
                   "{\"error\":\"service_unavailable\","
                   "\"detail\":\"all backend endpoints unreachable\"}\r\n";
-              send(pfe->fd, err_503, strlen(err_503), MSG_DONTWAIT | MSG_NOSIGNAL);
+              proxy_send_local_response(pfe, err_503, strlen(err_503));
             }
             return -1;
           }
@@ -1764,7 +1793,7 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
               "\r\n"
               "{\"error\":\"service_unavailable\","
               "\"detail\":\"all backend endpoints unreachable\"}\r\n";
-          send(pfe->fd, err_503, strlen(err_503), MSG_DONTWAIT | MSG_NOSIGNAL);
+          proxy_send_local_response(pfe, err_503, strlen(err_503));
         }
         if (sel) {
           ep_sel->n_eps = sel;

@@ -159,6 +159,174 @@ pd_teardown_conn(proxy_fd_ent_t *client)
   /* else: a notify worker owns the client's proxy_pdestroy()+free — skip. */
 }
 
+/* The text of every response this thread owes a client it ends, by kind
+ * (enum sp_reap_resp). Emitted by the fd's owner worker through the bounded
+ * TLS-aware sender (sp_reap_finish), or by the plaintext fallback below when
+ * that worker cannot be woken. `teardown` selects how the connection ends:
+ * the single-owner teardown of a request, or a shutdown of a stream the event
+ * loop then cleans up. */
+typedef struct sp_reap_text {
+  const char *text;
+  size_t len;
+  uint8_t teardown;
+  uint8_t body;      /* an event inside a response in progress, not a response */
+} sp_reap_text_t;
+
+#define SP_REAP_TEXT(s, td, body) { (s), sizeof(s) - 1, (td), (body) }
+
+static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
+  [SP_REAP_NONE] = { NULL, 0, 0 },
+  [SP_REAP_SSE_CAP] =
+      SP_REAP_TEXT("data: {\"error\":\"max_stream_duration_exceeded\"}\n\n", 0, 1),
+  [SP_REAP_PD_PREFILL_TIMEOUT] =
+      SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"pd_prefill_timeout\"}", 1, 0),
+  [SP_REAP_PD_DECODE_TIMEOUT] =
+      SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"pd_decode_timeout\"}", 1, 0),
+  [SP_REAP_PD_PARK_TIMEOUT] =
+      SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"pd_admission_park_timeout\"}", 1, 0),
+  [SP_REAP_PD_GRACEFUL_DONE] = SP_REAP_TEXT("data: [DONE]\n\n", 1, 1),
+  [SP_REAP_PD_STREAM_TIMEOUT] =
+      SP_REAP_TEXT("HTTP/1.1 502 Bad Gateway\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"pd_decode_stream_timeout\"}", 1, 0),
+  [SP_REAP_PD_IDLE_TIMEOUT] =
+      SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
+                   "Content-Type: application/json\r\n"
+                   "Connection: close\r\n"
+                   "\r\n"
+                   "{\"error\":\"pd_idle_timeout\"}", 1, 0),
+};
+
+/* End a client this thread decided against, answering it first.
+ *
+ * This thread runs under PROXY_LOCK while the fd's owner worker holds no lock
+ * in its event path, so a write from here races the worker's own writes, and
+ * on a TLS listener it is a plaintext write inside the TLS stream (SSL_write
+ * is not safe off the owner either). The response is therefore handed to the
+ * owner worker: the kind goes on pfe->reap_resp, client reads are paused so
+ * no further request bytes are dispatched meanwhile, and the worker is woken
+ * through the resume ring; sp_reap_finish then emits the text through the
+ * bounded TLS-aware sender and ends the connection. Only when the worker
+ * cannot be woken (no owner, ring full) does this thread end the connection
+ * itself: a plaintext socket still gets the text, a TLS socket gets a clean
+ * close with no body rather than bytes the record layer cannot decode. Either
+ * way nothing leaks.
+ *
+ * The caller has already moved the connection out of every pass of this
+ * thread (pd_phase ERROR or COMPLETE, or sse_active cleared), so the worker
+ * owing the response is never reaped a second time. */
+static void
+pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
+{
+  const sp_reap_text_t *t = &sp_reap_texts[kind];
+
+  if (pfe->fd > 0 && proxy_struct->ns) {
+    int owner = notify_owner_thr(proxy_struct->ns, pfe->fd);
+
+    if (owner >= 0) {
+      pfe->reap_resp = kind;
+      pfe->read_paused = 1;
+      if (notify_wake_worker(proxy_struct->ns, owner, pfe->fd) == 0) {
+        return;
+      }
+      pfe->reap_resp = SP_REAP_NONE;
+      log_warn("[REAPER] fd=%d: owner worker %d could not be woken, ending "
+               "the connection from the health thread", pfe->fd, owner);
+    }
+  }
+
+  if (pfe->fd > 0 && t->text) {
+    if (pfe->ssl) {
+      log_warn("[REAPER] fd=%d: TLS client ended without the response body "
+               "(no owner hand-off)", pfe->fd);
+    } else {
+      send(pfe->fd, t->text, t->len, MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+  }
+  if (t->teardown) {
+    pd_teardown_conn(pfe);
+  } else if (pfe->fd > 0) {
+    shutdown(pfe->fd, SHUT_RDWR);
+  }
+}
+
+/* Owner-worker half of pd_reap_respond, reached through the resume ring
+ * (pd_resume_parked). The text goes out through the bounded TLS-aware sender
+ * on the thread that owns the socket, then the connection ends the way this
+ * thread would have ended it: the single-owner teardown under PROXY_LOCK for
+ * a request, a shutdown for a stream the event loop cleans up. The kind is
+ * cleared first, so a second wake for the same fd finds nothing to do. */
+/* Whether the response this client is reading arrives chunked: the framing
+ * is the backend leg's, detected on its response headers. */
+static int
+sp_reap_client_chunked(proxy_fd_ent_t *pfe)
+{
+  proxy_fd_ent_t *leg;
+
+  if (pfe->n_rfd <= 0)
+    return 0;
+  leg = __atomic_load_n(&pfe->rfd_ent[0], __ATOMIC_ACQUIRE);
+  return leg && leg->is_chunked_response;
+}
+
+void
+sp_reap_finish(proxy_fd_ent_t *pfe)
+{
+  uint8_t kind = pfe->reap_resp;
+  const sp_reap_text_t *t;
+  char framed[256];
+  const char *buf;
+  size_t len;
+
+  pfe->reap_resp = SP_REAP_NONE;
+  if (kind == SP_REAP_NONE || kind >= SP_REAP_KINDS) {
+    return;
+  }
+  t = &sp_reap_texts[kind];
+  buf = t->text;
+  len = t->len;
+  /* An event written into a response in progress is body bytes: on a chunked
+   * relay the client decodes chunks, so the event goes out as the last chunk
+   * followed by the terminator, or the client never sees an event at all. */
+  if (buf && t->body && sp_reap_client_chunked(pfe)) {
+    int n = snprintf(framed, sizeof(framed), "%zx\r\n%s\r\n0\r\n\r\n",
+                     t->len, t->text);
+    if (n > 0 && n < (int)sizeof(framed)) {
+      buf = framed;
+      len = (size_t)n;
+    }
+  }
+  if (pfe->fd > 0 && buf) {
+    if (proxy_send_local_response_and_shutdown(pfe, buf, len) != 0) {
+      log_error("[REAPER] fd=%d failed to send complete bounded response "
+                "(kind %u)", pfe->fd, kind);
+    } else {
+      log_debug("[REAPER] fd=%d: response kind %u (%zu bytes%s) written by "
+                "the owner worker", pfe->fd, kind, len,
+                buf == framed ? ", chunk-framed" : "");
+    }
+  }
+  if (t->teardown) {
+    PROXY_LOCK();
+    pd_teardown_conn(pfe);
+    PROXY_UNLOCK();
+  }
+}
+
 /* prefill-timeout default with an env override (LLB_PD_PREFILL_TIMEOUT_SEC).
  * Unset/invalid => 30s (the production default, behaviour-identical). The override
  * exists so the prefill-timeout reaper — the path that drives pd_teardown_conn,
@@ -619,9 +787,6 @@ check_draining_endpoints(void)
    * effective_cap = min(max_stream_duration_sec, PROXY_SSE_HARD_CAP_SEC) when
    * max_stream_duration_sec > 0, else PROXY_SSE_HARD_CAP_SEC (24 h hard cap). */
   {
-    static const char sse_dur_err[] =
-        "data: {\"error\":\"max_stream_duration_exceeded\"}\n\n";
-
     proxy_map_ent_t *sse_node = proxy_struct->head;
     while (sse_node) {
       proxy_fd_ent_t *pfe = sse_node->val.fdlist;
@@ -640,10 +805,6 @@ check_draining_endpoints(void)
           if (elapsed >= cap) {
             log_debug("[SSE_CAP] fd=%d: elapsed=%lds >= cap=%lds, terminating stream",
                      pfe->fd, (long)elapsed, (long)cap);
-            /* Deliver an error SSE event before shutdown so the client can react. */
-            if (pfe->fd > 0) {
-              send(pfe->fd, sse_dur_err, sizeof(sse_dur_err) - 1, MSG_NOSIGNAL);
-            }
             /* Decrement the active-streams gauge BEFORE clearing sse_active.
              * PROXY_LOCK() is held throughout check_draining_endpoints, so the
              * call is safe without copying the model field (idempotent CAS inside).
@@ -654,10 +815,10 @@ check_draining_endpoints(void)
             llb_ai_stream_end("", (char *)proxy_effective_model(pfe));
             pfe->stream_end_ts = now;
             pfe->sse_active = 0;  /* Reset so eviction suppression no longer blocks cleanup */
-            /* Terminate both directions; the epoll loop will clean up. */
-            if (pfe->fd > 0) {
-              shutdown(pfe->fd, SHUT_RDWR);
-            }
+            /* An error SSE event so the client can react, then both
+             * directions shut; the event loop cleans up. Written by the
+             * socket's owner worker (pd_reap_respond). */
+            pd_reap_respond(pfe, SP_REAP_SSE_CAP);
           }
         }
 
@@ -757,19 +918,6 @@ check_draining_endpoints(void)
    * detect prefill phases that have exceeded their timeout.  Default is 30s
    * (typical prefill completes in 50-500ms). */
   {
-    static const char pd_timeout_resp[] =
-        "HTTP/1.1 504 Gateway Timeout\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{\"error\":\"pd_prefill_timeout\"}";
-    static const char pd_decode_timeout_resp[] =
-        "HTTP/1.1 504 Gateway Timeout\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{\"error\":\"pd_decode_timeout\"}";
-
     proxy_map_ent_t *pd_node = proxy_struct->head;
     while (pd_node) {
       proxy_fd_ent_t *pfe = pd_node->val.fdlist;
@@ -818,19 +966,16 @@ check_draining_endpoints(void)
                        pd_tmo_model, (long long)t_prefill_ms, t_kv);
               llb_ai_pd_record((char *)pd_tmo_model, t_prefill_ms, 0, t_kv, 1);
             }
-            if (pfe->fd > 0) {
-              send(pfe->fd, pd_timeout_resp, sizeof(pd_timeout_resp) - 1,
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
-            }
             /* single-owner teardown (see pd_teardown_conn). Mark ERROR,
              * then deregister+close+free each backend leg and the client exactly
              * once. We hold PROXY_LOCK and pd_teardown_conn does NOT re-acquire it
              * (the Phase-87 pd_teardown_legs route did, via notify_del->pdestroy,
              * and double-freed the client per leg -> conc=128 corruption+wedge).
              * Iteration uses pfe_next and backends sit head-ward, so the frees are
-             * pfe_next-safe. */
+             * pfe_next-safe. The 504 and the teardown go through
+             * pd_reap_respond: written by the socket's owner worker. */
             pfe->pd_phase = PD_PHASE_ERROR;
-            pd_teardown_conn(pfe);
+            pd_reap_respond(pfe, SP_REAP_PD_PREFILL_TIMEOUT);
           }
         }
 
@@ -923,20 +1068,11 @@ check_draining_endpoints(void)
                                  3 /*decode timeout*/);
               }
             }
-            if (pfe->fd > 0) {
-              /* SG keeps its historical body; the sequential machines name
-               * the leg that actually timed out. */
-              if (pfe->pd_sg_active) {
-                send(pfe->fd, pd_timeout_resp, sizeof(pd_timeout_resp) - 1,
-                     MSG_DONTWAIT | MSG_NOSIGNAL);
-              } else {
-                send(pfe->fd, pd_decode_timeout_resp,
-                     sizeof(pd_decode_timeout_resp) - 1,
-                     MSG_DONTWAIT | MSG_NOSIGNAL);
-              }
-            }
+            /* SG keeps its historical body; the sequential machines name
+             * the leg that actually timed out. */
             pfe->pd_phase = PD_PHASE_ERROR;
-            pd_teardown_conn(pfe);
+            pd_reap_respond(pfe, pfe->pd_sg_active ? SP_REAP_PD_PREFILL_TIMEOUT
+                                                   : SP_REAP_PD_DECODE_TIMEOUT);
           }
         }
 
@@ -967,13 +1103,6 @@ check_draining_endpoints(void)
       if (max_park == 0) {
         max_park = pd_prefill_timeout_default();  /* sane fallback < typical client timeout */
       }
-      static const char pd_park_timeout_resp[] =
-          "HTTP/1.1 504 Gateway Timeout\r\n"
-          "Content-Type: application/json\r\n"
-          "Connection: close\r\n"
-          "\r\n"
-          "{\"error\":\"pd_admission_park_timeout\"}";
-
       struct timespec _mpts;
       clock_gettime(CLOCK_MONOTONIC, &_mpts);
       uint64_t mp_now_ns = (uint64_t)_mpts.tv_sec * 1000000000ULL + (uint64_t)_mpts.tv_nsec;
@@ -1009,19 +1138,16 @@ check_draining_endpoints(void)
               }
             }
 
-            if (pfe->fd > 0) {
-              send(pfe->fd, pd_park_timeout_resp, sizeof(pd_park_timeout_resp) - 1,
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
-            }
             pfe->park_ep_idx   = -1;
             pfe->park_start_ts = 0;
             /* Single-owner teardown (see pd_teardown_conn): does NOT re-acquire
              * PROXY_LOCK, does NOT proxy_pdestroy. pfe_next captured above, so the
              * free is pfe_next-safe. A parked conn has NO backend leg (never
              * connected), so pd_teardown_conn just deregisters+closes+frees the
-             * client exactly once. */
+             * client exactly once. The 504 and the teardown go through
+             * pd_reap_respond: written by the socket's owner worker. */
             pfe->pd_phase = PD_PHASE_ERROR;
-            pd_teardown_conn(pfe);
+            pd_reap_respond(pfe, SP_REAP_PD_PARK_TIMEOUT);
           }
 
           pfe = pfe_next;
@@ -1049,8 +1175,6 @@ check_draining_endpoints(void)
    * same single-owner pd_teardown_conn as the other reapers.
    * Converts a forever-hang into a clean completion. */
   {
-    static const char pd_graceful_done[] = "data: [DONE]\n\n";
-
     proxy_map_ent_t *pd_node = proxy_struct->head;
     while (pd_node) {
       proxy_fd_ent_t *pfe = pd_node->val.fdlist;
@@ -1075,11 +1199,8 @@ check_draining_endpoints(void)
 
           const char *gc_model = proxy_effective_model(pfe);
 
-          /* 1) Send the synthesized SSE terminator BEFORE any teardown. */
-          if (pfe->fd > 0) {
-            send(pfe->fd, pd_graceful_done, sizeof(pd_graceful_done) - 1,
-                 MSG_DONTWAIT | MSG_NOSIGNAL);
-          }
+          /* 1) The synthesized SSE terminator goes out before the teardown,
+           * both written by the socket's owner worker (pd_reap_respond, step 4). */
 
           /* 2) End the active-streams gauge (balances llb_ai_stream_start at
            * SSE activation), then reset sse_active so eviction-suppression no
@@ -1110,7 +1231,7 @@ check_draining_endpoints(void)
           /* 4) Mark COMPLETE and tear down with the same leak-proof sequence as
  * (held under PROXY_LOCK; pfe_next-safe). */
           pfe->pd_phase = PD_PHASE_COMPLETE;
-          pd_teardown_conn(pfe);
+          pd_reap_respond(pfe, SP_REAP_PD_GRACEFUL_DONE);
         }
 
         pfe = pfe_next;
@@ -1124,13 +1245,6 @@ check_draining_endpoints(void)
    * Default is 120s. When a decode EP crashes mid-stream, this prevents the
    * client from hanging until the 300s SO_RCVTIMEO fires. */
   {
-    static const char pd_decode_timeout_resp[] =
-        "HTTP/1.1 502 Bad Gateway\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{\"error\":\"pd_decode_stream_timeout\"}";
-
     proxy_map_ent_t *pd_node = proxy_struct->head;
     while (pd_node) {
       proxy_fd_ent_t *pfe = pd_node->val.fdlist;
@@ -1163,14 +1277,10 @@ check_draining_endpoints(void)
           if (elapsed >= (time_t)timeout) {
             log_error("ERR-01: P/D decode stream timeout — fd=%d idle=%lds",
                       pfe->fd, (long)elapsed);
-            if (pfe->fd > 0) {
-              send(pfe->fd, pd_decode_timeout_resp,
-                   sizeof(pd_decode_timeout_resp) - 1,
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
-            }
-            /* real two-leg teardown (see above). */
+            /* real two-leg teardown (see above), the 502 first; both
+             * written by the socket's owner worker (pd_reap_respond). */
             pfe->pd_phase = PD_PHASE_ERROR;
-            pd_teardown_conn(pfe);
+            pd_reap_respond(pfe, SP_REAP_PD_STREAM_TIMEOUT);
           }
         }
 
@@ -1191,13 +1301,6 @@ check_draining_endpoints(void)
    * saved-pfe_next iteration + the same single-owner pd_teardown_conn
    * (no full client-destroy path → no PROXY_LOCK re-entry). */
   {
-    static const char pd_idle_resp[] =
-        "HTTP/1.1 504 Gateway Timeout\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{\"error\":\"pd_idle_timeout\"}";
-
     proxy_map_ent_t *pd_node = proxy_struct->head;
     while (pd_node) {
       proxy_fd_ent_t *pfe = pd_node->val.fdlist;
@@ -1242,12 +1345,8 @@ check_draining_endpoints(void)
             log_error("generic P/D idle reaper — fd=%d pd_phase=%d "
                       "elapsed=%lds >= cap=%us",
                       pfe->fd, (int)pfe->pd_phase, (long)elapsed, idle_cap);
-            if (pfe->fd > 0) {
-              send(pfe->fd, pd_idle_resp, sizeof(pd_idle_resp) - 1,
-                   MSG_DONTWAIT | MSG_NOSIGNAL);
-            }
             pfe->pd_phase = PD_PHASE_ERROR;
-            pd_teardown_conn(pfe);
+            pd_reap_respond(pfe, SP_REAP_PD_IDLE_TIMEOUT);
           }
         }
 

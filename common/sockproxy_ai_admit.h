@@ -61,6 +61,7 @@ typedef enum {
   AI_GW_STAGE_CONFLICT,        /* body/header model disagreement (400) */
   AI_GW_STAGE_RATELIMIT,       /* RPS / quota-latch check (429/503) */
   AI_GW_STAGE_RESERVE,         /* pre-admission token reservation (429) */
+  AI_GW_STAGE_CAPACITY,        /* service/endpoint capacity, after policy (429/503) */
 } ai_gw_admit_stage_t;
 
 /* Request view handed to the gate. All pointers are borrowed; strings are
@@ -150,6 +151,20 @@ typedef struct ai_gw_admit_result {
 } ai_gw_admit_result_t;
 
 int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);
+
+/* Record a refusal the capacity gate made AFTER ai_gw_admit admitted the
+ * request on policy. The policy arms refuse through ai_gw_admit's own
+ * verdict frame; capacity refuses at the dispatch site, once the pool and
+ * its ceilings are known, so it reports through this second frame with the
+ * identity the policy gate resolved. Both frames land on the same record
+ * export, so every refusal the gateway makes is on the trail. */
+void ai_gw_record_capacity_deny(const char *request_id, int producer_id,
+                                const char *svc_ident, const char *model,
+                                const char *tenant_id, const char *key_id,
+                                const char *user_id, int http_status,
+                                const char *error_code,
+                                const char *client_ip, const char *origin_ip,
+                                int trusted_hops);
 
 /* Write a fresh request ID into buf: 32 lowercase hex digits shaped as a
  * UUID v4, from a per-thread generator that needs neither the trace ring

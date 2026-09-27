@@ -133,6 +133,7 @@ void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
 // rule (0 = default, never "off") live in sockproxy_hdr_deadline.h so a unit
 // can pin them without the proxy object graph.
 #include "sockproxy_hdr_deadline.h"
+#include "sockproxy_fc.h"  /* capacity admission: per-pool state and per-request permit */
 
 // ============================================================================
 // PROMETHEUS METRICS: Global Stats (Forward Declaration)
@@ -720,6 +721,12 @@ typedef struct proxy_epval {
    * re-created rule, or one of several host-based rules, apart. */
   uint8_t sockmap_en;
 
+  /* Capacity admission state of this pool: the executing service and
+   * endpoint/role units and the ceilings they are held under. Zero from the
+   * calloc at proxy_add is a valid `off` state; fc_state_init applies the
+   * configuration beside pd_parked_lock. */
+  fc_state_t fc;
+
   UT_hash_handle hh;
 } proxy_epval_t;
 
@@ -1085,6 +1092,8 @@ struct proxy_fd_ent {
   char request_path[256];  // P6: Request URL path ("/v1/users")
   char url_path[512];      // Full URL with query string for query parameter extraction
   int http_path_ok;        // P6: Path extraction flag
+  uint8_t http_is_post;    // 1 = the request line's method is POST (capacity
+                           // permits apply to inference POSTs only)
   char last_header_name[128];
 
   // L7 policy generic header/cookie store — bounded fixed
@@ -1353,6 +1362,9 @@ struct proxy_fd_ent {
 
   // P/D Disaggregation orchestration state 
   pd_phase_t pd_phase;               // Current P/D orchestration phase
+  uint8_t  reap_resp;                // enum sp_reap_resp: a response the reaper thread
+                                     // owes this client, emitted by the fd's owner
+                                     // worker (sp_reap_finish); 0 = none
   uint8_t  is_pd_decode_backend;     // 1=this pfe is a decode backend (not prefill or client)
   // bounded backpressured admission — park bookkeeping. When this
   // client is parked (all prefill EPs capped, FIFO has room), park_ep_idx is the
@@ -1426,6 +1438,14 @@ struct proxy_fd_ent {
    * the resp_parser_inited precedent above. Zero-init (pfe_alloc) == not held. */
   uint8_t  kv_sr_load_held;          // 1 = single-role KV load unit held 
   int      kv_sr_ep_idx;             // EP index holding the unit (valid iff kv_sr_load_held)
+
+  /* Capacity admission permit of the request this connection is serving:
+   * one service unit and one endpoint unit per role, taken before the first
+   * backend byte and handed back exactly once — by the response-complete
+   * site, the keep-alive boundary or the teardown owner, whichever runs
+   * first. A kept backend leg is a transport, never a permit: the next
+   * request on it takes its own. Zero-init (pfe_alloc) == nothing held. */
+  fc_permit_t fc;
 
   char     resp_model[MAX_MODEL_LEN]; // Effective model snapshot taken at the keep-alive
                                       // request-reset boundary. The per-request resets clear

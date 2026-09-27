@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <unistd.h>
 #include <stdatomic.h>
@@ -24,6 +25,7 @@
 #include <openssl/err.h>  /* ERR_get_error / ERR_error_string (TLS error logging) */
 
 #include "sockproxy_h2.h"
+#include "sockproxy_internal.h"
 #include "sockproxy.h"
 #include "sockproxy_ai_security.h"
 #include "sockproxy_ai_admit.h"   /* the shared H1/H2 admission gate */
@@ -434,6 +436,11 @@ h2_stream_free(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
   if (!session || !stream) {
     return;
   }
+
+  /* The stream's capacity unit: this free runs for every stream end
+   * (response complete, client reset, session teardown), so this is the
+   * release that always runs. Idempotent with the refusal path. */
+  fc_permit_release(&stream->fc);
 
   /* Release the AI-deny response body if the stream still owns one (a client
    * reset before nghttp2 drained it never reached the read callback's EOF). */
@@ -2774,10 +2781,14 @@ proxy_h2_deny_body_read_callback(nghttp2_session *session, int32_t stream_id,
   return (ssize_t)to_copy;
 }
 
+/* Frame a terminal refusal on ONE stream: :status, content-type, an
+ * optional retry-after, the caller's extra headers, and the body. The
+ * multiplexed connection stays alive. */
 static int
-proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
-                      int status_code, int retry_after, int retry_body,
-                      const char *error_code, const char *error_msg)
+h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                   int status_code, int retry_after,
+                   const char *body, int blen,
+                   const nghttp2_nv *extra, size_t n_extra)
 {
   if (!pfe || !stream || !pfe->h2_session || !pfe->h2_session->session)
     return -1;
@@ -2787,22 +2798,9 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   char status_str[8];
   char retry_str[16];
   char clen_str[16];
-  char body[512];
-  int blen;
 
   snprintf(status_str, sizeof(status_str), "%d", status_code);
-  if (!error_code || !error_code[0])
-    error_code = "denied";
-  if (retry_body) {
-    blen = snprintf(body, sizeof(body),
-                    "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-                    error_code, retry_after);
-  } else {
-    blen = snprintf(body, sizeof(body),
-                    "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-                    error_code, error_msg ? error_msg : "");
-  }
-  if (blen < 0 || blen >= (int)sizeof(body))
+  if (blen < 0 || !body)
     blen = 0;
 
   /* The body must outlive this frame: nghttp2 pulls it from the read
@@ -2830,8 +2828,10 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 
   snprintf(clen_str, sizeof(clen_str), "%d", ctx ? blen : 0);
 
-  nghttp2_nv hdrs[4];
+  nghttp2_nv hdrs[4 + 3];
   size_t nvlen = 0;
+  if (n_extra > 3)
+    n_extra = 3;
   hdrs[nvlen].name = (uint8_t *)":status";
   hdrs[nvlen].value = (uint8_t *)status_str;
   hdrs[nvlen].namelen = 7;
@@ -2859,6 +2859,8 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   hdrs[nvlen].valuelen = strlen(clen_str);
   hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
   nvlen++;
+  for (size_t i = 0; i < n_extra; i++)
+    hdrs[nvlen++] = extra[i];
 
   nghttp2_data_provider data_prd;
   nghttp2_data_provider *prd = NULL;
@@ -2882,6 +2884,140 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   }
   nghttp2_session_send(pfe->h2_session->session);
   return 0;
+}
+
+static int
+proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                      int status_code, int retry_after, int retry_body,
+                      const char *error_code, const char *error_msg)
+{
+  char body[512];
+  int blen;
+
+  if (!error_code || !error_code[0])
+    error_code = "denied";
+  if (retry_body) {
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
+                    error_code, retry_after);
+  } else {
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+                    error_code, error_msg ? error_msg : "");
+  }
+  if (blen < 0 || blen >= (int)sizeof(body))
+    blen = 0;
+  return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
+                            NULL, 0);
+}
+
+/* A capacity refusal on one stream: the H2 twin of sp_h1_send_capacity_deny,
+ * with the same admission headers an upstream router reads. */
+static int
+proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                            int status_code, const char *error_code,
+                            const char *error_msg, uint32_t inflight,
+                            uint32_t limit)
+{
+  char body[512];
+  char inflight_str[16], queued_str[4] = "0", limit_str[16];
+  int blen;
+
+  if (status_code == 503) {
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
+                    error_code, error_msg ? error_msg : "");
+  } else {
+    blen = snprintf(body, sizeof(body),
+                    "{\"error\":\"%s\",\"retry_after\":1,\"jitter_hint_ms\":250}\r\n",
+                    error_code);
+  }
+  if (blen < 0 || blen >= (int)sizeof(body))
+    blen = 0;
+  snprintf(inflight_str, sizeof(inflight_str), "%u", inflight);
+  snprintf(limit_str, sizeof(limit_str), "%u", limit);
+  nghttp2_nv extra[3] = {
+    { (uint8_t *)"x-loxilb-admission-inflight", (uint8_t *)inflight_str,
+      27, strlen(inflight_str), NGHTTP2_NV_FLAG_NONE },
+    { (uint8_t *)"x-loxilb-admission-queued", (uint8_t *)queued_str,
+      25, strlen(queued_str), NGHTTP2_NV_FLAG_NONE },
+    { (uint8_t *)"x-loxilb-admission-limit", (uint8_t *)limit_str,
+      24, strlen(limit_str), NGHTTP2_NV_FLAG_NONE },
+  };
+  return h2_send_deny_frame(pfe, stream, status_code, 1, body, blen, extra, 3);
+}
+
+/* ---- capacity admission at the HTTP/2 stream site ---------------------------
+ *
+ * The stream's twin of the H1 site: the policy gate ran above and stamped
+ * the identity on the stream; the pool is resolved here; the service unit is
+ * taken before any selector and the endpoint unit after the pick, before
+ * the backend connect. A refusal is a terminal response on THIS stream and
+ * is recorded with the stream's identity. */
+static void
+sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+              proxy_epval_t *tepval, fc_verdict_t v, int role)
+{
+  int status = (v == FC_NO_CAPACITY) ? 503 : 429;
+  const char *code = (v == FC_NO_CAPACITY) ? "admission_no_capacity"
+                                           : "admission_capacity";
+  const char *msg = (v == FC_NO_CAPACITY) ? "no healthy endpoint has capacity"
+                                          : "";
+  uint32_t inflight = fc_inflight(&tepval->fc);
+  uint32_t limit = fc_limit_for(&tepval->fc, role);
+
+  proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, limit);
+  ai_gw_record_capacity_deny(stream->request_id, notify_worker_id(),
+                             stream->svc_ident, stream->effective_model,
+                             stream->tenant_id, stream->auth_key_id,
+                             stream->auth_user_id, status, code,
+                             pfe ? pfe->l7_peer_ip : "",
+                             stream->l7_origin_ip,
+                             (int)stream->l7_trusted_hops);
+  log_info("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
+           "role=%d inflight=%u limit=%u tenant=%s model=%s",
+           stream->stream_id, status, code, role, inflight, limit,
+           stream->tenant_id, stream->effective_model);
+  fc_permit_release(&stream->fc);
+}
+
+/* 0 = proceed; -1 = refused, terminal response framed on the stream. */
+static int
+sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                      proxy_epval_t *tepval)
+{
+  int is_post = stream->method[0] && !strcasecmp(stream->method, "POST");
+
+  fc_permit_release(&stream->fc);
+  if (fc_active(&tepval->fc) &&
+      !fc_is_inference_request(is_post, stream->path)) {
+    fc_bypass(&tepval->fc, &stream->fc);
+    return 0;
+  }
+  if (fc_service_acquire(&tepval->fc, &stream->fc) == FC_SHED) {
+    sp_fc_h2_shed(pfe, stream, tepval, FC_SHED, -1);
+    return -1;
+  }
+  return 0;
+}
+
+/* The endpoint the unit landed on, or -1 (refused, response framed). */
+static int
+sp_fc_h2_gate_endpoint(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
+                       proxy_epval_t *tepval, int ep_idx)
+{
+  fc_verdict_t v = FC_ADMIT;
+  int ep;
+
+  if (stream->fc.state != FC_P_EXECUTING)
+    return ep_idx;
+  ep = fc_ep_acquire_any(&tepval->fc, &stream->fc, FC_ROLE_NORMAL, ep_idx,
+                         tepval->n_eps, sp_fc_normal_eligible, tepval, &v);
+  if (ep < 0) {
+    sp_fc_h2_shed(pfe, stream, tepval, v, FC_ROLE_NORMAL);
+    return -1;
+  }
+  return ep;
 }
 
 /**
@@ -3786,6 +3922,13 @@ h2_have_tepval:
     return -1;
   }
   
+  /* Capacity admission, service level, on AI-gateway pools only: the pool
+   * and its ceilings are known, no selector has run, no backend byte has
+   * moved. A refusal is a terminal response on this stream; return 0 so the
+   * caller marks it answered and never redispatches. */
+  if (tepval->ai_gw_mode && sp_fc_h2_gate_service(pfe, stream, tepval) != 0)
+    return 0;
+
   // ============================================================================
   // ENDPOINT SELECTION LOGIC (integrates existing routing algorithms)
   // ============================================================================
@@ -3984,6 +4127,19 @@ h2_have_tepval:
     }
     
     return -1;
+  }
+
+  /* Capacity admission, endpoint level: the pick is a preference, the unit
+   * is the decision. The bounded-load unit the selector counted was handed
+   * back above, so a moved pick owes nothing. */
+  if (tepval->ai_gw_mode) {
+    int fc_ep = sp_fc_h2_gate_endpoint(pfe, stream, tepval, ep_idx);
+    if (fc_ep < 0)
+      return 0;
+    if (fc_ep != ep_idx)
+      log_info("[AIGateway][HTTP/2] stream=%d capacity moved the pick: ep[%d] -> ep[%d]",
+               stream->stream_id, ep_idx, fc_ep);
+    ep_idx = fc_ep;
   }
 
   // ============================================================================

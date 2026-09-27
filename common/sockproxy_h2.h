@@ -18,6 +18,7 @@
 #include <time.h>
 #include <pthread.h>
 #include "uthash.h"
+#include "sockproxy_fc.h"   /* per-stream capacity admission permit */
 #include "sockproxy_l7trust.h"   /* l7_hop_list_t on the per-stream request state */
 
 // Forward declarations
@@ -148,6 +149,9 @@ typedef struct proxy_h2_stream {
   uint16_t usage_tail_len;
   uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
   int      metric_response_status;   // backend :status relayed to the client (0 = unseen)
+  fc_permit_t fc;                    // capacity admission permit of THIS stream (one
+                                     // service unit + one endpoint unit); released by
+                                     // h2_stream_free, which runs for every stream end
 
   // Generic request header storage (for gRPC and protocol transparency)
   nghttp2_nv *request_headers;       // All request headers (malloc'd)

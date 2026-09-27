@@ -208,6 +208,53 @@ typedef struct proxy_qos_svc_stat {
  */
 int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
 
+/* =========================================================================
+ * AI admission gate (capacity) per-pool statistics.
+ *
+ * FIELD ORDER AND PADDING MUST MATCH the CGO block in
+ * api/prometheus/ai_admission_metrics.go AND the weak stub in
+ * api/prometheus/proxy_metrics_stub.c. Three-way lockstep, same commit --
+ * tail-append only.
+ *
+ * One row per model pool of an AI-gateway service, whatever the gate's mode:
+ * a pool with the gate off reports mode 0 and zero counts, so a scrape can
+ * tell "not enforcing" from "not an AI service". Role index 0 = normal,
+ * 1 = prefill, 2 = decode (enum fc_role); reason index follows enum
+ * fc_reason. Both counts are pinned by static asserts where the enums are
+ * visible.
+ * ========================================================================= */
+#define PROXY_FC_STAT_MAX 256   /* pools reported per proxy_get_fc_stats call */
+#define PROXY_FC_ROLES 3
+#define PROXY_FC_REASONS 5
+#define PROXY_FC_POOL_LEN 64    /* pool key as exported; longer keys are cut */
+
+typedef struct proxy_fc_svc_stat {
+    uint32_t xip;                          /* service VIP, network byte order (v4) */
+    uint16_t xport;                        /* service port, HOST byte order */
+    uint8_t  protocol;                     /* IPPROTO_* */
+    uint8_t  mode;                         /* enum fc_mode: 0 off, 1 observe, 2 enforce */
+    uint32_t max_outstanding;              /* service ceiling, 0 = unlimited */
+    uint32_t ep_cap[PROXY_FC_ROLES];       /* per-endpoint ceiling per role */
+    uint32_t inflight;                     /* gauge: service units held */
+    uint32_t ep_inflight[PROXY_FC_ROLES];  /* gauge: endpoint units held, summed per role */
+    uint64_t decisions[PROXY_FC_REASONS];  /* counter per enum fc_reason */
+    char     pool[PROXY_FC_POOL_LEN];      /* pool key ("host|path" or "host"), NUL-terminated */
+} proxy_fc_svc_stat_t;
+
+/*
+ * proxy_get_fc_stats - fill `out` with one entry per model pool of every
+ * AI-gateway service. Returns the number of entries written, capped at
+ * `max`; 0 when no AI service exists. Called by Go CGO
+ * (api/prometheus/ai_admission_metrics.go) off the hot path.
+ */
+int proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max);
+
+/*
+ * proxy_get_fc_anomaly - the process-wide anomaly counter for `kind`
+ * (enum fc_anomaly: 0 underflow, 1 unknown_permit); 0 for any other kind.
+ */
+uint64_t proxy_get_fc_anomaly(int kind);
+
 /*
  * proxy_set_service_catalog - associate catalog_id with a service entry.
  * Called from Go to enable deep inspection for a specific service.
