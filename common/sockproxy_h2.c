@@ -305,7 +305,10 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                           latency_ms, up, uc, 0, 0, "",
                           stream->request_id, stream->auth_user_id,
                           stream->auth_key_id, stream->svc_ident, 0,
-                          notify_worker_id());
+                          notify_worker_id(),
+                          pfe ? pfe->l7_peer_ip : "",
+                          stream->l7_origin_ip,
+                          (int)stream->l7_trusted_hops);
 
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
@@ -391,6 +394,12 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
     snprintf(e->key, sizeof(e->key), "%s", stream->auth_key_id);
     snprintf(e->svc_ident, sizeof(e->svc_ident), "%s", stream->svc_ident);
     snprintf(e->request_id, sizeof(e->request_id), "%s", stream->request_id);
+    /* Copied here, under the lock, exactly as the identity above: the record
+     * is emitted once PROXY_LOCK is dropped, by which time this stream has
+     * been freed and its connection may have been too. */
+    snprintf(e->client_ip, sizeof(e->client_ip), "%s", pfe->l7_peer_ip);
+    snprintf(e->origin_ip, sizeof(e->origin_ip), "%s", stream->l7_origin_ip);
+    e->trusted_hops = (int)stream->l7_trusted_hops;
     e->prompt_toks = up;
     e->complet_toks = uc;
     e->reserved_toks = (int)stream->usage_reserved_toks;
@@ -738,7 +747,15 @@ proxy_h2_on_header_callback(nghttp2_session *session,
   // the store is bounded (overflow dropped). Distinct from stream->request_headers
   // below (that is the per-stream forward buffer; this is the per-connection
   // match-operand store consumed by the L7 engine).
-  l7_store_header_n(pfe, (const char *)name, namelen,
+  //
+  // The forwarding chain rides the same helper, and so is parsed by the one
+  // parser on both protocols — but it is captured into THIS STREAM's list,
+  // not the connection's. Requests are forwarded only once the whole receive
+  // buffer has been parsed, so a connection-level list would by then hold
+  // every request in that buffer, and the first one spliced would be given
+  // the last one's chain to carry and be attributed to its sender.
+  l7_store_header_n(pfe, &stream->l7_inbound_hops,
+                    (const char *)name, namelen,
                     (const char *)value, valuelen);
 
   // ============================================================================
@@ -2953,7 +2970,10 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   ai_gw_record_capacity_deny(stream->request_id, notify_worker_id(),
                              stream->svc_ident, stream->effective_model,
                              stream->tenant_id, stream->auth_key_id,
-                             stream->auth_user_id, status, code);
+                             stream->auth_user_id, status, code,
+                             pfe ? pfe->l7_peer_ip : "",
+                             stream->l7_origin_ip,
+                             (int)stream->l7_trusted_hops);
   log_info("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
            "role=%d inflight=%u limit=%u tenant=%s model=%s",
            stream->stream_id, status, code, role, inflight, limit,
@@ -3541,6 +3561,7 @@ l7h2_emit(void *vctx, int op, const char *name, const char *value)
  */
 static int
 proxy_h2_build_l7_req_headers(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
+                              proxy_h2_stream_t *stream,
                               const nghttp2_nv *orig, size_t n_orig, int fd,
                               nghttp2_nv **out_nv, size_t *out_n,
                               l7h2_emit_ctx_t *ctx_out)
@@ -3572,7 +3593,15 @@ proxy_h2_build_l7_req_headers(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   uint16_t listener_port = ntohs(ent->key.xport);
   const char *xfproto = (pfe->ssl != NULL || pfe->ktls_enabled) ? "https" : "http";
 
-  l7_apply_req_filters(pfe, ent,
+  /* The chain and the attributed address belong to THIS stream. Every
+   * request in one receive buffer is parsed before any of them is forwarded,
+   * so reading them off the connection here would splice and attribute this
+   * request with whichever request in that buffer was parsed last. */
+  l7_origin_scope_t origin = { &stream->l7_inbound_hops,
+                               stream->l7_origin_ip,
+                               sizeof(stream->l7_origin_ip),
+                               &stream->l7_trusted_hops };
+  l7_apply_req_filters(pfe, ent, &origin,
                        xff_ip[0] ? xff_ip : NULL, listener_port, xfproto,
                        l7h2_emit, ctx_out);
 
@@ -3669,6 +3698,13 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .svc_ident = adm_svc_ident,
       .request_id = stream->request_id,
       .producer_id = notify_worker_id(),
+      /* The gate runs BEFORE the header splice, so no origin has been
+       * derived for this stream yet and "" says so rather than claiming the
+       * peer. The peer itself is known from the moment the connection was
+       * accepted. */
+      .client_ip = pfe ? pfe->l7_peer_ip : "",
+      .origin_ip = stream->l7_origin_ip,
+      .trusted_hops = (int)stream->l7_trusted_hops,
     };
     ai_gw_admit_result_t adm;
     ai_gw_admit(&adm_req, &adm);
@@ -4418,8 +4454,9 @@ h2_have_tepval:
   int l7_hdr_built = 0;
   if (ent && ent->has_l7_policy) {
     size_t l7_n = 0;
-    if (proxy_h2_build_l7_req_headers(pfe, ent, headers, nheaders, pfe->fd,
-                                      &l7_headers_nv, &l7_n, &l7_hdr_ctx) == 0) {
+    if (proxy_h2_build_l7_req_headers(pfe, ent, stream, headers, nheaders,
+                                      pfe->fd, &l7_headers_nv, &l7_n,
+                                      &l7_hdr_ctx) == 0) {
       headers = l7_headers_nv;
       nheaders = l7_n;
       l7_hdr_built = 1;

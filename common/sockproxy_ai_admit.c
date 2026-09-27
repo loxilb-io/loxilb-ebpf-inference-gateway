@@ -146,7 +146,10 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
                        (char *)(req->svc_ident ? req->svc_ident : ""),
                        res->effective_model, res->tenant_id, res->key_id,
                        res->user_id, (int)res->stage, res->http_status,
-                       res->error_code);
+                       res->error_code,
+                       (char *)(req->client_ip ? req->client_ip : ""),
+                       (char *)(req->origin_ip ? req->origin_ip : ""),
+                       req->trusted_hops);
   }
   return rc;
 }
@@ -156,8 +159,13 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                            const char *svc_ident, const char *model,
                            const char *tenant_id, const char *key_id,
                            const char *user_id, int http_status,
-                           const char *error_code)
+                           const char *error_code,
+                           const char *client_ip, const char *origin_ip,
+                           int trusted_hops)
 {
+  /* The same attribution every other record carries, with the same
+   * meaning: client_ip is the socket peer, origin_ip is "" unless the header
+   * splice derived one before this refusal, and trusted_hops pairs with it. */
   llb_ai_record_deny((char *)(request_id ? request_id : ""), producer_id,
                      (char *)(svc_ident ? svc_ident : ""),
                      (char *)(model ? model : ""),
@@ -165,7 +173,10 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                      (char *)(key_id ? key_id : ""),
                      (char *)(user_id ? user_id : ""),
                      (int)AI_GW_STAGE_CAPACITY, http_status,
-                     (char *)(error_code ? error_code : ""));
+                     (char *)(error_code ? error_code : ""),
+                     (char *)(client_ip ? client_ip : ""),
+                     (char *)(origin_ip ? origin_ip : ""),
+                     trusted_hops);
 }
 
 static int

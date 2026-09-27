@@ -349,24 +349,48 @@ int proxy_attach_l7_trusted_ranges(struct proxy_ent *key,
                                    int n_ranges);
 
 /*
+ * l7_origin_scope_t — where ONE request's forwarding chain is read from, and
+ * where the address it is attributed to is written back.
+ *
+ * It is a parameter rather than a reach through `pfe` because the two
+ * protocols keep this state in different places, and must. HTTP/1.1 parses
+ * and forwards one request before it looks at the next, so the connection is
+ * a sound home for it. HTTP/2 does not: nghttp2_session_mem_recv parses every
+ * frame in the receive buffer, and only then does proxy_h2_handle_client_data
+ * walk the streams that became ready and forward them. Several requests are
+ * therefore parsed before the first is spliced, so their state lives on the
+ * STREAM; a connection-level home would hand the first request the last one's
+ * chain, both to carry upstream and to be attributed to.
+ *
+ * Naming both ends here keeps ONE walk, one splice and one rule across the
+ * two protocols, with only the storage differing.
+ */
+typedef struct {
+  l7_hop_list_t *hops;          /* in: the chain this request arrived with */
+  char          *origin_ip;     /* out: the address it is attributed to */
+  size_t         origin_len;    /* sizeof the origin_ip buffer */
+  uint8_t       *trusted_hops;  /* out: hops of ours the walk stepped past */
+} l7_origin_scope_t;
+
+/*
  * l7_derive_origin — decide which address this request came from and record it
- * on `pfe` (l7_origin_ip, l7_trusted_hops). On a listener with no trusted
- * ranges that is the socket peer with no hops stepped past; otherwise it is the
- * right-most hop of the inbound chain that is not inside the listener's ranges,
- * falling back to the peer when every hop is. The chain it walks is
- * `pfe->l7_inbound_hops`, captured as the request was parsed, so nothing is
- * parsed here.
+ * through `scope`. On a listener with no trusted ranges that is the socket
+ * peer with no hops stepped past; otherwise it is the right-most hop of the
+ * inbound chain that is not inside the listener's ranges, falling back to the
+ * peer when every hop is. The chain it walks is `scope->hops`, captured as the
+ * request was parsed, so nothing is parsed here.
  *
  * l7_apply_req_filters calls this, so it runs wherever the header splice runs:
  * on a listener with an L7 policy attached, for a request the splice does not
  * decline (it declines a non-HTTP buffer, one with no header terminator, and a
  * chunked body, whose boundaries a splice would corrupt). Anywhere else there
- * is no derived origin and l7_origin_ip stays EMPTY to say so. A reader must
+ * is no derived origin and the origin stays EMPTY to say so. A reader must
  * not take that as "the origin is the peer" — nothing was decided — which is
- * why the field is empty rather than prefilled with the peer. Read it through
- * proxy_origin_ip(), paired with proxy_origin_trusted_hops().
+ * why the field is empty rather than prefilled with the peer. On HTTP/1.1 read
+ * it through proxy_origin_ip(), paired with proxy_origin_trusted_hops(); on
+ * HTTP/2 read the stream's own pair.
  */
-void l7_derive_origin(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
+void l7_derive_origin(const l7_origin_scope_t *scope, struct proxy_map_ent *ent,
                       const char *peer_ip);
 
 /*
@@ -450,7 +474,9 @@ typedef void (*l7_hdr_emit_fn)(void *ctx, int op, const char *name,
  *   1. SET X-Forwarded-For — the inbound chain REPLACED by `xff_ip` (the real
  *      TCP peer) on a listener with no trusted ranges, or the inbound chain
  *      EXTENDED with `xff_ip` on one that has them; it also derives the
- *      request's origin, see l7_derive_origin
+ *      request's origin, see l7_derive_origin. Both the chain it extends and
+ *      the origin it records are named by `scope`, which belongs to the one
+ *      request being spliced
  * 2. SET X-Forwarded-Port = `listener_port` (the listener port)
  *   3. SET X-Forwarded-Proto= `xfproto`  ("http"/"https" — actual client scheme)
  *   4. each insertHeaders op of the FIRST MATCHING route's hdr_filters[]
@@ -464,6 +490,7 @@ typedef void (*l7_hdr_emit_fn)(void *ctx, int op, const char *name,
  * only ever invoked on the L7_Proxy peer.
  */
 void l7_apply_req_filters(struct proxy_fd_ent *pfe, struct proxy_map_ent *ent,
+                          const l7_origin_scope_t *scope,
                           const char *xff_ip, uint16_t listener_port,
                           const char *xfproto,
                           l7_hdr_emit_fn emit, void *ctx);

@@ -1137,6 +1137,21 @@ struct proxy_fd_ent {
   char     resp_origin_ip[L7_HOP_TEXT_MAX];
   uint8_t  resp_trusted_hops;
 
+  // The socket peer of this client connection, in text, captured once when
+  // the connection was accepted. It is a property of the CONNECTION and
+  // cannot change over its life, so unlike everything above it is not reset
+  // per request and needs no snapshot.
+  //
+  // It is captured at accept rather than where the header splice already
+  // reads it, because the splice runs only on a listener with an L7 policy
+  // attached while every AI-gateway record wants the address its request
+  // arrived from. It is the `client_ip` an audit record reports, and the
+  // value the trusted-hop count disambiguates a derived origin against:
+  // without it an origin that resolved back to the peer and a client that
+  // connected directly are the same row. Empty only when getpeername failed
+  // or the peer is not IPv4.
+  char     l7_peer_ip[L7_HOP_TEXT_MAX];
+
   // Header-completion deadline anchor (slowloris guard), every listener.
   // HTTP/1.1: set on the first byte of a request's headers, cleared once
   // \r\n\r\n has been parsed, so it never bounds a body upload. HTTP/2: set
@@ -1627,19 +1642,25 @@ proxy_origin_trusted_hops(const proxy_fd_ent_t *pfe)
 // wrote. A client could then fill the list with a long chain of its own and push
 // the real hop out, choosing what it is attributed to. Overflow therefore drops
 // the LEFT end, which l7_hop_list_append_n does.
+//
+// `hops` is the list belonging to the REQUEST being parsed, and the caller
+// names it rather than it being reached through the connection: on HTTP/2 a
+// connection parses several requests before any of them is forwarded, so a
+// single list on the connection would hold every one of their chains at the
+// moment each is read back. See the per-stream list in proxy_h2_stream_t.
 static inline void
-l7_capture_inbound_chain(struct proxy_fd_ent *pfe,
+l7_capture_inbound_chain(l7_hop_list_t *hops,
                          const char *name, size_t namelen,
                          const char *value, size_t valuelen)
 {
   static const char xff[] = "X-Forwarded-For";
 
-  if (!pfe || !name || !value || valuelen == 0)
+  if (!hops || !name || !value || valuelen == 0)
     return;
   if (namelen != sizeof(xff) - 1 || strncasecmp(name, xff, namelen) != 0)
     return;
 
-  l7_hop_list_append_n(value, valuelen, &pfe->l7_inbound_hops);
+  l7_hop_list_append_n(value, valuelen, hops);
 }
 
 // ============================================================================
@@ -1653,19 +1674,23 @@ l7_capture_inbound_chain(struct proxy_fd_ent *pfe,
 // no-op (overflow dropped, never grown). Name/value are truncated to
 // L7_HDR_NAME_MAX-1 / L7_HDR_VALUE_MAX-1 and always NUL-terminated.
 static inline void
-l7_store_header_n(struct proxy_fd_ent *pfe,
+l7_store_header_n(struct proxy_fd_ent *pfe, l7_hop_list_t *hops,
                   const char *name, size_t namelen,
                   const char *value, size_t valuelen)
 {
   size_t nl, vl;
 
-  if (!pfe || !name)
+  if (!name)
     return;
-  /* The forwarding chain is captured per REQUEST, before the store's bound:
-   * the store is per-connection and stops accepting once it is full, and this
-   * capture must survive both. */
-  l7_capture_inbound_chain(pfe, name, namelen, value, valuelen);
-  if (pfe->n_l7_headers >= L7_MAX_CAPTURED_HEADERS)
+  /* The forwarding chain is captured per REQUEST, before the store's bound
+   * AND before the store's own guard: the store is per-connection and stops
+   * accepting once it is full, and this capture must survive both. `hops` is
+   * the parsing request's own list, which on HTTP/2 is the stream's and not
+   * the connection's — so it does not depend on the connection shell either,
+   * and is not gated on it. */
+  l7_capture_inbound_chain(hops, name, namelen, value, valuelen);
+
+  if (!pfe || pfe->n_l7_headers >= L7_MAX_CAPTURED_HEADERS)
     return;  // bounded: overflow dropped
 
   nl = (namelen < (size_t)(L7_HDR_NAME_MAX - 1)) ? namelen : (size_t)(L7_HDR_NAME_MAX - 1);
@@ -1683,11 +1708,13 @@ l7_store_header_n(struct proxy_fd_ent *pfe,
 
 // Convenience wrapper for NUL-terminated inputs.
 static inline void
-l7_store_header(struct proxy_fd_ent *pfe, const char *name, const char *value)
+l7_store_header(struct proxy_fd_ent *pfe, l7_hop_list_t *hops,
+                const char *name, const char *value)
 {
   if (!name)
     return;
-  l7_store_header_n(pfe, name, strlen(name), value, value ? strlen(value) : 0);
+  l7_store_header_n(pfe, hops, name, strlen(name), value,
+                    value ? strlen(value) : 0);
 }
 
 #define PROXY_MODE_DFL 0
