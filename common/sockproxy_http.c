@@ -9558,7 +9558,9 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe_rcv_note(pfe);
 
     /* NEW L7-gated request-header
-     * injection — ALWAYS-overwrite X-Forwarded-For (real TCP peer IP) +
+     * injection — X-Forwarded-For (the inbound chain replaced by the real TCP
+     * peer, or extended with it where the listener names the ranges its own
+     * upstreams occupy) +
      * X-Forwarded-Port/Proto + insertHeaders SET/ADD/REMOVE. Gated on
  * node->has_l7_policy: a pure no-op for the AI peer /
      * un-configured listeners (has_l7_policy==0), so that path is
@@ -9779,12 +9781,18 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     pfe->has_custom_session_header = 0;
     pfe->x_model_header[0] = '\0';  // Reset X-Model header for next request
 
+
     /* Snapshot the correlation key BEFORE the reset below clears it, for the
      * same reason resp_model is snapshotted above: this request has only been
      * forwarded, and its response-phase consumers — the completion record, the
      * token settle, the teardown release — all run after this point and
      * resolve the key via proxy_request_id() → resp_request_id. */
     proxy_request_id_snapshot(pfe);
+    /* The derived origin needs carrying across for the same reason and at the
+     * same moment: this request has only been forwarded, and the record that
+     * reports where it came from is written in its response phase. */
+    l7_origin_snapshot(pfe);
+    l7_origin_reset(pfe);
 
     // Reset vLLM request ID for next request on keep-alive connection
     pfe->vllm_request_id[0] = '\0';

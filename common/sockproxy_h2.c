@@ -4406,8 +4406,10 @@ h2_have_tepval:
   size_t nheaders = stream->request_headers_count;
 
   /* on the L7_Proxy peer (has_l7_policy)
-   * build an AUGMENTED nv array — always-overwrite X-Forwarded-For (real TCP peer
-   * IP) + X-Forwarded-Port/Proto + insertHeaders SET/ADD/REMOVE — via the SAME
+   * build an AUGMENTED nv array — X-Forwarded-For (the inbound chain replaced by
+   * the real TCP peer, or extended with it where the listener names the ranges
+   * its own upstreams occupy) + X-Forwarded-Port/Proto + insertHeaders
+   * SET/ADD/REMOVE — via the SAME
    * shared l7_apply_req_filters() the H1 path uses (Pitfall 1 parity; nghttp2_nv
    * only, never raw \r\n bytes). No-op for the AI peer (has_l7_policy==0): the
  * original headers are submitted byte-for-byte unchanged. */
