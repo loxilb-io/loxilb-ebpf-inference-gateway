@@ -2927,6 +2927,12 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry). 0 = process default.
   pval->fc_max_queue_depth = dat->fc_max_queue_depth;
   pval->fc_max_queue_wait_ms = dat->fc_max_queue_wait_ms;
+  pval->fc_mode = dat->fc_mode;
+  pval->fc_max_outstanding = dat->fc_max_outstanding;
+  pval->fc_ep_max_inflight = dat->fc_ep_max_inflight;
+  pval->fc_prefill_max_inflight = dat->fc_prefill_max_inflight;
+  pval->fc_decode_max_inflight = dat->fc_decode_max_inflight;
+  pval->fc_telemetry_stale_ms = dat->fc_telemetry_stale_ms;
 
   // Per-endpoint circuit breaker enable (opt-in per rule)
   pval->cb_enable = dat->cb_enable;

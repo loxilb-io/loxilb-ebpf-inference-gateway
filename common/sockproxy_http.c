@@ -4123,6 +4123,7 @@ _Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc
 _Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
 _Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
 _Static_assert(PROXY_FC_QWAIT_BUCKETS == FC_QWAIT_BUCKETS, "wait bucket count drifted from sockproxy_fc.h");
+_Static_assert(PROXY_FC_LIMITS == FC_LIMITS, "limit count drifted from sockproxy_fc.h");
 
 static void
 sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
@@ -4136,6 +4137,9 @@ sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
   }
   st->qwait_sum_ms = atomic_load_explicit(&fc->qwait_sum_ms, memory_order_relaxed);
   st->qwait_count = atomic_load_explicit(&fc->qwait_count, memory_order_relaxed);
+  st->telemetry_stale_ms = fc->cfg.telemetry_stale_ms;
+  for (int l = 0; l < FC_LIMITS; l++)
+    st->src[l] = fc->cfg.src[l];
 }
 
 int
@@ -8119,48 +8123,57 @@ sp_fc_wake(int fd, uint64_t gen)
   return notify_wake_worker(proxy_struct->ns, owner, fd) == 0 ? 0 : -1;
 }
 
-/* The rule's queue fields over the process defaults, on create and on every
- * in-place refresh (a health update or a rule replace arrives the same
- * way). A non-zero rule value replaces the environment's. Changes are
- * applied to the live pool with the entries waiting kept in order. The
- * depth is answered for: each waiting request parks a client connection
- * holding about a megabyte of receive buffer, so a depth that could park
- * more than half of the node's memory is said once, loudly, and left to the
- * operator (connectionLimit and LLB_PD_MAX_TOTAL_INFLIGHT bound the
- * connections themselves). */
+/* The rule's admission settings over the process defaults, on create and
+ * on every in-place refresh (a health update or a rule replace arrives the
+ * same way). Each non-zero rule value replaces the environment's, and the
+ * source of every value is kept for the read-back. Changes are applied to
+ * the live pool with the entries waiting kept in order, and the waiters a
+ * change lets through (more units, or no longer enforcing) are woken at
+ * once rather than one per periodic kick. The depth is answered for: each
+ * waiting request parks a client connection holding about a megabyte of
+ * receive buffer, so a depth that could park more than half of the node's
+ * memory is said once, loudly, and left to the operator (connectionLimit
+ * and LLB_PD_MAX_TOTAL_INFLIGHT bound the connections themselves). */
 static void
 sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
                  const proxy_ent_t *key, int created)
 {
-  fc_cfg_t cfg;
-  int changed;
+  fc_cfg_t env, cfg;
+  fc_rule_cfg_t rule;
+  uint32_t old_depth;
 
   if (!tepval || !arg)
     return;
-  fc_cfg_from_env(&cfg);
-  cfg.mode = tepval->fc.cfg.mode;
-  cfg.max_outstanding = tepval->fc.cfg.max_outstanding;
-  for (int r = 0; r < FC_ROLES; r++)
-    cfg.ep_cap[r] = tepval->fc.cfg.ep_cap[r];
-  if (arg->fc_max_queue_depth)
-    cfg.max_queue_depth = arg->fc_max_queue_depth > FC_QUEUE_DEPTH_MAX
-                          ? FC_QUEUE_DEPTH_MAX : arg->fc_max_queue_depth;
-  if (arg->fc_max_queue_wait_ms)
-    cfg.max_queue_wait_ms = arg->fc_max_queue_wait_ms;
-  if (cfg.max_queue_depth > 0 && cfg.max_queue_wait_ms == 0)
-    cfg.max_queue_wait_ms = 5000;
-  changed = created || cfg.max_queue_depth != tepval->fc.cfg.max_queue_depth ||
-            cfg.max_queue_wait_ms != tepval->fc.cfg.max_queue_wait_ms;
-  if (!changed)
+  memset(&rule, 0, sizeof(rule));
+  rule.mode = arg->fc_mode;
+  rule.max_outstanding = arg->fc_max_outstanding;
+  rule.ep_cap[FC_ROLE_NORMAL] = arg->fc_ep_max_inflight;
+  rule.ep_cap[FC_ROLE_PREFILL] = arg->fc_prefill_max_inflight;
+  rule.ep_cap[FC_ROLE_DECODE] = arg->fc_decode_max_inflight;
+  rule.max_queue_depth = arg->fc_max_queue_depth;
+  rule.max_queue_wait_ms = arg->fc_max_queue_wait_ms;
+  rule.telemetry_stale_ms = arg->fc_telemetry_stale_ms;
+  fc_cfg_from_env(&env);
+  fc_cfg_resolve(&cfg, &env, &rule);
+  if (!created && fc_cfg_equal(&cfg, &tepval->fc.cfg))
     return;
+  old_depth = tepval->fc.cfg.max_queue_depth;
   fc_state_apply(&tepval->fc, &cfg);
-  if (cfg.max_queue_depth > 0 || !created) {
-    log_info("[AIGateway] %s:%u (%s) capacity queue: depth=%u wait=%ums mode=%s",
+  if (!created)
+    fc_queue_wake_room(&tepval->fc);
+  if (!created || cfg.max_queue_depth > 0 || cfg.src[FC_L_MODE] == FC_SRC_RULE) {
+    log_info("[AIGateway] %s:%u (%s) admission: mode=%s max_outstanding=%u "
+             "ep=%u/%u/%u queue depth=%u wait=%ums telemetry_stale=%ums",
              inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
-             tepval->ephash_key, tepval->fc.cfg.max_queue_depth,
-             tepval->fc.cfg.max_queue_wait_ms, fc_mode_name(tepval->fc.cfg.mode));
+             tepval->ephash_key, fc_mode_name(tepval->fc.cfg.mode),
+             tepval->fc.cfg.max_outstanding,
+             tepval->fc.cfg.ep_cap[FC_ROLE_NORMAL],
+             tepval->fc.cfg.ep_cap[FC_ROLE_PREFILL],
+             tepval->fc.cfg.ep_cap[FC_ROLE_DECODE],
+             tepval->fc.cfg.max_queue_depth, tepval->fc.cfg.max_queue_wait_ms,
+             tepval->fc.cfg.telemetry_stale_ms);
   }
-  {
+  if (created || tepval->fc.cfg.max_queue_depth != old_depth) {
     uint64_t bytes = fc_queue_memory_bytes(tepval->fc.cfg.max_queue_depth);
     uint64_t node = fc_node_memory_bytes();
 

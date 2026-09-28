@@ -95,13 +95,58 @@ enum fc_mode {
   FC_MODE_ENFORCE = 2,
 };
 
+/* Where a value in force came from, per limit, for the read-back. */
+enum fc_src {
+  FC_SRC_DEFAULT = 0,            /* the product default */
+  FC_SRC_ENV = 1,                /* the process environment (LLB_FC_*) */
+  FC_SRC_RULE = 2,               /* the rule's own declaration */
+};
+
+enum fc_limit {
+  FC_L_MODE = 0,
+  FC_L_MAX_OUTSTANDING,
+  FC_L_EP_NORMAL,
+  FC_L_EP_PREFILL,
+  FC_L_EP_DECODE,
+  FC_L_QUEUE_DEPTH,
+  FC_L_QUEUE_WAIT,
+  FC_L_TELEMETRY_STALE,
+  FC_LIMITS,
+};
+
+/* How long an endpoint's scraped queue depth is trusted without a refresh
+ * (three default scrape intervals). */
+#define FC_TELEMETRY_STALE_MS_DEFAULT 30000u
+#define FC_TELEMETRY_STALE_MS_MAX     3600000u
+
 typedef struct fc_cfg {
   uint8_t  mode;                 /* enum fc_mode */
+  uint8_t  src[FC_LIMITS];       /* enum fc_src per enum fc_limit */
   uint32_t max_outstanding;      /* service ceiling on executing units; 0 = unlimited */
   uint32_t ep_cap[FC_ROLES];     /* per-endpoint ceiling per role; 0 = unlimited */
   uint32_t max_queue_depth;      /* requests that may wait for a unit; 0 = no waiting */
   uint32_t max_queue_wait_ms;    /* longest wait before a queued request is ended */
+  uint32_t telemetry_stale_ms;   /* scraped queue depth older than this is not trusted */
 } fc_cfg_t;
+
+/* A rule's declarations, as the control plane sends them. 0 on any field
+ * inherits the environment; the mode is shifted by one so a rule can say
+ * "off" under an enforcing environment. */
+enum fc_rule_mode {
+  FC_RULE_MODE_INHERIT = 0,
+  FC_RULE_MODE_OFF = 1,
+  FC_RULE_MODE_OBSERVE = 2,
+  FC_RULE_MODE_ENFORCE = 3,
+};
+
+typedef struct fc_rule_cfg {
+  uint8_t  mode;                 /* enum fc_rule_mode */
+  uint32_t max_outstanding;
+  uint32_t ep_cap[FC_ROLES];
+  uint32_t max_queue_depth;
+  uint32_t max_queue_wait_ms;
+  uint32_t telemetry_stale_ms;
+} fc_rule_cfg_t;
 
 /* What the gate decided, one counter each. The names are the wire values of
  * the decisions metric; they are spelled here once. Append only. */
@@ -209,6 +254,12 @@ extern _Atomic uint64_t fc_anomaly_total[FC_A_COUNT];
 /* Environment defaults. A rule's own values, when non-zero, replace them
  * pool by pool (fc_state_apply); the environment stays the process default. */
 void fc_cfg_from_env(fc_cfg_t *cfg);
+/* The configuration a rule runs on: `env` with each non-zero declaration of
+ * `rule` in its place, the queue depth held at its ceiling and a depth
+ * given a wait window, and the source of every value recorded. */
+void fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rule);
+/* Whether two configurations differ in any value or source. */
+int fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b);
 void fc_state_init(fc_state_t *fc);
 /* Apply a configuration to a live pool. The queue ring grows to the new
  * depth when needed; entries already waiting are kept in order. */
@@ -321,7 +372,10 @@ void fc_count(fc_state_t *fc, enum fc_reason reason);
 /* Park a request: push its fd and generation with an absolute deadline
  * `now_ns + max_queue_wait_ms`. `front` puts it at the head (a woken request
  * that lost its unit keeps its place, even when newcomers filled the queue
- * to its depth meanwhile: its own entry left the queue only for the turn).
+ * to its depth meanwhile: its own entry left the queue only for the turn);
+ * such a request keeps the arrival time and deadline it was first parked
+ * with, and settles behind any request back at the head that arrived before
+ * it, so going back neither extends its wait nor reorders the waiters.
  * The permit is QUEUED before its entry can be seen by any other thread.
  * Returns 0 with the permit QUEUED and the decision counted, -1 when the
  * queue is at its depth or the pool is dead (counted as queue_full, the
@@ -358,6 +412,10 @@ void fc_set_wake_hook(fc_wake_fn fn);
  * could not be delivered, a woken connection that is gone) is given again.
  * Harmless on an empty queue. */
 void fc_queue_wake_one(fc_state_t *fc);
+/* After a configuration change: wake, in order, the waiters the new limits
+ * let through: all of them when the pool no longer enforces, else one per
+ * free service unit. */
+void fc_queue_wake_room(fc_state_t *fc);
 
 /* Take every waiting request out, oldest first, and hand each to `fn`,
  * which returns non-zero when it ended a request (counted as drained) and

@@ -1136,6 +1136,17 @@ struct dp_proxy_tacts {
   // verbatim into proxy_arg by llb_conv_nat2proxy; set from Go through cgo.
   uint32_t fc_max_queue_depth;
   uint32_t fc_max_queue_wait_ms;
+  // The rest of the rule's admission gate. 0 on any field ⇒ the process
+  // environment (LLB_FC_*) or the product default applies. fc_mode is
+  // enum fc_rule_mode: 0 inherit, 1 off, 2 observe, 3 enforce. Copied
+  // verbatim into proxy_arg by llb_conv_nat2proxy; set from Go through cgo.
+  uint8_t  fc_mode;
+  uint8_t  fc_pad[3];
+  uint32_t fc_max_outstanding;
+  uint32_t fc_ep_max_inflight;
+  uint32_t fc_prefill_max_inflight;
+  uint32_t fc_decode_max_inflight;
+  uint32_t fc_telemetry_stale_ms;
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1185,21 +1196,26 @@ struct dp_proxy_tacts {
 //   (8-aligned region): all four asserts shift by +8 (2912→2920, 2904→2912,
 //   3688→3696, 3680→3688). Set from Go through cgo (dpebpf_linux.go DpLBRuleMod),
 //   copied verbatim into proxy_arg by llb_conv_nat2proxy.
+// ABI guard updated for: +fc_mode(1)+fc_pad(3)+fc_max_outstanding(4)
+//   +fc_ep/prefill/decode_max_inflight(12)+fc_telemetry_stale_ms(4) = +24
+//   (8-aligned region): all four asserts shift by +24 (2920→2944, 2912→2936,
+//   3696→3720, 3688→3712). Set from Go through cgo (dpebpf_linux.go
+//   DpLBRuleMod), copied verbatim into proxy_arg by llb_conv_nat2proxy.
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2920,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2944,
               "dp_proxy_tacts ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2912,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2936,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// mTLS-enabled layout: 2920→3696 bytes, DPU slim 2912→3688 bytes.
+// mTLS-enabled layout: 2944→3720 bytes, DPU slim 2936→3712 bytes.
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3696,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3720,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3688,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3712,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */
