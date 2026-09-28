@@ -1142,6 +1142,28 @@ proxy_rcvbuf_cache_setup(const char *env)
              rcvbuf_check_enabled() ? " (high-water check on)" : "");
   }
 }
+
+/* The accept valve's gate (LLB_PD_MAX_TOTAL_INFLIGHT): open while the
+ * footprint gauge is under the bound, always open with the bound off. */
+int
+pd_accept_valve_open(void)
+{
+  return pd_admission_should_accept(
+      atomic_load_explicit(&global_stats.pd_admission_total_inflight, memory_order_relaxed),
+      pd_max_total_inflight());
+}
+
+/* Re-arm the listeners the accept valve paused once its gate is open again.
+ * Nothing paused costs one atomic load. Called after the gauge drops, and by
+ * the health pass as a backstop. */
+void
+pd_accept_valve_rearm(void)
+{
+  if (proxy_struct && proxy_struct->ns) {
+    notify_rearm_paused(proxy_struct->ns, pd_accept_valve_open);
+  }
+}
+
 static unsigned long   pfe_pool_total;  /* shells ever created (high-water)  */
 static unsigned long   pfe_pool_live;   /* shells currently checked out      */
 
@@ -1185,11 +1207,13 @@ pfe_alloc_ex(int with_rcvbuf)
       pthread_mutex_unlock(&pfe_pool_lock);
       /* mirror the pfe_pool_live dec: this checkout never produced a live shell.
        * Gated identically to the inc above (default-off when the bound is unset). */
-      if (pd_max_total_inflight() != 0 &&
-          atomic_load_explicit(&global_stats.pd_admission_total_inflight,
-                               memory_order_relaxed) > 0)
-        atomic_fetch_sub_explicit(&global_stats.pd_admission_total_inflight, 1,
-                                  memory_order_relaxed);
+      if (pd_max_total_inflight() != 0) {
+        if (atomic_load_explicit(&global_stats.pd_admission_total_inflight,
+                                 memory_order_relaxed) > 0)
+          atomic_fetch_sub_explicit(&global_stats.pd_admission_total_inflight, 1,
+                                    memory_order_relaxed);
+        pd_accept_valve_rearm();
+      }
       log_error("pfe_alloc: shell OOM");
       return NULL;
     }
@@ -1336,11 +1360,13 @@ pfe_recycle(proxy_fd_ent_t *pfe)
    * match the pfe_pool_live underflow guard / the active_conns idiom. Gated on the
    * bound being enabled (default-off byte-identical when LLB_PD_MAX_TOTAL_INFLIGHT
    * is unset), paired identically with the pfe_alloc inc. */
-  if (pd_max_total_inflight() != 0 &&
-      atomic_load_explicit(&global_stats.pd_admission_total_inflight,
-                           memory_order_relaxed) > 0)
-    atomic_fetch_sub_explicit(&global_stats.pd_admission_total_inflight, 1,
-                              memory_order_relaxed);
+  if (pd_max_total_inflight() != 0) {
+    if (atomic_load_explicit(&global_stats.pd_admission_total_inflight,
+                             memory_order_relaxed) > 0)
+      atomic_fetch_sub_explicit(&global_stats.pd_admission_total_inflight, 1,
+                                memory_order_relaxed);
+    pd_accept_valve_rearm();   /* a listener the valve paused may take this room */
+  }
 }
 
 /* : read-only snapshot of the pfe-pool gauges for the bounded-

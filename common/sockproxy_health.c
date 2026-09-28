@@ -492,6 +492,9 @@ proxy_drain_checker_thread(void *arg)
      * soak harness sets the bound to observe pfe_pool_live / accept-gate activity. */
     if (pd_max_total_inflight() != 0) {
       static unsigned int fp_tick;
+      /* backstop for the accept valve: a listener paused at the bound is
+       * re-armed here if no release has done it */
+      pd_accept_valve_rearm();
       if ((++fp_tick % 10u) == 0u) {
         unsigned long live = 0, total = 0;
         pfe_pool_snapshot(&live, &total);

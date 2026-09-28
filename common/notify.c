@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <netdb.h>
 #include <poll.h>
 #include <ifaddrs.h>
@@ -46,6 +47,10 @@
  * "the next slot-free re-attempts" (the conn stays parked), never to a wedge. */
 #define MAX_NOTIFY_RESUME_PENDING 4096
 
+/* Bound on the listeners the accept valve can hold paused at once (one per
+ * listening socket; a full table falls back to the unpaused decline). */
+#define MAX_NOTIFY_PAUSED 1024
+
 typedef struct notify_ent {
   int fd;
   notify_type_t type;
@@ -58,6 +63,10 @@ typedef struct notify_ent {
    * lands on whatever fd occupies that slot by the time the worker looks
    * (the worker then tore down a live, newer registration). */
   uint8_t evict;
+  /* Paused by notify_pause_ent: its poll events are held in paused_events
+   * and restored by notify_rearm_paused. Reset with the registration. */
+  uint8_t paused;
+  short paused_events;
 } notify_ent_t;
 
 #define NOTI_LOCK(C) pthread_rwlock_wrlock(&(C)->lock)
@@ -101,6 +110,12 @@ typedef struct notify_ctx {
    * pace of accept() and not at the pace of the relay loop it used to share
    * (one accept per poll round, behind that round's relay events). */
   int acc_thr;
+  /* Paused registrations (fds, under the lock; an entry whose registration
+   * was released meanwhile is skipped and dropped) and how many are paused
+   * now (read without the lock on the re-arm fast path). */
+  int paused_fds[MAX_NOTIFY_PAUSED];
+  int n_paused_fds;
+  atomic_int n_paused;
   notify_cbs_t cbs;
   notify_poll_ctx_t poll_ctx[MAX_NOTIFY_THREADS];
 } notify_ctx_t ;
@@ -329,7 +344,9 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
     pctx = &nctx->poll_ctx[ent->thr_id];
     assert(pctx);
     if (ent->priv == priv) {
-      if (pctx->pfds[ent->poll_slot].events != events) {
+      if (ent->paused) {
+        ent->paused_events = events;   /* applied when it is re-armed */
+      } else if (pctx->pfds[ent->poll_slot].events != events) {
         pctx->pfds[ent->poll_slot].events = events;
       }
       NOTI_UNLOCK(nctx);
@@ -370,6 +387,7 @@ __notify_add_ent(void *ctx, int fd, notify_type_t type, void *priv, uint64_t gen
   ent->gen = gen;
   ent->thr_id = tslot;
   ent->evict = 0;
+  ent->paused = 0;
   
   pctx->pfds[pctx->n_pfds].fd = fd;
   pctx->pfds[pctx->n_pfds].events = events;
@@ -438,6 +456,17 @@ notify_listener_thr(void *ctx)
   return nctx ? nctx->acc_thr : -1;
 }
 
+/* A registration that goes away (or is disarmed) is no longer paused. Its fd
+ * may stay in paused_fds; the re-arm skips it. Caller holds the lock. */
+static void
+notify_forget_pause(notify_ctx_t *nctx, notify_ent_t *ent)
+{
+  if (ent->paused) {
+    ent->paused = 0;
+    atomic_fetch_sub(&nctx->n_paused, 1);
+  }
+}
+
 int
 __notify_delete_ent(void *ctx, int fd, uint64_t gen, int check_gen)
 {
@@ -490,6 +519,7 @@ __notify_delete_ent(void *ctx, int fd, uint64_t gen, int check_gen)
   ent->poll_slot = -1;
   ent->priv = NULL;
   ent->thr_id = 0;
+  notify_forget_pause(nctx, ent);
 
   pctx = &nctx->poll_ctx[tslot];
 
@@ -676,6 +706,7 @@ notify_deregister_ent(void *ctx, int fd)
   ent->poll_slot = -1;
   ent->priv = NULL;
   ent->thr_id = 0;
+  notify_forget_pause(nctx, ent);
 
   pctx = &nctx->poll_ctx[tslot];
 
@@ -731,11 +762,146 @@ notify_disarm_ent(void *ctx, int fd)
     return -EINVAL;
   }
   ent->type = 0;
+  notify_forget_pause(nctx, ent);
   pctx = &nctx->poll_ctx[ent->thr_id];
   pctx->pfds[ent->poll_slot].events = 0;
   NOTI_UNLOCK(nctx);
 
   return 0;
+}
+
+/* Wake the workers in `mask` so a re-armed fd is polled now rather than at
+ * the next poll timeout. */
+static void
+notify_wake_mask(notify_ctx_t *nctx, unsigned mask)
+{
+  for (int t = 0; t < MAX_NOTIFY_THREADS; t++) {
+    int wfd = nctx->poll_ctx[t].wake_fd;
+    if ((mask & (1u << t)) && wfd >= 0) {
+      uint64_t one = 1;
+      ssize_t w = write(wfd, &one, sizeof(one));
+      (void)w;  /* coalescing counter; a missed wake is caught at the poll timeout */
+    }
+  }
+}
+
+/* Restore every paused registration. Caller holds the lock; returns how many
+ * were re-armed and ORs their workers into *mask. */
+static int
+notify_rearm_locked(notify_ctx_t *nctx, unsigned *mask)
+{
+  int n = 0;
+
+  for (int i = 0; i < nctx->n_paused_fds; i++) {
+    notify_ent_t *ent = &nctx->earr[nctx->paused_fds[i]];
+    if (ent->fd <= 0 || !ent->paused) {
+      continue;   /* released (and maybe registered again) since its pause */
+    }
+    nctx->poll_ctx[ent->thr_id].pfds[ent->poll_slot].events = ent->paused_events;
+    ent->paused = 0;
+    atomic_fetch_sub(&nctx->n_paused, 1);
+    *mask |= 1u << ent->thr_id;
+    n++;
+  }
+  nctx->n_paused_fds = 0;
+  return n;
+}
+
+/* Pause a registered fd (see notify.h), then ask `gate` once more: when it
+ * is open already, whatever freed the room may have looked for paused fds
+ * before this one was paused, so re-arm here. The fence pairs with the one
+ * in notify_rearm_paused: either this side sees the room, or the releasing
+ * side sees the pause. */
+int
+notify_pause_ent(void *ctx, int fd, int (*gate)(void))
+{
+  notify_ctx_t *nctx = ctx;
+  notify_ent_t *ent;
+  unsigned mask = 0;
+  int n;
+
+  assert(ctx);
+
+  if (fd <= 0 || fd >= MAX_NOTIFY_FDS || !gate) {
+    return -EINVAL;
+  }
+
+  NOTI_LOCK(nctx);
+  ent = &nctx->earr[fd];
+  if (ent->fd <= 0) {
+    NOTI_UNLOCK(nctx);
+    return -ENOENT;
+  }
+  if (ent->paused) {
+    NOTI_UNLOCK(nctx);
+    return 0;   /* an event polled before the pause */
+  }
+  if (nctx->n_paused_fds >= MAX_NOTIFY_PAUSED) {
+    /* drop the entries whose registration went away */
+    int j = 0;
+    for (int i = 0; i < nctx->n_paused_fds; i++) {
+      notify_ent_t *p = &nctx->earr[nctx->paused_fds[i]];
+      if (p->fd > 0 && p->paused) {
+        nctx->paused_fds[j++] = nctx->paused_fds[i];
+      }
+    }
+    nctx->n_paused_fds = j;
+    if (j >= MAX_NOTIFY_PAUSED) {
+      NOTI_UNLOCK(nctx);
+      return -ENOSPC;
+    }
+  }
+  ent->paused_events = nctx->poll_ctx[ent->thr_id].pfds[ent->poll_slot].events;
+  nctx->poll_ctx[ent->thr_id].pfds[ent->poll_slot].events = 0;
+  ent->paused = 1;
+  nctx->paused_fds[nctx->n_paused_fds++] = fd;
+  atomic_fetch_add(&nctx->n_paused, 1);
+  NOTI_UNLOCK(nctx);
+
+  atomic_thread_fence(memory_order_seq_cst);
+  if (!gate()) {
+    return 1;
+  }
+  NOTI_LOCK(nctx);
+  n = notify_rearm_locked(nctx, &mask);
+  NOTI_UNLOCK(nctx);
+  if (n) {
+    notify_wake_mask(nctx, mask);
+  }
+  return 0;
+}
+
+/* Re-arm every paused registration when `gate` is open (see notify.h). */
+int
+notify_rearm_paused(void *ctx, int (*gate)(void))
+{
+  notify_ctx_t *nctx = ctx;
+  unsigned mask = 0;
+  int n;
+
+  if (!nctx || !gate) {
+    return 0;
+  }
+  atomic_thread_fence(memory_order_seq_cst);
+  if (atomic_load(&nctx->n_paused) == 0 || !gate()) {
+    return 0;
+  }
+  NOTI_LOCK(nctx);
+  n = notify_rearm_locked(nctx, &mask);
+  NOTI_UNLOCK(nctx);
+  if (n) {
+    notify_wake_mask(nctx, mask);
+  }
+  return n;
+}
+
+/* How many registrations are paused now. */
+int
+notify_paused_count(void *ctx)
+{
+  notify_ctx_t *nctx = ctx;
+
+  return nctx ? atomic_load(&nctx->n_paused) : 0;
 }
 
 /* (R1): drain THIS worker's resume-pending ring and re-drive each parked
