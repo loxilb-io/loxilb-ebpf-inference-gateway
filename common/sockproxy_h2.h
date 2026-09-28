@@ -149,6 +149,7 @@ typedef struct proxy_h2_stream {
   uint16_t usage_tail_len;
   uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
   int      metric_response_status;   // backend :status relayed to the client (0 = unseen)
+  uint8_t  fc_first_data_seen;       // the first response DATA chunk was looked at for TTFT
   fc_permit_t fc;                    // capacity admission permit of THIS stream (one
                                      // service unit + one endpoint unit); released by
                                      // h2_stream_free, which runs for every stream end

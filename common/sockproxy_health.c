@@ -323,7 +323,7 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
   struct timespec ts;
   uint64_t now_ns, queued_ms = 0;
   uint32_t inflight = fc_inflight(fc), queued = fc_queued(fc);
-  uint32_t limit = fc ? fc->cfg.max_outstanding : 0;
+  uint32_t limit = fc ? fc_svc_cap(fc) : 0;
   uint32_t retry_after = kind == SP_REAP_FC_DRAINED ? 5 : fc_retry_after_s(fc);
   int status = kind == SP_REAP_FC_DRAINED ? 503 : 504;
   const char *code = kind == SP_REAP_FC_DRAINED ? "admission_drained"
@@ -1301,6 +1301,26 @@ check_draining_endpoints(void)
     }
   }
 
+  /* Adaptive service ceilings: one step per adapting pool per pass, on
+   * what its endpoints reported within the pool's telemetry window. */
+  {
+    proxy_map_ent_t *a_node;
+    proxy_epval_t *a_ep, *a_tmp;
+    struct timespec a_ts;
+    uint64_t a_now_ns = fc_now_ns();
+    fc_signal_t sig;
+
+    clock_gettime(CLOCK_MONOTONIC, &a_ts);
+    for (a_node = proxy_struct->head; a_node; a_node = a_node->next) {
+      HASH_ITER(hh, a_node->val.ephash, a_ep, a_tmp) {
+        if (!a_ep->ai_gw_mode || !a_ep->fc.cfg.adaptive)
+          continue;
+        sp_fc_adapt_signal(a_ep, (uint64_t)a_ts.tv_sec, a_now_ns, &sig);
+        fc_adapt_tick(&a_ep->fc, &sig);
+      }
+    }
+  }
+
   /* (RESOLVED): graceful [DONE]-synthesis safety-net — the real
    * deliverable. Diagnosis: vLLM's P/D-disagg path FINISHES generation but omits
    * the closing "data: [DONE]" SSE chunk for ~2.5% of streams under concurrency
@@ -1653,6 +1673,9 @@ circuit_breaker_record_success(proxy_epval_t *tepval, int ep_index)
       // Enough successes - close circuit
       cb->state = CB_STATE_CLOSED;
       cb->failure_count = 0;
+      /* Back in service: its admission ceiling ramps up over the pool's
+       * warm-up window instead of taking a full share of a burst cold. */
+      fc_ep_warm_start(&tepval->fc, ep_index, 0);
       atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* OBS-03: HALF_OPEN→CLOSED */
       /* (D1): complete the recovery observability triad. The OPEN→HALF_OPEN
        * heal ([CB heal], sockproxy_health.c) and CLOSED→OPEN trip already log; this
@@ -1746,6 +1769,7 @@ circuit_breaker_record_origin_success(proxy_epval_t *tepval, int ep_index)
     cb->failure_count = 0;
     cb->success_count = 0;
     cb->origin_tripped = 0;
+    fc_ep_warm_start(&tepval->fc, ep_index, 0);
     atomic_fetch_add(&global_stats.pd_cb_flips, 1);  /* HALF_OPEN→CLOSED */
     log_info("[CB_ORIGIN] ep[%d] HALF_OPEN->CLOSED on origin success — "
              "fully back in rotation", ep_index);

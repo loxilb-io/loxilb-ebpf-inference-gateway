@@ -366,10 +366,14 @@ test_fc_gate: test_fc_gate.c sockproxy_fc.c sockproxy_fc.h
 test_fc_queue: test_fc_queue.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_queue.c sockproxy_fc.c -I. -lpthread
 
+test_fc_adapt: test_fc_adapt.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_adapt.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue
+test_fc: test_fc_gate test_fc_queue test_fc_adapt
 	./test_fc_gate
 	./test_fc_queue
+	./test_fc_adapt
 
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
@@ -727,7 +731,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
+	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

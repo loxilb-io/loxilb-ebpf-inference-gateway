@@ -2933,6 +2933,9 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->fc_prefill_max_inflight = dat->fc_prefill_max_inflight;
   pval->fc_decode_max_inflight = dat->fc_decode_max_inflight;
   pval->fc_telemetry_stale_ms = dat->fc_telemetry_stale_ms;
+  pval->fc_adaptive = dat->fc_adaptive;
+  pval->fc_warmup_ms = dat->fc_warmup_ms;
+  pval->fc_ttft_target_ms = dat->fc_ttft_target_ms;
 
   // Per-endpoint circuit breaker enable (opt-in per rule)
   pval->cb_enable = dat->cb_enable;

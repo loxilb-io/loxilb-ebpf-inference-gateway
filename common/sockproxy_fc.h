@@ -111,6 +111,9 @@ enum fc_limit {
   FC_L_QUEUE_DEPTH,
   FC_L_QUEUE_WAIT,
   FC_L_TELEMETRY_STALE,
+  FC_L_ADAPTIVE,
+  FC_L_WARMUP,
+  FC_L_TTFT_TARGET,
   FC_LIMITS,
 };
 
@@ -118,6 +121,10 @@ enum fc_limit {
  * (three default scrape intervals). */
 #define FC_TELEMETRY_STALE_MS_DEFAULT 30000u
 #define FC_TELEMETRY_STALE_MS_MAX     3600000u
+
+/* The longest warm-up window and TTFT target a rule may declare: an hour. */
+#define FC_WARMUP_MS_MAX              3600000u
+#define FC_TTFT_TARGET_MS_MAX         3600000u
 
 typedef struct fc_cfg {
   uint8_t  mode;                 /* enum fc_mode */
@@ -127,6 +134,9 @@ typedef struct fc_cfg {
   uint32_t max_queue_depth;      /* requests that may wait for a unit; 0 = no waiting */
   uint32_t max_queue_wait_ms;    /* longest wait before a queued request is ended */
   uint32_t telemetry_stale_ms;   /* scraped queue depth older than this is not trusted */
+  uint8_t  adaptive;             /* 1: the service ceiling tightens under backpressure */
+  uint32_t warmup_ms;            /* an endpoint back in service ramps to its ceiling over this; 0 = at once */
+  uint32_t ttft_target_ms;       /* an endpoint's TTFT above this is backpressure; 0 = TTFT unused */
 } fc_cfg_t;
 
 /* A rule's declarations, as the control plane sends them. 0 on any field
@@ -139,6 +149,13 @@ enum fc_rule_mode {
   FC_RULE_MODE_ENFORCE = 3,
 };
 
+/* The same shift for the adaptive switch. */
+enum fc_rule_adaptive {
+  FC_RULE_ADAPTIVE_INHERIT = 0,
+  FC_RULE_ADAPTIVE_OFF = 1,
+  FC_RULE_ADAPTIVE_ON = 2,
+};
+
 typedef struct fc_rule_cfg {
   uint8_t  mode;                 /* enum fc_rule_mode */
   uint32_t max_outstanding;
@@ -146,7 +163,36 @@ typedef struct fc_rule_cfg {
   uint32_t max_queue_depth;
   uint32_t max_queue_wait_ms;
   uint32_t telemetry_stale_ms;
+  uint8_t  adaptive;             /* enum fc_rule_adaptive */
+  uint32_t warmup_ms;
+  uint32_t ttft_target_ms;
 } fc_rule_cfg_t;
+
+/* The adaptive ceiling's state, for the read-back and the metrics. */
+enum fc_adapt_state {
+  FC_AS_OFF = 0,                 /* not adaptive, or no service ceiling to tighten */
+  FC_AS_OPEN,                    /* at the configured ceiling */
+  FC_AS_TIGHTENED,               /* below it, following fresh signals */
+  FC_AS_FROZEN,                  /* below it, signals stale: held where it is */
+  FC_AS_COUNT,
+};
+
+/* Why the adaptive ceiling last moved, or why it holds. */
+enum fc_adapt_reason {
+  FC_AR_NONE = 0,
+  FC_AR_QUEUED,                  /* an endpoint reported waiting requests */
+  FC_AR_TTFT,                    /* an endpoint's TTFT is above the target */
+  FC_AR_CLEAR,                   /* fresh signals, no backpressure: widened */
+  FC_AR_STALE,                   /* no fresh signal: held */
+  FC_AR_COUNT,
+};
+
+/* What the 1 Hz pass saw across a pool's endpoints. */
+typedef struct fc_signal {
+  uint8_t fresh;                 /* at least one endpoint reported within the telemetry window */
+  uint8_t queued;                /* a fresh endpoint has requests waiting */
+  uint8_t ttft_over;             /* a fresh endpoint's TTFT is above the target */
+} fc_signal_t;
 
 /* What the gate decided, one counter each. The names are the wire values of
  * the decisions metric; they are spelled here once. Append only. */
@@ -218,6 +264,17 @@ typedef struct fc_state {
   _Atomic uint64_t qwait_sum_ms;
   _Atomic uint64_t qwait_count;
   fc_queue_t queue;
+  /* The adaptive ceiling in force while cfg.adaptive is set; otherwise
+   * unused (the configured ceiling is). Moved by fc_adapt_tick only. */
+  _Atomic uint32_t eff_max;
+  _Atomic uint8_t adapt_state;   /* enum fc_adapt_state */
+  _Atomic uint8_t adapt_reason;  /* enum fc_adapt_reason */
+  _Atomic uint64_t adapt_moves[2]; /* times the ceiling went down, up */
+  /* Per endpoint: when its warm-up began (0 = warm), and its TTFT
+   * estimate with the time of the last sample. */
+  _Atomic uint64_t warm_since_ns[FC_MAX_EP];
+  _Atomic uint32_t ttft_ewma_ms[FC_MAX_EP];
+  _Atomic uint64_t ttft_ts_ns[FC_MAX_EP];
 } fc_state_t;
 
 enum fc_permit_state {
@@ -239,6 +296,7 @@ typedef struct fc_permit {
   uint64_t q_gen;
   uint64_t q_enqueue_ns;
   uint64_t q_deadline_ns;
+  uint64_t admit_ns;             /* fc_now_ns() when the first endpoint unit landed: dispatch */
 } fc_permit_t;
 
 typedef enum fc_verdict {
@@ -284,6 +342,22 @@ fc_queue_enabled(const fc_state_t *fc)
          fc->cfg.max_queue_depth > 0 && fc->queue.cap > 0;
 }
 
+/* The service ceiling in force: the adaptive one while the pool adapts,
+ * else the configured one. 0 is unlimited, and an unlimited pool has
+ * nothing to tighten. */
+static inline uint32_t
+fc_svc_cap(const fc_state_t *fc)
+{
+  if (fc->cfg.adaptive && fc->cfg.max_outstanding)
+    return atomic_load_explicit(&fc->eff_max, memory_order_relaxed);
+  return fc->cfg.max_outstanding;
+}
+
+/* An endpoint's ceiling for the role at `now_ns`: the configured one, or,
+ * while the endpoint warms up, a ramp from a quarter of it (at least one)
+ * to all of it across the warm-up window. An unlimited role is not ramped. */
+uint32_t fc_ep_cap_now(const fc_state_t *fc, int ep, int role, uint64_t now_ns);
+
 /* Whether the service ceiling has a unit free. A read: the CAS in the gate
  * is still the last word. */
 static inline int
@@ -293,7 +367,7 @@ fc_has_room(const fc_state_t *fc)
 
   if (!fc)
     return 0;
-  cap = fc->cfg.max_outstanding;
+  cap = fc_svc_cap(fc);
   return cap == 0 ||
          atomic_load_explicit(&fc->inflight, memory_order_relaxed) < cap;
 }
@@ -465,9 +539,54 @@ fc_limit_for(const fc_state_t *fc, int role)
   if (!fc)
     return 0;
   if (role < 0 || role >= FC_ROLES)
-    return fc->cfg.max_outstanding;
-  return fc->cfg.ep_cap[role] ? fc->cfg.ep_cap[role] : fc->cfg.max_outstanding;
+    return fc_svc_cap(fc);
+  return fc->cfg.ep_cap[role] ? fc->cfg.ep_cap[role] : fc_svc_cap(fc);
 }
+
+/* ---- adaptive ceiling and warm-up ------------------------------------------ */
+
+/* One step of the adaptive ceiling, once a second per pool. Backpressure
+ * on a fresh signal takes the ceiling to four fifths (never below a quarter
+ * of the configured one, and never below one); a fresh signal without
+ * backpressure gives one unit back, up to the configured ceiling, and wakes
+ * the waiters that now fit; no fresh signal holds it where it is. Only a
+ * fresh signal ever raises it. */
+void fc_adapt_tick(fc_state_t *fc, const fc_signal_t *sig);
+
+/* A time-to-first-token sample for an endpoint: folded into its estimate
+ * (an exponential average weighting the new sample one eighth). */
+void fc_ttft_sample(fc_state_t *fc, int ep, uint32_t ms, uint64_t now_ns);
+
+/* A streamed response's first data event for the request holding `p`:
+ * its time from admission is one TTFT sample for the endpoint holding the
+ * request's unit (the decode endpoint of a disaggregated request). A no-op
+ * unless the permit is executing and its pool has a TTFT target. */
+void fc_permit_ttft(fc_permit_t *p);
+
+/* Whether the endpoint has a TTFT sample within the telemetry window. */
+int fc_ttft_fresh(const fc_state_t *fc, int ep, uint64_t now_ns);
+
+/* Whether the endpoint's TTFT estimate is fresh at `now_ns` and above the
+ * pool's target. False when no target is set or no fresh sample exists. */
+int fc_ttft_over(const fc_state_t *fc, int ep, uint64_t now_ns, int *fresh);
+
+/* The endpoint came back into service (a breaker closed, it was added or
+ * re-enabled): its ceilings ramp up over the warm-up window. A no-op when
+ * the pool has no warm-up window. */
+void fc_ep_warm_start(fc_state_t *fc, int ep, uint64_t now_ns);
+
+/* Endpoints still inside their warm-up window at `now_ns`. */
+uint32_t fc_warming_eps(const fc_state_t *fc, uint64_t now_ns);
+
+/* The module's clock for warm-up and freshness: CLOCK_MONOTONIC in
+ * nanoseconds, so a wall-clock step never ends or extends a window. Tests
+ * replace it. */
+uint64_t fc_now_ns(void);
+typedef uint64_t (*fc_clock_fn)(void);
+void fc_set_clock(fc_clock_fn fn);
+
+const char *fc_adapt_state_name(uint8_t state);
+const char *fc_adapt_reason_name(uint8_t reason);
 
 const char *fc_reason_name(enum fc_reason reason);
 const char *fc_anomaly_name(enum fc_anomaly a);

@@ -272,6 +272,10 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
      * source is the same accessor seam. */
     snapshot.pd_admission_overflow_shed = pd_admission_stats_get(2);
 
+    snapshot.proxy_context_inflight = atomic_load(&global_stats.pd_admission_total_inflight);
+    snapshot.proxy_accept_blocked   = atomic_load(&global_stats.pd_admission_total_blocked);
+    snapshot.proxy_accept_bound     = pd_max_total_inflight();
+
     return snapshot;
 }
 
@@ -295,7 +299,10 @@ llb_ai_update_ep_queue_depth(uint32_t service_ip, uint16_t service_port,
   while (node) {
     if (node->key.xip == service_ip && node->key.xport == service_port) {
       proxy_epval_t *tepval = node->val.ephash;
-      if (tepval && tepval->pd_disagg_enabled && ep_index < tepval->n_eps) {
+      /* A P/D pool's scorers read the depth; an AI pool's adaptive
+       * ceiling does too (sp_fc_adapt_signal). */
+      if (tepval && (tepval->pd_disagg_enabled || tepval->ai_gw_mode) &&
+          ep_index < tepval->n_eps) {
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         atomic_store(&tepval->pd_ep_loads[ep_index].queued_requests, queued_requests);
