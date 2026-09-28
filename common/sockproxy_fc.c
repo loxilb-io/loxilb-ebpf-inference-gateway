@@ -78,8 +78,10 @@ fc_mode_name(uint8_t mode)
 
 /* ---- configuration ------------------------------------------------------ */
 
+/* A numeric knob from the environment: `dflt` when unset or unparseable,
+ * and the source marked when the environment gave the value. */
 static uint32_t
-fc_env_u32(const char *name, uint32_t dflt)
+fc_env_u32(const char *name, uint32_t dflt, uint8_t *src)
 {
   const char *e = getenv(name);
   char *end = NULL;
@@ -90,6 +92,8 @@ fc_env_u32(const char *name, uint32_t dflt)
   n = strtol(e, &end, 10);
   if (end == e || (end && *end) || n < 0 || n > 100000000)
     return dflt;
+  if (src)
+    *src = FC_SRC_ENV;
   return (uint32_t)n;
 }
 
@@ -100,31 +104,117 @@ fc_cfg_from_env(fc_cfg_t *cfg)
 
   memset(cfg, 0, sizeof(*cfg));
   mode = getenv("LLB_FC_MODE");
-  if (mode && !strcasecmp(mode, "enforce"))
+  if (mode && !strcasecmp(mode, "enforce")) {
     cfg->mode = FC_MODE_ENFORCE;
-  else if (mode && !strcasecmp(mode, "observe"))
+    cfg->src[FC_L_MODE] = FC_SRC_ENV;
+  } else if (mode && !strcasecmp(mode, "observe")) {
     cfg->mode = FC_MODE_OBSERVE;
-  else
+    cfg->src[FC_L_MODE] = FC_SRC_ENV;
+  } else {
     cfg->mode = FC_MODE_OFF;
+    if (mode && !strcasecmp(mode, "off"))
+      cfg->src[FC_L_MODE] = FC_SRC_ENV;
+  }
 
-  cfg->max_outstanding = fc_env_u32("LLB_FC_MAX_OUTSTANDING", 0);
-  cfg->ep_cap[FC_ROLE_NORMAL] = fc_env_u32("LLB_FC_EP_MAX_INFLIGHT", 0);
+  cfg->max_outstanding = fc_env_u32("LLB_FC_MAX_OUTSTANDING", 0,
+                                    &cfg->src[FC_L_MAX_OUTSTANDING]);
+  cfg->ep_cap[FC_ROLE_NORMAL] = fc_env_u32("LLB_FC_EP_MAX_INFLIGHT", 0,
+                                           &cfg->src[FC_L_EP_NORMAL]);
   /* The prefill ceiling keeps reading the knob the prefill selector already
    * honours, so an operator who set it keeps the same bound under the gate. */
   cfg->ep_cap[FC_ROLE_PREFILL] =
     fc_env_u32("LLB_FC_PREFILL_MAX_INFLIGHT",
-               fc_env_u32("LLB_PD_MAX_INFLIGHT_PER_EP", 0));
-  cfg->ep_cap[FC_ROLE_DECODE] = fc_env_u32("LLB_FC_DECODE_MAX_INFLIGHT", 0);
-  cfg->max_queue_depth = fc_env_u32("LLB_FC_MAX_QUEUE_DEPTH", 0);
+               fc_env_u32("LLB_PD_MAX_INFLIGHT_PER_EP", 0,
+                          &cfg->src[FC_L_EP_PREFILL]),
+               &cfg->src[FC_L_EP_PREFILL]);
+  cfg->ep_cap[FC_ROLE_DECODE] = fc_env_u32("LLB_FC_DECODE_MAX_INFLIGHT", 0,
+                                           &cfg->src[FC_L_EP_DECODE]);
+  cfg->max_queue_depth = fc_env_u32("LLB_FC_MAX_QUEUE_DEPTH", 0,
+                                    &cfg->src[FC_L_QUEUE_DEPTH]);
   if (cfg->max_queue_depth > FC_QUEUE_DEPTH_MAX)
     cfg->max_queue_depth = FC_QUEUE_DEPTH_MAX;
-  cfg->max_queue_wait_ms = fc_env_u32("LLB_FC_MAX_QUEUE_WAIT_MS", 0);
+  cfg->max_queue_wait_ms = fc_env_u32("LLB_FC_MAX_QUEUE_WAIT_MS", 0,
+                                      &cfg->src[FC_L_QUEUE_WAIT]);
   if (cfg->max_queue_wait_ms > FC_QUEUE_WAIT_MS_MAX)
     cfg->max_queue_wait_ms = FC_QUEUE_WAIT_MS_MAX;
   /* A depth with no wait window would park a request forever: the window
    * defaults so the queue is always bounded in time as well as in size. */
   if (cfg->max_queue_depth > 0 && cfg->max_queue_wait_ms == 0)
     cfg->max_queue_wait_ms = 5000;
+  cfg->telemetry_stale_ms = fc_env_u32("LLB_FC_TELEMETRY_STALE_MS",
+                                       FC_TELEMETRY_STALE_MS_DEFAULT,
+                                       &cfg->src[FC_L_TELEMETRY_STALE]);
+  if (cfg->telemetry_stale_ms == 0 ||
+      cfg->telemetry_stale_ms > FC_TELEMETRY_STALE_MS_MAX) {
+    cfg->telemetry_stale_ms = FC_TELEMETRY_STALE_MS_DEFAULT;
+    cfg->src[FC_L_TELEMETRY_STALE] = FC_SRC_DEFAULT;
+  }
+}
+
+static inline void
+fc_overlay_u32(uint32_t *val, uint8_t *src, uint32_t declared)
+{
+  if (declared) {
+    *val = declared;
+    *src = FC_SRC_RULE;
+  }
+}
+
+void
+fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rule)
+{
+  *out = *env;
+  if (!rule)
+    return;
+  if (rule->mode >= FC_RULE_MODE_OFF && rule->mode <= FC_RULE_MODE_ENFORCE) {
+    out->mode = rule->mode - 1;
+    out->src[FC_L_MODE] = FC_SRC_RULE;
+  }
+  fc_overlay_u32(&out->max_outstanding, &out->src[FC_L_MAX_OUTSTANDING],
+                 rule->max_outstanding);
+  fc_overlay_u32(&out->ep_cap[FC_ROLE_NORMAL], &out->src[FC_L_EP_NORMAL],
+                 rule->ep_cap[FC_ROLE_NORMAL]);
+  fc_overlay_u32(&out->ep_cap[FC_ROLE_PREFILL], &out->src[FC_L_EP_PREFILL],
+                 rule->ep_cap[FC_ROLE_PREFILL]);
+  fc_overlay_u32(&out->ep_cap[FC_ROLE_DECODE], &out->src[FC_L_EP_DECODE],
+                 rule->ep_cap[FC_ROLE_DECODE]);
+  fc_overlay_u32(&out->max_queue_depth, &out->src[FC_L_QUEUE_DEPTH],
+                 rule->max_queue_depth);
+  if (out->max_queue_depth > FC_QUEUE_DEPTH_MAX)
+    out->max_queue_depth = FC_QUEUE_DEPTH_MAX;
+  /* The environment's defaulted window was for the environment's depth:
+   * start from its declared wait, or none, before the rule's. */
+  if (env->src[FC_L_QUEUE_WAIT] == FC_SRC_DEFAULT)
+    out->max_queue_wait_ms = 0;
+  fc_overlay_u32(&out->max_queue_wait_ms, &out->src[FC_L_QUEUE_WAIT],
+                 rule->max_queue_wait_ms);
+  if (out->max_queue_wait_ms > FC_QUEUE_WAIT_MS_MAX)
+    out->max_queue_wait_ms = FC_QUEUE_WAIT_MS_MAX;
+  if (out->max_queue_depth > 0 && out->max_queue_wait_ms == 0) {
+    out->max_queue_wait_ms = 5000;
+    out->src[FC_L_QUEUE_WAIT] = FC_SRC_DEFAULT;
+  }
+  fc_overlay_u32(&out->telemetry_stale_ms, &out->src[FC_L_TELEMETRY_STALE],
+                 rule->telemetry_stale_ms);
+  if (out->telemetry_stale_ms > FC_TELEMETRY_STALE_MS_MAX)
+    out->telemetry_stale_ms = FC_TELEMETRY_STALE_MS_MAX;
+}
+
+int
+fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b)
+{
+  if (a->mode != b->mode || a->max_outstanding != b->max_outstanding ||
+      a->max_queue_depth != b->max_queue_depth ||
+      a->max_queue_wait_ms != b->max_queue_wait_ms ||
+      a->telemetry_stale_ms != b->telemetry_stale_ms)
+    return 0;
+  for (int r = 0; r < FC_ROLES; r++)
+    if (a->ep_cap[r] != b->ep_cap[r])
+      return 0;
+  for (int l = 0; l < FC_LIMITS; l++)
+    if (a->src[l] != b->src[l])
+      return 0;
+  return 1;
 }
 
 /* ---- the ring, lock held ------------------------------------------------ */
@@ -209,6 +299,8 @@ fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
     fc->cfg.max_queue_wait_ms = FC_QUEUE_WAIT_MS_MAX;
   if (fc->cfg.max_queue_depth > 0 && fc->cfg.max_queue_wait_ms == 0)
     fc->cfg.max_queue_wait_ms = 5000;
+  if (fc->cfg.telemetry_stale_ms == 0)
+    fc->cfg.telemetry_stale_ms = FC_TELEMETRY_STALE_MS_DEFAULT;
   if (!fc->queue.dead && fc->cfg.max_queue_depth > fc->queue.cap)
     (void)fc_ring_grow(&fc->queue, fc->cfg.max_queue_depth);
   pthread_mutex_unlock(&fc->queue.lock);
@@ -373,9 +465,14 @@ static fc_verdict_t
 fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken)
 {
   int over = 0;
+  uint64_t enq = woken ? p->q_enqueue_ns : 0;
+  uint64_t deadline = woken ? p->q_deadline_ns : 0;
 
   fc_permit_init(p);
   p->fc = fc;
+  /* A woken request keeps the wait it was first given, should it go back. */
+  p->q_enqueue_ns = enq;
+  p->q_deadline_ns = deadline;
   if (!fc_active(fc)) {
     p->state = FC_P_BYPASS;
     return FC_ADMIT;
@@ -649,8 +746,24 @@ fc_ring_insert(fc_queue_t *q, const fc_queue_ent_t *e, int front,
   if (q->used >= q->cap)
     return -1;
   if (front) {
+    uint32_t next;
+
     slot = q->head == 0 ? q->cap - 1 : q->head - 1;
     q->head = slot;
+    /* Back at the head, but behind anyone who went back before it and
+     * arrived earlier: several woken requests that lose keep their order. */
+    q->ring[slot] = *e;
+    q->ring[slot].live = 1;
+    for (uint32_t k = 0; k < q->used; k++) {
+      next = fc_ring_wrap(q, slot + 1);
+      if (q->ring[next].live &&
+          q->ring[next].enqueue_ns >= q->ring[slot].enqueue_ns)
+        break;
+      fc_queue_ent_t t = q->ring[next];
+      q->ring[next] = q->ring[slot];
+      q->ring[slot] = t;
+      slot = next;
+    }
   } else {
     slot = q->tail;
     q->tail = fc_ring_wrap(q, q->tail + 1);
@@ -670,10 +783,17 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
 {
   fc_queue_ent_t e;
   uint32_t slot = 0;
+  uint64_t first_deadline = 0;
   int rc = -1;
 
   if (!fc || !p || fd < 0)
     return -1;
+  /* A woken request going back is still bounded by its first window, and
+   * takes its place among the waiters by when it first arrived. */
+  if (front && p->q_deadline_ns) {
+    now_ns = p->q_enqueue_ns;
+    first_deadline = p->q_deadline_ns;
+  }
   e.fd = fd;
   e.live = 1;
   e.gen = gen;
@@ -690,7 +810,8 @@ fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
   p->q_enqueue_ns = now_ns;
 
   pthread_mutex_lock(&fc->queue.lock);
-  e.deadline_ns = now_ns + (uint64_t)fc->cfg.max_queue_wait_ms * 1000000ULL;
+  e.deadline_ns = first_deadline ? first_deadline
+                 : now_ns + (uint64_t)fc->cfg.max_queue_wait_ms * 1000000ULL;
   p->q_deadline_ns = e.deadline_ns;
   if (!fc->queue.dead && fc_queue_enabled(fc) &&
       (front || fc->queue.count < fc->cfg.max_queue_depth))
@@ -834,17 +955,15 @@ fc_queue_resumed(fc_state_t *fc, fc_permit_t *p, uint64_t now_ns)
   p->woken = 1;
 }
 
-void
-fc_queue_wake_one(fc_state_t *fc)
+/* Pop the head and wake its owner. 0 when nobody was popped or the wake
+ * could not be delivered. */
+static int
+fc_queue_wake_head(fc_state_t *fc)
 {
   fc_queue_ent_t e;
 
-  if (!fc || !fc_wake_hook)
-    return;
-  if (fc_queued(fc) == 0 || !fc_has_room(fc))
-    return;
   if (!fc_queue_pop(fc, &e))
-    return;
+    return 0;
   if (fc_wake_hook(e.fd, e.gen) != 0) {
     /* The owner could not be woken now: the request keeps its place at
      * the head and the next released unit tries again. Its deadline is
@@ -853,6 +972,45 @@ fc_queue_wake_one(fc_state_t *fc)
     (void)fc_ring_insert(&fc->queue, &e, 1, NULL);
     atomic_store_explicit(&fc->queued, fc->queue.count, memory_order_relaxed);
     pthread_mutex_unlock(&fc->queue.lock);
+    return 0;
+  }
+  return 1;
+}
+
+void
+fc_queue_wake_one(fc_state_t *fc)
+{
+  if (!fc || !fc_wake_hook)
+    return;
+  if (fc_queued(fc) == 0 || !fc_has_room(fc))
+    return;
+  (void)fc_queue_wake_head(fc);
+}
+
+void
+fc_queue_wake_room(fc_state_t *fc)
+{
+  uint32_t n, cap, inflight;
+
+  if (!fc || !fc_wake_hook)
+    return;
+  n = fc_queued(fc);
+  if (n == 0)
+    return;
+  /* A woken request takes its unit when its worker runs, not now, so the
+   * units free at this moment bound how many turns are given; a woken one
+   * that still meets a ceiling (an endpoint's) goes back to the head. */
+  cap = fc->cfg.max_outstanding;
+  if (fc->cfg.mode == FC_MODE_ENFORCE && cap != 0) {
+    inflight = fc_inflight(fc);
+    if (inflight >= cap)
+      return;
+    if (cap - inflight < n)
+      n = cap - inflight;
+  }
+  while (n-- > 0) {
+    if (!fc_queue_wake_head(fc))
+      break;
   }
 }
 

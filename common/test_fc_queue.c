@@ -218,6 +218,79 @@ test_woken_loser_returns_to_the_head(void)
   printf("  head: a woken request that lost the race went back to the front\n");
 }
 
+/* A request woken and sent back to wait is still bounded by the window it
+ * was first given: going back must not restart its clock, or a pool whose
+ * head keeps losing at an endpoint ceiling would hold it past the wait. */
+static void
+test_woken_loser_keeps_its_deadline(void)
+{
+  fc_state_t fc;
+  fc_permit_t a, b, thief;
+  uint64_t t0 = MS(1), later = MS(900);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 7, t0, 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &b, 2, 7, t0, 0) == FC_QUEUE);
+  assert(b.q_deadline_ns == t0 + MS(1000));
+
+  fc_permit_release(&a);
+  assert(woken_n == 1 && woken_fd[0] == 2);
+  fc_queue_resumed(&fc, &b, later);
+  assert(h1_gate(&fc, &thief, 9, 7, later, 1) == FC_ADMIT);
+  assert(h1_gate(&fc, &b, 2, 7, later, 1) == FC_QUEUE);
+  assert(b.q_enqueue_ns == t0);
+  assert(b.q_deadline_ns == t0 + MS(1000));
+
+  assert(fc_queue_take(&fc, &b));
+  fc_permit_release(&thief);
+  fc_state_destroy(&fc);
+  printf("  head: a woken request sent back keeps its first deadline\n");
+}
+
+/* Several woken requests that all lose go back in the order they arrived,
+ * not in the order they happened to come back. */
+static void
+test_woken_losers_keep_arrival_order(void)
+{
+  fc_state_t fc;
+  fc_cfg_t cfg;
+  fc_permit_t a, w1, w2, w3, t1, t2;
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 1, MS(1), 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, MS(2), 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w2, 3, 1, MS(3), 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w3, 4, 1, MS(4), 0) == FC_QUEUE);
+
+  cfg = fc.cfg;
+  cfg.max_outstanding = 3;                        /* two turns given at once */
+  fc_state_apply(&fc, &cfg);
+  fc_queue_wake_room(&fc);
+  assert(woken_n == 2 && woken_fd[0] == 2 && woken_fd[1] == 3);
+  fc_queue_resumed(&fc, &w1, MS(5));
+  fc_queue_resumed(&fc, &w2, MS(5));
+  /* Both units are taken before either woken request runs; each goes back,
+   * the first-woken first. */
+  assert(h1_gate(&fc, &t1, 8, 1, MS(5), 1) == FC_ADMIT);
+  assert(h1_gate(&fc, &t2, 9, 1, MS(5), 1) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, MS(6), 1) == FC_QUEUE);
+  assert(h1_gate(&fc, &w2, 3, 1, MS(6), 1) == FC_QUEUE);
+  assert(fc_queued(&fc) == 3);
+
+  reset_wakes();
+  fc_permit_release(&t1);
+  fc_queue_resumed(&fc, &w1, MS(7));
+  fc_permit_release(&t2);
+  assert(woken_n == 2 && woken_fd[0] == 2 && woken_fd[1] == 3);
+  fc_queue_resumed(&fc, &w2, MS(7));
+  assert(fc_queue_take(&fc, &w3));
+  fc_permit_release(&a);
+  fc_state_destroy(&fc);
+  printf("  head: woken requests sent back keep their arrival order\n");
+}
+
 /* ---- exactly one terminal action per entry --------------------------------- */
 
 static void
@@ -541,6 +614,49 @@ test_a_wake_needs_room(void)
   printf("  turns: no wake while full; a lost wake was given again once there was room\n");
 }
 
+/* A rule replace that frees units wakes that many waiters, in order, at
+ * once rather than one per periodic kick; one that stops enforcing wakes
+ * every waiter, since the gate now lets each of them through. */
+static void
+test_reconfigure_wakes_what_fits(void)
+{
+  fc_state_t fc;
+  fc_cfg_t cfg;
+  fc_permit_t a, w1, w2, w3;
+  uint64_t now = MS(9);
+
+  pool_with(&fc, FC_MODE_ENFORCE, 1, 4, 1000);
+  reset_wakes();
+  assert(h1_gate(&fc, &a, 1, 1, now, 0) == FC_ADMIT);
+  assert(h1_gate(&fc, &w1, 2, 1, now, 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w2, 3, 1, now, 0) == FC_QUEUE);
+  assert(h1_gate(&fc, &w3, 4, 1, now, 0) == FC_QUEUE);
+  fc_queue_wake_room(&fc);                        /* unchanged: nothing fits */
+  assert(woken_n == 0 && fc_queued(&fc) == 3);
+
+  cfg = fc.cfg;
+  cfg.max_outstanding = 3;                        /* two more units */
+  fc_state_apply(&fc, &cfg);
+  fc_queue_wake_room(&fc);
+  assert(woken_n == 2 && woken_fd[0] == 2 && woken_fd[1] == 3);
+  assert(fc_queued(&fc) == 1);
+
+  cfg.mode = FC_MODE_OBSERVE;                     /* no longer enforcing */
+  fc_state_apply(&fc, &cfg);
+  fc_queue_wake_room(&fc);
+  assert(woken_n == 3 && woken_fd[2] == 4 && fc_queued(&fc) == 0);
+
+  fc_queue_resumed(&fc, &w1, now);
+  fc_queue_resumed(&fc, &w2, now);
+  fc_queue_resumed(&fc, &w3, now);
+  fc_permit_release(&w1);
+  fc_permit_release(&w2);
+  fc_permit_release(&w3);
+  fc_permit_release(&a);
+  fc_state_destroy(&fc);
+  printf("  reconfigure: freed units woke that many waiters in order; observe woke the rest\n");
+}
+
 /* A request that goes back to wait hands its unit back without waking
  * anyone: the next waiter would meet the same ceiling. */
 static void
@@ -794,6 +910,8 @@ main(void)
   fc_set_wake_hook(record_wake);
   test_fifo_order_and_depth();
   test_woken_loser_returns_to_the_head();
+  test_woken_loser_keeps_its_deadline();
+  test_woken_losers_keep_arrival_order();
   test_cancel_deadline_and_pop_are_exclusive();
   test_undeliverable_wake_keeps_the_place();
   test_resize_keeps_waiting_entries();
@@ -802,6 +920,7 @@ main(void)
   test_drain_counts_what_it_ended();
   test_a_lost_turn_is_passed_on();
   test_a_wake_needs_room();
+  test_reconfigure_wakes_what_fits();
   test_release_nowake();
   test_front_push_is_not_refused_at_depth();
   test_a_dead_pool_takes_no_waiter();

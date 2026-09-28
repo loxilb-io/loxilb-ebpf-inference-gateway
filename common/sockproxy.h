@@ -382,7 +382,7 @@ typedef struct ep_load_tracker {
   _Atomic uint64_t total_requests; // Total requests routed
   // H-17 (metrics audit): CLOCK_MONOTONIC seconds of the last scraper update
   // for queued_requests (stamped by llb_ai_update_ep_queue_depth; 0 = scraper
-  // never reported). Scorers treat entries older than PD_QUEUE_STALE_SEC as
+  // never reported). Scorers treat entries older than the pool's fc telemetry window as
   // unknown instead of trusting a dead EP's last value forever.
   _Atomic uint64_t last_update_ts;
   int ep_available;                 // Endpoint health flag
@@ -1860,6 +1860,14 @@ struct proxy_arg {
   // proxy_arg -> proxy_add_entry, applied on create and on refresh).
   uint32_t fc_max_queue_depth;
   uint32_t fc_max_queue_wait_ms;
+  // The rest of the rule's admission gate, same hop. 0 = the environment or
+  // the product default; fc_mode is enum fc_rule_mode (0 = inherit).
+  uint8_t  fc_mode;
+  uint32_t fc_max_outstanding;
+  uint32_t fc_ep_max_inflight;
+  uint32_t fc_prefill_max_inflight;
+  uint32_t fc_decode_max_inflight;
+  uint32_t fc_telemetry_stale_ms;
 
   // KV-Cache Exact Routing configuration 
   uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 

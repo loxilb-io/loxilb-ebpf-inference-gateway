@@ -1563,26 +1563,31 @@ pd_now_ns(void)
  * report was queue=0 looks least-loaded indefinitely and swallows traffic.
  *
  * llb_ai_update_ep_queue_depth stamps last_update_ts (CLOCK_MONOTONIC secs)
- * on every push. A value older than PD_QUEUE_STALE_SEC (3x the default 10s
- * scrape interval) is no longer trusted: the scorer substitutes the average
+ * on every push. A value older than the pool's telemetry window
+ * (fc_telemetry_stale_ms on the rule, else LLB_FC_TELEMETRY_STALE_MS, else
+ * 30 s = 3x the default 10s scrape interval; the stamp is in whole seconds,
+ * so the window is too, in effect) is no longer trusted: the scorer substitutes the average
  * fresh queue depth of the candidate set (neutral — the EP is neither favored
  * nor punished on a signal nobody is refreshing). ts==0 means the scraper
  * never reported at all; queued_requests is 0 there, preserving the legacy
  * min-active_conns behavior when no scraper runs.
  * =========================================================================== */
-#define PD_QUEUE_STALE_SEC 30
-
 static inline int
-pd_queued_is_fresh(ep_load_tracker_t *ld, uint64_t now_sec)
+pd_queued_is_fresh(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_ms)
 {
   uint64_t ts = atomic_load(&ld->last_update_ts);
-  return !(ts != 0 && now_sec > ts && now_sec - ts > PD_QUEUE_STALE_SEC);
+
+  /* A pool whose admission state was never applied reads 0: the default. */
+  if (stale_ms == 0)
+    stale_ms = FC_TELEMETRY_STALE_MS_DEFAULT;
+  return !(ts != 0 && now_sec > ts && (now_sec - ts) * 1000ULL > stale_ms);
 }
 
 static inline uint32_t
-pd_queued_or_fill(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_fill)
+pd_queued_or_fill(ep_load_tracker_t *ld, uint64_t now_sec, uint32_t stale_fill,
+                  uint32_t stale_ms)
 {
-  if (!pd_queued_is_fresh(ld, now_sec))
+  if (!pd_queued_is_fresh(ld, now_sec, stale_ms))
     return stale_fill;
   return atomic_load(&ld->queued_requests);
 }
@@ -2106,7 +2111,7 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
       if (tepval->cb_enabled &&
           tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
       if (pd_ctrl_draining(tepval, i, cmode)) continue;
-      if (!pd_queued_is_fresh(&tepval->pd_ep_loads[i], q_now_sec)) continue;
+      if (!pd_queued_is_fresh(&tepval->pd_ep_loads[i], q_now_sec, tepval->fc.cfg.telemetry_stale_ms)) continue;
       fresh_q_sum += atomic_load(&tepval->pd_ep_loads[i].queued_requests);
       fresh_q_n++;
     }
@@ -2119,7 +2124,8 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
       if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* no NEW work */
       uint32_t conns = atomic_load(&tepval->pd_ep_loads[i].active_conns);
-      uint32_t queued = pd_queued_or_fill(&tepval->pd_ep_loads[i], q_now_sec, stale_fill);
+      uint32_t queued = pd_queued_or_fill(&tepval->pd_ep_loads[i], q_now_sec, stale_fill,
+                                        tepval->fc.cfg.telemetry_stale_ms);
       uint64_t score;
       if (c2_capacity_aware) {
         /* C2: capacity-weighted blend — consumes the reserved
@@ -2210,7 +2216,7 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
     if (tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
     if (tepval->cb_enabled &&
         tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
-    if (!pd_queued_is_fresh(&tepval->pd_ep_loads[i], q_now_sec)) continue;
+    if (!pd_queued_is_fresh(&tepval->pd_ep_loads[i], q_now_sec, tepval->fc.cfg.telemetry_stale_ms)) continue;
     fresh_q_sum += atomic_load(&tepval->pd_ep_loads[i].queued_requests);
     fresh_q_n++;
   }
@@ -2220,7 +2226,8 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
     if (tepval->cb_enabled &&
         tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
     uint32_t conns = atomic_load(&tepval->pd_ep_loads[i].active_conns);
-    uint32_t queued = pd_queued_or_fill(&tepval->pd_ep_loads[i], q_now_sec, stale_fill);
+    uint32_t queued = pd_queued_or_fill(&tepval->pd_ep_loads[i], q_now_sec, stale_fill,
+                                        tepval->fc.cfg.telemetry_stale_ms);
     uint64_t score = (uint64_t)conns + (uint64_t)queued;
     if (score < best_score) { best_score = score; n_cand = 0; }
     if (score == best_score) candidates[n_cand++] = i;

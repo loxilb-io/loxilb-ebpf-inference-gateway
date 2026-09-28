@@ -229,6 +229,7 @@ int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
 #define PROXY_FC_REASONS 12     /* enum fc_reason: the decisions array grew with the queue reasons */
 #define PROXY_FC_POOL_LEN 64    /* pool key as exported; longer keys are cut */
 #define PROXY_FC_QWAIT_BUCKETS 8 /* queue wait histogram buckets (FC_QWAIT_BUCKETS) */
+#define PROXY_FC_LIMITS 8        /* configured limits with a source (FC_LIMITS) */
 
 typedef struct proxy_fc_svc_stat {
     uint32_t xip;                          /* service VIP, network byte order (v4) */
@@ -249,18 +250,24 @@ typedef struct proxy_fc_svc_stat {
     uint64_t qwait_bucket[PROXY_FC_QWAIT_BUCKETS]; /* histogram: waits in (bound[i-1], bound[i]] ms */
     uint64_t qwait_sum_ms;                 /* histogram: summed wait of every resumed request */
     uint64_t qwait_count;                  /* histogram: resumed requests */
+    /* The rule's configuration read-back: same lockstep, offsets pinned below. */
+    uint32_t telemetry_stale_ms;           /* scraped queue depth trusted this long */
+    uint8_t  src[PROXY_FC_LIMITS];         /* enum fc_src per enum fc_limit: 0 default, 1 env, 2 rule */
+    uint32_t pad2;
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
  * definition, and its test links a stub with a third: all three pin the
  * same layout, so a field moved in one without the others fails to build
  * instead of shifting every counter after it. */
-_Static_assert(sizeof(proxy_fc_svc_stat_t) == 296, "proxy_fc_svc_stat_t size");
+_Static_assert(sizeof(proxy_fc_svc_stat_t) == 312, "proxy_fc_svc_stat_t size");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, decisions) == 40, "decisions offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 136, "pool offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 200, "queued offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_bucket) == 216, "qwait_bucket offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_count) == 288, "qwait_count offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, telemetry_stale_ms) == 296, "telemetry_stale_ms offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, src) == 300, "src offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every

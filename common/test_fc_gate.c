@@ -450,6 +450,80 @@ test_env_defaults(void)
   assert(cfg.mode == FC_MODE_OFF);             /* an unknown mode never enforces by accident */
 }
 
+/* ---- a rule's declarations over the environment ---------------------------- */
+
+static void
+test_rule_overlays_env_with_sources(void)
+{
+  fc_cfg_t env, out;
+  fc_rule_cfg_t rule;
+
+  unsetenv("LLB_FC_PREFILL_MAX_INFLIGHT");
+  unsetenv("LLB_FC_DECODE_MAX_INFLIGHT");
+  unsetenv("LLB_PD_MAX_INFLIGHT_PER_EP");
+  unsetenv("LLB_FC_MAX_QUEUE_DEPTH");
+  unsetenv("LLB_FC_MAX_QUEUE_WAIT_MS");
+  unsetenv("LLB_FC_TELEMETRY_STALE_MS");
+  setenv("LLB_FC_MODE", "enforce", 1);
+  setenv("LLB_FC_MAX_OUTSTANDING", "8", 1);
+  setenv("LLB_FC_EP_MAX_INFLIGHT", "4", 1);
+  fc_cfg_from_env(&env);
+  assert(env.src[FC_L_MODE] == FC_SRC_ENV);
+  assert(env.src[FC_L_MAX_OUTSTANDING] == FC_SRC_ENV);
+  assert(env.src[FC_L_EP_NORMAL] == FC_SRC_ENV);
+  assert(env.src[FC_L_EP_PREFILL] == FC_SRC_DEFAULT);
+  assert(env.src[FC_L_QUEUE_DEPTH] == FC_SRC_DEFAULT);
+  assert(env.telemetry_stale_ms == FC_TELEMETRY_STALE_MS_DEFAULT);
+  assert(env.src[FC_L_TELEMETRY_STALE] == FC_SRC_DEFAULT);
+
+  /* Nothing declared: the rule runs on the environment exactly. */
+  memset(&rule, 0, sizeof(rule));
+  fc_cfg_resolve(&out, &env, &rule);
+  assert(memcmp(&out, &env, sizeof(out)) == 0);
+
+  /* Each non-zero declaration replaces the environment's value. */
+  rule.mode = FC_RULE_MODE_OBSERVE;
+  rule.max_outstanding = 4;
+  rule.ep_cap[FC_ROLE_PREFILL] = 2;
+  rule.max_queue_depth = 16;
+  rule.telemetry_stale_ms = 60000;
+  fc_cfg_resolve(&out, &env, &rule);
+  assert(out.mode == FC_MODE_OBSERVE && out.src[FC_L_MODE] == FC_SRC_RULE);
+  assert(out.max_outstanding == 4 && out.src[FC_L_MAX_OUTSTANDING] == FC_SRC_RULE);
+  assert(out.ep_cap[FC_ROLE_NORMAL] == 4 && out.src[FC_L_EP_NORMAL] == FC_SRC_ENV);
+  assert(out.ep_cap[FC_ROLE_PREFILL] == 2 && out.src[FC_L_EP_PREFILL] == FC_SRC_RULE);
+  assert(out.ep_cap[FC_ROLE_DECODE] == 0 && out.src[FC_L_EP_DECODE] == FC_SRC_DEFAULT);
+  assert(out.max_queue_depth == 16 && out.src[FC_L_QUEUE_DEPTH] == FC_SRC_RULE);
+  /* A depth with no wait anywhere gets the product's window. */
+  assert(out.max_queue_wait_ms == 5000 && out.src[FC_L_QUEUE_WAIT] == FC_SRC_DEFAULT);
+  assert(out.telemetry_stale_ms == 60000 && out.src[FC_L_TELEMETRY_STALE] == FC_SRC_RULE);
+
+  /* A rule may switch the gate off under an enforcing environment. */
+  memset(&rule, 0, sizeof(rule));
+  rule.mode = FC_RULE_MODE_OFF;
+  fc_cfg_resolve(&out, &env, &rule);
+  assert(out.mode == FC_MODE_OFF && out.src[FC_L_MODE] == FC_SRC_RULE);
+
+  /* Out of range: a mode the wire does not define inherits; a depth over
+   * the ceiling is held at it. */
+  rule.mode = 9;
+  rule.max_queue_depth = FC_QUEUE_DEPTH_MAX + 1;
+  rule.max_queue_wait_ms = 100;
+  fc_cfg_resolve(&out, &env, &rule);
+  assert(out.mode == FC_MODE_ENFORCE && out.src[FC_L_MODE] == FC_SRC_ENV);
+  assert(out.max_queue_depth == FC_QUEUE_DEPTH_MAX);
+  assert(out.max_queue_wait_ms == 100 && out.src[FC_L_QUEUE_WAIT] == FC_SRC_RULE);
+
+  setenv("LLB_FC_TELEMETRY_STALE_MS", "45000", 1);
+  fc_cfg_from_env(&env);
+  assert(env.telemetry_stale_ms == 45000 && env.src[FC_L_TELEMETRY_STALE] == FC_SRC_ENV);
+  unsetenv("LLB_FC_TELEMETRY_STALE_MS");
+  unsetenv("LLB_FC_MODE");
+  unsetenv("LLB_FC_MAX_OUTSTANDING");
+  unsetenv("LLB_FC_EP_MAX_INFLIGHT");
+  printf("  rule: each declaration replaces the environment, with its source\n");
+}
+
 int
 main(void)
 {
@@ -462,6 +536,7 @@ main(void)
   test_off_bypasses_without_touching_a_counter();
   test_non_inference_requests_bypass_and_are_counted();
   test_env_defaults();
+  test_rule_overlays_env_with_sources();
   printf("test_fc_gate: all passed\n");
   return 0;
 }
