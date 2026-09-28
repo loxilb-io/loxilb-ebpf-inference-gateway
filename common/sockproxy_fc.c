@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "sockproxy_fc.h"
@@ -46,6 +47,21 @@ static const char *const fc_anomaly_names[FC_A_COUNT] = {
   [FC_A_UNKNOWN_PERMIT] = "unknown_permit",
 };
 
+static const char *const fc_adapt_state_names[FC_AS_COUNT] = {
+  [FC_AS_OFF] = "off",
+  [FC_AS_OPEN] = "open",
+  [FC_AS_TIGHTENED] = "tightened",
+  [FC_AS_FROZEN] = "frozen",
+};
+
+static const char *const fc_adapt_reason_names[FC_AR_COUNT] = {
+  [FC_AR_NONE] = "none",
+  [FC_AR_QUEUED] = "queued",
+  [FC_AR_TTFT] = "ttft",
+  [FC_AR_CLEAR] = "clear",
+  [FC_AR_STALE] = "stale",
+};
+
 static fc_wake_fn fc_wake_hook;
 static _Atomic int fc_drain_flag;
 
@@ -63,6 +79,41 @@ fc_anomaly_name(enum fc_anomaly a)
   if ((int)a < 0 || a >= FC_A_COUNT)
     return "unknown";
   return fc_anomaly_names[a];
+}
+
+const char *
+fc_adapt_state_name(uint8_t state)
+{
+  return state < FC_AS_COUNT ? fc_adapt_state_names[state] : "unknown";
+}
+
+const char *
+fc_adapt_reason_name(uint8_t reason)
+{
+  return reason < FC_AR_COUNT ? fc_adapt_reason_names[reason] : "unknown";
+}
+
+static uint64_t
+fc_clock_monotonic(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static fc_clock_fn fc_clock = fc_clock_monotonic;
+
+uint64_t
+fc_now_ns(void)
+{
+  return fc_clock();
+}
+
+void
+fc_set_clock(fc_clock_fn fn)
+{
+  fc_clock = fn ? fn : fc_clock_monotonic;
 }
 
 const char *
@@ -100,7 +151,7 @@ fc_env_u32(const char *name, uint32_t dflt, uint8_t *src)
 void
 fc_cfg_from_env(fc_cfg_t *cfg)
 {
-  const char *mode;
+  const char *mode, *adaptive;
 
   memset(cfg, 0, sizeof(*cfg));
   mode = getenv("LLB_FC_MODE");
@@ -149,6 +200,20 @@ fc_cfg_from_env(fc_cfg_t *cfg)
     cfg->telemetry_stale_ms = FC_TELEMETRY_STALE_MS_DEFAULT;
     cfg->src[FC_L_TELEMETRY_STALE] = FC_SRC_DEFAULT;
   }
+  adaptive = getenv("LLB_FC_ADAPTIVE");
+  if (adaptive && !strcasecmp(adaptive, "on")) {
+    cfg->adaptive = 1;
+    cfg->src[FC_L_ADAPTIVE] = FC_SRC_ENV;
+  } else if (adaptive && !strcasecmp(adaptive, "off")) {
+    cfg->src[FC_L_ADAPTIVE] = FC_SRC_ENV;
+  }
+  cfg->warmup_ms = fc_env_u32("LLB_FC_WARMUP_MS", 0, &cfg->src[FC_L_WARMUP]);
+  if (cfg->warmup_ms > FC_WARMUP_MS_MAX)
+    cfg->warmup_ms = FC_WARMUP_MS_MAX;
+  cfg->ttft_target_ms = fc_env_u32("LLB_FC_TTFT_TARGET_MS", 0,
+                                   &cfg->src[FC_L_TTFT_TARGET]);
+  if (cfg->ttft_target_ms > FC_TTFT_TARGET_MS_MAX)
+    cfg->ttft_target_ms = FC_TTFT_TARGET_MS_MAX;
 }
 
 static inline void
@@ -198,6 +263,18 @@ fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rule)
                  rule->telemetry_stale_ms);
   if (out->telemetry_stale_ms > FC_TELEMETRY_STALE_MS_MAX)
     out->telemetry_stale_ms = FC_TELEMETRY_STALE_MS_MAX;
+  if (rule->adaptive == FC_RULE_ADAPTIVE_OFF ||
+      rule->adaptive == FC_RULE_ADAPTIVE_ON) {
+    out->adaptive = rule->adaptive == FC_RULE_ADAPTIVE_ON;
+    out->src[FC_L_ADAPTIVE] = FC_SRC_RULE;
+  }
+  fc_overlay_u32(&out->warmup_ms, &out->src[FC_L_WARMUP], rule->warmup_ms);
+  if (out->warmup_ms > FC_WARMUP_MS_MAX)
+    out->warmup_ms = FC_WARMUP_MS_MAX;
+  fc_overlay_u32(&out->ttft_target_ms, &out->src[FC_L_TTFT_TARGET],
+                 rule->ttft_target_ms);
+  if (out->ttft_target_ms > FC_TTFT_TARGET_MS_MAX)
+    out->ttft_target_ms = FC_TTFT_TARGET_MS_MAX;
 }
 
 int
@@ -206,7 +283,9 @@ fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b)
   if (a->mode != b->mode || a->max_outstanding != b->max_outstanding ||
       a->max_queue_depth != b->max_queue_depth ||
       a->max_queue_wait_ms != b->max_queue_wait_ms ||
-      a->telemetry_stale_ms != b->telemetry_stale_ms)
+      a->telemetry_stale_ms != b->telemetry_stale_ms ||
+      a->adaptive != b->adaptive || a->warmup_ms != b->warmup_ms ||
+      a->ttft_target_ms != b->ttft_target_ms)
     return 0;
   for (int r = 0; r < FC_ROLES; r++)
     if (a->ep_cap[r] != b->ep_cap[r])
@@ -286,12 +365,41 @@ fc_ring_grow(fc_queue_t *q, uint32_t want)
   return 0;
 }
 
+/* Where the adaptive ceiling stands after a configuration change: at the
+ * new ceiling when the pool just became adaptive (it starts open and only
+ * tightens on evidence) or was open, held under a lowered ceiling, and,
+ * when it was tightened, left where it was under a raised one (it climbs
+ * back one unit per fresh tick, as it would have under the old one). */
+static void
+fc_adapt_reset(fc_state_t *fc, const fc_cfg_t *old)
+{
+  uint32_t ceil = fc->cfg.max_outstanding;
+  uint32_t eff = atomic_load_explicit(&fc->eff_max, memory_order_relaxed);
+
+  if (!fc->cfg.adaptive || ceil == 0) {
+    atomic_store_explicit(&fc->eff_max, ceil, memory_order_relaxed);
+    atomic_store_explicit(&fc->adapt_state, FC_AS_OFF, memory_order_relaxed);
+    atomic_store_explicit(&fc->adapt_reason, FC_AR_NONE, memory_order_relaxed);
+    return;
+  }
+  if (!old->adaptive || old->max_outstanding == 0 || eff == 0 || eff > ceil ||
+      eff >= old->max_outstanding)
+    eff = ceil;
+  atomic_store_explicit(&fc->eff_max, eff, memory_order_relaxed);
+  atomic_store_explicit(&fc->adapt_state,
+                        eff < ceil ? FC_AS_TIGHTENED : FC_AS_OPEN,
+                        memory_order_relaxed);
+}
+
 void
 fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
 {
+  fc_cfg_t old;
+
   if (!fc || !cfg)
     return;
   pthread_mutex_lock(&fc->queue.lock);
+  old = fc->cfg;
   fc->cfg = *cfg;
   if (fc->cfg.max_queue_depth > FC_QUEUE_DEPTH_MAX)
     fc->cfg.max_queue_depth = FC_QUEUE_DEPTH_MAX;
@@ -301,6 +409,15 @@ fc_state_apply(fc_state_t *fc, const fc_cfg_t *cfg)
     fc->cfg.max_queue_wait_ms = 5000;
   if (fc->cfg.telemetry_stale_ms == 0)
     fc->cfg.telemetry_stale_ms = FC_TELEMETRY_STALE_MS_DEFAULT;
+  if (fc->cfg.warmup_ms > FC_WARMUP_MS_MAX)
+    fc->cfg.warmup_ms = FC_WARMUP_MS_MAX;
+  if (fc->cfg.ttft_target_ms > FC_TTFT_TARGET_MS_MAX)
+    fc->cfg.ttft_target_ms = FC_TTFT_TARGET_MS_MAX;
+  /* A window removed ends every warm-up at once. */
+  if (fc->cfg.warmup_ms == 0)
+    for (int e = 0; e < FC_MAX_EP; e++)
+      atomic_store_explicit(&fc->warm_since_ns[e], 0, memory_order_relaxed);
+  fc_adapt_reset(fc, &old);
   if (!fc->queue.dead && fc->cfg.max_queue_depth > fc->queue.cap)
     (void)fc_ring_grow(&fc->queue, fc->cfg.max_queue_depth);
   pthread_mutex_unlock(&fc->queue.lock);
@@ -350,6 +467,7 @@ fc_permit_init(fc_permit_t *p)
   p->q_gen = 0;
   p->q_enqueue_ns = 0;
   p->q_deadline_ns = 0;
+  p->admit_ns = 0;
 }
 
 void
@@ -488,7 +606,7 @@ fc_service_acquire__(fc_state_t *fc, fc_permit_t *p, int can_queue, int woken)
   if (fc->cfg.mode == FC_MODE_ENFORCE && fc_queue_enabled(fc) && !woken &&
       fc_queued(fc) > 0)
     over = 1;
-  if (!over && fc_unit_take(&fc->inflight, fc->cfg.max_outstanding) != 0)
+  if (!over && fc_unit_take(&fc->inflight, fc_svc_cap(fc)) != 0)
     over = 1;
   if (over) {
     if (fc->cfg.mode == FC_MODE_ENFORCE) {
@@ -528,7 +646,7 @@ fc_ep_over_cap(const fc_state_t *fc, int ep, int role)
     return 0;
   if (ep < 0 || ep >= FC_MAX_EP || role < 0 || role >= FC_ROLES)
     return 0;
-  cap = fc->cfg.ep_cap[role];
+  cap = fc_ep_cap_now(fc, ep, role, 0);
   return cap && fc_ep_inflight(fc, ep, role) >= cap;
 }
 
@@ -541,7 +659,8 @@ fc_ep_acquire(fc_state_t *fc, fc_permit_t *p, int ep, int role)
     return FC_ADMIT;
   if (p->ep[role] == ep)
     return FC_ADMIT;              /* already held for this leg */
-  if (fc_unit_take(&fc->ep_inflight[ep][role], fc->cfg.ep_cap[role]) != 0) {
+  if (fc_unit_take(&fc->ep_inflight[ep][role],
+                   fc_ep_cap_now(fc, ep, role, 0)) != 0) {
     if (fc->cfg.mode == FC_MODE_ENFORCE)
       return FC_SHED;
     fc_count(fc, fc->cfg.max_queue_depth > 0 ? FC_R_OBSERVE_WOULD_QUEUE
@@ -557,9 +676,12 @@ fc_ep_acquire(fc_state_t *fc, fc_permit_t *p, int ep, int role)
       fc_unit_give(&fc->ep_inflight[(int)p->ep[role]][role]);
     p->ep[role] = (int8_t)ep;
     /* One admitted decision per request: the first leg's unit, not each
-     * leg of a request that opens two. */
-    if (!had_leg)
+     * leg of a request that opens two. Its time is the dispatch a TTFT
+     * sample is measured from, so a wait at the gate is not the engine's. */
+    if (!had_leg) {
       fc_count(fc, FC_R_ADMITTED);
+      p->admit_ns = fc_now_ns();
+    }
   }
   return FC_ADMIT;
 }
@@ -617,7 +739,8 @@ fc_permit_move(fc_permit_t *p, int role, int new_ep)
   old = p->ep[role];
   if (old == new_ep)
     return 0;
-  if (fc_unit_take(&fc->ep_inflight[new_ep][role], fc->cfg.ep_cap[role]) != 0) {
+  if (fc_unit_take(&fc->ep_inflight[new_ep][role],
+                   fc_ep_cap_now(fc, new_ep, role, 0)) != 0) {
     if (fc->cfg.mode == FC_MODE_ENFORCE) {
       fc_count(fc, FC_R_CAPACITY_SHED);
       return -1;
@@ -1000,7 +1123,7 @@ fc_queue_wake_room(fc_state_t *fc)
   /* A woken request takes its unit when its worker runs, not now, so the
    * units free at this moment bound how many turns are given; a woken one
    * that still meets a ceiling (an endpoint's) goes back to the head. */
-  cap = fc->cfg.max_outstanding;
+  cap = fc_svc_cap(fc);
   if (fc->cfg.mode == FC_MODE_ENFORCE && cap != 0) {
     inflight = fc_inflight(fc);
     if (inflight >= cap)
@@ -1062,4 +1185,182 @@ fc_node_memory_bytes(void)
   if (pages <= 0 || psize <= 0)
     return 0;
   return (uint64_t)pages * (uint64_t)psize;
+}
+
+/* ---- adaptive ceiling and warm-up ------------------------------------------ */
+
+uint32_t
+fc_ep_cap_now(const fc_state_t *fc, int ep, int role, uint64_t now_ns)
+{
+  uint32_t cap, floor, win;
+  uint64_t since, elapsed_ms;
+
+  if (!fc || role < 0 || role >= FC_ROLES)
+    return 0;
+  cap = fc->cfg.ep_cap[role];
+  win = fc->cfg.warmup_ms;
+  if (cap == 0 || win == 0 || ep < 0 || ep >= FC_MAX_EP)
+    return cap;
+  since = atomic_load_explicit(&fc->warm_since_ns[ep], memory_order_relaxed);
+  if (since == 0)
+    return cap;
+  if (now_ns == 0)
+    now_ns = fc_now_ns();
+  if (now_ns <= since)
+    elapsed_ms = 0;
+  else
+    elapsed_ms = (now_ns - since) / 1000000ULL;
+  if (elapsed_ms >= win)
+    return cap;
+  floor = cap / 4 ? cap / 4 : 1;
+  return floor + (uint32_t)((uint64_t)(cap - floor) * elapsed_ms / win);
+}
+
+void
+fc_ep_warm_start(fc_state_t *fc, int ep, uint64_t now_ns)
+{
+  if (!fc || ep < 0 || ep >= FC_MAX_EP || fc->cfg.warmup_ms == 0)
+    return;
+  if (now_ns == 0)
+    now_ns = fc_now_ns();
+  atomic_store_explicit(&fc->warm_since_ns[ep], now_ns, memory_order_relaxed);
+}
+
+uint32_t
+fc_warming_eps(const fc_state_t *fc, uint64_t now_ns)
+{
+  uint32_t n = 0;
+  uint64_t win_ns;
+
+  if (!fc || fc->cfg.warmup_ms == 0)
+    return 0;
+  win_ns = (uint64_t)fc->cfg.warmup_ms * 1000000ULL;
+  for (int e = 0; e < FC_MAX_EP; e++) {
+    uint64_t since = atomic_load_explicit(&fc->warm_since_ns[e],
+                                          memory_order_relaxed);
+    if (since != 0 && (now_ns <= since || now_ns - since < win_ns))
+      n++;
+  }
+  return n;
+}
+
+void
+fc_ttft_sample(fc_state_t *fc, int ep, uint32_t ms, uint64_t now_ns)
+{
+  uint32_t old, next;
+
+  if (!fc || ep < 0 || ep >= FC_MAX_EP)
+    return;
+  if (now_ns == 0)
+    now_ns = fc_now_ns();
+  old = atomic_load_explicit(&fc->ttft_ewma_ms[ep], memory_order_relaxed);
+  /* The first sample, or the first after the estimate went stale, starts
+   * it over: an average carried across a silence describes nothing. */
+  if (old == 0 || !fc_ttft_fresh(fc, ep, now_ns))
+    next = ms ? ms : 1;
+  else
+    next = (uint32_t)(((uint64_t)old * 7 + ms + 7) / 8);
+  atomic_store_explicit(&fc->ttft_ewma_ms[ep], next, memory_order_relaxed);
+  atomic_store_explicit(&fc->ttft_ts_ns[ep], now_ns, memory_order_relaxed);
+}
+
+void
+fc_permit_ttft(fc_permit_t *p)
+{
+  fc_state_t *fc;
+  int ep;
+  uint64_t now;
+
+  if (!p || p->state != FC_P_EXECUTING || !p->fc || p->admit_ns == 0)
+    return;
+  fc = p->fc;
+  if (fc->cfg.ttft_target_ms == 0)
+    return;
+  ep = p->ep[FC_ROLE_DECODE] >= 0 ? p->ep[FC_ROLE_DECODE] : p->ep[FC_ROLE_NORMAL];
+  if (ep < 0)
+    return;
+  now = fc_now_ns();
+  if (now <= p->admit_ns)
+    return;
+  fc_ttft_sample(fc, ep, (uint32_t)((now - p->admit_ns) / 1000000ULL), now);
+}
+
+int
+fc_ttft_fresh(const fc_state_t *fc, int ep, uint64_t now_ns)
+{
+  uint64_t ts;
+
+  if (!fc || ep < 0 || ep >= FC_MAX_EP)
+    return 0;
+  ts = atomic_load_explicit(&fc->ttft_ts_ns[ep], memory_order_relaxed);
+  if (ts == 0)
+    return 0;
+  return now_ns <= ts ||
+         now_ns - ts <= (uint64_t)fc->cfg.telemetry_stale_ms * 1000000ULL;
+}
+
+int
+fc_ttft_over(const fc_state_t *fc, int ep, uint64_t now_ns, int *fresh)
+{
+  int f;
+
+  if (fresh)
+    *fresh = 0;
+  if (!fc || fc->cfg.ttft_target_ms == 0)
+    return 0;
+  f = fc_ttft_fresh(fc, ep, now_ns);
+  if (fresh)
+    *fresh = f;
+  return f && atomic_load_explicit(&fc->ttft_ewma_ms[ep], memory_order_relaxed) >
+              fc->cfg.ttft_target_ms;
+}
+
+void
+fc_adapt_tick(fc_state_t *fc, const fc_signal_t *sig)
+{
+  uint32_t ceil, eff, floor, next;
+  uint8_t reason;
+
+  if (!fc || !sig || !fc->cfg.adaptive || fc->cfg.max_outstanding == 0)
+    return;
+  ceil = fc->cfg.max_outstanding;
+  eff = atomic_load_explicit(&fc->eff_max, memory_order_relaxed);
+  if (eff == 0 || eff > ceil)
+    eff = ceil;
+  floor = ceil / 4 ? ceil / 4 : 1;
+  if (!sig->fresh) {
+    /* Nothing to go on: hold. A stale signal never widens. */
+    atomic_store_explicit(&fc->adapt_state,
+                          eff < ceil ? FC_AS_FROZEN : FC_AS_OPEN,
+                          memory_order_relaxed);
+    if (eff < ceil)
+      atomic_store_explicit(&fc->adapt_reason, FC_AR_STALE, memory_order_relaxed);
+    return;
+  }
+  if (sig->queued || sig->ttft_over) {
+    reason = sig->queued ? FC_AR_QUEUED : FC_AR_TTFT;
+    next = (uint32_t)((uint64_t)eff * 4 / 5);
+    if (next < floor)
+      next = floor;
+    if (next < eff) {
+      atomic_store_explicit(&fc->eff_max, next, memory_order_relaxed);
+      atomic_fetch_add_explicit(&fc->adapt_moves[0], 1, memory_order_relaxed);
+    }
+    atomic_store_explicit(&fc->adapt_reason, reason, memory_order_relaxed);
+    atomic_store_explicit(&fc->adapt_state,
+                          next < ceil ? FC_AS_TIGHTENED : FC_AS_OPEN,
+                          memory_order_relaxed);
+    return;
+  }
+  if (eff < ceil) {
+    atomic_store_explicit(&fc->eff_max, eff + 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&fc->adapt_moves[1], 1, memory_order_relaxed);
+    atomic_store_explicit(&fc->adapt_reason, FC_AR_CLEAR, memory_order_relaxed);
+    eff++;
+  }
+  atomic_store_explicit(&fc->adapt_state,
+                        eff < ceil ? FC_AS_TIGHTENED : FC_AS_OPEN,
+                        memory_order_relaxed);
+  /* The unit given back is a turn for the oldest waiting request. */
+  fc_queue_wake_room(fc);
 }

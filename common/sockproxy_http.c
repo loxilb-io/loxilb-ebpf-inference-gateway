@@ -1935,6 +1935,7 @@ skip_deferred_masking:
         const uint8_t *ev_p = (const uint8_t *)msg;
         size_t ev_left = len;
         const uint8_t *ev_hit;
+        uint32_t sse_events_before = rfd_ent->usage_sse_events;
         while ((ev_hit = memmem(ev_p, ev_left, "data:", 5)) != NULL) {
           const uint8_t *ev_v = ev_hit + 5;
           const uint8_t *ev_end = (const uint8_t *)msg + len;
@@ -1945,6 +1946,8 @@ skip_deferred_masking:
           ev_left -= (size_t)(ev_hit + 5 - ev_p);
           ev_p = ev_hit + 5;
         }
+        if (sse_events_before == 0 && rfd_ent->usage_sse_events > 0)
+          sp_fc_ttft_first_event(rfd_ent);
       }
 
       uint8_t window[PROXY_SSE_TAIL_KEEP * 2];
@@ -2508,6 +2511,8 @@ static int qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int 
 static int qos_resume_reader(int fd, proxy_fd_ent_t *pfe);
 static void sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
                              const proxy_ent_t *key, int created);
+static void sp_fc_warm_returning(proxy_epval_t *tepval, const proxy_ent_t *old_eps,
+                                 int old_n);
 static int sp_fc_wake(int fd, uint64_t gen);
 
 int
@@ -2549,6 +2554,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * Only membership/health state is touched; the P/D trie, per-EP loads,
          * chwbl_config, session maps and locks are intentionally preserved
          * across the update (adapted from loxilb-ebpf upstream facdb93). */
+        proxy_ent_t fc_old_eps[MAX_PROXY_EP];
+        int fc_old_n = tepval->n_eps;
+
+        memcpy(fc_old_eps, tepval->eps, sizeof(fc_old_eps));
 #ifdef HAVE_DP_GPU_ROUTING
         proxy_epval_t candidate = {0};
         proxy_epval_t retired = {0};
@@ -2596,6 +2605,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * same way: they may change at runtime, entries waiting keep
          * their order. */
         sp_fc_apply_rule(tepval, arg, new_ent, 0);
+        sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
@@ -3488,6 +3498,10 @@ ep_health_apply(proxy_map_ent_t *ent, proxy_epval_t *tepval, int ep_index,
     if (tepval->drain_state[ep_index].is_draining) {
       tepval->drain_state[ep_index].is_draining = 0;
     }
+    /* Back in service: its admission ceiling ramps up over the pool's
+     * warm-up window instead of taking a full share of a burst cold. */
+    if (tepval->ai_gw_mode)
+      fc_ep_warm_start(&tepval->fc, ep_index, 0);
   }
 
   log_info("EP health updated - %s:%u pool='%s' ep[%d] %u->%u",
@@ -4123,7 +4137,10 @@ _Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc
 _Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
 _Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
 _Static_assert(PROXY_FC_QWAIT_BUCKETS == FC_QWAIT_BUCKETS, "wait bucket count drifted from sockproxy_fc.h");
-_Static_assert(PROXY_FC_LIMITS == FC_LIMITS, "limit count drifted from sockproxy_fc.h");
+_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS == FC_LIMITS,
+               "limit count drifted from sockproxy_fc.h");
+_Static_assert(FC_L_ADAPTIVE == PROXY_FC_LIMITS,
+               "the adaptive limits must follow the first block");
 
 static void
 sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
@@ -4138,8 +4155,19 @@ sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
   st->qwait_sum_ms = atomic_load_explicit(&fc->qwait_sum_ms, memory_order_relaxed);
   st->qwait_count = atomic_load_explicit(&fc->qwait_count, memory_order_relaxed);
   st->telemetry_stale_ms = fc->cfg.telemetry_stale_ms;
-  for (int l = 0; l < FC_LIMITS; l++)
+  for (int l = 0; l < PROXY_FC_LIMITS; l++)
     st->src[l] = fc->cfg.src[l];
+  st->effective_max_outstanding = fc_svc_cap(fc);
+  st->warmup_ms = fc->cfg.warmup_ms;
+  st->ttft_target_ms = fc->cfg.ttft_target_ms;
+  st->adaptive = fc->cfg.adaptive;
+  st->adapt_state = atomic_load_explicit(&fc->adapt_state, memory_order_relaxed);
+  st->adapt_reason = atomic_load_explicit(&fc->adapt_reason, memory_order_relaxed);
+  for (int l = 0; l < PROXY_FC_ADAPT_LIMITS; l++)
+    st->src_adapt[l] = fc->cfg.src[PROXY_FC_LIMITS + l];
+  st->warming_eps = (uint16_t)fc_warming_eps(fc, fc_now_ns());
+  st->adapt_down = atomic_load_explicit(&fc->adapt_moves[0], memory_order_relaxed);
+  st->adapt_up = atomic_load_explicit(&fc->adapt_moves[1], memory_order_relaxed);
 }
 
 int
@@ -8123,6 +8151,68 @@ sp_fc_wake(int fd, uint64_t gen)
   return notify_wake_worker(proxy_struct->ns, owner, fd) == 0 ? 0 : -1;
 }
 
+/* Endpoints an in-place update brought back into service (a slot that was
+ * empty or marked down and is now up): each ramps up over the pool's
+ * warm-up window. */
+static void
+sp_fc_warm_returning(proxy_epval_t *tepval, const proxy_ent_t *old_eps,
+                     int old_n)
+{
+  uint64_t now;
+  int n;
+
+  if (!tepval->ai_gw_mode || tepval->fc.cfg.warmup_ms == 0)
+    return;
+  now = fc_now_ns();
+  n = tepval->n_eps < FC_MAX_EP ? tepval->n_eps : FC_MAX_EP;
+  for (int i = 0; i < n; i++) {
+    int was_up = i < old_n && !old_eps[i].inv;
+
+    if (!tepval->eps[i].inv && !was_up)
+      fc_ep_warm_start(&tepval->fc, i, now);
+  }
+}
+
+/* The first data event of a streamed response. Only a stream shows the
+ * time to first token: a buffered response's headers come when the whole
+ * completion is done, so its first byte says how long the answer was, not
+ * how soon the engine started on it. */
+void
+sp_fc_ttft_first_event(proxy_fd_ent_t *pfe)
+{
+  fc_permit_ttft(&pfe->fc);
+}
+
+/* What an adapting pool's endpoints said within its telemetry window:
+ * whether any reported at all (a scraped depth or a TTFT sample), whether
+ * a fresh one has requests waiting, and whether a fresh TTFT estimate is
+ * over the target. A depth never reported is no evidence, unlike for the
+ * P/D scorers, which read it as zero. */
+void
+sp_fc_adapt_signal(proxy_epval_t *tepval, uint64_t now_s, uint64_t now_ns,
+                   fc_signal_t *sig)
+{
+  uint64_t win_ms = tepval->fc.cfg.telemetry_stale_ms;
+  int n = tepval->n_eps < FC_MAX_EP ? tepval->n_eps : FC_MAX_EP;
+
+  memset(sig, 0, sizeof(*sig));
+  for (int i = 0; i < n; i++) {
+    ep_load_tracker_t *ld = &tepval->pd_ep_loads[i];
+    uint64_t ts = atomic_load(&ld->last_update_ts);
+    int t_fresh = 0;
+
+    if (ts != 0 && now_s >= ts && (now_s - ts) * 1000ULL <= win_ms) {
+      sig->fresh = 1;
+      if (atomic_load(&ld->queued_requests) > 0)
+        sig->queued = 1;
+    }
+    if (fc_ttft_over(&tepval->fc, i, now_ns, &t_fresh))
+      sig->ttft_over = 1;
+    if (t_fresh)
+      sig->fresh = 1;
+  }
+}
+
 /* The rule's admission settings over the process defaults, on create and
  * on every in-place refresh (a health update or a rule replace arrives the
  * same way). Each non-zero rule value replaces the environment's, and the
@@ -8153,6 +8243,9 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   rule.max_queue_depth = arg->fc_max_queue_depth;
   rule.max_queue_wait_ms = arg->fc_max_queue_wait_ms;
   rule.telemetry_stale_ms = arg->fc_telemetry_stale_ms;
+  rule.adaptive = arg->fc_adaptive;
+  rule.warmup_ms = arg->fc_warmup_ms;
+  rule.ttft_target_ms = arg->fc_ttft_target_ms;
   fc_cfg_from_env(&env);
   fc_cfg_resolve(&cfg, &env, &rule);
   if (!created && fc_cfg_equal(&cfg, &tepval->fc.cfg))
@@ -8161,9 +8254,11 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   fc_state_apply(&tepval->fc, &cfg);
   if (!created)
     fc_queue_wake_room(&tepval->fc);
-  if (!created || cfg.max_queue_depth > 0 || cfg.src[FC_L_MODE] == FC_SRC_RULE) {
+  if (!created || cfg.max_queue_depth > 0 || cfg.src[FC_L_MODE] == FC_SRC_RULE ||
+      cfg.adaptive || cfg.warmup_ms) {
     log_info("[AIGateway] %s:%u (%s) admission: mode=%s max_outstanding=%u "
-             "ep=%u/%u/%u queue depth=%u wait=%ums telemetry_stale=%ums",
+             "ep=%u/%u/%u queue depth=%u wait=%ums telemetry_stale=%ums "
+             "adaptive=%s warmup=%ums ttft_target=%ums",
              inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
              tepval->ephash_key, fc_mode_name(tepval->fc.cfg.mode),
              tepval->fc.cfg.max_outstanding,
@@ -8171,7 +8266,9 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
              tepval->fc.cfg.ep_cap[FC_ROLE_PREFILL],
              tepval->fc.cfg.ep_cap[FC_ROLE_DECODE],
              tepval->fc.cfg.max_queue_depth, tepval->fc.cfg.max_queue_wait_ms,
-             tepval->fc.cfg.telemetry_stale_ms);
+             tepval->fc.cfg.telemetry_stale_ms,
+             tepval->fc.cfg.adaptive ? "on" : "off", tepval->fc.cfg.warmup_ms,
+             tepval->fc.cfg.ttft_target_ms);
   }
   if (created || tepval->fc.cfg.max_queue_depth != old_depth) {
     uint64_t bytes = fc_queue_memory_bytes(tepval->fc.cfg.max_queue_depth);

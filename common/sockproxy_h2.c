@@ -1748,6 +1748,15 @@ proxy_h2_backend_on_data_chunk_recv_callback(nghttp2_session *session,
       !cstream->usage_consumed)
     proxy_h2_stream_tail_update(cstream, data, len);
 
+  /* The first response bytes of a stream: when they open an SSE event,
+   * this is the stream's first token (a JSON body is never sampled; its
+   * first byte comes with the whole completion). */
+  if (len > 0 && cstream && !cstream->fc_first_data_seen) {
+    cstream->fc_first_data_seen = 1;
+    if (len >= 5 && memcmp(data, "data:", 5) == 0)
+      fc_permit_ttft(&cstream->fc);
+  }
+
   if (!cstream) {
     /* The client reset the stream: nothing to relay to. Drop the chunk
      * instead of failing the whole connection. */

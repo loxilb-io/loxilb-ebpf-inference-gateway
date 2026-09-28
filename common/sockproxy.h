@@ -1868,6 +1868,11 @@ struct proxy_arg {
   uint32_t fc_prefill_max_inflight;
   uint32_t fc_decode_max_inflight;
   uint32_t fc_telemetry_stale_ms;
+  // Adaptive service ceiling and endpoint warm-up, same hop. fc_adaptive is
+  // enum fc_rule_adaptive (0 = inherit); 0 on a window = the environment.
+  uint8_t  fc_adaptive;
+  uint32_t fc_warmup_ms;
+  uint32_t fc_ttft_target_ms;
 
   // KV-Cache Exact Routing configuration 
   uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 

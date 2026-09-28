@@ -233,6 +233,14 @@ int sp_fc_normal_eligible(void *ctx, int ep);
  * (SP_REAP_FC_DRAINED): the pool is going away, or the process drains.
  * The caller holds PROXY_LOCK. */
 void sp_fc_drain_pool(proxy_epval_t *tepval, uint8_t kind, int detach);
+/* The adaptive ceiling's signal for one pool at the 1 Hz pass: fresh
+ * scraped depths and TTFT estimates within the pool's telemetry window.
+ * The caller holds PROXY_LOCK. */
+void sp_fc_adapt_signal(proxy_epval_t *tepval, uint64_t now_s, uint64_t now_ns,
+                        fc_signal_t *sig);
+/* A streamed response's first data event: one TTFT sample for the
+ * endpoint holding the request's unit, when the pool has a TTFT target. */
+void sp_fc_ttft_first_event(proxy_fd_ent_t *pfe);
 /* (R1): owner-worker resume of a parked client fd. Registered as
  * notify_cbs.resume and invoked ON THE PARKED FD'S OWNER WORKER (via notify_wake_worker)
  * when a prefill slot frees. Re-arms EPOLLIN, reconstructs the dispatch from the pfe

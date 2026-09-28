@@ -1147,6 +1147,14 @@ struct dp_proxy_tacts {
   uint32_t fc_prefill_max_inflight;
   uint32_t fc_decode_max_inflight;
   uint32_t fc_telemetry_stale_ms;
+  // Adaptive service ceiling and endpoint warm-up. fc_adaptive is enum
+  // fc_rule_adaptive: 0 inherit, 1 off, 2 on; 0 on the two windows ⇒ the
+  // environment or the product default. Same hop as the fields above.
+  uint8_t  fc_adaptive;
+  uint8_t  fc_pad2[3];
+  uint32_t fc_warmup_ms;
+  uint32_t fc_ttft_target_ms;
+  uint32_t fc_pad3;
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1201,21 +1209,24 @@ struct dp_proxy_tacts {
 //   (8-aligned region): all four asserts shift by +24 (2920→2944, 2912→2936,
 //   3696→3720, 3688→3712). Set from Go through cgo (dpebpf_linux.go
 //   DpLBRuleMod), copied verbatim into proxy_arg by llb_conv_nat2proxy.
+// ABI guard updated for: +fc_adaptive(1)+fc_pad2(3)+fc_warmup_ms(4)
+//   +fc_ttft_target_ms(4)+fc_pad3(4) = +16 (8-aligned region): all four
+//   asserts shift by +16 (2944→2960, 2936→2952, 3720→3736, 3712→3728).
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2944,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2960,
               "dp_proxy_tacts ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 2936,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 2952,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// mTLS-enabled layout: 2944→3720 bytes, DPU slim 2936→3712 bytes.
+// mTLS-enabled layout: 2960→3736 bytes, DPU slim 2952→3728 bytes.
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3720,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3736,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3712,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3728,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */

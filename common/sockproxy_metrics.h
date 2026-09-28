@@ -147,6 +147,15 @@ typedef struct proxy_metrics_snapshot {
      * within the listener's deadline (read path and health pass). TAIL-APPEND
      * ONLY — same three-way lockstep contract as the blocks above. */
     uint64_t hdr_deadline_drops;
+
+    /* The process accept valve (LLB_PD_MAX_TOTAL_INFLIGHT): connection
+     * contexts held (a gauge, backend legs included; counted only while the
+     * bound is set, 0 otherwise), accept()s it held back
+     * (a counter), and the bound (0 = unbounded). TAIL-APPEND ONLY — same
+     * three-way lockstep contract as the blocks above. */
+    uint64_t proxy_context_inflight;
+    uint64_t proxy_accept_blocked;
+    uint64_t proxy_accept_bound;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================
@@ -229,7 +238,8 @@ int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
 #define PROXY_FC_REASONS 12     /* enum fc_reason: the decisions array grew with the queue reasons */
 #define PROXY_FC_POOL_LEN 64    /* pool key as exported; longer keys are cut */
 #define PROXY_FC_QWAIT_BUCKETS 8 /* queue wait histogram buckets (FC_QWAIT_BUCKETS) */
-#define PROXY_FC_LIMITS 8        /* configured limits with a source (FC_LIMITS) */
+#define PROXY_FC_LIMITS 8        /* configured limits with a source, first block */
+#define PROXY_FC_ADAPT_LIMITS 3  /* adaptive, warm-up, TTFT target: FC_LIMITS is the sum */
 
 typedef struct proxy_fc_svc_stat {
     uint32_t xip;                          /* service VIP, network byte order (v4) */
@@ -254,13 +264,24 @@ typedef struct proxy_fc_svc_stat {
     uint32_t telemetry_stale_ms;           /* scraped queue depth trusted this long */
     uint8_t  src[PROXY_FC_LIMITS];         /* enum fc_src per enum fc_limit: 0 default, 1 env, 2 rule */
     uint32_t pad2;
+    /* The adaptive ceiling and the warm-up: same lockstep, offsets pinned below. */
+    uint32_t effective_max_outstanding;    /* the service ceiling in force (the adaptive one while adapting) */
+    uint32_t warmup_ms;                    /* endpoint warm-up window, 0 = none */
+    uint32_t ttft_target_ms;               /* TTFT above this is backpressure, 0 = TTFT unused */
+    uint8_t  adaptive;                     /* 1 when the ceiling adapts */
+    uint8_t  adapt_state;                  /* enum fc_adapt_state: 0 off, 1 open, 2 tightened, 3 frozen */
+    uint8_t  adapt_reason;                 /* enum fc_adapt_reason: 0 none, 1 queued, 2 ttft, 3 clear, 4 stale */
+    uint8_t  src_adapt[PROXY_FC_ADAPT_LIMITS]; /* sources of adaptive, warmup_ms, ttft_target_ms */
+    uint16_t warming_eps;                  /* gauge: endpoints inside their warm-up window */
+    uint64_t adapt_down;                   /* counter: times the adaptive ceiling went down */
+    uint64_t adapt_up;                     /* counter: times it went up */
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
  * definition, and its test links a stub with a third: all three pin the
  * same layout, so a field moved in one without the others fails to build
  * instead of shifting every counter after it. */
-_Static_assert(sizeof(proxy_fc_svc_stat_t) == 312, "proxy_fc_svc_stat_t size");
+_Static_assert(sizeof(proxy_fc_svc_stat_t) == 352, "proxy_fc_svc_stat_t size");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, decisions) == 40, "decisions offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 136, "pool offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 200, "queued offset");
@@ -268,6 +289,11 @@ _Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_bucket) == 216, "qwait_bucket
 _Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_count) == 288, "qwait_count offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, telemetry_stale_ms) == 296, "telemetry_stale_ms offset");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, src) == 300, "src offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, effective_max_outstanding) == 312,
+               "effective_max_outstanding offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, adaptive) == 324, "adaptive offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 330, "warming_eps offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 336, "adapt_down offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every
