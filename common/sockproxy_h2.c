@@ -2973,6 +2973,7 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   int status = (v == FC_NO_CAPACITY || v == FC_DRAINING) ? 503 : 429;
   const char *code = v == FC_NO_CAPACITY ? "admission_no_capacity"
                    : v == FC_DRAINING ? "gateway_draining"
+                   : v == FC_TENANT_SHARE ? "admission_tenant_share"
                    : "admission_capacity";
   const char *msg = v == FC_NO_CAPACITY ? "no healthy endpoint has capacity"
                   : v == FC_DRAINING ? "the gateway is draining for maintenance"
@@ -2987,6 +2988,8 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     fc_count(&tepval->fc, FC_R_CAPACITY_SHED);
   else if (v == FC_DRAINING)
     fc_count(&tepval->fc, FC_R_DRAINING);
+  else if (v == FC_TENANT_SHARE)
+    fc_count(&tepval->fc, FC_R_TENANT_SHARE);
   proxy_h2_send_capacity_deny(pfe, stream, status, code, msg, inflight, queued,
                               limit, v == FC_DRAINING ? 5 : 1);
   ai_gw_record_capacity_deny(stream->request_id, notify_worker_id(),
@@ -3017,8 +3020,11 @@ sp_fc_h2_gate_service(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     return 0;
   }
   {
-    fc_verdict_t v = fc_service_acquire(&tepval->fc, &stream->fc);
-    if (v == FC_SHED || v == FC_DRAINING) {
+    /* The stream's own tenant: concurrent streams may carry different
+     * credentials. */
+    fc_verdict_t v = fc_service_acquire_tenant(&tepval->fc, &stream->fc,
+                                               fc_tenant_key(stream->tenant_id));
+    if (v == FC_SHED || v == FC_DRAINING || v == FC_TENANT_SHARE) {
       sp_fc_h2_shed(pfe, stream, tepval, v, -1);
       return -1;
     }

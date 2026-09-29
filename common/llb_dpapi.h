@@ -1154,7 +1154,11 @@ struct dp_proxy_tacts {
   uint8_t  fc_pad2[3];
   uint32_t fc_warmup_ms;
   uint32_t fc_ttft_target_ms;
-  uint32_t fc_pad3;
+  // The most of the service ceiling and of the queue one tenant may hold,
+  // in percent (1..100; 0 inherits). Takes the first byte of what was
+  // padding: the struct's size and every offset are unchanged.
+  uint8_t  fc_tenant_share_pct;
+  uint8_t  fc_pad3[3];
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1212,6 +1216,7 @@ struct dp_proxy_tacts {
 // ABI guard updated for: +fc_adaptive(1)+fc_pad2(3)+fc_warmup_ms(4)
 //   +fc_ttft_target_ms(4)+fc_pad3(4) = +16 (8-aligned region): all four
 //   asserts shift by +16 (2944→2960, 2936→2952, 3720→3736, 3712→3728).
+// fc_tenant_share_pct(1)+fc_pad3[3] replace the u32 fc_pad3: no size change.
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
 _Static_assert(sizeof(struct dp_proxy_tacts) == 2960,

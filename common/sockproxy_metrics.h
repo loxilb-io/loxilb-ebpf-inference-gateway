@@ -235,7 +235,7 @@ int proxy_get_qos_stats(proxy_qos_svc_stat_t *out, int max);
  * ========================================================================= */
 #define PROXY_FC_STAT_MAX 256   /* pools reported per proxy_get_fc_stats call */
 #define PROXY_FC_ROLES 3
-#define PROXY_FC_REASONS 12     /* enum fc_reason: the decisions array grew with the queue reasons */
+#define PROXY_FC_REASONS 13     /* enum fc_reason: the decisions array grew with the queue and tenant-share reasons */
 #define PROXY_FC_POOL_LEN 64    /* pool key as exported; longer keys are cut */
 #define PROXY_FC_QWAIT_BUCKETS 8 /* queue wait histogram buckets (FC_QWAIT_BUCKETS) */
 #define PROXY_FC_LIMITS 8        /* configured limits with a source, first block */
@@ -275,25 +275,31 @@ typedef struct proxy_fc_svc_stat {
     uint16_t warming_eps;                  /* gauge: endpoints inside their warm-up window */
     uint64_t adapt_down;                   /* counter: times the adaptive ceiling went down */
     uint64_t adapt_up;                     /* counter: times it went up */
+    /* The tenant share: same lockstep, offsets pinned below. */
+    uint32_t tenants_active;               /* gauge: tenants holding a unit or a queue entry */
+    uint8_t  tenant_share_pct;             /* the share in force, 0 or 100 = none */
+    uint8_t  src_tenant;                   /* source of tenant_share_pct */
+    uint16_t pad3;
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
  * definition, and its test links a stub with a third: all three pin the
  * same layout, so a field moved in one without the others fails to build
  * instead of shifting every counter after it. */
-_Static_assert(sizeof(proxy_fc_svc_stat_t) == 352, "proxy_fc_svc_stat_t size");
+_Static_assert(sizeof(proxy_fc_svc_stat_t) == 368, "proxy_fc_svc_stat_t size");
 _Static_assert(offsetof(proxy_fc_svc_stat_t, decisions) == 40, "decisions offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 136, "pool offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 200, "queued offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_bucket) == 216, "qwait_bucket offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_count) == 288, "qwait_count offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, telemetry_stale_ms) == 296, "telemetry_stale_ms offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, src) == 300, "src offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, effective_max_outstanding) == 312,
+_Static_assert(offsetof(proxy_fc_svc_stat_t, pool) == 144, "pool offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, queued) == 208, "queued offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_bucket) == 224, "qwait_bucket offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, qwait_count) == 296, "qwait_count offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, telemetry_stale_ms) == 304, "telemetry_stale_ms offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, src) == 308, "src offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, effective_max_outstanding) == 320,
                "effective_max_outstanding offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, adaptive) == 324, "adaptive offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 330, "warming_eps offset");
-_Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 336, "adapt_down offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, adaptive) == 332, "adaptive offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, warming_eps) == 338, "warming_eps offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, adapt_down) == 344, "adapt_down offset");
+_Static_assert(offsetof(proxy_fc_svc_stat_t, tenants_active) == 360, "tenants_active offset");
 
 /*
  * proxy_get_fc_stats - fill `out` with one entry per model pool of every
