@@ -4137,10 +4137,12 @@ _Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc
 _Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
 _Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
 _Static_assert(PROXY_FC_QWAIT_BUCKETS == FC_QWAIT_BUCKETS, "wait bucket count drifted from sockproxy_fc.h");
-_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS == FC_LIMITS,
+_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS + 1 == FC_LIMITS,
                "limit count drifted from sockproxy_fc.h");
 _Static_assert(FC_L_ADAPTIVE == PROXY_FC_LIMITS,
                "the adaptive limits must follow the first block");
+_Static_assert(FC_L_TENANT_SHARE == PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS,
+               "the tenant share's source follows the adaptive block");
 
 static void
 sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
@@ -4168,6 +4170,9 @@ sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
   st->warming_eps = (uint16_t)fc_warming_eps(fc, fc_now_ns());
   st->adapt_down = atomic_load_explicit(&fc->adapt_moves[0], memory_order_relaxed);
   st->adapt_up = atomic_load_explicit(&fc->adapt_moves[1], memory_order_relaxed);
+  st->tenants_active = fc_tenants_active((fc_state_t *)fc);
+  st->tenant_share_pct = fc->cfg.tenant_share_pct;
+  st->src_tenant = fc->cfg.src[FC_L_TENANT_SHARE];
 }
 
 int
@@ -7989,6 +7994,7 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
   uint32_t inflight, queued, limit, retry_after = 1;
   int woken = pfe->fc.woken;
   int queue_full = 0;
+  int tenant_full = 0;
   int keep;
 
   /* Whatever the service level granted before the refusal goes back now:
@@ -8005,15 +8011,21 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
    * may not wait here (a role leg, a stream) takes the refusal below. */
   if ((v == FC_QUEUE || v == FC_SHED) && may_wait && fc_queue_enabled(fc) &&
       !pfe->h2_session) {
-    if (fc_queue_push(fc, &pfe->fc, pfe->fd,
-                      atomic_load_explicit(&pfe->gen, memory_order_acquire),
-                      qos_now_ns(), woken) == 0) {
+    int prc = fc_queue_push(fc, &pfe->fc, pfe->fd,
+                            atomic_load_explicit(&pfe->gen, memory_order_acquire),
+                            qos_now_ns(), woken);
+    if (prc == 0) {
       log_debug("[AIGateway] fd=%d parked: role=%d inflight=%u queued=%u "
                 "depth=%u%s", pfe->fd, role, fc_inflight(fc), fc_queued(fc),
                 fc->cfg.max_queue_depth, woken ? " (back at the head)" : "");
       return SP_FC_H1_QUEUED;
     }
-    queue_full = 1;
+    /* The push counted what refused it: the queue at its depth, or the
+     * tenant at its share of the queue. */
+    if (prc == -2)
+      tenant_full = 1;
+    else
+      queue_full = 1;
     retry_after = fc_retry_after_s(fc);
   }
   if (v == FC_NO_CAPACITY) {
@@ -8026,6 +8038,11 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
     msg = "the gateway is draining for maintenance";
     retry_after = 5;
     fc_count(fc, FC_R_DRAINING);
+  } else if (v == FC_TENANT_SHARE || tenant_full) {
+    code = "admission_tenant_share";
+    msg = "the tenant holds its share of this service";
+    if (!tenant_full)
+      fc_count(fc, FC_R_TENANT_SHARE);
   } else if (!queue_full) {
     fc_count(fc, FC_R_CAPACITY_SHED);
   }
@@ -8096,7 +8113,10 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
     fc_bypass(&tepval->fc, &pfe->fc);
     return 0;
   }
-  v = fc_service_acquire_h1(&tepval->fc, &pfe->fc, woken);
+  /* Admitted as the tenant the credential resolved to (the admission gate
+   * ran before dispatch); no tenant is the keyless pseudo-tenant. */
+  v = fc_service_acquire_h1_tenant(&tepval->fc, &pfe->fc, woken,
+                                   fc_tenant_key(pfe->tenant_id));
   if (v == FC_ADMIT)
     return 0;
   pfe->fc.woken = (uint8_t)woken;
@@ -8246,6 +8266,7 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   rule.adaptive = arg->fc_adaptive;
   rule.warmup_ms = arg->fc_warmup_ms;
   rule.ttft_target_ms = arg->fc_ttft_target_ms;
+  rule.tenant_share_pct = arg->fc_tenant_share_pct;
   fc_cfg_from_env(&env);
   fc_cfg_resolve(&cfg, &env, &rule);
   if (!created && fc_cfg_equal(&cfg, &tepval->fc.cfg))
@@ -8255,10 +8276,10 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   if (!created)
     fc_queue_wake_room(&tepval->fc);
   if (!created || cfg.max_queue_depth > 0 || cfg.src[FC_L_MODE] == FC_SRC_RULE ||
-      cfg.adaptive || cfg.warmup_ms) {
+      cfg.adaptive || cfg.warmup_ms || cfg.tenant_share_pct) {
     log_info("[AIGateway] %s:%u (%s) admission: mode=%s max_outstanding=%u "
              "ep=%u/%u/%u queue depth=%u wait=%ums telemetry_stale=%ums "
-             "adaptive=%s warmup=%ums ttft_target=%ums",
+             "adaptive=%s warmup=%ums ttft_target=%ums tenant_share=%u%%",
              inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
              tepval->ephash_key, fc_mode_name(tepval->fc.cfg.mode),
              tepval->fc.cfg.max_outstanding,
@@ -8268,7 +8289,7 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
              tepval->fc.cfg.max_queue_depth, tepval->fc.cfg.max_queue_wait_ms,
              tepval->fc.cfg.telemetry_stale_ms,
              tepval->fc.cfg.adaptive ? "on" : "off", tepval->fc.cfg.warmup_ms,
-             tepval->fc.cfg.ttft_target_ms);
+             tepval->fc.cfg.ttft_target_ms, tepval->fc.cfg.tenant_share_pct);
   }
   if (created || tepval->fc.cfg.max_queue_depth != old_depth) {
     uint64_t bytes = fc_queue_memory_bytes(tepval->fc.cfg.max_queue_depth);

@@ -51,6 +51,16 @@
  * happens to the connection. HTTP/2 streams never queue: over a ceiling is
  * a refusal on the stream.
  *
+ * Tenant share. With a share set, a tenant (the credential-resolved tenant
+ * id; no id is one pseudo-tenant) holds at most that share of the service
+ * ceiling and of the queue depth. Over it, a request waits for one of its
+ * own tenant's units, or is refused with its own reason while every other
+ * tenant still admits. Waiting tenants that cannot run are no reason for
+ * anyone else to wait: a newcomer waits behind the queue only when a waiter
+ * could take the unit, and a released unit wakes the oldest waiter that can.
+ * The counts sit in a bounded table under the queue lock, taken on the
+ * admission path only while a share is set.
+ *
  * Modes. `off` takes no atomics at all and the dispatch path is byte for
  * byte what it was. `observe` counts every decision the gate would have
  * taken and admits everything. `enforce` refuses or queues. Zero ceilings
@@ -114,6 +124,7 @@ enum fc_limit {
   FC_L_ADAPTIVE,
   FC_L_WARMUP,
   FC_L_TTFT_TARGET,
+  FC_L_TENANT_SHARE,
   FC_LIMITS,
 };
 
@@ -126,6 +137,11 @@ enum fc_limit {
 #define FC_WARMUP_MS_MAX              3600000u
 #define FC_TTFT_TARGET_MS_MAX         3600000u
 
+/* Tenants a pool tracks by name for the tenant share. Tenants past these are
+ * held together to one share in a last, shared slot (counted as an anomaly):
+ * the table stays bounded whatever the credentials in use. */
+#define FC_TENANT_SLOTS 64
+
 typedef struct fc_cfg {
   uint8_t  mode;                 /* enum fc_mode */
   uint8_t  src[FC_LIMITS];       /* enum fc_src per enum fc_limit */
@@ -137,6 +153,7 @@ typedef struct fc_cfg {
   uint8_t  adaptive;             /* 1: the service ceiling tightens under backpressure */
   uint32_t warmup_ms;            /* an endpoint back in service ramps to its ceiling over this; 0 = at once */
   uint32_t ttft_target_ms;       /* an endpoint's TTFT above this is backpressure; 0 = TTFT unused */
+  uint8_t  tenant_share_pct;     /* most of the ceiling and of the queue one tenant may hold; 0 or 100 = no share */
 } fc_cfg_t;
 
 /* A rule's declarations, as the control plane sends them. 0 on any field
@@ -166,6 +183,7 @@ typedef struct fc_rule_cfg {
   uint8_t  adaptive;             /* enum fc_rule_adaptive */
   uint32_t warmup_ms;
   uint32_t ttft_target_ms;
+  uint8_t  tenant_share_pct;     /* 1..100; 0 inherits */
 } fc_rule_cfg_t;
 
 /* The adaptive ceiling's state, for the read-back and the metrics. */
@@ -209,12 +227,14 @@ enum fc_reason {
   FC_R_DRAINED,                  /* the pool or the process stopped taking work while it waited */
   FC_R_OBSERVE_WOULD_QUEUE,      /* over a ceiling in observe mode with a queue depth, admitted */
   FC_R_DRAINING,                 /* refused: the process is draining for maintenance */
+  FC_R_TENANT_SHARE,             /* refused: the tenant holds its share of the ceiling or of the queue */
   FC_R_COUNT,
 };
 
 enum fc_anomaly {
   FC_A_UNDERFLOW = 0,            /* a release found its counter at zero */
   FC_A_UNKNOWN_PERMIT,           /* an executing permit with no service */
+  FC_A_TENANT_TABLE_FULL,        /* a tenant past the table was put in the shared slot */
   FC_A_COUNT,
 };
 
@@ -227,10 +247,12 @@ extern const uint32_t fc_qwait_bounds_ms[FC_QWAIT_BUCKETS];
 /* One waiting request: the parked client's fd and the connection generation
  * captured when it was parked, so a recycled fd is never woken for a
  * request that is gone. `live` is cleared in place when the entry is taken
- * out of turn (cancelled, expired, drained), and a pop skips it. */
+ * out of turn (cancelled, expired, drained), and a pop skips it. `tslot` is
+ * the tenant slot whose queue count the entry holds, -1 for none. */
 typedef struct fc_queue_ent {
   int      fd;
-  uint32_t live;
+  uint16_t live;
+  int16_t  tslot;
   uint64_t gen;
   uint64_t enqueue_ns;
   uint64_t deadline_ns;
@@ -250,6 +272,15 @@ typedef struct fc_queue {
   uint32_t dead;                 /* the pool's rule is gone: nothing may wait here again */
   pthread_mutex_t lock;
 } fc_queue_t;
+
+/* One tenant's hold on a pool: the service units it executes on and the
+ * queue entries it waits in. A slot is free again when both are zero. */
+typedef struct fc_tenant {
+  uint64_t key;
+  uint32_t inflight;
+  uint32_t queued;
+  uint8_t  used;
+} fc_tenant_t;
 
 /* Per-service (per model pool) admission state. Zero-initialised memory is a
  * valid `off` state, which is what a pool that predates this module looks
@@ -275,6 +306,12 @@ typedef struct fc_state {
   _Atomic uint64_t warm_since_ns[FC_MAX_EP];
   _Atomic uint32_t ttft_ewma_ms[FC_MAX_EP];
   _Atomic uint64_t ttft_ts_ns[FC_MAX_EP];
+  /* The tenant share: slots by tenant key, the last one shared by tenants
+   * past the table. Under queue.lock, which every path that moves a queue
+   * entry already holds; taken on the admission path only while a share is
+   * set. */
+  fc_tenant_t tenants[FC_TENANT_SLOTS + 1];
+  uint32_t tenants_used;
 } fc_state_t;
 
 enum fc_permit_state {
@@ -297,6 +334,8 @@ typedef struct fc_permit {
   uint64_t q_enqueue_ns;
   uint64_t q_deadline_ns;
   uint64_t admit_ns;             /* fc_now_ns() when the first endpoint unit landed: dispatch */
+  uint64_t tkey;                 /* the tenant the request is admitted as */
+  int16_t  tslot;                /* tenant slot whose inflight count this permit holds, -1 = none */
 } fc_permit_t;
 
 typedef enum fc_verdict {
@@ -305,6 +344,7 @@ typedef enum fc_verdict {
   FC_NO_CAPACITY = 2,            /* no eligible endpoint: 503 admission_no_capacity */
   FC_QUEUE = 3,                  /* over a ceiling with a queue: the caller parks the request */
   FC_DRAINING = 4,               /* the process is draining: 503 gateway_draining */
+  FC_TENANT_SHARE = 5,           /* the tenant holds its share: 429 admission_tenant_share */
 } fc_verdict_t;
 
 extern _Atomic uint64_t fc_anomaly_total[FC_A_COUNT];
@@ -374,6 +414,29 @@ fc_has_room(const fc_state_t *fc)
 
 void fc_permit_init(fc_permit_t *p);
 
+/* ---- tenant share ----------------------------------------------------------- */
+
+/* A tenant's key: a 64-bit hash of the credential-resolved tenant id. No id
+ * (a keyless request, or a credential with no tenant) is one pseudo-tenant. */
+uint64_t fc_tenant_key(const char *tenant_id);
+
+/* Whether the pool holds tenants to a share. */
+static inline int
+fc_share_active(const fc_state_t *fc)
+{
+  return fc != NULL && fc->cfg.mode != FC_MODE_OFF &&
+         fc->cfg.tenant_share_pct > 0 && fc->cfg.tenant_share_pct < 100;
+}
+
+/* The executing units one tenant may hold: its share of the ceiling in
+ * force, rounded up, at least one. 0 (no bound) when the pool has no share or
+ * no ceiling. */
+uint32_t fc_tenant_svc_bound(const fc_state_t *fc);
+/* The same for queue entries, as a share of the queue depth. */
+uint32_t fc_tenant_queue_bound(const fc_state_t *fc);
+/* Tenants holding a unit or a queue entry on the pool now. */
+uint32_t fc_tenants_active(fc_state_t *fc);
+
 /* Capacity permits apply to inference requests only: a POST on one of the
  * inference paths. Everything else on an AI service (model listings, health
  * probes, preflight) bypasses capacity, never policy, and is counted under
@@ -394,6 +457,16 @@ fc_verdict_t fc_service_acquire(fc_state_t *fc, fc_permit_t *p);
  * the pool has a queue. `woken` is a request popped from that queue: it
  * takes its unit ahead of newcomers. */
 fc_verdict_t fc_service_acquire_h1(fc_state_t *fc, fc_permit_t *p, int woken);
+
+/* The same two, for a request admitted as tenant `tkey`. On a pool with a
+ * share, a tenant at its share of the ceiling waits (when it may, within its
+ * share of the queue) or is refused with FC_TENANT_SHARE while other tenants
+ * still admit, and a newcomer waits behind the queue only when someone in it
+ * can run. The two above are the pseudo-tenant. */
+fc_verdict_t fc_service_acquire_tenant(fc_state_t *fc, fc_permit_t *p,
+                                       uint64_t tkey);
+fc_verdict_t fc_service_acquire_h1_tenant(fc_state_t *fc, fc_permit_t *p,
+                                          int woken, uint64_t tkey);
 
 /* The same, for a request that is not an inference request. */
 void fc_bypass(fc_state_t *fc, fc_permit_t *p);
@@ -453,7 +526,8 @@ void fc_count(fc_state_t *fc, enum fc_reason reason);
  * The permit is QUEUED before its entry can be seen by any other thread.
  * Returns 0 with the permit QUEUED and the decision counted, -1 when the
  * queue is at its depth or the pool is dead (counted as queue_full, the
- * permit reset). */
+ * permit reset), -2 when the permit's tenant holds its share of the queue
+ * (counted as tenant_share, the permit reset). */
 int fc_queue_push(fc_state_t *fc, fc_permit_t *p, int fd, uint64_t gen,
                   uint64_t now_ns, int front);
 
@@ -481,7 +555,8 @@ typedef int (*fc_wake_fn)(int fd, uint64_t gen);
 void fc_set_wake_hook(fc_wake_fn fn);
 
 /* Pop one waiting request and wake it, when the service ceiling has a unit
- * free. Called for every released service unit, and once a second for every
+ * free. On a pool with a share, the oldest waiter whose tenant is under its
+ * share: one that could not run is passed over and keeps its place. Called for every released service unit, and once a second for every
  * pool with waiting requests so a turn that was lost on the way (a wake that
  * could not be delivered, a woken connection that is gone) is given again.
  * Harmless on an empty queue. */

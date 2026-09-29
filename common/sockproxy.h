@@ -1874,6 +1874,9 @@ struct proxy_arg {
   uint8_t  fc_adaptive;
   uint32_t fc_warmup_ms;
   uint32_t fc_ttft_target_ms;
+  // Tenant share, same hop: percent of the ceiling and of the queue one
+  // tenant may hold; 0 = the environment.
+  uint8_t  fc_tenant_share_pct;
 
   // KV-Cache Exact Routing configuration 
   uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 
