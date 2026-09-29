@@ -125,6 +125,7 @@ enum fc_limit {
   FC_L_WARMUP,
   FC_L_TTFT_TARGET,
   FC_L_TENANT_SHARE,
+  FC_L_EXPOSE_HEADERS,
   FC_LIMITS,
 };
 
@@ -154,6 +155,7 @@ typedef struct fc_cfg {
   uint32_t warmup_ms;            /* an endpoint back in service ramps to its ceiling over this; 0 = at once */
   uint32_t ttft_target_ms;       /* an endpoint's TTFT above this is backpressure; 0 = TTFT unused */
   uint8_t  tenant_share_pct;     /* most of the ceiling and of the queue one tenant may hold; 0 or 100 = no share */
+  uint8_t  expose_headers;       /* 1: an admitted response carries the admission headers */
 } fc_cfg_t;
 
 /* A rule's declarations, as the control plane sends them. 0 on any field
@@ -173,6 +175,13 @@ enum fc_rule_adaptive {
   FC_RULE_ADAPTIVE_ON = 2,
 };
 
+/* And for the admission headers on admitted responses. */
+enum fc_rule_expose {
+  FC_RULE_EXPOSE_INHERIT = 0,
+  FC_RULE_EXPOSE_OFF = 1,
+  FC_RULE_EXPOSE_ON = 2,
+};
+
 typedef struct fc_rule_cfg {
   uint8_t  mode;                 /* enum fc_rule_mode */
   uint32_t max_outstanding;
@@ -184,6 +193,7 @@ typedef struct fc_rule_cfg {
   uint32_t warmup_ms;
   uint32_t ttft_target_ms;
   uint8_t  tenant_share_pct;     /* 1..100; 0 inherits */
+  uint8_t  expose_headers;       /* enum fc_rule_expose */
 } fc_rule_cfg_t;
 
 /* The adaptive ceiling's state, for the read-back and the metrics. */
@@ -659,6 +669,35 @@ uint32_t fc_warming_eps(const fc_state_t *fc, uint64_t now_ns);
 uint64_t fc_now_ns(void);
 typedef uint64_t (*fc_clock_fn)(void);
 void fc_set_clock(fc_clock_fn fn);
+
+/* ---- admission headers on admitted responses ------------------------------ */
+
+/* What an admitted response reports: the pool's executing units and waiting
+ * requests as its head goes out, and the service ceiling in force (0 is
+ * none), the same three a refusal carries. */
+typedef struct fc_expose {
+  uint32_t inflight;
+  uint32_t queued;
+  uint32_t limit;
+} fc_expose_t;
+
+/* Whether the request holding `p` reports them on its response: it holds
+ * its units on a pool that exposes them. Fills `out` with the values now. */
+int fc_expose_take(const fc_permit_t *p, fc_expose_t *out);
+
+enum fc_expose_h1 {
+  FC_EXPOSE_H1_DONE = 0,         /* the head now carries them */
+  FC_EXPOSE_H1_INTERIM,          /* a 1xx: the final response carries them */
+  FC_EXPOSE_H1_SKIPPED,          /* not a whole response head, or no room */
+};
+
+/* Put the three headers into the HTTP/1.x response head at the start of
+ * `buf` (`len` bytes, `cap` room), in place of any the backend sent. Only a
+ * final response whose whole head is in the buffer is touched; what follows
+ * the head (a body, chunks, an event stream) is moved, never read. Returns
+ * the new length; `res` says which of the three happened. */
+size_t fc_expose_h1(uint8_t *buf, size_t len, size_t cap, const fc_expose_t *v,
+                    int *res);
 
 const char *fc_adapt_state_name(uint8_t state);
 const char *fc_adapt_reason_name(uint8_t reason);

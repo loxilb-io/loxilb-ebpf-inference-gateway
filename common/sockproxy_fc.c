@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -153,7 +154,7 @@ fc_env_u32(const char *name, uint32_t dflt, uint8_t *src)
 void
 fc_cfg_from_env(fc_cfg_t *cfg)
 {
-  const char *mode, *adaptive;
+  const char *mode, *adaptive, *expose;
 
   memset(cfg, 0, sizeof(*cfg));
   mode = getenv("LLB_FC_MODE");
@@ -226,6 +227,13 @@ fc_cfg_from_env(fc_cfg_t *cfg)
     }
     cfg->tenant_share_pct = (uint8_t)pct;
   }
+  expose = getenv("LLB_FC_EXPOSE_HEADERS");
+  if (expose && !strcasecmp(expose, "on")) {
+    cfg->expose_headers = 1;
+    cfg->src[FC_L_EXPOSE_HEADERS] = FC_SRC_ENV;
+  } else if (expose && !strcasecmp(expose, "off")) {
+    cfg->src[FC_L_EXPOSE_HEADERS] = FC_SRC_ENV;
+  }
 }
 
 static inline void
@@ -291,6 +299,11 @@ fc_cfg_resolve(fc_cfg_t *out, const fc_cfg_t *env, const fc_rule_cfg_t *rule)
     out->tenant_share_pct = rule->tenant_share_pct;
     out->src[FC_L_TENANT_SHARE] = FC_SRC_RULE;
   }
+  if (rule->expose_headers == FC_RULE_EXPOSE_OFF ||
+      rule->expose_headers == FC_RULE_EXPOSE_ON) {
+    out->expose_headers = rule->expose_headers == FC_RULE_EXPOSE_ON;
+    out->src[FC_L_EXPOSE_HEADERS] = FC_SRC_RULE;
+  }
 }
 
 int
@@ -302,7 +315,8 @@ fc_cfg_equal(const fc_cfg_t *a, const fc_cfg_t *b)
       a->telemetry_stale_ms != b->telemetry_stale_ms ||
       a->adaptive != b->adaptive || a->warmup_ms != b->warmup_ms ||
       a->ttft_target_ms != b->ttft_target_ms ||
-      a->tenant_share_pct != b->tenant_share_pct)
+      a->tenant_share_pct != b->tenant_share_pct ||
+      a->expose_headers != b->expose_headers)
     return 0;
   for (int r = 0; r < FC_ROLES; r++)
     if (a->ep_cap[r] != b->ep_cap[r])
@@ -1672,4 +1686,103 @@ fc_adapt_tick(fc_state_t *fc, const fc_signal_t *sig)
                         memory_order_relaxed);
   /* The unit given back is a turn for the oldest waiting request. */
   fc_queue_wake_room(fc);
+}
+
+/* ---- admission headers on admitted responses ----------------------------- */
+
+int
+fc_expose_take(const fc_permit_t *p, fc_expose_t *out)
+{
+  const fc_state_t *fc;
+
+  if (!p || p->state != FC_P_EXECUTING || !p->fc)
+    return 0;
+  fc = p->fc;
+  if (!fc_active(fc) || !fc->cfg.expose_headers)
+    return 0;
+  if (out) {
+    out->inflight = fc_inflight(fc);
+    out->queued = fc_queued(fc);
+    out->limit = fc_svc_cap(fc);
+  }
+  return 1;
+}
+
+#define FC_EXPOSE_NAME "x-loxilb-admission-"
+#define FC_EXPOSE_NAME_LEN (sizeof(FC_EXPOSE_NAME) - 1)
+
+/* The end of the header block (the offset of its blank line's CRLF), or 0
+ * when the buffer does not hold all of it. */
+static size_t
+fc_h1_head_end(const uint8_t *buf, size_t len)
+{
+  for (size_t i = 0; i + 3 < len; i++) {
+    if (buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' &&
+        buf[i + 3] == '\n')
+      return i + 2;
+  }
+  return 0;
+}
+
+size_t
+fc_expose_h1(uint8_t *buf, size_t len, size_t cap, const fc_expose_t *v,
+             int *res)
+{
+  char add[3 * 64];
+  size_t end, i, n;
+  int alen, status;
+
+  if (res)
+    *res = FC_EXPOSE_H1_SKIPPED;
+  if (!buf || !v || len < 12 || memcmp(buf, "HTTP/1.", 7) != 0 ||
+      buf[8] != ' ' || buf[9] < '1' || buf[9] > '5' ||
+      buf[10] < '0' || buf[10] > '9' || buf[11] < '0' || buf[11] > '9')
+    return len;
+  status = (buf[9] - '0') * 100 + (buf[10] - '0') * 10 + (buf[11] - '0');
+  if (status < 200) {
+    /* An interim response: the final one still follows and carries them. */
+    if (res)
+      *res = FC_EXPOSE_H1_INTERIM;
+    return len;
+  }
+  end = fc_h1_head_end(buf, len);
+  if (end == 0)
+    return len;
+
+  /* The values are the gateway's own: a backend's lines of the same names
+   * go, so a client never reads two answers. */
+  i = 0;
+  while (i < end && !(buf[i] == '\r' && buf[i + 1] == '\n'))
+    i++;
+  i += 2;                                   /* past the status line */
+  while (i < end) {
+    size_t eol = i;
+    while (eol < end && !(buf[eol] == '\r' && buf[eol + 1] == '\n'))
+      eol++;
+    eol += 2;
+    if (eol - i > FC_EXPOSE_NAME_LEN &&
+        !strncasecmp((const char *)buf + i, FC_EXPOSE_NAME, FC_EXPOSE_NAME_LEN)) {
+      memmove(buf + i, buf + eol, len - eol);
+      len -= eol - i;
+      end -= eol - i;
+      continue;
+    }
+    i = eol;
+  }
+
+  alen = snprintf(add, sizeof(add),
+                  "X-Loxilb-Admission-Inflight: %u\r\n"
+                  "X-Loxilb-Admission-Queued: %u\r\n"
+                  "X-Loxilb-Admission-Limit: %u\r\n",
+                  v->inflight, v->queued, v->limit);
+  if (alen <= 0 || (size_t)alen >= sizeof(add))
+    return len;
+  n = (size_t)alen;
+  if (len + n > cap)
+    return len;
+  memmove(buf + end + n, buf + end, len - end);
+  memcpy(buf + end, add, n);
+  if (res)
+    *res = FC_EXPOSE_H1_DONE;
+  return len + n;
 }

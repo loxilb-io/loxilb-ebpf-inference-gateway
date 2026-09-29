@@ -1240,6 +1240,8 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 {
   int n;
   proxy_fd_ent_t *rfd_ent = NULL;
+  fc_expose_t fc_xv;
+  int fc_x = 0;
 
 #ifdef HAVE_PII_DETECTION
   // CRITICAL FIX: Apply deferred PII masking NOW (before forwarding)
@@ -1386,6 +1388,13 @@ skip_deferred_masking:
      * cookie-affinity reads on the :2020 listener (the connection was cut mid-keepalive). Only clears
  * the -armed anchor on a non-sticky connection; sticky sessions manage last_activity
      * themselves (is_sticky path), so leave those untouched. */
+    /* The admission values are read before anything below can complete the
+     * response: a whole response in this one read hands its unit back
+     * before the head goes out, and the head reports the pool as the
+     * request found it, itself included. */
+    if (ent->odir == 1 && rfd_ent->odir == 0 && rfd_ent->fc_expose_pending)
+      fc_x = fc_expose_take(&rfd_ent->fc, &fc_xv);
+
     if (ent->odir == 1 && rfd_ent && !rfd_ent->is_sticky && rfd_ent->last_activity != 0) {
       rfd_ent->last_activity = 0;
     }
@@ -2237,6 +2246,25 @@ skip_deferred_masking:
        * l7_inject_hsts_h1). Pure no-op for plain-HTTP / AI / un-configured
  * listeners — byte-for-byte unchanged. */
       len = l7_inject_hsts_h1(rfd_ent, (uint8_t *)msg, len, SP_SOCK_MSG_LEN);
+    }
+
+    /* The admission headers on the admitted response's head. Not on the
+     * seam above: a chunked or event-stream response is marked chunked by
+     * this very read, and its head is still whole text here; only the head
+     * is touched and the chunks after it are moved as they are. A prefill
+     * leg's answer and a drain leg never reach the client. A head split
+     * across reads is left as it is: the values would be a read late. */
+    if (ent->odir == 1 && rfd_ent->odir == 0 && rfd_ent->fc_expose_pending &&
+        !ent->pd_sg_drain && rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
+      int xr = FC_EXPOSE_H1_SKIPPED;
+
+      if (fc_x)
+        len = fc_expose_h1((uint8_t *)msg, len, SP_SOCK_MSG_LEN, &fc_xv, &xr);
+      if (xr != FC_EXPOSE_H1_INTERIM)
+        rfd_ent->fc_expose_pending = 0;
+      if (fc_x && xr == FC_EXPOSE_H1_SKIPPED)
+        log_debug("[AIGateway] fd=%d admission headers not added: the response "
+                  "head is not whole in this read, or has no room", rfd_ent->fd);
     }
 
     rfd_ent->chunk_seq++;  // Increment sequence for each transmission attempt
@@ -4137,12 +4165,14 @@ _Static_assert(PROXY_FC_ROLES == FC_ROLES, "role count drifted from sockproxy_fc
 _Static_assert(PROXY_FC_REASONS == FC_R_COUNT, "reason count drifted from sockproxy_fc.h");
 _Static_assert(FC_MAX_EP == MAX_PROXY_EP, "endpoint bound drifted from sockproxy.h");
 _Static_assert(PROXY_FC_QWAIT_BUCKETS == FC_QWAIT_BUCKETS, "wait bucket count drifted from sockproxy_fc.h");
-_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS + 1 == FC_LIMITS,
+_Static_assert(PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS + 2 == FC_LIMITS,
                "limit count drifted from sockproxy_fc.h");
 _Static_assert(FC_L_ADAPTIVE == PROXY_FC_LIMITS,
                "the adaptive limits must follow the first block");
 _Static_assert(FC_L_TENANT_SHARE == PROXY_FC_LIMITS + PROXY_FC_ADAPT_LIMITS,
                "the tenant share's source follows the adaptive block");
+_Static_assert(FC_L_EXPOSE_HEADERS == FC_L_TENANT_SHARE + 1,
+               "the admission headers' source follows the tenant share's");
 
 static void
 sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
@@ -4173,6 +4203,8 @@ sp_fc_fill_queue_stat(const fc_state_t *fc, proxy_fc_svc_stat_t *st)
   st->tenants_active = fc_tenants_active((fc_state_t *)fc);
   st->tenant_share_pct = fc->cfg.tenant_share_pct;
   st->src_tenant = fc->cfg.src[FC_L_TENANT_SHARE];
+  st->expose_headers = fc->cfg.expose_headers;
+  st->src_expose = fc->cfg.src[FC_L_EXPOSE_HEADERS];
 }
 
 int
@@ -8100,6 +8132,7 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
    * took in between. */
   if (pfe->fc.state == FC_P_EXECUTING && pfe->fc.fc == &tepval->fc)
     return 0;
+  pfe->fc_expose_pending = 0;
   /* A request just woken from the pool's queue takes its unit ahead of
    * newcomers, and goes back to the head when it finds none. */
   woken = pfe->fc.state == FC_P_NONE && pfe->fc.fc == &tepval->fc &&
@@ -8117,8 +8150,10 @@ sp_fc_h1_gate_service(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
    * ran before dispatch); no tenant is the keyless pseudo-tenant. */
   v = fc_service_acquire_h1_tenant(&tepval->fc, &pfe->fc, woken,
                                    fc_tenant_key(pfe->tenant_id));
-  if (v == FC_ADMIT)
+  if (v == FC_ADMIT) {
+    pfe->fc_expose_pending = 1;
     return 0;
+  }
   pfe->fc.woken = (uint8_t)woken;
   return sp_fc_h1_refuse(pfe, tepval, v, -1, 1);
 }
@@ -8267,6 +8302,7 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   rule.warmup_ms = arg->fc_warmup_ms;
   rule.ttft_target_ms = arg->fc_ttft_target_ms;
   rule.tenant_share_pct = arg->fc_tenant_share_pct;
+  rule.expose_headers = arg->fc_expose_headers;
   fc_cfg_from_env(&env);
   fc_cfg_resolve(&cfg, &env, &rule);
   if (!created && fc_cfg_equal(&cfg, &tepval->fc.cfg))
@@ -8276,10 +8312,12 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
   if (!created)
     fc_queue_wake_room(&tepval->fc);
   if (!created || cfg.max_queue_depth > 0 || cfg.src[FC_L_MODE] == FC_SRC_RULE ||
-      cfg.adaptive || cfg.warmup_ms || cfg.tenant_share_pct) {
+      cfg.adaptive || cfg.warmup_ms || cfg.tenant_share_pct ||
+      cfg.expose_headers) {
     log_info("[AIGateway] %s:%u (%s) admission: mode=%s max_outstanding=%u "
              "ep=%u/%u/%u queue depth=%u wait=%ums telemetry_stale=%ums "
-             "adaptive=%s warmup=%ums ttft_target=%ums tenant_share=%u%%",
+             "adaptive=%s warmup=%ums ttft_target=%ums tenant_share=%u%% "
+             "expose_headers=%s",
              inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
              tepval->ephash_key, fc_mode_name(tepval->fc.cfg.mode),
              tepval->fc.cfg.max_outstanding,
@@ -8289,7 +8327,8 @@ sp_fc_apply_rule(proxy_epval_t *tepval, const proxy_arg_t *arg,
              tepval->fc.cfg.max_queue_depth, tepval->fc.cfg.max_queue_wait_ms,
              tepval->fc.cfg.telemetry_stale_ms,
              tepval->fc.cfg.adaptive ? "on" : "off", tepval->fc.cfg.warmup_ms,
-             tepval->fc.cfg.ttft_target_ms, tepval->fc.cfg.tenant_share_pct);
+             tepval->fc.cfg.ttft_target_ms, tepval->fc.cfg.tenant_share_pct,
+             tepval->fc.cfg.expose_headers ? "on" : "off");
   }
   if (created || tepval->fc.cfg.max_queue_depth != old_depth) {
     uint64_t bytes = fc_queue_memory_bytes(tepval->fc.cfg.max_queue_depth);

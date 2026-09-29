@@ -1447,6 +1447,11 @@ struct proxy_fd_ent {
    * first. A kept backend leg is a transport, never a permit: the next
    * request on it takes its own. Zero-init (pfe_alloc) == nothing held. */
   fc_permit_t fc;
+  /* The admitted request's response head has not gone out yet: set by the
+   * service gate on admission, cleared by the relay at the first final
+   * response head, which carries the admission headers when the pool
+   * exposes them. */
+  uint8_t  fc_expose_pending;
 
   char     resp_model[MAX_MODEL_LEN]; // Effective model snapshot taken at the keep-alive
                                       // request-reset boundary. The per-request resets clear
@@ -1877,6 +1882,9 @@ struct proxy_arg {
   // Tenant share, same hop: percent of the ceiling and of the queue one
   // tenant may hold; 0 = the environment.
   uint8_t  fc_tenant_share_pct;
+  // Admission headers on admitted responses, same hop: 0 = the
+  // environment, 1 off, 2 on.
+  uint8_t  fc_expose_headers;
 
   // KV-Cache Exact Routing configuration 
   uint8_t  kv_exact_mode;        // 0=off, 1=zmq(P/D), 2=nats(reserved), 3=zmq single-role 

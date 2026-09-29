@@ -279,7 +279,8 @@ typedef struct proxy_fc_svc_stat {
     uint32_t tenants_active;               /* gauge: tenants holding a unit or a queue entry */
     uint8_t  tenant_share_pct;             /* the share in force, 0 or 100 = none */
     uint8_t  src_tenant;                   /* source of tenant_share_pct */
-    uint16_t pad3;
+    uint8_t  expose_headers;               /* 1 when admitted responses carry the admission headers */
+    uint8_t  src_expose;                   /* source of expose_headers */
 } proxy_fc_svc_stat_t;
 
 /* The Go collector reads this struct through cgo from its own copy of this
