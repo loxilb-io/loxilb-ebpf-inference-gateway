@@ -9588,8 +9588,12 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
    * calling accept() so the SYN stays in the listen backlog and the kernel
    * applies natural TCP backpressure. This is the XDP-safest primitive under
    * --net=host: it touches NO established-conn epoll/XDP state and does NOT delete
-   * the listener from the pollset (a busy spin while over the bound is bounded by
-   * the gauge draining via pfe_recycle on the next teardown). With the bound unset
+   * the listener from the pollset. It pauses the listener instead: the poll slot
+   * stays and only its events are held, so a backlog that will not be accepted
+   * is not reported on every poll round (which spun the listener shard), and the
+   * release of a context re-arms it once the gauge is under the bound again
+   * (pfe_recycle; the health pass is the backstop). blocked counts the pauses.
+   * A pause that cannot be taken falls back to declining this round. With the bound unset
    * (== 0) pd_admission_should_accept() always returns 1 ⇒ this whole block is a
    * no-op ⇒ the accept path is byte-identical to today. */
   {
@@ -9598,13 +9602,17 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       uint64_t cur = atomic_load_explicit(
           &global_stats.pd_admission_total_inflight, memory_order_relaxed);
       if (!pd_admission_should_accept(cur, total_bound)) {
-        uint64_t blk = atomic_fetch_add_explicit(
-            &global_stats.pd_admission_total_blocked, 1, memory_order_relaxed) + 1;
-        /* Rate-limit the log so a sustained flood does not spam: every 1024th. */
-        if ((blk & 1023u) == 1u) {
-          log_debug("[PD_ADMISSION] accept gated: total_inflight=%lu >= bound=%u "
-                   "(blocked_total=%lu) — SYN held in listen backlog",
-                   (unsigned long)cur, total_bound, (unsigned long)blk);
+        int prc = notify_pause_ent(proxy_struct->ns, fd, pd_accept_valve_open);
+        if (prc != 0) {
+          uint64_t blk = atomic_fetch_add_explicit(
+              &global_stats.pd_admission_total_blocked, 1, memory_order_relaxed) + 1;
+          /* Rate-limit the log so a sustained flood does not spam: every 1024th. */
+          if ((blk & 1023u) == 1u) {
+            log_debug("[PD_ADMISSION] accept gated: total_inflight=%lu >= bound=%u "
+                     "(blocked_total=%lu, listener %s) — SYN held in listen backlog",
+                     (unsigned long)cur, total_bound, (unsigned long)blk,
+                     prc > 0 ? "paused" : "not paused");
+          }
         }
         return PROXY_ACCEPT_DONE; // SYN stays queued in the backlog.
       }

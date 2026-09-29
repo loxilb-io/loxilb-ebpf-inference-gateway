@@ -168,8 +168,9 @@ typedef struct proxy_global_stats {
     // : global total-footprint admission. pd_admission_total_inflight is a
     // GAUGE — incremented once per pfe_alloc (loxilb commits to holding a connection's
     // footprint) and decremented (>0-guarded) once per pfe_recycle, so it is balanced
-    // like pfe_pool_live. pd_admission_total_blocked is a COUNTER of accept()s refused
-    // by the LLB_PD_MAX_TOTAL_INFLIGHT ingress bound (SYN left in the listen backlog).
+    // like pfe_pool_live. pd_admission_total_blocked is a COUNTER of the times the
+    // LLB_PD_MAX_TOTAL_INFLIGHT ingress bound paused a listener (SYN left in the listen
+    // backlog until a release re-arms it).
     _Atomic uint64_t pd_admission_total_inflight;
     _Atomic uint64_t pd_admission_total_blocked;
     // (KV Tier 1.5 routing diagnostics): per-guard miss counters + fallthrough.
@@ -2193,6 +2194,11 @@ uint32_t pd_max_total_inflight(void);
  * 0 = REFUSE (at/over the bound — leave the SYN in the listen backlog). bound==0
  * (feature off) always ACCEPTs. */
 int pd_admission_should_accept(uint64_t cur_inflight, uint32_t bound);
+/* The accept valve's gate: 1 while the footprint gauge is under the bound
+ * (or the bound is off). A listener the valve paused is re-armed when it opens. */
+int pd_accept_valve_open(void);
+/* Re-arm the listeners the valve paused when its gate is open. */
+void pd_accept_valve_rearm(void);
 int pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out);
 int pd_select_any_healthy(proxy_epval_t *tepval, int *ep_out);
 

@@ -58,6 +58,22 @@ int notify_deregister_ent(void *ctx, int fd);
  * level-triggered POLLRDHUP would otherwise spin the worker. Re-arm with
  * notify_add_ent (same priv updates the mask in place). */
 int notify_disarm_ent(void *ctx, int fd);
+/* Pause a registered fd: poll stops reporting it (POLLHUP/POLLERR still come
+ * through) until notify_rearm_paused restores its events. The accept valve
+ * pauses a listener at its bound, where a readable backlog it will not accept
+ * would otherwise be reported on every poll round. `gate` answers whether the
+ * pause is still wanted to end; it is asked once after the pause, and if it
+ * is open already every paused fd is re-armed at once. Returns 1 when the fd
+ * was paused and stays paused, 0 when it was already paused or re-armed at
+ * once, <0 on error (unregistered fd, pause table full). One event polled
+ * before the pause may still dispatch after it. */
+int notify_pause_ent(void *ctx, int fd, int (*gate)(void));
+/* Re-arm every paused fd when `gate` is open, and wake their workers.
+ * Nothing paused costs one atomic load; `gate` is not called. Returns the
+ * number re-armed. Callable from any thread that does not hold the notifier. */
+int notify_rearm_paused(void *ctx, int (*gate)(void));
+/* How many fds are paused now. */
+int notify_paused_count(void *ctx);
 /* D2 root fix: `gen` is the pfe's generation stamp at registration time; it is
  * stored on the notify entry and handed back to cbs.notify at dispatch so the
  * callback can detect a recycled-slot stale event. Pass 0 for non-pooled priv. */
