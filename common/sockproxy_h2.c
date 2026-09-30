@@ -1069,6 +1069,49 @@ h2_mapping_clear_resp_headers(stream_mapping_t *mapping)
   mapping->response_headers_count = 0;
 }
 
+/* Put the admission headers on an admitted stream's final response, in
+ * place of any fields of the same names the backend sent. */
+static void
+h2_expose_admission(stream_mapping_t *mapping, const fc_permit_t *permit)
+{
+  static const char prefix[] = "x-loxilb-admission-";
+  const size_t plen = sizeof(prefix) - 1;
+  fc_expose_t xv;
+  char val[3][16];
+  int vlen[3];
+  size_t i, j;
+
+  if (!fc_expose_take(permit, &xv))
+    return;
+  for (i = 0, j = 0; mapping->response_headers &&
+                     i < mapping->response_headers_count; i++) {
+    nghttp2_nv *nv = &mapping->response_headers[i];
+    if (nv->namelen > plen && !strncasecmp((const char *)nv->name, prefix, plen)) {
+      free(nv->name);
+      free(nv->value);
+      continue;
+    }
+    mapping->response_headers[j++] = *nv;
+  }
+  if (mapping->response_headers)
+    mapping->response_headers_count = j;
+
+  vlen[0] = snprintf(val[0], sizeof(val[0]), "%u", xv.inflight);
+  vlen[1] = snprintf(val[1], sizeof(val[1]), "%u", xv.queued);
+  vlen[2] = snprintf(val[2], sizeof(val[2]), "%u", xv.limit);
+  {
+    nghttp2_nv add[3] = {
+      { (uint8_t *)"x-loxilb-admission-inflight", (uint8_t *)val[0], 27,
+        (size_t)vlen[0], NGHTTP2_NV_FLAG_NONE },
+      { (uint8_t *)"x-loxilb-admission-queued", (uint8_t *)val[1], 25,
+        (size_t)vlen[1], NGHTTP2_NV_FLAG_NONE },
+      { (uint8_t *)"x-loxilb-admission-limit", (uint8_t *)val[2], 24,
+        (size_t)vlen[2], NGHTTP2_NV_FLAG_NONE },
+    };
+    proxy_h2_inject_resp_headers(mapping, add, 3);
+  }
+}
+
 static void
 h2_resp_account_release(proxy_h2_session_t *client_session, size_t n)
 {
@@ -1535,6 +1578,11 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     }
 
     /* Final response. */
+
+    /* The admission headers, when the stream holds its units on a pool
+     * that exposes them. The values are read now, while the stream still
+     * holds its own unit. */
+    h2_expose_admission(mapping, &cstream->fc);
 
     // on the L7_Proxy peer only ( gate),
     // inject a stateless HTTP_COOKIE Set-Cookie into the relayed HEADERS frame

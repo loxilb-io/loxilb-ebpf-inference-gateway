@@ -372,12 +372,16 @@ test_fc_adapt: test_fc_adapt.c sockproxy_fc.c sockproxy_fc.h
 test_fc_tenant: test_fc_tenant.c sockproxy_fc.c sockproxy_fc.h
 	$(CC) -Wall -Wextra -o $@ test_fc_tenant.c sockproxy_fc.c -I. -lpthread
 
+test_fc_expose: test_fc_expose.c sockproxy_fc.c sockproxy_fc.h
+	$(CC) -Wall -Wextra -o $@ test_fc_expose.c sockproxy_fc.c -I. -lpthread
+
 .PHONY: test_fc
-test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant
+test_fc: test_fc_gate test_fc_queue test_fc_adapt test_fc_tenant test_fc_expose
 	./test_fc_gate
 	./test_fc_queue
 	./test_fc_adapt
 	./test_fc_tenant
+	./test_fc_expose
 
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
