@@ -9308,12 +9308,26 @@ creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   }
 }
 
+/* A response that answers the request. 101 ends HTTP on the connection, so it
+ * answers too; the other 1xx do not. */
+static int
+cresp_is_answer(int status)
+{
+  return status >= 200 || status == 101;
+}
+
 static int
 cresp_on_headers_complete(llhttp_t *parser)
 {
   proxy_fd_ent_t *pfe = parser->data;
 
   if (!pfe) {
+    return 0;
+  }
+  /* An interim response (100 Continue, 103 Early Hints) is not the answer:
+   * llhttp completes it as a message of its own, and the final response to
+   * the same request follows. It takes no HEAD bit and completes nothing. */
+  if (!cresp_is_answer(parser->status_code)) {
     return 0;
   }
   /* A response with neither Content-Length nor chunked framing runs until the
@@ -9337,7 +9351,7 @@ cresp_on_message_complete(llhttp_t *parser)
 {
   proxy_fd_ent_t *pfe = parser->data;
 
-  if (pfe) {
+  if (pfe && cresp_is_answer(parser->status_code)) {
     atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
   }
