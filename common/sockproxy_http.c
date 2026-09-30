@@ -77,6 +77,7 @@
 #include "sockproxy_h2.h"
 #include "sockproxy_teardown_settle.h"
 #include "sockproxy_ka_leg.h"
+#include "sockproxy_hc.h"         /* half-close observation hooks */
 /* pure HTTP-message-end detector (chunked "0\r\n\r\n" /
  * SSE "[DONE]") shared with the unit TU. Included AFTER sockproxy.h so the real
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
@@ -295,6 +296,7 @@ static int handle_resp_message_complete(llhttp_t *parser);
 static void cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void cresp_note_backend_eof(proxy_fd_ent_t *client);
+static void cresp_note_local_answer(proxy_fd_ent_t *client);
 
 static ssize_t
 proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
@@ -2482,6 +2484,7 @@ skip_deferred_masking:
     }
     if (n != len) {
       if (n > 0) {
+        hc_prog_write(rfd_ent);
         pfe_ent_accouting(rfd_ent, n, 1);
         if (!sel) {
           if (proxy_add_xmitcache(rfd_ent, (uint8_t *)(msg) + n, len - n) < 0) {
@@ -2509,6 +2512,9 @@ skip_deferred_masking:
       }
     }
 
+    /* The whole message went out directly, so the cache is empty. */
+    hc_prog_write(rfd_ent);
+    hc_prog_settled(rfd_ent);
     pfe_ent_accouting(rfd_ent, n, 1);
     PROXY_ENT_UNLOCK(rfd_ent);
   }
@@ -5299,6 +5305,10 @@ proxy_pdestroy(void *priv)
 
   assert(pfe);
 
+  /* A client reset that arrived while its reads were paused or disarmed is
+   * visible only here, as the socket's pending error. */
+  hc_client_reset_check(pfe);
+
   // Log sticky session cleanup
   if (pfe->is_sticky && pfe->session_key[0] != '\0') {
     log_debug("STICKY-SESSION: Cleaning up sticky session - fd=%d, key='%s', server=%d, created=%ld",
@@ -6662,6 +6672,16 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
          * at 1 for every close, while owed should be 0 once the answer is
          * framed. Nothing branches on this yet. */
         if (pfe->odir == 0) {
+          /* The FIN, for the half-close observation. The immediate teardown
+           * passes this branch twice for one FIN; only the first pass counts. A
+           * request not yet complete (bytes still buffered, or a body still
+           * streaming) gives no gap. kTLS lands here too. */
+          if (pfe->ssl) {
+            hc_tls_fin_seen(pfe, HC_TLS_KTLS);
+          } else {
+            hc_fin_seen(pfe, HC_ENTRY_EOF,
+                        pfe->rcv_off != 0 || pfe->stream_body_remaining != 0);
+          }
           log_debug("[CRESP_OWED] fd=%d forwarded=%u completed=%u owed=%d "
                     "resp_outstanding=%u unframed=%u",
                     pfe->fd,
@@ -6832,6 +6852,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
       }
 
       if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        if (errno == ECONNRESET) {
+          hc_client_reset_seen(pfe);
+        }
         log_debug("recv() error on fd=%d: rval=%d, errno=%d (%s)",
                  pfe->fd, rval, errno, strerror(errno));
         shutdown(pfe->fd, SHUT_RDWR);
@@ -6875,6 +6898,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         return 0;
       case SSL_ERROR_SSL:
       case SSL_ERROR_SYSCALL:
+        /* Before the log below pops the error queue: a FIN without
+         * close_notify, or a reset, for the half-close observation. */
+        hc_tls_read_failed(pfe, ssl_error, rval, errno);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[SSL_ERROR_SYSCALL] fd=%d odir=%d ssl_error=%d | SSL or syscall error, shutting down",
                   pfe->fd, pfe->odir, ssl_error);
@@ -6927,6 +6953,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         return 1;
       case SSL_ERROR_ZERO_RETURN:
       default:
+        if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+          hc_tls_fin_seen(pfe, HC_TLS_CLOSE_NOTIFY);
+        }
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[SSL_ERROR_ZERO_RETURN_OR_DEFAULT] fd=%d odir=%d ssl_error=%d | "
                   "SSL connection closed or unknown error, should emit trace events",
@@ -7264,6 +7293,8 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
           proxy_struct->sockmap_cb(key, ep_cfd, 0);
         }
         log_error("Sockmap: Registration failed! client_ret=%d, backend_ret=%d", ret1, ret2);
+      } else {
+        hc_note_accel(pfe, HC_ACCEL_REQ | HC_ACCEL_RESP);
       }
     }
 #endif
@@ -7353,6 +7384,7 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
         if (vret == 0) {
           npfe2->peer_map_resp_installed = 1;
           npfe2->peer_map_resp_verdict = 1;
+          hc_note_accel(pfe, HC_ACCEL_RESP);
         } else {
           proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
           log_error("Sockmap: sock_verdict_map add failed for backend fd=%d (%d), "
@@ -7453,6 +7485,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
     }
     pfe->pd_phase = PD_PHASE_PARKED;
+    hc_note_park(pfe, HC_ENTRY_SETUP_PARK);
     log_debug("[PD_ADMISSION] fd=%d SUSPENDED (parked ep=%d) — EPOLLIN-paused, held open",
              pfe->fd, pfe->park_ep_idx);
     return PD_SETUP_PARKED;
@@ -8036,6 +8069,7 @@ sp_fc_h1_park(proxy_fd_ent_t *pfe)
     notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
   }
   pfe->pd_phase = PD_PHASE_PARKED;
+  hc_note_park(pfe, HC_ENTRY_FC_PARK);
 }
 
 /* The gate found no room (or the process drains): park the request when
@@ -8124,6 +8158,7 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
    * waiting request's turn. */
   fc_queue_wake_one(fc);
   if (keep) {
+    cresp_note_local_answer(pfe);
     sp_h1_kept_request_reset(pfe);
     return SP_FC_H1_KEPT;
   }
@@ -9264,10 +9299,67 @@ creq_on_message_complete(llhttp_t *parser)
    * llhttp in response mode cannot know the method. Queue the bit for the
    * response framer. */
   cresp_head_push(pfe, parser->method == HTTP_HEAD);
+  hc_req_done(pfe);
   log_debug("[CRESP_REQ] fd=%d request framed, forwarded=%u completed=%u", pfe->fd,
             atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed),
             atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed));
   return 0;
+}
+
+/* The rest of the request framer's callbacks feed the half-close
+ * observation only: which request is current, and its User-Agent. */
+static int
+creq_on_message_begin(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_begin(parser->data);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_field(llhttp_t *parser, const char *at, size_t len)
+{
+  if (parser->data) {
+    hc_req_header_field(parser->data, at, len);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_field_complete(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_header_field_done(parser->data);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_value(llhttp_t *parser, const char *at, size_t len)
+{
+  if (parser->data) {
+    hc_req_header_value(parser->data, at, len);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_value_complete(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_header_value_done(parser->data);
+  }
+  return 0;
+}
+
+static int
+creq_on_headers_complete(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_headers_done(parser->data);
+  }
+  return 0;                          /* a request's body follows its framing */
 }
 
 static void
@@ -9275,6 +9367,12 @@ creq_parser_init(proxy_fd_ent_t *pfe)
 {
   if (!creq_settings_inited) {
     llhttp_settings_init(&creq_settings);
+    creq_settings.on_message_begin = creq_on_message_begin;
+    creq_settings.on_header_field = creq_on_header_field;
+    creq_settings.on_header_field_complete = creq_on_header_field_complete;
+    creq_settings.on_header_value = creq_on_header_value;
+    creq_settings.on_header_value_complete = creq_on_header_value_complete;
+    creq_settings.on_headers_complete = creq_on_headers_complete;
     creq_settings.on_message_complete = creq_on_message_complete;
     creq_settings_inited = 1;
   }
@@ -9330,6 +9428,7 @@ cresp_on_headers_complete(llhttp_t *parser)
   if (!cresp_is_answer(parser->status_code)) {
     return 0;
   }
+  hc_resp_headers(pfe);
   /* A response with neither Content-Length nor chunked framing runs until the
    * backend closes, so its completion arrives as that EOF rather than from
    * llhttp. Record it now, while the flags are the ones for this message. */
@@ -9354,8 +9453,22 @@ cresp_on_message_complete(llhttp_t *parser)
   if (pfe && cresp_is_answer(parser->status_code)) {
     atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
+    hc_resp_done(pfe);
   }
   return 0;
+}
+
+/* The proxy answered a request itself on a connection it keeps, in place of
+ * the backend: the capacity 429's keep branch, the only such answer. The
+ * response framer never sees it, so the answer is counted here, and the
+ * request's HEAD bit is taken so the next backend response does not read it
+ * as its own. Runs on the client's worker, not the backend's; both counter
+ * updates are atomic read-modify-writes, so a second writer is safe. */
+static void
+cresp_note_local_answer(proxy_fd_ent_t *client)
+{
+  (void)cresp_head_pop(client);
+  atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
 }
 
 /* Initialises the client entry's response framer. Called with the entry locked. */
@@ -10344,6 +10457,9 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
         if (ug_body && ug_body_len > 0 && pfe->http_content_length > 0 &&
             ug_body_len >= (size_t)pfe->http_content_length) {
           size_t ug_new_len = ug_body_len;
+          /* The whole body is at hand: record whether it asked to stream,
+           * for the half-close observation's stream dimension. */
+          hc_note_stream(pfe, json_stream_flag(ug_body, ug_body_len));
           if (inject_include_usage(ug_body, ug_body_len,
                                    SP_SOCK_MSG_LEN - ug_hdr_len,
                                    &ug_new_len) == 0) {

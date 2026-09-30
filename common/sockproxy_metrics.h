@@ -156,6 +156,27 @@ typedef struct proxy_metrics_snapshot {
     uint64_t proxy_context_inflight;
     uint64_t proxy_accept_blocked;
     uint64_t proxy_accept_bound;
+
+    /* Half-close observation (sockproxy_hc.c). The dimensions are the enums
+     * of sockproxy_hc_core.h, spelled as numbers because the Go mirror reads
+     * them; sockproxy_hc.c holds them to the enums at compile time. Buckets
+     * are cumulative, the bounds are hc_fin_bounds_us / hc_prog_bounds_us,
+     * and the count includes samples past the last bound. TAIL-APPEND ONLY —
+     * same three-way lockstep contract as the blocks above. */
+    uint64_t hc_fin_gap_bucket[4][3][15];   /* [entry][stream][bound] */
+    uint64_t hc_fin_gap_sum_us[4][3];
+    uint64_t hc_fin_gap_count[4][3];
+    uint64_t hc_fin_total[7][5];            /* [entry][outcome] */
+    uint64_t hc_accel_early_fin;
+    uint64_t hc_tls_fin[3][2];              /* [path][early and owed] */
+    uint64_t hc_client_reset;
+    uint64_t hc_user_agent[13];             /* [family] */
+    uint64_t hc_first_gap_bucket[3][15];    /* [stream][bound] */
+    uint64_t hc_first_gap_sum_us[3];
+    uint64_t hc_first_gap_count[3];
+    uint64_t hc_max_gap_bucket[3][15];      /* [stream][bound] */
+    uint64_t hc_max_gap_sum_us[3];
+    uint64_t hc_max_gap_count[3];
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

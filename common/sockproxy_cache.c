@@ -43,6 +43,7 @@
 #include "sockproxy_internal.h"
 #include "sockproxy_cache.h"
 #include "sockproxy_conn.h"
+#include "sockproxy_hc.h"
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_trace_event.h"
 #include "sockproxy_trace.h"
@@ -404,6 +405,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
 
         return -1;
       }
+      hc_prog_write(ent);
       if (n != curr->len) {
         curr->off += n;
         curr->len -= n;
@@ -494,6 +496,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         }
       }
       
+      hc_prog_write(ent);
       // CRITICAL FIX: Handle partial writes for SSL (same as plaintext path)
       if (n != curr->len) {
         curr->off += n;
@@ -578,6 +581,10 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
 
   // CRITICAL FIX: Clear draining flag on successful completion
   ent->cache_draining = 0;
+
+  /* Drained to empty: a response the framer saw end has now reached the
+   * client's socket. The caller holds the entry's lock. */
+  hc_prog_settled(ent);
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
   log_debug("✅ [DRAIN_FLAG_CLEAR] fd=%d: cache_draining=0 (drain completed successfully)",

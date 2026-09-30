@@ -34,6 +34,7 @@
 #include "sockproxy_internal.h"    /* proxy_struct_t, proxy_struct, PROXY_LOCK */
 #include "sockproxy_metrics.h"
 #include "sockproxy_kv_exact.h"    /* KV_STAGE_* enum + record_kv_stage contract */
+#include "sockproxy_hc.h"          /* hc_metrics_fill */
 
 /* =========================================================================
  * Internal forward declarations
@@ -275,6 +276,8 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
     snapshot.proxy_context_inflight = atomic_load(&global_stats.pd_admission_total_inflight);
     snapshot.proxy_accept_blocked   = atomic_load(&global_stats.pd_admission_total_blocked);
     snapshot.proxy_accept_bound     = pd_max_total_inflight();
+
+    hc_metrics_fill(&snapshot);
 
     return snapshot;
 }

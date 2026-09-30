@@ -1080,6 +1080,36 @@ struct proxy_fd_ent {
    * Low byte is the bits, high byte how many are live. */
   _Atomic uint16_t cresp_head;
 
+  /* Half-close observation on the CLIENT entry (sockproxy_hc.c). Nothing
+   * decides anything from these; they feed metrics only.
+   *
+   * Written on the client's worker: the request-side stamps, the FIN stamp,
+   * the User-Agent capture and the park kind. Written under this entry's lock:
+   * the response-progress fields, which the relay and the cache drain update
+   * while they hold it for the write. Atomic where a second worker writes:
+   * the accel bits (a pairing can complete on the backend's worker) and the
+   * handoff stamp (the backend-side cache drain sends the request). */
+  _Atomic uint8_t hc_accel;          // HC_ACCEL_* — the kernel was given a direction; never cleared
+  uint8_t  hc_park;                  // enum hc_entry of the park that set PD_PHASE_PARKED
+  uint8_t  hc_stream;                // enum hc_stream of the latest request
+  uint8_t  hc_ua;                    // enum hc_ua of the latest request
+  int8_t   hc_ua_name;               // hc_ua_name_step state for the header name being read
+  uint8_t  hc_ua_capture;            // the header value being read is the User-Agent
+  uint8_t  hc_ua_seen;               // this request carried a User-Agent
+  uint8_t  hc_ua_len;
+  char     hc_ua_buf[32];            // enough of the value to classify it
+  uint8_t  hc_counted;               // HC_COUNTED_* — each family counts a connection once
+  uint64_t hc_req_done_ns;           // the latest request was framed complete
+  uint64_t hc_fin_ns;                // the client's FIN was first seen; 0 = not yet
+  _Atomic uint8_t  hc_handoff_pending; // a framed request has not reached the backend yet
+  _Atomic uint64_t hc_handoff_ns;      // it did, at this time; taken by the first write back
+  uint8_t  hc_resp_active;           // a final response is being delivered
+  uint8_t  hc_deliver_pending;       // the framer saw it end; the sample waits for an empty cache
+  uint64_t hc_resp_handoff_ns;       // the handoff this response answers; 0 = unknown
+  uint64_t hc_first_write_ns;
+  uint64_t hc_last_write_ns;
+  uint64_t hc_max_gap_ns;
+
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
   int peer_map_pair_installed;   // 1 if this backend pfe owns any peer_map entry

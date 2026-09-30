@@ -706,6 +706,17 @@ json_top_find(const char *body, size_t len, const char *key, size_t klen,
 }
 
 int
+json_stream_flag(const char *body, size_t len)
+{
+  const char *vs = NULL, *ve = NULL;
+  int rc = json_top_find(body, len, "stream", 6, &vs, &ve, NULL);
+
+  if (rc == -2)
+    return -1;
+  return rc == 0 && (size_t)(ve - vs) == 4 && memcmp(vs, "true", 4) == 0;
+}
+
+int
 extract_model_field_prefix(const char *body, size_t len, char *out, size_t cap)
 {
   const char *vs = NULL, *ve = NULL, *root_close = NULL;

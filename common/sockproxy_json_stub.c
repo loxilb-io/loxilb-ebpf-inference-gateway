@@ -39,6 +39,13 @@ extract_llm_prefix(const char *json_body, size_t len,
 }
 
 int
+json_stream_flag(const char *body, size_t len)
+{
+  (void)body; (void)len;
+  return -1;
+}
+
+int
 inject_include_usage(char *body, size_t body_len, size_t cap, size_t *new_len)
 {
   (void)body; (void)cap;

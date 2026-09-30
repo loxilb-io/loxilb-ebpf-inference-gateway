@@ -43,6 +43,12 @@ int extract_model_field_prefix(const char *body, size_t len,
 int extract_usage_tokens(const char *buf, size_t len, int *prompt_tokens,
                          int *completion_tokens);
 
+/* The top-level "stream" field of a complete JSON request body: 1 when it is
+ * true, 0 when it is anything else or absent, -1 when the body is not a
+ * complete JSON object. Read for observation; the relay does not use it.
+ */
+int json_stream_flag(const char *body, size_t len);
+
 /* Force stream_options.include_usage=true into a streaming OpenAI-compatible
  * request body (in place; cap is the buffer capacity behind body) so the
  * final SSE chunk carries the usage object token accounting charges from.
