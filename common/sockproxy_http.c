@@ -78,6 +78,7 @@
 #include "sockproxy_teardown_settle.h"
 #include "sockproxy_ka_leg.h"
 #include "sockproxy_hc.h"         /* half-close observation hooks */
+#include "sockproxy_hold.h"       /* half-close hold: sp_notify_arm */
 /* pure HTTP-message-end detector (chunked "0\r\n\r\n" /
  * SSE "[DONE]") shared with the unit TU. Included AFTER sockproxy.h so the real
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
@@ -4022,7 +4023,7 @@ qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd)
   pfe->read_paused = 1;
   pfe->qos_park_ns = qos_now_ns();
   atomic_fetch_add_explicit(&b->parks, 1, memory_order_relaxed);
-  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
   return 0;
 }
 
@@ -4072,7 +4073,7 @@ qos_resume_reader(int fd, proxy_fd_ent_t *pfe)
   pfe->qos_park_ns = 0;
   pfe->qos_parked = 0;
   pfe->read_paused = 0;
-  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
   return 1;
 }
 
@@ -5803,9 +5804,9 @@ proxy_pdestroy(void *priv)
             pfe->n_rfd--;
           }
           /* Keep the drain moving: the cache flushes on client EPOLLOUT. */
-          notify_add_ent(proxy_struct->ns, cpfe->fd,
-                         NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP,
-                         cpfe, cpfe->gen);
+          sp_notify_arm(proxy_struct->ns, cpfe->fd,
+                        NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP,
+                        cpfe, cpfe->gen);
         }
         PROXY_ENT_UNLOCK(cpfe);
       }
@@ -6990,7 +6991,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
 #endif
         log_trace("ssl-want-wr %s",
           ERR_error_string(ERR_get_error(), NULL));
-        notify_add_ent(proxy_struct->ns, pfe->fd,
+        sp_notify_arm(proxy_struct->ns, pfe->fd,
               NOTI_TYPE_IN|NOTI_TYPE_HUP|NOTI_TYPE_OUT, pfe, pfe->gen);
         return 1;
       case SSL_ERROR_ZERO_RETURN:
@@ -7524,7 +7525,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
   if (psep_rc == PD_SETUP_PARKED) {
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
-      notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
     }
     pfe->pd_phase = PD_PHASE_PARKED;
     hc_note_park(pfe, HC_ENTRY_SETUP_PARK);
@@ -7814,7 +7815,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
      * the admission park uses). */
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
-      notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
     }
     pfe->connect_wait = 1;
     return SP_SETUP_CONNECTING;
@@ -8108,7 +8109,7 @@ sp_fc_h1_park(proxy_fd_ent_t *pfe)
 {
   if (!pfe->read_paused) {
     pfe->read_paused = 1;
-    notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+    sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
   }
   pfe->pd_phase = PD_PHASE_PARKED;
   hc_note_park(pfe, HC_ENTRY_FC_PARK);
@@ -10348,7 +10349,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 
   // Register with notification system (with retry for fd mapping)
   for (retry = 0; retry < PROXY_MAPFD_RETRIES; retry++) {
-    if (notify_add_ent(proxy_struct->ns, new_sd,
+    if (sp_notify_arm(proxy_struct->ns, new_sd,
             NOTI_TYPE_IN|NOTI_TYPE_HUP, npfe1, npfe1->gen) == 0)  {
       break;
     }
@@ -11022,7 +11023,7 @@ pd_resume_parked(int fd)
 
   /* Un-pause + re-arm EPOLLIN|HUP, capturing the CURRENT gen (gen-guard preserved). */
   pfe->read_paused = 0;
-  notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
 
   /* A request parked by the capacity gate: its turn came (a unit was
    * released and its entry popped). The wait is recorded and the permit
@@ -11147,12 +11148,12 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
   setup_proxy_leg_accel(&key, &rkey, client, pfe, ent, epv, protocol, epprotocol);
 
   /* Relay events from here on; same priv, so the mask is updated in place. */
-  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
 
   client->connect_wait = 0;
   client->read_paused = 0;
-  notify_add_ent(proxy_struct->ns, client->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
-                 client, client->gen);
+  sp_notify_arm(proxy_struct->ns, client->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
+                client, client->gen);
 
   /* The held request rides the leg just wired: no re-selection. */
   client->ka_keep_leg = 1;
@@ -11235,7 +11236,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     // Without this, epoll keeps firing because the EPOLLIN event is never consumed
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
-      notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_warn("[BACKPRESSURE_PAUSE_READ] fd=%d (odir=%d): DISABLED EPOLLIN due to destination backpressure | "
                "This will BLOCK data flow until cache drains below %.2f MB",
@@ -11253,7 +11254,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     // Tier-1 shaper: a QoS park is released only by the refill wake.
     if (pfe->read_paused && !pfe->qos_parked) {
       pfe->read_paused = 0;
-      notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, pfe, pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_warn("[BACKPRESSURE_RESUME_READ] fd=%d (odir=%d): RE-ENABLED EPOLLIN after backpressure cleared",
                fd, pfe->odir);

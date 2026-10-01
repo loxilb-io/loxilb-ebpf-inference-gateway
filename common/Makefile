@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -167,6 +167,9 @@ sockproxy_fc.o: sockproxy_fc.c sockproxy_fc.h
 	$(CC) $(CFLAGS) -c sockproxy_fc.c -o sockproxy_fc.o
 
 sockproxy_hc.o: sockproxy_hc.c sockproxy_hc.h sockproxy_hc_core.h sockproxy_metrics.h sockproxy_internal.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_hold.o: sockproxy_hold.c sockproxy_hold.h sockproxy_internal.h notify.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_ai_bench.o: sockproxy_ai_bench.c sockproxy_ai_bench.h sockproxy_ai_gw.h
@@ -394,6 +397,12 @@ test_hc_metrics: test_hc_metrics.c sockproxy_hc_core.h
 .PHONY: test_hc
 test_hc: test_hc_metrics
 	./test_hc_metrics
+
+# Source invariant: every arming of a proxy connection's fd goes through
+# sp_notify_arm (a client held after its FIN must not be armed for reads).
+.PHONY: check_notify_arm
+check_notify_arm:
+	sh ./check_notify_arm.sh
 
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure

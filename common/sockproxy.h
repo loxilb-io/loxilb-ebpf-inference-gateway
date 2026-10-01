@@ -1111,6 +1111,11 @@ struct proxy_fd_ent {
   uint64_t hc_last_write_ns;
   uint64_t hc_max_gap_ns;
 
+  /* Half-close hold on the CLIENT entry (sockproxy_hold.c). Unlike the hc_*
+   * fields above, which only feed metrics, these decide what happens to the
+   * connection. Read them through sp_eof_held(). */
+  uint8_t  eof_hold;                 // held on EOF: FIN read, kept open for an owed answer
+
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
   int peer_map_pair_installed;   // 1 if this backend pfe owns any peer_map entry

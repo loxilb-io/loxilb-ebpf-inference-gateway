@@ -44,6 +44,7 @@
 #include "sockproxy_cache.h"
 #include "sockproxy_conn.h"
 #include "sockproxy_hc.h"
+#include "sockproxy_hold.h"
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_trace_event.h"
 #include "sockproxy_trace.h"
@@ -180,7 +181,7 @@ proxy_add_xmitcache(proxy_fd_ent_t *ent, uint8_t *cache, size_t len)
 
   // Enable EPOLLOUT AFTER releasing lock (prevents deadlock)
   if (need_epollout) {
-    notify_add_ent(proxy_struct->ns, ent->fd,
+    sp_notify_arm(proxy_struct->ns, ent->fd,
         NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, ent, ent->gen);
   }
 
@@ -302,7 +303,7 @@ proxy_check_release_backpressure(proxy_fd_ent_t *ent)
         // Always re-enable reading, regardless of read_paused flag
         // This ensures data flow resumes even if pause flag got out of sync
         source_pfe->read_paused = 0;
-        notify_add_ent(proxy_struct->ns, source_pfe->fd,
+        sp_notify_arm(proxy_struct->ns, source_pfe->fd,
                       NOTI_TYPE_IN|NOTI_TYPE_HUP, source_pfe, source_pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_warn("[BACKPRESSURE_RESUME_SOURCE] src_fd=%d (odir=%d) → dst_fd=%d (odir=%d): "
@@ -399,7 +400,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         // Without this, socket will never wake up to retry cache drain
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           log_debug("🔄 [EPOLLOUT_REREGISTER] fd=%d: Re-registering EPOLLOUT for plaintext EAGAIN", ent->fd);
-          notify_add_ent(proxy_struct->ns, ent->fd,
+          sp_notify_arm(proxy_struct->ns, ent->fd,
                         NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, ent, ent->gen);
         }
 
@@ -454,7 +455,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
           }
 
           PROXY_ENT_CUNLOCK(ent);
-          notify_add_ent(proxy_struct->ns, ent->fd,
+          sp_notify_arm(proxy_struct->ns, ent->fd,
             NOTI_TYPE_IN|NOTI_TYPE_HUP|NOTI_TYPE_OUT, ent, ent->gen);
           return -1;
         case SSL_ERROR_WANT_READ:
@@ -467,7 +468,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
           // CRITICAL FIX: Register EPOLLIN to wake up when SSL can read
           // SSL_ERROR_WANT_READ means SSL needs to read before it can write (e.g., renegotiation)
           log_debug("🔄 [EPOLLIN_REGISTER] fd=%d: SSL_ERROR_WANT_READ - registering EPOLLIN for renegotiation", ent->fd);
-          notify_add_ent(proxy_struct->ns, ent->fd,
+          sp_notify_arm(proxy_struct->ns, ent->fd,
                         NOTI_TYPE_IN|NOTI_TYPE_HUP, ent, ent->gen);
 
           return -1;
@@ -565,7 +566,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
           if (source_pfe->odir == target_odir && 
               (source_pfe->rfd_ent[0] == ent || source_pfe->rfd_ent[1] == ent)) {
             source_pfe->read_paused = 0;
-            notify_add_ent(proxy_struct->ns, source_pfe->fd,
+            sp_notify_arm(proxy_struct->ns, source_pfe->fd,
                           NOTI_TYPE_IN|NOTI_TYPE_HUP, source_pfe, source_pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
             log_warn("🔓 [FORCE_RESUME_SOURCE] fd=%d: Force re-enabled EPOLLIN on source after full cache drain",
@@ -639,7 +640,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         return -1;
       }
 
-      notify_add_ent(proxy_struct->ns, ent->fd,
+      sp_notify_arm(proxy_struct->ns, ent->fd,
             NOTI_TYPE_IN|NOTI_TYPE_HUP, ent, ent->gen);
 
 #if defined(HAVE_SOCKOPS)
@@ -654,7 +655,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("📬 [CACHE_NOT_EMPTY] fd=%d: Cache partially drained, keeping EPOLLOUT monitoring", ent->fd);
 #endif
-      notify_add_ent(proxy_struct->ns, ent->fd,
+      sp_notify_arm(proxy_struct->ns, ent->fd,
             NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, ent, ent->gen);
     }
   }
