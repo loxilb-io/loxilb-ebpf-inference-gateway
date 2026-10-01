@@ -153,8 +153,9 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
 
   switch (sp_hold_decide(&in)) {
   case SP_HOLD_REENTRY:
-    /* The fd is disarmed for reads while held, so this should not happen:
-     * a count above zero is an arming path the helper did not cover. */
+    /* The fd is disarmed for reads while held and the dispatch drops them,
+     * so this should not happen: a count above zero is a read path the two
+     * did not cover. */
     hold_inc(&hold_stats.reentry);
     return 1;
   case SP_HOLD_REFUSE_RESIDUE:

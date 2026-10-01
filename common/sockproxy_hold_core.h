@@ -157,4 +157,17 @@ sp_hold_arm_type(uint32_t type, int held)
   return type;
 }
 
+/* The events a held client is dispatched for: never the reads (IN, RDHUP).
+ * Arming it for OUT alone is not enough to keep it from being read: the
+ * notifier core reports every OUT as IN as well, and a read would only meet
+ * its EOF again. A reset or a full close still arrives as HUP or ERROR. */
+static inline uint32_t
+sp_hold_dispatch_type(uint32_t type, int held)
+{
+  if (held) {
+    type &= ~(uint32_t)(NOTI_TYPE_IN | NOTI_TYPE_RDHUP);
+  }
+  return type;
+}
+
 #endif /* __SOCKPROXY_HOLD_CORE_H__ */

@@ -6,7 +6,7 @@
  * test_hold_core.c - the pure half of holding a half-closed client
  * (sockproxy_hold_core.h): the gate, when a hold settles, how its end is
  * classified at release, the idle bound and the events a held client may be
- * armed for.
+ * armed and dispatched for.
  *
  * Build (wired into `make test_hold`):
  *   gcc -Wall -Wextra -Werror -o test_hold_core test_hold_core.c -I.
@@ -170,6 +170,25 @@ test_arm_type(void)
   printf("  arming: ok\n");
 }
 
+static void
+test_dispatch_type(void)
+{
+  const uint32_t out_as_in = NOTI_TYPE_OUT | NOTI_TYPE_IN; /* how the core reports OUT */
+
+  /* Not held: dispatched as reported. */
+  assert(sp_hold_dispatch_type(out_as_in, 0) == out_as_in);
+  assert(sp_hold_dispatch_type(NOTI_TYPE_RDHUP, 0) == NOTI_TYPE_RDHUP);
+
+  /* Held: a wake-up to write is a write, never a read. */
+  assert(sp_hold_dispatch_type(out_as_in, 1) == NOTI_TYPE_OUT);
+  assert(sp_hold_dispatch_type(NOTI_TYPE_IN | NOTI_TYPE_RDHUP, 1) == 0);
+
+  /* A reset or a full close still reaches it. */
+  assert(sp_hold_dispatch_type(NOTI_TYPE_IN | NOTI_TYPE_HUP, 1) == NOTI_TYPE_HUP);
+  assert(sp_hold_dispatch_type(NOTI_TYPE_IN | NOTI_TYPE_ERROR, 1) == NOTI_TYPE_ERROR);
+  printf("  dispatch: ok\n");
+}
+
 int
 main(void)
 {
@@ -179,6 +198,7 @@ main(void)
   test_end_at_release();
   test_expired();
   test_arm_type();
+  test_dispatch_type();
   printf("test_hold_core: all passed\n");
   return 0;
 }

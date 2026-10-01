@@ -33,7 +33,8 @@ struct proxy_metrics_snapshot;
 int sp_eof_held(const struct proxy_fd_ent *pfe);
 
 /* Arms fd's poll events. Every arming of a proxy connection's fd goes
- * through here, so the rule for a held client is kept in one place.
+ * through here, so the rule for a held client is kept in one place (the
+ * notifier's dispatch keeps the other half: sp_hold_dispatch_type).
  *
  * A held client's socket reports POLLIN and POLLRDHUP for as long as it is
  * armed for them, level-triggered: its read side is at EOF. Armed that way,

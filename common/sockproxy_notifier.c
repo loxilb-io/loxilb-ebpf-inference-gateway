@@ -386,6 +386,11 @@ proxy_notifier(int fd, notify_type_t type, void *priv, uint64_t gen)
   }
 #endif
 
+  /* A held client is never read, whatever woke it: its read side is at EOF,
+   * and the notifier core reports every OUT as IN as well, so each wake-up to
+   * write would read that EOF again (sp_hold_dispatch_type). */
+  type = (notify_type_t)sp_hold_dispatch_type(type, sp_eof_held(pfe));
+
   //log_trace("notify fd = %d(%d) type 0x%x", fd, pfe->fd, type);
 restart:
   while (type) {
