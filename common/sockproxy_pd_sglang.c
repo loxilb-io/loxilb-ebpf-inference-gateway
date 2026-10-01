@@ -39,6 +39,7 @@
 #include "sockproxy.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_hold.h"
 
 /* ==========================================================================
  * SGLang P/D dual dispatch
@@ -512,6 +513,7 @@ pd_sg_dual_dispatch(proxy_fd_ent_t *client_pfe)
       client_pfe->rfd[slot] = ep_cfd;
       client_pfe->rfd_ent[slot] = decode_pfe;
       client_pfe->n_rfd++;
+      sp_hold_leg_attached(client_pfe);
     }
 
     {
@@ -872,6 +874,7 @@ pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
         client_pfe->rfd[j] = d_cfd;
         client_pfe->rfd_ent[j] = decode_pfe;
         client_pfe->n_rfd++;
+        sp_hold_leg_attached(client_pfe);
         break;
       }
     }

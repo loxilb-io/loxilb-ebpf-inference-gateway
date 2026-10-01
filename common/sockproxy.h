@@ -601,6 +601,7 @@ typedef struct proxy_epval {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  uint8_t  hold_mode;              // enum sp_hold_mode: hold a client that half-closed after its request
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
@@ -1081,7 +1082,10 @@ struct proxy_fd_ent {
   _Atomic uint16_t cresp_head;
 
   /* Half-close observation on the CLIENT entry (sockproxy_hc.c). Nothing
-   * decides anything from these; they feed metrics only.
+   * decides anything from these, with one exception: hc_accel is also the
+   * history the half-close hold is gated on (sockproxy_hold.c). It is set
+   * only where a verdict entry is added and never cleared, which is what a
+   * gate needs. The rest feed metrics only.
    *
    * Written on the client's worker: the request-side stamps, the FIN stamp,
    * the User-Agent capture and the park kind. Written under this entry's lock:
@@ -1115,6 +1119,16 @@ struct proxy_fd_ent {
    * fields above, which only feed metrics, these decide what happens to the
    * connection. Read them through sp_eof_held(). */
   uint8_t  eof_hold;                 // held on EOF: FIN read, kept open for an owed answer
+  /* Written under this entry's lock (the read path takes it to hold, the relay
+   * and the drain hold it for the writes), except where marked atomic: those
+   * are written from the backend's worker or the health pass as well. */
+  uint8_t  cresp_answer_open;        // the response framer is inside an answer (1xx excluded)
+  uint8_t  hold_answer_began;        // an answer to the held request has begun
+  _Atomic uint8_t  hold_leg_ended;   // the leg carrying the answer ended (EOF or teardown detach)
+  _Atomic uint8_t  hold_end;         // enum sp_hold_end; the first reason recorded wins
+  uint64_t hold_start_ns;            // when the hold began (the FIN was read)
+  _Atomic uint64_t hold_handoff_ns;  // when the request was known to have reached the backend
+  uint64_t hold_progress_ns;         // last successful write of the answer to the client
 
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.

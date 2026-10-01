@@ -1379,7 +1379,9 @@ skip_deferred_masking:
 
     // DEFENSIVE: Check if peer connection is being torn down (EOF deferred)
     // Avoid processing data on connections marked for closure
-    if (rfd_ent->peer_eof) {
+    /* Not for a held client: whatever set its peer_eof, the bytes coming its
+     * way are its answer, and the caller drops what this path skips. */
+    if (rfd_ent->peer_eof && !sp_eof_held(rfd_ent)) {
       log_trace("[PEER_EOF_SKIP] fd=%d: Peer marked for EOF, skipping processing", rfd_ent->fd);
       PROXY_ENT_UNLOCK(rfd_ent);
       return 0;  // Skip processing but don't error
@@ -2514,6 +2516,7 @@ skip_deferred_masking:
     if (n != len) {
       if (n > 0) {
         hc_prog_write(rfd_ent);
+        sp_hold_progress(rfd_ent);
         pfe_ent_accouting(rfd_ent, n, 1);
         if (!sel) {
           if (proxy_add_xmitcache(rfd_ent, (uint8_t *)(msg) + n, len - n) < 0) {
@@ -2536,6 +2539,7 @@ skip_deferred_masking:
           PROXY_ENT_UNLOCK(rfd_ent);
           return 0;
         }
+        sp_hold_peer_error(rfd_ent, errno);
         PROXY_ENT_UNLOCK(rfd_ent);
         return -1;
       }
@@ -2544,6 +2548,10 @@ skip_deferred_masking:
     /* The whole message went out directly, so the cache is empty. */
     hc_prog_write(rfd_ent);
     hc_prog_settled(rfd_ent);
+    sp_hold_progress(rfd_ent);
+    if (sp_hold_settle(rfd_ent)) {
+      shutdown(rfd_ent->fd, SHUT_RDWR);   /* the held client's answer is out */
+    }
     pfe_ent_accouting(rfd_ent, n, 1);
     PROXY_ENT_UNLOCK(rfd_ent);
   }
@@ -5345,7 +5353,7 @@ proxy_pdestroy(void *priv)
 
   /* A client reset that arrived while its reads were paused or disarmed is
    * visible only here, as the socket's pending error. */
-  hc_client_reset_check(pfe);
+  sp_hold_peer_error(pfe, hc_client_reset_check(pfe));
 
   // Log sticky session cleanup
   if (pfe->is_sticky && pfe->session_key[0] != '\0') {
@@ -5776,6 +5784,9 @@ proxy_pdestroy(void *priv)
         if (!cpfe || cpfe->odir != 0 || cpfe->pd_phase != PD_PHASE_NONE) {
           continue;
         }
+        /* The leg carrying this client's answer is going: a held client then
+         * closes once its cache is out, whatever is still owed. */
+        sp_hold_leg_ended(cpfe);
         PROXY_ENT_LOCK(cpfe);
         if (cpfe->fd > 0 && cpfe->cache_head && !cpfe->ssl_err) {
           if (!cpfe->peer_eof) {
@@ -6784,6 +6795,19 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
           return 1;
         }
 
+        /* The same half-close where the proxy relays the answer itself: owed
+         * an answer it can follow (plaintext, the kernel never given a
+         * direction, the rule's mode set to hold), the client is kept open
+         * until the answer is out (sockproxy_hold.c). The two branches never
+         * both apply - the one above needs the response direction in the
+         * kernel - and this one comes second so that one reads as today's
+         * path. It comes before the peer-cache block below: that block marks
+         * the backend leg to close once a request still draining to it is
+         * out, which would take away the leg the answer comes on. */
+        if (pfe->odir == 0 && sp_hold_eof(pfe)) {
+          return 1;
+        }
+
         /* A response framed by nothing but this EOF is complete now. No lock:
          * the counter it touches is written only from this connection's backend
          * worker — here and from the relay, which runs on that same worker and
@@ -6796,6 +6820,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             !pfe->pd_sg_drain &&
             pfe->rfd_ent[0]->pd_phase != PD_PHASE_PREFILL_WAITING) {
           cresp_note_backend_eof(pfe->rfd_ent[0]);
+          sp_hold_leg_ended(pfe->rfd_ent[0]);
         }
 
         // Check if peer connection still has data to send
@@ -7739,6 +7764,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe1->rfd[npfe1->n_rfd] = ep_cfd;
     npfe1->rfd_ent[npfe1->n_rfd] = npfe2;
     npfe1->n_rfd++;
+    sp_hold_leg_attached(npfe1);
 
     for (retry = 0; retry < PROXY_MAPFD_RETRIES; retry++) {
       /* Option A: pin the backend fd to the CLIENT fd's (npfe1) notify
@@ -9495,6 +9521,7 @@ cresp_on_headers_complete(llhttp_t *parser)
     return 0;
   }
   hc_resp_headers(pfe);
+  sp_hold_answer_began(pfe);
   /* A response with neither Content-Length nor chunked framing runs until the
    * backend closes, so its completion arrives as that EOF rather than from
    * llhttp. Record it now, while the flags are the ones for this message. */
@@ -9520,6 +9547,7 @@ cresp_on_message_complete(llhttp_t *parser)
     atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
     hc_resp_done(pfe);
+    sp_hold_answer_ended(pfe);
   }
   return 0;
 }
@@ -9595,6 +9623,7 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
   if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
     hc_resp_done(client);
+    sp_hold_answer_ended(client);
   }
 }
 

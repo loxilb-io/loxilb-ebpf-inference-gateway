@@ -169,7 +169,7 @@ sockproxy_fc.o: sockproxy_fc.c sockproxy_fc.h
 sockproxy_hc.o: sockproxy_hc.c sockproxy_hc.h sockproxy_hc_core.h sockproxy_metrics.h sockproxy_internal.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-sockproxy_hold.o: sockproxy_hold.c sockproxy_hold.h sockproxy_internal.h notify.h
+sockproxy_hold.o: sockproxy_hold.c sockproxy_hold.h sockproxy_hold_core.h sockproxy_metrics.h sockproxy_internal.h notify.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_ai_bench.o: sockproxy_ai_bench.c sockproxy_ai_bench.h sockproxy_ai_gw.h

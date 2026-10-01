@@ -348,7 +348,9 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
   // CRITICAL FIX: Timeout enforcement for graceful shutdown
   // If peer EOF was set more than 30 seconds ago, force close to prevent indefinite hang
   #define GRACEFUL_SHUTDOWN_TIMEOUT 30
-  if (ent->peer_eof && ent->eof_timestamp > 0) {
+  /* Not for a held client: its bound is the hold's own idle bound, checked by
+   * the health pass, and a peer_eof set behind it must not cut it at 30 s. */
+  if (ent->peer_eof && ent->eof_timestamp > 0 && !sp_eof_held(ent)) {
     time_t now = time(NULL);
     time_t elapsed = now - ent->eof_timestamp;
 
@@ -394,6 +396,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         // which corrupts chunked transfer encoding.
         // The flag will be cleared on successful completion (line 748) or fatal error.
 
+        sp_hold_peer_error(ent, errno);
         PROXY_ENT_CUNLOCK(ent);
 
         // CRITICAL FIX: Re-register EPOLLOUT for plaintext EAGAIN
@@ -407,6 +410,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         return -1;
       }
       hc_prog_write(ent);
+      sp_hold_progress(ent);
       if (n != curr->len) {
         curr->off += n;
         curr->len -= n;
@@ -498,6 +502,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
       }
       
       hc_prog_write(ent);
+      sp_hold_progress(ent);
       // CRITICAL FIX: Handle partial writes for SSL (same as plaintext path)
       if (n != curr->len) {
         curr->off += n;
@@ -586,6 +591,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
   /* Drained to empty: a response the framer saw end has now reached the
    * client's socket. The caller holds the entry's lock. */
   hc_prog_settled(ent);
+  sp_hold_handoff(ent);   /* a backend's cache: the request has reached it */
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
   log_debug("✅ [DRAIN_FLAG_CLEAR] fd=%d: cache_draining=0 (drain completed successfully)",
@@ -628,8 +634,16 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
       }
 #endif
 
-      // CRITICAL FIX: Check if peer closed and we should now close gracefully
-      if (ent->peer_eof) {
+      if (sp_eof_held(ent)) {
+        /* A held client closes on the hold's own terms: once nothing is owed,
+         * or once the leg carrying the answer has ended - never on a bare
+         * peer_eof, which a leg that sends nothing to the client can set. */
+        if (sp_hold_settle(ent)) {
+          shutdown(ent->fd, SHUT_RDWR);
+          return -1;
+        }
+      } else if (ent->peer_eof) {
+        // CRITICAL FIX: the peer closed; close gracefully now the cache is out
         log_info("✅ [GRACEFUL_CLOSE] fd=%d: Cache drained after peer EOF - closing connection gracefully",
                  ent->fd);
 

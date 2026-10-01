@@ -56,6 +56,7 @@
 #include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
 #include "sockproxy_health.h"
 #include "sockproxy_ai_gw.h"
+#include "sockproxy_hold.h"
 #include "notify.h"
 /* pure two-leg teardown helper shared with the unit TU.
  * Included AFTER the headers that define `struct proxy_fd_ent` and
@@ -476,6 +477,13 @@ proxy_drain_checker_thread(void *arg)
         continue;
       }
       last_drain_ms = now_ms;
+    }
+    /* Half-close holds: expiry on the idle bound, an operator's release, and
+     * the oldest-hold gauge. An atomic read while nothing is held. */
+    if (sp_hold_sweep_due()) {
+      PROXY_LOCK();
+      sp_hold_sweep();
+      PROXY_UNLOCK();
     }
     check_draining_endpoints();
 

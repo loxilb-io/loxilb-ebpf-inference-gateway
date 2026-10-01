@@ -438,6 +438,7 @@ restart:
         } else {
           // HTTP/1.1 cache draining (original behavior)
           PROXY_ENT_LOCK(pfe);
+          sp_hold_out_wake(pfe);
           proxy_xmit_cache(pfe);
           PROXY_ENT_UNLOCK(pfe);
         }
