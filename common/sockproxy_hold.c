@@ -46,6 +46,7 @@
 #include "uthash.h"
 #include "log.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_metrics.h"
 #include "sockproxy_hc_core.h"
 #include "sockproxy_hold_core.h"
 #include "sockproxy_hold.h"
@@ -419,3 +420,57 @@ sp_hold_pairing_allowed(proxy_fd_ent_t *client, proxy_epval_t *epv)
             client->fd, (unsigned)ti.tcpi_state);
   return 0;
 }
+
+/* ---- control and export ---------------------------------------------------- */
+
+void
+proxy_update_halfclose_config(int allow, uint32_t cap_sec)
+{
+  if (cap_sec < SP_HOLD_CAP_MIN_SEC) {
+    cap_sec = SP_HOLD_CAP_MIN_SEC;
+  } else if (cap_sec > SP_HOLD_CAP_MAX_SEC) {
+    cap_sec = SP_HOLD_CAP_MAX_SEC;
+  }
+  atomic_store_explicit(&hold_allowed, allow ? 1 : 0, memory_order_relaxed);
+  atomic_store_explicit(&hold_cap_sec, cap_sec, memory_order_relaxed);
+  log_info("[HOLD] half-close holds %s, bound %u s", allow ? "allowed" : "blocked", cap_sec);
+}
+
+void
+proxy_halfclose_release(void)
+{
+  atomic_store_explicit(&hold_release_req, 1, memory_order_relaxed);
+  log_info("[HOLD] release requested: held connections close at the next pass");
+}
+
+#define HOLD_COPY(dst, src, n)                                             \
+  do {                                                                     \
+    const _Atomic uint64_t *s_ = (const _Atomic uint64_t *)(src);          \
+    uint64_t *d_ = (uint64_t *)(dst);                                      \
+    for (size_t i_ = 0; i_ < (n); i_++) {                                  \
+      d_[i_] = atomic_load_explicit(&s_[i_], memory_order_relaxed);        \
+    }                                                                      \
+  } while (0)
+
+void
+sp_hold_metrics_fill(proxy_metrics_snapshot_t *s)
+{
+  s->hold_held = atomic_load_explicit(&hold_stats.held, memory_order_relaxed);
+  s->hold_oldest_ms = atomic_load_explicit(&hold_stats.oldest_ms, memory_order_relaxed);
+  s->hold_begun = atomic_load_explicit(&hold_stats.begun, memory_order_relaxed);
+  HOLD_COPY(s->hold_ended, hold_stats.ended, SP_HOLD_END_MAX);
+  HOLD_COPY(s->hold_expired, hold_stats.expired, 2 * HC_STREAM_MAX);
+  s->hold_refused_residue =
+      atomic_load_explicit(&hold_stats.refused_residue, memory_order_relaxed);
+  s->hold_reentry = atomic_load_explicit(&hold_stats.reentry, memory_order_relaxed);
+  s->hold_empty_out = atomic_load_explicit(&hold_stats.empty_out, memory_order_relaxed);
+  s->hold_accel_skipped =
+      atomic_load_explicit(&hold_stats.accel_skipped, memory_order_relaxed);
+  s->hold_allowed = atomic_load_explicit(&hold_allowed, memory_order_relaxed);
+  s->hold_cap_sec = atomic_load_explicit(&hold_cap_sec, memory_order_relaxed);
+}
+
+_Static_assert(sizeof(((proxy_metrics_snapshot_t *)0)->hold_ended) ==
+               sizeof(uint64_t) * SP_HOLD_END_MAX, "hold_ended");
+_Static_assert(sizeof(((proxy_metrics_snapshot_t *)0)->hold_expired) ==
+               sizeof(uint64_t) * 2 * HC_STREAM_MAX, "hold_expired");

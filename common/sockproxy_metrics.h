@@ -177,6 +177,23 @@ typedef struct proxy_metrics_snapshot {
     uint64_t hc_max_gap_bucket[3][15];      /* [stream][bound] */
     uint64_t hc_max_gap_sum_us[3];
     uint64_t hc_max_gap_count[3];
+
+    /* Half-close hold (sockproxy_hold.c): gauges (held now, age of the oldest
+     * in ms, the switch, the bound in s) and counters. hold_ended is by enum
+     * sp_hold_end, hold_expired by [answer had begun][enum hc_stream].
+     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks
+     * above. */
+    uint64_t hold_held;
+    uint64_t hold_oldest_ms;
+    uint64_t hold_allowed;
+    uint64_t hold_cap_sec;
+    uint64_t hold_begun;
+    uint64_t hold_ended[7];
+    uint64_t hold_expired[2][3];
+    uint64_t hold_refused_residue;
+    uint64_t hold_reentry;
+    uint64_t hold_empty_out;
+    uint64_t hold_accel_skipped;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================

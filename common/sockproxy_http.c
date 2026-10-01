@@ -2666,6 +2666,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * same way: they may change at runtime, entries waiting keep
          * their order. */
         sp_fc_apply_rule(tepval, arg, new_ent, 0);
+        tepval->hold_mode = arg->half_close_mode;   /* new holds only; held ones stay */
         sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
@@ -2806,6 +2807,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         fc_set_wake_hook(sp_fc_wake);
         fc_state_init(&tepval->fc);
         sp_fc_apply_rule(tepval, arg, new_ent, 1);
+        tepval->hold_mode = arg->half_close_mode;
         /* allocate radix trie for Tier 1 cache affinity */
         if (tepval->pd_cache_aware_mode) {
           tepval->pd_trie = pd_trie_create();
@@ -3263,6 +3265,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   fc_set_wake_hook(sp_fc_wake);
   fc_state_init(&tepval->fc);
   sp_fc_apply_rule(tepval, arg, new_ent, 1);
+  tepval->hold_mode = arg->half_close_mode;
   /* allocate radix trie for Tier 1 cache affinity */
   if (tepval->pd_cache_aware_mode) {
     tepval->pd_trie = pd_trie_create();

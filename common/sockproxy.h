@@ -1952,6 +1952,9 @@ struct proxy_arg {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  // Half-close hold mode, same hop as the admission fields: enum
+  // sp_hold_mode (0 = the process default).
+  uint8_t  half_close_mode;
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at
