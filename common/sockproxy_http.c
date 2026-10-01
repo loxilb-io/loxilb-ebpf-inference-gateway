@@ -7311,7 +7311,19 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
   if (protocol == IPPROTO_TCP && epprotocol == IPPROTO_TCP) {
     // Case 1: HTTP→HTTP (plaintext only) - SOCKMAP ENABLED
     if (!pfe->ssl && !ssl) {
-      sockmap_eligible = 1;
+#if defined(HAVE_SOCKOPS)
+      uint8_t accel_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
+#else
+      uint8_t accel_mode = ent->val.sockmap_en;
+#endif
+      /* Under a hold-mode rule, a client that has already sent its FIN is not
+       * paired (sp_hold_pairing_allowed). Asked only where a pair could be
+       * installed, so other rules pay nothing for it. The rule's mode is read
+       * from tepval, not pfe->epv: on a connection's first leg the client's
+       * epv is set only after this runs. */
+      sockmap_eligible = !accel_mode ||
+                         sp_hold_pairing_allowed(pfe, tepval ? tepval :
+                                                      (proxy_epval_t *)pfe->epv);
     }
     // Case 2: HTTPS→HTTP (TLS termination) - SOCKMAP DISABLED, kTLS ONLY
     else if (pfe->ssl && !ssl && g_ktls_cfg.enabled) {

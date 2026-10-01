@@ -37,6 +37,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -64,6 +66,7 @@ static struct {
   _Atomic uint64_t refused_residue;             /* would hold, a pipelined request was arriving */
   _Atomic uint64_t reentry;                     /* the EOF handling ran again on a held client */
   _Atomic uint64_t empty_out;                   /* a held client woke for OUT with nothing to send */
+  _Atomic uint64_t accel_skipped;               /* pairing skipped: the client had already sent FIN */
 } hold_stats;
 
 static inline void
@@ -385,4 +388,34 @@ sp_hold_sweep(void)
     }
   }
   atomic_store_explicit(&hold_stats.oldest_ms, oldest / 1000000ull, memory_order_relaxed);
+}
+
+/* ---- pairing -------------------------------------------------------------- */
+
+int
+sp_hold_pairing_allowed(proxy_fd_ent_t *client, proxy_epval_t *epv)
+{
+  struct tcp_info ti;
+  socklen_t len = sizeof(ti);
+
+  /* Only where a hold could be taken: elsewhere the pairing keeps today's
+   * behaviour. */
+  if (!client || client->fd <= 0 || !epv || epv->hold_mode != SP_HOLD_MODE_HOLD ||
+      !atomic_load_explicit(&hold_allowed, memory_order_relaxed)) {
+    return 1;
+  }
+  memset(&ti, 0, sizeof(ti));
+  if (getsockopt(client->fd, IPPROTO_TCP, TCP_INFO, &ti, &len) != 0) {
+    return 1;
+  }
+  if (ti.tcpi_state == TCP_ESTABLISHED) {
+    return 1;
+  }
+  /* The client has sent its FIN (CLOSE_WAIT): installing the pair now would
+   * take the connection out of the hold's reach, and the kernel would carry
+   * an answer to a client the proxy can no longer follow. */
+  hold_inc(&hold_stats.accel_skipped);
+  log_debug("[HOLD] client fd=%d already sent its FIN (tcp state %u): not pairing",
+            client->fd, (unsigned)ti.tcpi_state);
+  return 0;
 }

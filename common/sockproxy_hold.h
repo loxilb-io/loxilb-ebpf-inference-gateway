@@ -22,6 +22,7 @@
 #include "sockproxy_hold_core.h"
 
 struct proxy_fd_ent;
+struct proxy_epval;
 
 /* Whether this client is held on EOF: its FIN has been read and it is being
  * kept open for an answer still owed. Every place that treats a held client
@@ -88,5 +89,10 @@ void sp_hold_retire(struct proxy_fd_ent *pfe);
  * release, the oldest-hold gauge). sp_hold_sweep runs under PROXY_LOCK. */
 int sp_hold_sweep_due(void);
 void sp_hold_sweep(void);
+
+/* Whether a client may be paired with its backend for kernel redirection.
+ * Under a hold-mode rule a client that has already sent its FIN is not: the
+ * pair would take its answer out of the hold's reach. */
+int sp_hold_pairing_allowed(struct proxy_fd_ent *client, struct proxy_epval *epv);
 
 #endif /* __SOCKPROXY_HOLD_H__ */
