@@ -457,7 +457,10 @@ void
 sp_hold_metrics_fill(proxy_metrics_snapshot_t *s)
 {
   s->hold_held = atomic_load_explicit(&hold_stats.held, memory_order_relaxed);
-  s->hold_oldest_ms = atomic_load_explicit(&hold_stats.oldest_ms, memory_order_relaxed);
+  /* The pass that keeps the age stops once nothing is held, and would leave
+   * the last one's age behind. */
+  s->hold_oldest_ms = s->hold_held ?
+      atomic_load_explicit(&hold_stats.oldest_ms, memory_order_relaxed) : 0;
   s->hold_begun = atomic_load_explicit(&hold_stats.begun, memory_order_relaxed);
   HOLD_COPY(s->hold_ended, hold_stats.ended, SP_HOLD_END_MAX);
   HOLD_COPY(s->hold_expired, hold_stats.expired, 2 * HC_STREAM_MAX);
