@@ -278,6 +278,36 @@ test_no_terminator_keepalive_silence(void)
          "(reaper still required)\n");
 }
 
+/* ---- Case 6: an interim response completes as a message of its own ----
+ * 100 Continue (and 103 Early Hints) come before the answer to the same
+ * request, and llhttp fires on_message_complete for each of them. A framer
+ * that counts every completion as an answer therefore counts one request as
+ * answered twice and clears "owed" before the answer is sent. The client
+ * framer (cresp_on_headers_complete / cresp_on_message_complete) skips a
+ * status below 200 other than 101 for this reason; this case pins the llhttp
+ * behaviour that makes the skip necessary. */
+static void
+test_interim_response_completes_separately(void)
+{
+  const char *wire =
+      "HTTP/1.1 100 Continue\r\n\r\n"
+      "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n"
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+  llhttp_t p;
+  llhttp_settings_t s;
+  struct fctx c;
+  parser_init(&p, &s, &c);
+
+  assert(feed(&p, wire, strlen(wire)) == HPE_OK && "all three parse");
+  assert(c.headers_complete == 3 && "three header blocks");
+  assert(c.message_complete == 3 &&
+         "llhttp completes each interim response -- the framer must skip them");
+  assert(p.status_code == 200 && "the last message is the answer");
+  assert(c.body_bytes == 2 && "only the answer has a body");
+  printf("  [PASS] 100 + 103 + 200 -> 3 completions, 1 answer\n");
+}
+
 int
 main(void)
 {
@@ -288,6 +318,7 @@ main(void)
   test_trailer_only_final_read();
   test_cl_satisfied_no_double_complete();
   test_no_terminator_keepalive_silence();
+  test_interim_response_completes_separately();
   printf("ALL PASS (test_resp_framing)\n");
   return 0;
 }

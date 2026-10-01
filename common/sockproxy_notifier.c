@@ -56,6 +56,7 @@
 #include "sockproxy_ktls.h"
 #include "sockproxy_h2.h"
 #include "sockproxy_http.h"
+#include "sockproxy_hc.h"
 #ifdef HAVE_MTLS
 #include "sockproxy_mtls.h"
 #endif
@@ -472,12 +473,15 @@ restart:
            * keep the fd; the resume re-arms EPOLLIN and the read path then
            * meets the EOF behind a request in flight, which defers the
            * close until the response is done (proxy_sock_read_err). */
+          hc_fin_seen(pfe, HC_ENTRY_CONNECT_WAIT, 0);
           notify_disarm_ent(proxy_struct->ns, fd);
         } else {
           /* A paused CLIENT (parked upload / admission park) half-closed:
            * nothing is owed to a departing client — keep the historic
            * teardown semantics. Full shutdown surfaces POLLHUP, which
-           * cascades the normal destroy path. */
+           * cascades the normal destroy path. The FIN is observed first:
+           * which pause held the reads decides whether it can be sampled. */
+          hc_fin_seen(pfe, hc_paused_entry(pfe), 0);
           shutdown(pfe->fd, SHUT_RDWR);
         }
       }

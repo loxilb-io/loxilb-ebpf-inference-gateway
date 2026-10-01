@@ -77,6 +77,7 @@
 #include "sockproxy_h2.h"
 #include "sockproxy_teardown_settle.h"
 #include "sockproxy_ka_leg.h"
+#include "sockproxy_hc.h"         /* half-close observation hooks */
 /* pure HTTP-message-end detector (chunked "0\r\n\r\n" /
  * SSE "[DONE]") shared with the unit TU. Included AFTER sockproxy.h so the real
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
@@ -292,6 +293,10 @@ pd_framing_v2_test_set(int on)
 static int handle_resp_headers_complete(llhttp_t *parser);
 static int handle_resp_body(llhttp_t *parser, const char *at, size_t length);
 static int handle_resp_message_complete(llhttp_t *parser);
+static void cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
+static void creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
+static void cresp_note_backend_eof(proxy_fd_ent_t *client);
+static void cresp_note_local_answer(proxy_fd_ent_t *client);
 
 static ssize_t
 proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
@@ -1793,6 +1798,21 @@ skip_deferred_masking:
       return 0;
     }
 
+    /* Response framing on the CLIENT entry. This sits beside the SSE detector on
+     * purpose: both run with rfd_ent's lock held (taken at the relay scope
+     * above; every PROXY_ENT_UNLOCK(rfd_ent) between there and here ends an
+     * early return), and both only read the bytes being relayed. Keeping the
+     * parser state on rfd_ent is what makes it free of the lock-order problem
+     * the pd_framing_v2 feed below has, where the state lives on `ent`.
+     *
+     * Skipped on the legs whose bytes never reach the client, matching the
+     * pd_framing_v2 guard: the SGLang drain leg and the P/D prefill leg. */
+    if (ent->odir == 1 && len > 0 && rfd_ent &&
+        !ent->pd_sg_drain &&
+        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
+      cresp_feed(rfd_ent, msg, len);
+    }
+
     /* C-1: SSE stream activation — detect "Content-Type: text/event-stream" in the
      * first backend response packet and flip sse_active on the client-side pfe.
      * Only triggered when the LB rule has sse_mode=1 and the stream is not yet live. */
@@ -2492,6 +2512,7 @@ skip_deferred_masking:
     }
     if (n != len) {
       if (n > 0) {
+        hc_prog_write(rfd_ent);
         pfe_ent_accouting(rfd_ent, n, 1);
         if (!sel) {
           if (proxy_add_xmitcache(rfd_ent, (uint8_t *)(msg) + n, len - n) < 0) {
@@ -2519,6 +2540,9 @@ skip_deferred_masking:
       }
     }
 
+    /* The whole message went out directly, so the cache is empty. */
+    hc_prog_write(rfd_ent);
+    hc_prog_settled(rfd_ent);
     pfe_ent_accouting(rfd_ent, n, 1);
     PROXY_ENT_UNLOCK(rfd_ent);
   }
@@ -5318,6 +5342,10 @@ proxy_pdestroy(void *priv)
 
   assert(pfe);
 
+  /* A client reset that arrived while its reads were paused or disarmed is
+   * visible only here, as the socket's pending error. */
+  hc_client_reset_check(pfe);
+
   // Log sticky session cleanup
   if (pfe->is_sticky && pfe->session_key[0] != '\0') {
     log_debug("STICKY-SESSION: Cleaning up sticky session - fd=%d, key='%s', server=%d, created=%ld",
@@ -5327,6 +5355,11 @@ proxy_pdestroy(void *priv)
   PROXY_LOCK();
   if (pfe) {
     PROXY_ENT_LOCK(pfe);
+    /* An answer that ended while nothing was left to write - the backend
+     * closed with the client's cache already empty, or the drain finished
+     * just before the end was known - has no later write to be sampled at.
+     * Its cache is still intact here; it is freed further down. */
+    hc_prog_settled(pfe);
     proxy_peer_map_delete(pfe);
     /* The pair lives on the backend entry, and removing it credits what the
      * kernel carried to the client's endpoint. When the client goes first,
@@ -6579,6 +6612,21 @@ proxy_sock_read(proxy_fd_ent_t *pfe, int fd, void *buf, size_t len)
   }
 }
 
+/* Lock order in here, for whatever is added next.
+ *
+ * This runs with nothing held: handle_client_data takes no lock and neither does
+ * the notifier around its calls. Everything below therefore acquires as a leaf,
+ * which is why the entry locks it takes cannot close a cycle.
+ *
+ * The invariant that keeps that true: PROXY_LOCK is always taken FIRST, and no
+ * entry lock may be live across taking it. Take an entry lock, finish with it,
+ * drop it. The global order is PROXY_LOCK -> entry, as proxy_pdestroy has it;
+ * an entry lock held while PROXY_LOCK is acquired inverts that and deadlocks
+ * against exactly that teardown, with nothing to show for it but the watchdog's
+ * "data plane WEDGED ~30s" half a minute later.
+ *
+ * Reaching across the pair is fine and already happens, as long as the reach is
+ * the only lock held at the time. */
 static int
 proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
 {
@@ -6660,6 +6708,33 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         }
 #endif
 
+        /* What the counters say at the one moment they will eventually be
+         * consulted. resp_outstanding is printed beside them because the gap
+         * between the two is the defect: on an accelerated response it is stuck
+         * at 1 for every close, while owed should be 0 once the answer is
+         * framed. Nothing branches on this yet. */
+        if (pfe->odir == 0) {
+          /* The FIN, for the half-close observation. The immediate teardown
+           * passes this branch twice for one FIN; only the first pass counts. A
+           * request not yet complete (bytes still buffered, or a body still
+           * streaming) gives no gap. kTLS lands here too. */
+          if (pfe->ssl) {
+            hc_tls_fin_seen(pfe, HC_TLS_KTLS);
+          } else {
+            hc_fin_seen(pfe, HC_ENTRY_EOF,
+                        pfe->rcv_off != 0 || pfe->stream_body_remaining != 0);
+          }
+          log_debug("[CRESP_OWED] fd=%d forwarded=%u completed=%u owed=%d "
+                    "resp_outstanding=%u unframed=%u",
+                    pfe->fd,
+                    atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed),
+                    atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed),
+                    atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed) >
+                      atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed) ? 1 : 0,
+                    pfe->resp_outstanding,
+                    atomic_load_explicit(&pfe->cresp_unframed, memory_order_relaxed));
+        }
+
         /* A CLIENT that half-closed after a complete request is saying "that
          * was my last request", not "forget the response". Tearing the pair
          * down here answers nothing: the request was already parsed and
@@ -6706,6 +6781,20 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
           log_debug("[HALF_CLOSE] fd=%d: client finished its request and is awaiting "
                    "the response; keeping the response leg open", pfe->fd);
           return 1;
+        }
+
+        /* A response framed by nothing but this EOF is complete now. No lock:
+         * the counter it touches is written only from this connection's backend
+         * worker — here and from the relay, which runs on that same worker and
+         * takes the client entry's lock for the client's fields, not for this
+         * one. Observation only; nothing reads the counters yet. */
+        /* The same two exclusions the feed makes: a leg whose bytes never reach
+         * the client must not consume the flag a client-facing leg set, or a
+         * response the client never saw is counted as delivered. */
+        if (pfe->odir == 1 && pfe->n_rfd > 0 && pfe->rfd_ent[0] &&
+            !pfe->pd_sg_drain &&
+            pfe->rfd_ent[0]->pd_phase != PD_PHASE_PREFILL_WAITING) {
+          cresp_note_backend_eof(pfe->rfd_ent[0]);
         }
 
         // Check if peer connection still has data to send
@@ -6805,6 +6894,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
       }
 
       if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        if (errno == ECONNRESET) {
+          hc_client_reset_seen(pfe);
+        }
         log_debug("recv() error on fd=%d: rval=%d, errno=%d (%s)",
                  pfe->fd, rval, errno, strerror(errno));
         shutdown(pfe->fd, SHUT_RDWR);
@@ -6848,6 +6940,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         return 0;
       case SSL_ERROR_SSL:
       case SSL_ERROR_SYSCALL:
+        /* Before the log below pops the error queue: a FIN without
+         * close_notify, or a reset, for the half-close observation. */
+        hc_tls_read_failed(pfe, ssl_error, rval, errno);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[SSL_ERROR_SYSCALL] fd=%d odir=%d ssl_error=%d | SSL or syscall error, shutting down",
                   pfe->fd, pfe->odir, ssl_error);
@@ -6900,6 +6995,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         return 1;
       case SSL_ERROR_ZERO_RETURN:
       default:
+        if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+          hc_tls_fin_seen(pfe, HC_TLS_CLOSE_NOTIFY);
+        }
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[SSL_ERROR_ZERO_RETURN_OR_DEFAULT] fd=%d odir=%d ssl_error=%d | "
                   "SSL connection closed or unknown error, should emit trace events",
@@ -7237,6 +7335,8 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
           proxy_struct->sockmap_cb(key, ep_cfd, 0);
         }
         log_error("Sockmap: Registration failed! client_ret=%d, backend_ret=%d", ret1, ret2);
+      } else {
+        hc_note_accel(pfe, HC_ACCEL_REQ | HC_ACCEL_RESP);
       }
     }
 #endif
@@ -7326,6 +7426,7 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
         if (vret == 0) {
           npfe2->peer_map_resp_installed = 1;
           npfe2->peer_map_resp_verdict = 1;
+          hc_note_accel(pfe, HC_ACCEL_RESP);
         } else {
           proxy_struct->peer_map_cb(rkey, NULL, 0, NULL);
           log_error("Sockmap: sock_verdict_map add failed for backend fd=%d (%d), "
@@ -7426,6 +7527,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
     }
     pfe->pd_phase = PD_PHASE_PARKED;
+    hc_note_park(pfe, HC_ENTRY_SETUP_PARK);
     log_debug("[PD_ADMISSION] fd=%d SUSPENDED (parked ep=%d) — EPOLLIN-paused, held open",
              pfe->fd, pfe->park_ep_idx);
     return PD_SETUP_PARKED;
@@ -8009,6 +8111,7 @@ sp_fc_h1_park(proxy_fd_ent_t *pfe)
     notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
   }
   pfe->pd_phase = PD_PHASE_PARKED;
+  hc_note_park(pfe, HC_ENTRY_FC_PARK);
 }
 
 /* The gate found no room (or the process drains): park the request when
@@ -8109,6 +8212,7 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
    * waiting request's turn. */
   fc_queue_wake_one(fc);
   if (keep) {
+    cresp_note_local_answer(pfe);
     sp_h1_kept_request_reset(pfe);
     return SP_FC_H1_KEPT;
   }
@@ -9180,6 +9284,319 @@ handle_resp_message_complete(llhttp_t *parser)
  * bytes for it. Mirrors the request-leg init shape (:6118-6125) but uses
  * HTTP_RESPONSE, NOT HTTP_BOTH. Idempotent via resp_parser_inited so we never
  * re-init mid-message (which would discard llhttp's incremental state). */
+/* ---------------------------------------------------------------------------
+ * Response framing on the client entry (see proxy_fd_ent_t.cresp_parser).
+ *
+ * Counts responses as they finish so the client entry can say whether it is
+ * still owed one. Observation only: nothing here changes what is relayed, and
+ * no caller consults the counters yet.
+ * ------------------------------------------------------------------------- */
+static llhttp_settings_t cresp_settings;   /* one for every connection */
+static int cresp_settings_inited;
+static llhttp_settings_t creq_settings;
+static int creq_settings_inited;
+
+/* The HEAD queue, written by both of a connection's workers: the client's when a
+ * request is framed, the backend's when the matching response's headers are.
+ * Packed into one word so each side can do its half with a compare-exchange and
+ * neither has to hold a lock. Saturates at 8 outstanding rather than wrapping. */
+static void
+cresp_head_push(proxy_fd_ent_t *pfe, int is_head)
+{
+  uint16_t cur = atomic_load_explicit(&pfe->cresp_head, memory_order_relaxed);
+
+  for (;;) {
+    uint8_t q = (uint8_t)(cur & 0xFF);
+    uint8_t n = (uint8_t)(cur >> 8);
+    uint16_t nxt;
+
+    if (n >= 8) {
+      return;                      /* deeper than the queue: lose the hint only */
+    }
+    if (is_head) {
+      q |= (uint8_t)(1u << n);
+    }
+    nxt = (uint16_t)q | (uint16_t)((n + 1) << 8);
+    if (atomic_compare_exchange_weak_explicit(&pfe->cresp_head, &cur, nxt,
+                                              memory_order_relaxed,
+                                              memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
+/* Takes the oldest bit. Returns 1 if that request was a HEAD, 0 if it was not or
+ * the queue is empty (deeper than 8 outstanding, where the hint was dropped). */
+static int
+cresp_head_pop(proxy_fd_ent_t *pfe)
+{
+  uint16_t cur = atomic_load_explicit(&pfe->cresp_head, memory_order_relaxed);
+
+  for (;;) {
+    uint8_t q = (uint8_t)(cur & 0xFF);
+    uint8_t n = (uint8_t)(cur >> 8);
+    int was_head;
+    uint16_t nxt;
+
+    if (n == 0) {
+      return 0;
+    }
+    was_head = q & 1;
+    nxt = (uint16_t)(q >> 1) | (uint16_t)((n - 1) << 8);
+    if (atomic_compare_exchange_weak_explicit(&pfe->cresp_head, &cur, nxt,
+                                              memory_order_relaxed,
+                                              memory_order_relaxed)) {
+      return was_head;
+    }
+  }
+}
+
+static int
+creq_on_message_complete(llhttp_t *parser)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+
+  if (!pfe) {
+    return 0;
+  }
+  atomic_fetch_add_explicit(&pfe->cresp_forwarded, 1, memory_order_relaxed);
+  /* A response to HEAD carries no body however its Content-Length reads, and
+   * llhttp in response mode cannot know the method. Queue the bit for the
+   * response framer. */
+  cresp_head_push(pfe, parser->method == HTTP_HEAD);
+  hc_req_done(pfe);
+  log_debug("[CRESP_REQ] fd=%d request framed, forwarded=%u completed=%u", pfe->fd,
+            atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed),
+            atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed));
+  return 0;
+}
+
+/* The rest of the request framer's callbacks feed the half-close
+ * observation only: which request is current, and its User-Agent. */
+static int
+creq_on_message_begin(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_begin(parser->data);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_field(llhttp_t *parser, const char *at, size_t len)
+{
+  if (parser->data) {
+    hc_req_header_field(parser->data, at, len);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_field_complete(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_header_field_done(parser->data);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_value(llhttp_t *parser, const char *at, size_t len)
+{
+  if (parser->data) {
+    hc_req_header_value(parser->data, at, len);
+  }
+  return 0;
+}
+
+static int
+creq_on_header_value_complete(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_header_value_done(parser->data);
+  }
+  return 0;
+}
+
+static int
+creq_on_headers_complete(llhttp_t *parser)
+{
+  if (parser->data) {
+    hc_req_headers_done(parser->data);
+  }
+  return 0;                          /* a request's body follows its framing */
+}
+
+static void
+creq_parser_init(proxy_fd_ent_t *pfe)
+{
+  if (!creq_settings_inited) {
+    llhttp_settings_init(&creq_settings);
+    creq_settings.on_message_begin = creq_on_message_begin;
+    creq_settings.on_header_field = creq_on_header_field;
+    creq_settings.on_header_field_complete = creq_on_header_field_complete;
+    creq_settings.on_header_value = creq_on_header_value;
+    creq_settings.on_header_value_complete = creq_on_header_value_complete;
+    creq_settings.on_headers_complete = creq_on_headers_complete;
+    creq_settings.on_message_complete = creq_on_message_complete;
+    creq_settings_inited = 1;
+  }
+  llhttp_init(&pfe->creq_parser, HTTP_REQUEST, &creq_settings);
+  pfe->creq_parser.data = pfe;
+  pfe->creq_parser_inited = 1;
+}
+
+/* Feeds the bytes a client just sent to its own request framer. Runs on that
+ * client's worker, beside the read, so no lock is taken or needed. */
+static void
+creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
+{
+  enum llhttp_errno rerr;
+
+  if (!client || len == 0) {
+    return;
+  }
+  if (!client->creq_parser_inited) {
+    creq_parser_init(client);
+  }
+  rerr = llhttp_execute(&client->creq_parser, (const char *)msg, len);
+  if (rerr == HPE_PAUSED_UPGRADE) {
+    llhttp_resume_after_upgrade(&client->creq_parser);
+    return;
+  }
+  if (rerr != HPE_OK && rerr != HPE_PAUSED) {
+    log_debug("[CREQ_FRAMING] fd=%d llhttp err=%d (%s) — relay unaffected, framer reset",
+              client->fd, rerr, llhttp_errno_name(rerr));
+    creq_parser_init(client);
+  }
+}
+
+/* A response that answers the request. 101 ends HTTP on the connection, so it
+ * answers too; the other 1xx do not. */
+static int
+cresp_is_answer(int status)
+{
+  return status >= 200 || status == 101;
+}
+
+static int
+cresp_on_headers_complete(llhttp_t *parser)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+
+  if (!pfe) {
+    return 0;
+  }
+  /* An interim response (100 Continue, 103 Early Hints) is not the answer:
+   * llhttp completes it as a message of its own, and the final response to
+   * the same request follows. It takes no HEAD bit and completes nothing. */
+  if (!cresp_is_answer(parser->status_code)) {
+    return 0;
+  }
+  hc_resp_headers(pfe);
+  /* A response with neither Content-Length nor chunked framing runs until the
+   * backend closes, so its completion arrives as that EOF rather than from
+   * llhttp. Record it now, while the flags are the ones for this message. */
+  atomic_store_explicit(&pfe->cresp_unframed,
+                        (parser->flags & (F_CONTENT_LENGTH | F_CHUNKED)) ? 0 : 1,
+                        memory_order_relaxed);
+
+  /* llhttp handles the body-less statuses itself; HEAD it cannot know about, so
+   * the oldest outstanding request's bit says whether to skip the body. */
+  if (cresp_head_pop(pfe)) {
+    atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
+    return 1;                        /* no body follows */
+  }
+  return 0;
+}
+
+static int
+cresp_on_message_complete(llhttp_t *parser)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+
+  if (pfe && cresp_is_answer(parser->status_code)) {
+    atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
+    atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
+    hc_resp_done(pfe);
+  }
+  return 0;
+}
+
+/* The proxy answered a request itself on a connection it keeps, in place of
+ * the backend: the capacity 429's keep branch, the only such answer. The
+ * response framer never sees it, so the answer is counted here, and the
+ * request's HEAD bit is taken so the next backend response does not read it
+ * as its own. Runs on the client's worker, not the backend's; both counter
+ * updates are atomic read-modify-writes, so a second writer is safe. */
+static void
+cresp_note_local_answer(proxy_fd_ent_t *client)
+{
+  (void)cresp_head_pop(client);
+  atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
+}
+
+/* Initialises the client entry's response framer. Called with the entry locked. */
+static void
+cresp_parser_init(proxy_fd_ent_t *pfe)
+{
+  if (!cresp_settings_inited) {
+    llhttp_settings_init(&cresp_settings);
+    cresp_settings.on_headers_complete = cresp_on_headers_complete;
+    cresp_settings.on_message_complete = cresp_on_message_complete;
+    cresp_settings_inited = 1;
+  }
+  llhttp_init(&pfe->cresp_parser, HTTP_RESPONSE, &cresp_settings);
+  pfe->cresp_parser.data = pfe;
+  pfe->cresp_parser_inited = 1;
+}
+
+/* Feeds response bytes to the client entry's framer. MUST be called with that
+ * entry locked — the relay already holds it here, which is the point. */
+static void
+cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
+{
+  enum llhttp_errno rerr;
+
+  if (!client || len == 0) {
+    return;
+  }
+  if (!client->cresp_parser_inited) {
+    cresp_parser_init(client);
+  }
+  rerr = llhttp_execute(&client->cresp_parser, (const char *)msg, len);
+  if (rerr == HPE_PAUSED_UPGRADE) {
+    llhttp_resume_after_upgrade(&client->cresp_parser);
+    return;
+  }
+  if (rerr != HPE_OK && rerr != HPE_PAUSED) {
+    /* Observation only: a framing error must never disturb the relay. Reset so
+     * the next response on this connection is framed from a clean state, and
+     * leave the counters alone — a response we could not frame is one we cannot
+     * count, which keeps owed conservative (still owed) rather than wrong. */
+    log_debug("[CRESP_FRAMING] fd=%d llhttp err=%d (%s) — relay unaffected, framer reset",
+              client->fd, rerr, llhttp_errno_name(rerr));
+    cresp_parser_init(client);
+  }
+}
+
+/* The backend closed. A response that was delimited by that EOF is complete. */
+static void
+cresp_note_backend_eof(proxy_fd_ent_t *client)
+{
+  if (!client || !client->cresp_parser_inited) {
+    return;
+  }
+  /* Take the flag, then count. The exchange is what makes this safe to run
+   * without the entry lock the framer holds: only the caller that actually
+   * clears it counts the completion, so two legs closing cannot count one
+   * response twice. */
+  if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
+    atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
+    hc_resp_done(client);
+  }
+}
+
 void
 pd_resp_parser_init(proxy_fd_ent_t *pfe)
 {
@@ -10106,6 +10523,9 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
         if (ug_body && ug_body_len > 0 && pfe->http_content_length > 0 &&
             ug_body_len >= (size_t)pfe->http_content_length) {
           size_t ug_new_len = ug_body_len;
+          /* The whole body is at hand: record whether it asked to stream,
+           * for the half-close observation's stream dimension. */
+          hc_note_stream(pfe, json_stream_flag(ug_body, ug_body_len));
           if (inject_include_usage(ug_body, ug_body_len,
                                    SP_SOCK_MSG_LEN - ug_hdr_len,
                                    &ug_new_len) == 0) {
@@ -10961,6 +11381,14 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
     if (!pfe->odir) {  // Client → Proxy direction (odir=0)
       const char *phurl = "";
+
+      /* Count what the client asked for. Fed here, from the read, because the
+       * routing parser below runs only in the PARSING PHASE — with a backend leg
+       * already up and no gate re-arm, requests 2..N never reach it. H/2 carries
+       * its own framing and is counted by nghttp2, not here. */
+      if (!pfe->h2_session && rc > 0) {
+        creq_feed(pfe, (char *)pfe->rcvbuf + pfe->rcv_off, (size_t)rc);
+      }
 
       // Week 3: Check if this is HTTP/2 connection
       if (pfe->h2_session && pfe->h2_session->h2_enabled) {

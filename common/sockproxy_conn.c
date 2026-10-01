@@ -57,6 +57,7 @@
 #include "sockproxy_conn.h"
 #include "sockproxy_connect.h"
 #include "sockproxy_cache.h"
+#include "sockproxy_hc.h"
 #include "sockproxy_lb.h"
 #include "sockproxy_h2_load.h"
 #include "sockproxy_routing.h"
@@ -327,6 +328,7 @@ proxy_peer_map_activate_req(proxy_fd_ent_t *client_pfe)
   ret = proxy_struct->verdict_map_cb(&client_key, client_pfe->fd, 1);
   if (ret == 0) {
     be->peer_map_req_verdict = 1;
+    hc_note_accel(client_pfe, HC_ACCEL_REQ);
     return;
   }
 

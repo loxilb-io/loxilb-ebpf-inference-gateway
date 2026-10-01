@@ -1023,6 +1023,94 @@ struct proxy_fd_ent {
   uint32_t connect_deadline_ms;
   uint64_t connect_start_ms;
 
+  /* Response framing on the CLIENT entry.
+   *
+   * resp_outstanding above is set where the request is handed over and cleared
+   * only by handle_resp_message_complete, which pd_resp_parser_init installs and
+   * which runs only under pd_framing_v2 — off by default. So on an ordinary
+   * connection nothing ever clears it and it cannot say whether an answer is
+   * still owed. These fields replace it with a pair of counters that a framer on
+   * THIS entry maintains: owed == cresp_forwarded > cresp_completed.
+   *
+   * The framer lives here, on the client, rather than on the backend where
+   * pd_framing_v2 puts it, and that is the whole reason it is affordable: the
+   * relay already holds this entry's lock when it scans response bytes
+   * (the SSE detector does its writes under it), so feeding a parser that keeps
+   * its state here takes no second lock and opens no lock-order cycle. A parser
+   * on the backend entry would need one, which is why that feed is a trylock
+   * that drops feeds under contention.
+   *
+   * Zero-init (pfe_alloc memsets recycled shells) == no framing seen yet. */
+  /* The request side of the same count. There is no per-request hook to borrow:
+   * the routing parser runs only while there is no backend leg yet, or on the
+   * AI-gateway gate re-arm (the PARSING PHASE gate in handle_client_data), so on
+   * an ordinary keep-alive connection requests 2..N are relayed without ever
+   * reaching llhttp. That is also why resp_outstanding is set once per
+   * connection rather than once per request. This framer sees every request
+   * because it is fed from the read itself, beside the routing parser rather
+   * than through it. */
+  llhttp_t creq_parser;            // HTTP_REQUEST; settings are one shared static
+  uint8_t  creq_parser_inited;
+
+  llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
+  uint8_t  cresp_parser_inited;
+  /* Set by the response framer under this entry's lock, consumed by the backend
+   * leg's EOF without it, so it is atomic and the consumer takes it with an
+   * exchange: whoever clears it is the one that counts the completion. A
+   * connection with one backend leg would not need that, since feed and EOF are
+   * then the same fd on the same worker, but a P/D client has a prefill leg and
+   * a decode leg on different fds, and this codebase shards those to different
+   * notify workers. */
+  _Atomic uint8_t cresp_unframed;  // this response is delimited by the backend's EOF
+  /* The two counters have one writer each — requests are framed on the client's
+   * worker, responses on the backend's — so a relaxed atomic is enough for each
+   * and no lock is needed to keep them whole.
+   *
+   * The HEAD queue is the one piece both workers write, and it is packed into a
+   * single word so they can do it with a compare-exchange instead. Taking this
+   * entry's lock on the client side would have worked, but that lock is held by
+   * the relay from the moment it starts a response until after it has sent it,
+   * so a read path that had no lock at all would have begun serialising against
+   * every send. */
+  _Atomic uint32_t cresp_forwarded;  // requests framed on this connection
+  _Atomic uint32_t cresp_completed;  // responses framed to completion
+  /* llhttp in response mode cannot know the request method, so a HEAD response
+   * would be read as having the body its Content-Length promises. One bit per
+   * outstanding request, oldest in bit 0; pipelining (E-5) is why it is a queue.
+   * Low byte is the bits, high byte how many are live. */
+  _Atomic uint16_t cresp_head;
+
+  /* Half-close observation on the CLIENT entry (sockproxy_hc.c). Nothing
+   * decides anything from these; they feed metrics only.
+   *
+   * Written on the client's worker: the request-side stamps, the FIN stamp,
+   * the User-Agent capture and the park kind. Written under this entry's lock:
+   * the response-progress fields, which the relay and the cache drain update
+   * while they hold it for the write. Atomic where a second worker writes:
+   * the accel bits (a pairing can complete on the backend's worker), the
+   * handoff stamp (the backend-side cache drain sends the request), and the
+   * end of an answer (a backend's close ends it without the lock). */
+  _Atomic uint8_t hc_accel;          // HC_ACCEL_* — the kernel was given a direction; never cleared
+  uint8_t  hc_park;                  // enum hc_entry of the park that set PD_PHASE_PARKED
+  uint8_t  hc_stream;                // enum hc_stream of the latest request
+  uint8_t  hc_ua;                    // enum hc_ua of the latest request
+  int8_t   hc_ua_name;               // hc_ua_name_step state for the header name being read
+  uint8_t  hc_ua_capture;            // the header value being read is the User-Agent
+  uint8_t  hc_ua_seen;               // this request carried a User-Agent
+  uint8_t  hc_ua_len;
+  char     hc_ua_buf[32];            // enough of the value to classify it
+  uint8_t  hc_counted;               // HC_COUNTED_* — each family counts a connection once
+  uint64_t hc_req_done_ns;           // the latest request was framed complete
+  uint64_t hc_fin_ns;                // the client's FIN was first seen; 0 = not yet
+  _Atomic uint8_t  hc_handoff_pending; // a framed request has not reached the backend yet
+  _Atomic uint64_t hc_handoff_ns;      // it did, at this time; taken by the first write back
+  uint8_t  hc_resp_active;           // a final response is being delivered
+  _Atomic uint8_t hc_deliver_pending; // the answer ended; the sample waits for an empty cache
+  uint64_t hc_resp_handoff_ns;       // the handoff this response answers; 0 = unknown
+  uint64_t hc_first_write_ns;
+  uint64_t hc_last_write_ns;
+  uint64_t hc_max_gap_ns;
+
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
   int peer_map_pair_installed;   // 1 if this backend pfe owns any peer_map entry
