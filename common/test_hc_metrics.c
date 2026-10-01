@@ -106,13 +106,19 @@ static void
 test_classify(void)
 {
   /* TLS and accel take the connection out of the gate whatever else holds. */
-  assert(hc_classify(1, HC_ACCEL_RESP, 1, 1) == HC_OUT_TLS);
-  assert(hc_classify(0, HC_ACCEL_REQ, 0, 1) == HC_OUT_ACCEL);
-  assert(hc_classify(0, HC_ACCEL_RESP, 0, 0) == HC_OUT_ACCEL);
-  /* In the gate, a paused mid-request read is counted, never sampled. */
-  assert(hc_classify(0, 0, 1, 1) == HC_OUT_PARTIAL);
-  assert(hc_classify(0, 0, 0, 1) == HC_OUT_OWED);
-  assert(hc_classify(0, 0, 0, 0) == HC_OUT_IDLE);
+  assert(hc_classify(1, HC_ACCEL_RESP, 1, 1, 1) == HC_OUT_TLS);
+  assert(hc_classify(0, HC_ACCEL_REQ, 0, 1, 1) == HC_OUT_ACCEL);
+  assert(hc_classify(0, HC_ACCEL_RESP, 1, 1, 1) == HC_OUT_ACCEL);
+  assert(hc_classify(0, HC_ACCEL_RESP, 0, 1, 0) == HC_OUT_ACCEL);
+  /* In the gate, a FIN behind an incomplete request is counted, never
+   * sampled: a pipeline's remainder when an answer is owed, a truncated
+   * request when none is. */
+  assert(hc_classify(0, 0, 1, 1, 1) == HC_OUT_RESIDUE);
+  assert(hc_classify(0, 0, 1, 1, 0) == HC_OUT_PARTIAL);
+  /* Reads paused mid-request: owed is not known, so it stays partial. */
+  assert(hc_classify(0, 0, 1, 0, 1) == HC_OUT_PARTIAL);
+  assert(hc_classify(0, 0, 0, 1, 1) == HC_OUT_OWED);
+  assert(hc_classify(0, 0, 0, 1, 0) == HC_OUT_IDLE);
   printf("  gate: ok\n");
 }
 

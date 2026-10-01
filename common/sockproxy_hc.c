@@ -255,7 +255,8 @@ hc_fin_seen(proxy_fd_ent_t *c, enum hc_entry entry, int partial)
    * is complete: the gap would be negative, so it is counted, not sampled. */
   sampled_entry = entry < HC_ENTRY_SAMPLED;
   accel = atomic_load_explicit(&c->hc_accel, memory_order_relaxed);
-  out = hc_classify(c->ssl != NULL, accel, partial || !sampled_entry, hc_owed(c));
+  out = hc_classify(c->ssl != NULL, accel, partial || !sampled_entry, sampled_entry,
+                    hc_owed(c));
   hc_inc(&hc_stats.fin_total[entry][out]);
 
   /* The response direction went to the kernel and the request direction did
@@ -379,7 +380,11 @@ hc_resp_headers(proxy_fd_ent_t *c)
 void
 hc_resp_done(proxy_fd_ent_t *c)
 {
-  c->hc_deliver_pending = 1;
+  /* Atomic: a response the backend ends by closing is completed on the
+   * backend's worker without the client's lock. */
+  if (hc_is_client(c)) {
+    atomic_store_explicit(&c->hc_deliver_pending, 1, memory_order_relaxed);
+  }
 }
 
 void
@@ -393,7 +398,11 @@ hc_prog_write(proxy_fd_ent_t *dst)
   if (dst->odir != 0) {
     /* A write towards a backend: the first one after a request was framed is
      * where it was handed over. The client entry is not locked here; the two
-     * fields are atomic for that. */
+     * fields are atomic for that, and the client is found through the leg's
+     * link without a generation check, so a shell recycled under it can take
+     * a stamp meant for another connection. That costs one wrong sample here.
+     * Nothing may decide from this stamp: a hold bound that needs the handoff
+     * time must take its own, under the client's lock. */
     proxy_fd_ent_t *c = dst->n_rfd > 0 ? dst->rfd_ent[0] : NULL;
 
     if (hc_is_client(c) &&
@@ -423,13 +432,14 @@ hc_prog_write(proxy_fd_ent_t *dst)
 void
 hc_prog_settled(proxy_fd_ent_t *c)
 {
-  if (!hc_is_client(c) || !c->hc_deliver_pending || c->cache_head != NULL) {
+  if (!hc_is_client(c) || c->cache_head != NULL ||
+      !atomic_load_explicit(&c->hc_deliver_pending, memory_order_relaxed)) {
     return;
   }
-  /* Unpaired connections only: with a direction in the kernel the request
-   * framer misses requests (so the handoff is stale) or the response framer
-   * misses responses. */
-  if (c->hc_first_write_ns != 0 &&
+  /* Unpaired plaintext connections only, the population a hold bound is for:
+   * with a direction in the kernel the request framer misses requests (so the
+   * handoff is stale) or the response framer misses responses. */
+  if (c->hc_first_write_ns != 0 && c->ssl == NULL &&
       atomic_load_explicit(&c->hc_accel, memory_order_relaxed) == 0) {
     enum hc_stream st = hc_stream_of(c);
 
@@ -443,7 +453,7 @@ hc_prog_settled(proxy_fd_ent_t *c)
                c->hc_max_gap_ns / 1000);
   }
   c->hc_resp_active = 0;
-  c->hc_deliver_pending = 0;
+  atomic_store_explicit(&c->hc_deliver_pending, 0, memory_order_relaxed);
   c->hc_resp_handoff_ns = 0;
   c->hc_first_write_ns = 0;
   c->hc_last_write_ns = 0;

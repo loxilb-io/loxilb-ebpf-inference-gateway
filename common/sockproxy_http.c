@@ -5318,6 +5318,11 @@ proxy_pdestroy(void *priv)
   PROXY_LOCK();
   if (pfe) {
     PROXY_ENT_LOCK(pfe);
+    /* An answer that ended while nothing was left to write - the backend
+     * closed with the client's cache already empty, or the drain finished
+     * just before the end was known - has no later write to be sampled at.
+     * Its cache is still intact here; it is freed further down. */
+    hc_prog_settled(pfe);
     proxy_peer_map_delete(pfe);
     /* The pair lives on the backend entry, and removing it credits what the
      * kernel carried to the client's endpoint. When the client goes first,
@@ -9528,6 +9533,7 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
    * response twice. */
   if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
+    hc_resp_done(client);
   }
 }
 

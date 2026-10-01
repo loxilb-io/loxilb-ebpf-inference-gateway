@@ -1087,8 +1087,9 @@ struct proxy_fd_ent {
    * the User-Agent capture and the park kind. Written under this entry's lock:
    * the response-progress fields, which the relay and the cache drain update
    * while they hold it for the write. Atomic where a second worker writes:
-   * the accel bits (a pairing can complete on the backend's worker) and the
-   * handoff stamp (the backend-side cache drain sends the request). */
+   * the accel bits (a pairing can complete on the backend's worker), the
+   * handoff stamp (the backend-side cache drain sends the request), and the
+   * end of an answer (a backend's close ends it without the lock). */
   _Atomic uint8_t hc_accel;          // HC_ACCEL_* — the kernel was given a direction; never cleared
   uint8_t  hc_park;                  // enum hc_entry of the park that set PD_PHASE_PARKED
   uint8_t  hc_stream;                // enum hc_stream of the latest request
@@ -1104,7 +1105,7 @@ struct proxy_fd_ent {
   _Atomic uint8_t  hc_handoff_pending; // a framed request has not reached the backend yet
   _Atomic uint64_t hc_handoff_ns;      // it did, at this time; taken by the first write back
   uint8_t  hc_resp_active;           // a final response is being delivered
-  uint8_t  hc_deliver_pending;       // the framer saw it end; the sample waits for an empty cache
+  _Atomic uint8_t hc_deliver_pending; // the answer ended; the sample waits for an empty cache
   uint64_t hc_resp_handoff_ns;       // the handoff this response answers; 0 = unknown
   uint64_t hc_first_write_ns;
   uint64_t hc_last_write_ns;

@@ -166,7 +166,7 @@ typedef struct proxy_metrics_snapshot {
     uint64_t hc_fin_gap_bucket[4][3][15];   /* [entry][stream][bound] */
     uint64_t hc_fin_gap_sum_us[4][3];
     uint64_t hc_fin_gap_count[4][3];
-    uint64_t hc_fin_total[7][5];            /* [entry][outcome] */
+    uint64_t hc_fin_total[7][6];            /* [entry][outcome] */
     uint64_t hc_accel_early_fin;
     uint64_t hc_tls_fin[3][2];              /* [path][early and owed] */
     uint64_t hc_client_reset;

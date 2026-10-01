@@ -68,8 +68,9 @@ void hc_tls_read_failed(struct proxy_fd_ent *client, int ssl_err, int rval, int 
 void hc_client_reset_seen(struct proxy_fd_ent *client);
 void hc_client_reset_check(struct proxy_fd_ent *client);
 
-/* Response framer on the client entry, for a response that answers the
- * request (the framer skips interim ones); the relay holds the client's lock. */
+/* An answer began (response framer, client's lock held) or ended (the framer
+ * under the same lock, or a backend's close without it). Interim responses
+ * are not reported. */
 void hc_resp_headers(struct proxy_fd_ent *client);
 void hc_resp_done(struct proxy_fd_ent *client);
 
@@ -77,7 +78,8 @@ void hc_resp_done(struct proxy_fd_ent *client);
  * a framed request is handed over; a write to a client is response progress. */
 void hc_prog_write(struct proxy_fd_ent *dst);
 
-/* The client's relay cache is empty after a write (client's lock held). */
+/* The client's relay cache is empty after a write, or the client is being
+ * torn down (client's lock held). */
 void hc_prog_settled(struct proxy_fd_ent *client);
 
 void hc_metrics_fill(struct proxy_metrics_snapshot *s);

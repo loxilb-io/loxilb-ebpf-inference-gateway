@@ -40,7 +40,11 @@ enum hc_entry {
 enum hc_outcome {
   HC_OUT_OWED = 0,  /* in the gate and an answer is owed: the case under study */
   HC_OUT_IDLE,      /* in the gate, nothing owed: an ordinary close */
-  HC_OUT_PARTIAL,   /* in the gate, reads were paused mid-request: count only */
+  HC_OUT_PARTIAL,   /* in the gate, the FIN came before the request was complete
+                     * (or reads were paused mid-request): count only */
+  HC_OUT_RESIDUE,   /* in the gate, an answer is owed and the next request was
+                     * still arriving: a pipeline's remainder. Count only; a hold
+                     * would refuse it */
   HC_OUT_TLS,       /* outside the gate: a TLS connection */
   HC_OUT_ACCEL,     /* outside the gate: the kernel carried bytes on this connection */
   HC_OUT_MAX
@@ -173,9 +177,15 @@ hc_is_early(uint64_t req_done_ns, uint64_t fin_ns)
 
 /* The gate the samples are taken under: no TLS, and the kernel never carried a
  * byte on the connection. Outside it the counters the samples need are not
- * trustworthy (an accelerated direction is invisible to the framers). */
+ * trustworthy (an accelerated direction is invisible to the framers).
+ *
+ * partial: the request the FIN arrived behind was not complete. Where the
+ * count of owed answers is known at that moment (owed_known), a partial
+ * request behind an owed answer is a pipeline's remainder, not a truncated
+ * request. Where reads were paused mid-request it is not known: the paused
+ * request may itself be the one the answer is owed for. */
 static inline enum hc_outcome
-hc_classify(int is_tls, uint8_t accel, int paused_mid_request, int owed)
+hc_classify(int is_tls, uint8_t accel, int partial, int owed_known, int owed)
 {
   if (is_tls) {
     return HC_OUT_TLS;
@@ -183,8 +193,8 @@ hc_classify(int is_tls, uint8_t accel, int paused_mid_request, int owed)
   if (accel) {
     return HC_OUT_ACCEL;
   }
-  if (paused_mid_request) {
-    return HC_OUT_PARTIAL;
+  if (partial) {
+    return owed_known && owed ? HC_OUT_RESIDUE : HC_OUT_PARTIAL;
   }
   return owed ? HC_OUT_OWED : HC_OUT_IDLE;
 }
