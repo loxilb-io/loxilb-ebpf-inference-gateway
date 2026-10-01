@@ -54,6 +54,9 @@ jobs:
       - name: Half-close observation (bucket edges, sampling gate, TLS end classification, User-Agent families)
         run: make -C common test_hc
 
+      - name: Holding a half-closed client (gate, settle, end classification, idle bound, arming)
+        run: make -C common test_hold
+
       - name: Every fd arming goes through sp_notify_arm (source invariant)
         run: make -C common check_notify_arm
 

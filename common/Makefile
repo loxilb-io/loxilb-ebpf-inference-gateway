@@ -398,6 +398,15 @@ test_hc_metrics: test_hc_metrics.c sockproxy_hc_core.h
 test_hc: test_hc_metrics
 	./test_hc_metrics
 
+# Holding a half-closed client, the pure half: the gate, settling, the end
+# classification at release, the idle bound and the arming of a held client.
+test_hold_core: test_hold_core.c sockproxy_hold_core.h notify.h
+	$(CC) -Wall -Wextra -Werror -o $@ test_hold_core.c -I.
+
+.PHONY: test_hold
+test_hold: test_hold_core
+	./test_hold_core
+
 # Source invariant: every arming of a proxy connection's fd goes through
 # sp_notify_arm (a client held after its FIN must not be armed for reads).
 .PHONY: check_notify_arm
@@ -760,7 +769,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics
+	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
