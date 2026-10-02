@@ -105,12 +105,6 @@ hold_record_end(proxy_fd_ent_t *c, enum sp_hold_end e)
 }
 
 int
-sp_eof_held(const proxy_fd_ent_t *pfe)
-{
-  return pfe && pfe->odir == 0 && pfe->eof_hold;
-}
-
-int
 sp_notify_arm(void *ns, int fd, notify_type_t type, proxy_fd_ent_t *pfe, uint64_t gen)
 {
   if (sp_eof_held(pfe)) {
@@ -141,7 +135,7 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
   be = pfe->n_rfd > 0 ? pfe->rfd_ent[0] : NULL;
   epv = (proxy_epval_t *)pfe->epv;
   in.is_client = 1;
-  in.held = pfe->eof_hold;
+  in.held = atomic_load_explicit(&pfe->eof_hold, memory_order_relaxed);
   in.owed = hold_owed(pfe);
   in.has_leg = be && be->fd > 0;
   in.accel = atomic_load_explicit(&pfe->hc_accel, memory_order_relaxed) != 0;
@@ -169,12 +163,13 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
 
   now = hold_now_ns();
   PROXY_ENT_LOCK(pfe);
-  pfe->eof_hold = 1;
-  pfe->hold_start_ns = now;
+  atomic_store_explicit(&pfe->eof_hold, 1, memory_order_relaxed);
+  atomic_store_explicit(&pfe->hold_start_ns, now, memory_order_relaxed);
   /* An answer already under way when the FIN came (the client half-closed
    * after the first bytes) is progress from the start. */
-  pfe->hold_answer_began = pfe->cresp_answer_open;
-  pfe->hold_progress_ns = 0;
+  atomic_store_explicit(&pfe->hold_answer_began,
+                        atomic_load_explicit(&pfe->cresp_answer_open, memory_order_relaxed), memory_order_relaxed);
+  atomic_store_explicit(&pfe->hold_progress_ns, 0, memory_order_relaxed);
   /* With nothing left in the backend's cache the request has reached the
    * backend already; otherwise the cache drain says when it does. */
   atomic_store_explicit(&pfe->hold_handoff_ns,
@@ -203,16 +198,16 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
 void
 sp_hold_answer_began(proxy_fd_ent_t *c)
 {
-  c->cresp_answer_open = 1;
-  if (c->eof_hold) {
-    c->hold_answer_began = 1;
+  atomic_store_explicit(&c->cresp_answer_open, 1, memory_order_relaxed);
+  if (atomic_load_explicit(&c->eof_hold, memory_order_relaxed)) {
+    atomic_store_explicit(&c->hold_answer_began, 1, memory_order_relaxed);
   }
 }
 
 void
 sp_hold_answer_ended(proxy_fd_ent_t *c)
 {
-  c->cresp_answer_open = 0;
+  atomic_store_explicit(&c->cresp_answer_open, 0, memory_order_relaxed);
 }
 
 void
@@ -220,8 +215,8 @@ sp_hold_progress(proxy_fd_ent_t *dst)
 {
   /* Interim responses (100 Continue, 103) are not progress: only writes once
    * an answer has begun count. */
-  if (sp_eof_held(dst) && dst->hold_answer_began) {
-    dst->hold_progress_ns = hold_now_ns();
+  if (sp_eof_held(dst) && atomic_load_explicit(&dst->hold_answer_began, memory_order_relaxed)) {
+    atomic_store_explicit(&dst->hold_progress_ns, hold_now_ns(), memory_order_relaxed);
   }
 }
 
@@ -321,7 +316,7 @@ sp_hold_retire(proxy_fd_ent_t *pfe)
 {
   enum sp_hold_end e;
 
-  if (!pfe || !pfe->eof_hold) {
+  if (!pfe || !atomic_load_explicit(&pfe->eof_hold, memory_order_relaxed)) {
     return;
   }
   e = sp_hold_end_at_release(
@@ -331,7 +326,7 @@ sp_hold_retire(proxy_fd_ent_t *pfe)
   if (atomic_load_explicit(&hold_stats.held, memory_order_relaxed) > 0) {
     atomic_fetch_sub_explicit(&hold_stats.held, 1, memory_order_relaxed);
   }
-  pfe->eof_hold = 0;
+  atomic_store_explicit(&pfe->eof_hold, 0, memory_order_relaxed);
 }
 
 /* ---- the 1 Hz pass --------------------------------------------------------- */
@@ -363,6 +358,7 @@ sp_hold_sweep(void)
 {
   proxy_map_ent_t *node;
   proxy_fd_ent_t *pfe;
+  uint64_t start;
   uint64_t now = hold_now_ns();
   uint64_t cap = (uint64_t)atomic_load_explicit(&hold_cap_sec, memory_order_relaxed) *
                  1000000000ull;
@@ -382,22 +378,27 @@ sp_hold_sweep(void)
         }
         continue;
       }
-      if (sp_hold_expired(now, pfe->hold_start_ns,
+      start = atomic_load_explicit(&pfe->hold_start_ns, memory_order_relaxed);
+      if (sp_hold_expired(now, start,
                           atomic_load_explicit(&pfe->hold_handoff_ns, memory_order_relaxed),
-                          pfe->hold_progress_ns, cap)) {
+                          atomic_load_explicit(&pfe->hold_progress_ns, memory_order_relaxed), cap)) {
         if (hold_record_end(pfe, SP_HOLD_END_EXPIRED)) {
-          int st = pfe->hc_stream < HC_STREAM_MAX ? pfe->hc_stream : HC_STREAM_UNKNOWN;
+          uint8_t st = __atomic_load_n(&pfe->hc_stream, __ATOMIC_RELAXED);
+          int began = atomic_load_explicit(&pfe->hold_answer_began, memory_order_relaxed) != 0;
 
-          hold_inc(&hold_stats.expired[pfe->hold_answer_began ? 1 : 0][st]);
+          if (st >= HC_STREAM_MAX) {
+            st = HC_STREAM_UNKNOWN;
+          }
+          hold_inc(&hold_stats.expired[began][st]);
           log_info("[HOLD] fd=%d: no progress towards the client for %u s (answer %s), "
                    "closing", pfe->fd, (unsigned)(cap / 1000000000ull),
-                   pfe->hold_answer_began ? "started" : "not started");
+                   began ? "started" : "not started");
           hold_close(pfe);
         }
         continue;
       }
-      if (now > pfe->hold_start_ns && now - pfe->hold_start_ns > oldest) {
-        oldest = now - pfe->hold_start_ns;
+      if (now > start && now - start > oldest) {
+        oldest = now - start;
       }
     }
   }

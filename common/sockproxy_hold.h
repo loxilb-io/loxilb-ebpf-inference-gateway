@@ -25,12 +25,8 @@ struct proxy_fd_ent;
 struct proxy_epval;
 struct proxy_metrics_snapshot;
 
-/* Whether this client is held on EOF: its FIN has been read and it is being
- * kept open for an answer still owed. Every place that treats a held client
- * differently asks this and nothing else, so they cannot disagree. A client
- * whose FIN was only seen as RDHUP while its reads were paused, and not yet
- * read, is not held on EOF. */
-int sp_eof_held(const struct proxy_fd_ent *pfe);
+/* Whether a client is held on EOF is sp_eof_held(), inline in sockproxy.h:
+ * the notifier asks it on every event and every arming. */
 
 /* Arms fd's poll events. Every arming of a proxy connection's fd goes
  * through here, so the rule for a held client is kept in one place (the

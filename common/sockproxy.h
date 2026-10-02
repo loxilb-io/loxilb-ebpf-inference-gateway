@@ -1117,18 +1117,20 @@ struct proxy_fd_ent {
 
   /* Half-close hold on the CLIENT entry (sockproxy_hold.c). Unlike the hc_*
    * fields above, which only feed metrics, these decide what happens to the
-   * connection. Read them through sp_eof_held(). */
-  uint8_t  eof_hold;                 // held on EOF: FIN read, kept open for an owed answer
-  /* Written under this entry's lock (the read path takes it to hold, the relay
-   * and the drain hold it for the writes), except where marked atomic: those
-   * are written from the backend's worker or the health pass as well. */
-  uint8_t  cresp_answer_open;        // the response framer is inside an answer (1xx excluded)
-  uint8_t  hold_answer_began;        // an answer to the held request has begun
-  _Atomic uint8_t  hold_end;         // enum sp_hold_end; the first reason recorded wins
-  _Atomic uint32_t hold_leg_ended;   // requests framed when the answer's leg ended, plus one (0: none)
-  uint64_t hold_start_ns;            // when the hold began (the FIN was read)
-  _Atomic uint64_t hold_handoff_ns;  // when the request was known to have reached the backend
-  uint64_t hold_progress_ns;         // last successful write of the answer to the client
+   * connection. Read the hold itself through sp_eof_held().
+   *
+   * All atomic, accessed relaxed: the client's worker writes them - under
+   * this entry's lock, or from the backend's worker, which is pinned to the
+   * same thread - and the 1 Hz health pass reads them holding PROXY_LOCK
+   * only. */
+  _Atomic uint8_t  eof_hold;          // held on EOF: FIN read, kept open for an owed answer
+  _Atomic uint8_t  cresp_answer_open; // the response framer is inside an answer (1xx excluded)
+  _Atomic uint8_t  hold_answer_began; // an answer to the held request has begun
+  _Atomic uint8_t  hold_end;          // enum sp_hold_end; the first reason recorded wins
+  _Atomic uint32_t hold_leg_ended;    // requests framed when the answer's leg ended, plus one (0: none)
+  _Atomic uint64_t hold_start_ns;     // when the hold began (the FIN was read)
+  _Atomic uint64_t hold_handoff_ns;   // when the request was known to have reached the backend
+  _Atomic uint64_t hold_progress_ns;  // last successful write of the answer to the client
 
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
@@ -1588,6 +1590,19 @@ struct proxy_fd_ent {
                                       // here or they would report a request they cannot name.
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
+
+/* Whether this client is held on EOF (sockproxy_hold.c): its FIN has been read
+ * and it is being kept open for an answer still owed. Every place that treats
+ * a held client differently asks this and nothing else, so they cannot
+ * disagree. A client whose FIN was only seen as RDHUP while its reads were
+ * paused, and not yet read, is not held on EOF. Inline: the notifier asks it
+ * on every event and every arming. */
+static inline int
+sp_eof_held(const proxy_fd_ent_t *pfe)
+{
+  return pfe && pfe->odir == 0 &&
+         atomic_load_explicit(&pfe->eof_hold, memory_order_relaxed);
+}
 
 /* The receive buffer is recycled (sockproxy_rcvbuf.h): its next user gets the
  * span this one wrote zeroed, and nothing more, so every site that writes
