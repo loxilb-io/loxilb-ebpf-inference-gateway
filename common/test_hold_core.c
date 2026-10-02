@@ -4,9 +4,9 @@
  * SPDX short identifier: BSD-3-Clause
  *
  * test_hold_core.c - the pure half of holding a half-closed client
- * (sockproxy_hold_core.h): the gate, when a hold settles, how its end is
- * classified at release, the idle bound and the events a held client may be
- * armed and dispatched for.
+ * (sockproxy_hold_core.h): the gate, when a hold settles, when the answer's
+ * leg counts as ended, how its end is classified at release, the idle bound
+ * and the events a held client may be armed and dispatched for.
  *
  * Build (wired into `make test_hold`):
  *   gcc -Wall -Wextra -Werror -o test_hold_core test_hold_core.c -I.
@@ -88,6 +88,23 @@ test_settle(void)
   /* Still owed, the leg still there: keep waiting. */
   assert(sp_hold_settle_decide(1, 1, 0) == SP_HOLD_END_NONE);
   printf("  settle: ok\n");
+}
+
+static void
+test_leg_ended(void)
+{
+  /* No mark: no leg has ended. */
+  assert(!sp_hold_leg_ended_now(0, 0));
+  assert(!sp_hold_leg_ended_now(0, 3));
+
+  /* A leg ended after three requests were framed: it speaks for those. */
+  assert(sp_hold_leg_ended_now(3 + 1, 3));
+
+  /* The next request went to another leg, which has not ended: the mark is
+   * stale without anything clearing it. */
+  assert(!sp_hold_leg_ended_now(3 + 1, 4));
+  assert(!sp_hold_leg_ended_now(3 + 1, 5));
+  printf("  leg ended: ok\n");
 }
 
 static void
@@ -195,6 +212,7 @@ main(void)
   printf("test_hold_core:\n");
   test_decide();
   test_settle();
+  test_leg_ended();
   test_end_at_release();
   test_expired();
   test_arm_type();

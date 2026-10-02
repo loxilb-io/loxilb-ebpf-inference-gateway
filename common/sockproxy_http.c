@@ -5787,10 +5787,10 @@ proxy_pdestroy(void *priv)
         if (!cpfe || cpfe->odir != 0 || cpfe->pd_phase != PD_PHASE_NONE) {
           continue;
         }
+        PROXY_ENT_LOCK(cpfe);
         /* The leg carrying this client's answer is going: a held client then
          * closes once its cache is out, whatever is still owed. */
-        sp_hold_leg_ended(cpfe);
-        PROXY_ENT_LOCK(cpfe);
+        sp_hold_leg_ended(cpfe, pfe);
         if (cpfe->fd > 0 && cpfe->cache_head && !cpfe->ssl_err) {
           if (!cpfe->peer_eof) {
             cpfe->peer_eof = 1;
@@ -6823,7 +6823,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             !pfe->pd_sg_drain &&
             pfe->rfd_ent[0]->pd_phase != PD_PHASE_PREFILL_WAITING) {
           cresp_note_backend_eof(pfe->rfd_ent[0]);
-          sp_hold_leg_ended(pfe->rfd_ent[0]);
+          sp_hold_leg_ended(pfe->rfd_ent[0], pfe);
         }
 
         // Check if peer connection still has data to send
@@ -7779,7 +7779,6 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
     npfe1->rfd[npfe1->n_rfd] = ep_cfd;
     npfe1->rfd_ent[npfe1->n_rfd] = npfe2;
     npfe1->n_rfd++;
-    sp_hold_leg_attached(npfe1);
 
     for (retry = 0; retry < PROXY_MAPFD_RETRIES; retry++) {
       /* Option A: pin the backend fd to the CLIENT fd's (npfe1) notify

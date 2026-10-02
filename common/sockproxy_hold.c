@@ -243,22 +243,34 @@ sp_hold_handoff(proxy_fd_ent_t *be)
 }
 
 void
-sp_hold_leg_ended(proxy_fd_ent_t *c)
+sp_hold_leg_ended(proxy_fd_ent_t *c, proxy_fd_ent_t *be)
 {
+  int i;
+
   /* Recorded whether or not the client is held yet: a leg that ended
-   * mid-answer before the FIN was read still means nothing more will come.
-   * It describes the current leg: attaching another clears it. */
-  if (c && c->odir == 0) {
-    atomic_store_explicit(&c->hold_leg_ended, 1, memory_order_relaxed);
+   * mid-answer before the FIN was read still means nothing more will come for
+   * the requests framed so far. The mark is their count, so the next request
+   * makes it stale (sp_hold_leg_ended_now) - whichever path attaches the leg
+   * that serves it. Only a leg the client still links leaves a mark: one it
+   * let go earlier and torn down late does not speak for its successor. */
+  if (!c || c->odir != 0 || !be) {
+    return;
+  }
+  for (i = 0; i < MAX_PROXY_EP; i++) {
+    if (c->rfd_ent[i] == be) {
+      atomic_store_explicit(&c->hold_leg_ended,
+                            atomic_load_explicit(&c->cresp_forwarded, memory_order_relaxed) + 1,
+                            memory_order_relaxed);
+      return;
+    }
   }
 }
 
-void
-sp_hold_leg_attached(proxy_fd_ent_t *c)
+static int
+hold_leg_ended(proxy_fd_ent_t *c)
 {
-  if (c && c->odir == 0) {
-    atomic_store_explicit(&c->hold_leg_ended, 0, memory_order_relaxed);
-  }
+  return sp_hold_leg_ended_now(atomic_load_explicit(&c->hold_leg_ended, memory_order_relaxed),
+                               atomic_load_explicit(&c->cresp_forwarded, memory_order_relaxed));
 }
 
 /* ---- settle ---------------------------------------------------------------- */
@@ -272,7 +284,7 @@ sp_hold_settle(proxy_fd_ent_t *c)
     return 0;
   }
   e = sp_hold_settle_decide(c->cache_head == NULL && !c->cache_draining, hold_owed(c),
-                            atomic_load_explicit(&c->hold_leg_ended, memory_order_relaxed));
+                            hold_leg_ended(c));
   if (e == SP_HOLD_END_NONE) {
     return 0;
   }
@@ -314,7 +326,7 @@ sp_hold_retire(proxy_fd_ent_t *pfe)
   }
   e = sp_hold_end_at_release(
       (enum sp_hold_end)atomic_load_explicit(&pfe->hold_end, memory_order_relaxed),
-      hold_owed(pfe), atomic_load_explicit(&pfe->hold_leg_ended, memory_order_relaxed));
+      hold_owed(pfe), hold_leg_ended(pfe));
   hold_inc(&hold_stats.ended[e < SP_HOLD_END_MAX ? e : SP_HOLD_END_OTHER]);
   if (atomic_load_explicit(&hold_stats.held, memory_order_relaxed) > 0) {
     atomic_fetch_sub_explicit(&hold_stats.held, 1, memory_order_relaxed);

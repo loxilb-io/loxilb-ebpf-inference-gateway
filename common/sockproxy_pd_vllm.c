@@ -45,7 +45,6 @@
 #include "sockproxy.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
-#include "sockproxy_hold.h"
 #include "sockproxy_pd_leak.h"
 
 /* Rewrite the prefill address inside a P/D request-id receipt
@@ -393,7 +392,6 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     client_pfe->rfd[slot] = ep_cfd;
     client_pfe->rfd_ent[slot] = decode_pfe;
     client_pfe->n_rfd++;
-    sp_hold_leg_attached(client_pfe);
   }
 
   /* Set phase BEFORE notify_add_ent to eliminate race condition.

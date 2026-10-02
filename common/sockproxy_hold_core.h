@@ -110,6 +110,16 @@ sp_hold_settle_decide(int cache_empty, int owed, int leg_ended)
   return SP_HOLD_END_NONE;
 }
 
+/* Whether the leg carrying the answer has ended, from the mark its end left:
+ * the number of requests the client had framed by then, plus one (0: none).
+ * A request framed since went to a leg that has not ended, so the mark is
+ * then stale - no place that attaches a leg has to clear it. */
+static inline int
+sp_hold_leg_ended_now(uint32_t mark, uint32_t framed)
+{
+  return mark != 0 && mark == framed + 1;
+}
+
 /* The reason a hold ended, at release: the one recorded, else what the
  * counters say happened (a backend close with nothing left to drain releases
  * the client without passing a settle point). */

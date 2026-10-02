@@ -66,11 +66,11 @@ void sp_hold_progress(struct proxy_fd_ent *dst);
  * (backend's lock held). */
 void sp_hold_handoff(struct proxy_fd_ent *be);
 
-/* The leg carrying the client's answer ended: its EOF, or its teardown
- * detaching the client. A new leg attached to the client clears it: rules
- * that route per request let a leg go between requests and take another. */
-void sp_hold_leg_ended(struct proxy_fd_ent *client);
-void sp_hold_leg_attached(struct proxy_fd_ent *client);
+/* The leg be carrying the client's answer ended: its EOF, or its teardown
+ * detaching the client. It holds for the requests framed so far: rules that
+ * route per request let a leg go between requests and take another, and the
+ * next request's leg has not ended. Only a leg the client still links counts. */
+void sp_hold_leg_ended(struct proxy_fd_ent *client, struct proxy_fd_ent *be);
 
 /* After a write that left the client's relay cache empty (client's lock
  * held): returns 1 when the hold is over and the caller should close the

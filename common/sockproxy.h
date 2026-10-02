@@ -1124,8 +1124,8 @@ struct proxy_fd_ent {
    * are written from the backend's worker or the health pass as well. */
   uint8_t  cresp_answer_open;        // the response framer is inside an answer (1xx excluded)
   uint8_t  hold_answer_began;        // an answer to the held request has begun
-  _Atomic uint8_t  hold_leg_ended;   // the leg carrying the answer ended (EOF or teardown detach)
   _Atomic uint8_t  hold_end;         // enum sp_hold_end; the first reason recorded wins
+  _Atomic uint32_t hold_leg_ended;   // requests framed when the answer's leg ended, plus one (0: none)
   uint64_t hold_start_ns;            // when the hold began (the FIN was read)
   _Atomic uint64_t hold_handoff_ns;  // when the request was known to have reached the backend
   uint64_t hold_progress_ns;         // last successful write of the answer to the client
