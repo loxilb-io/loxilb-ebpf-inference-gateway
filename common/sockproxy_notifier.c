@@ -57,6 +57,7 @@
 #include "sockproxy_h2.h"
 #include "sockproxy_http.h"
 #include "sockproxy_hc.h"
+#include "sockproxy_hold.h"
 #ifdef HAVE_MTLS
 #include "sockproxy_mtls.h"
 #endif
@@ -79,8 +80,8 @@ int proxy_notify_add_fd(int fd, int type, void *priv)
   /* D2 root fix: stamp the registration with the pfe's current generation so a
    * later stale dispatch on a recycled slot is detected and dropped. All priv
    * passed through the notifier are proxy_fd_ent_t shells (pfe_alloc'd). */
-  return notify_add_ent(proxy_struct->ns, fd, type, priv,
-                        priv ? ((proxy_fd_ent_t *)priv)->gen : 0);
+  return sp_notify_arm(proxy_struct->ns, fd, type, priv,
+                       priv ? ((proxy_fd_ent_t *)priv)->gen : 0);
 }
 
 /* Pinned variant: the new fd inherits pin_fd's notify worker, so both legs of
@@ -385,6 +386,11 @@ proxy_notifier(int fd, notify_type_t type, void *priv, uint64_t gen)
   }
 #endif
 
+  /* A held client is never read, whatever woke it: its read side is at EOF,
+   * and the notifier core reports every OUT as IN as well, so each wake-up to
+   * write would read that EOF again (sp_hold_dispatch_type). */
+  type = (notify_type_t)sp_hold_dispatch_type(type, sp_eof_held(pfe));
+
   //log_trace("notify fd = %d(%d) type 0x%x", fd, pfe->fd, type);
 restart:
   while (type) {
@@ -437,6 +443,7 @@ restart:
         } else {
           // HTTP/1.1 cache draining (original behavior)
           PROXY_ENT_LOCK(pfe);
+          sp_hold_out_wake(pfe);
           proxy_xmit_cache(pfe);
           PROXY_ENT_UNLOCK(pfe);
         }

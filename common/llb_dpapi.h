@@ -1161,7 +1161,10 @@ struct dp_proxy_tacts {
   // The admission headers on admitted responses: 0 inherits, 1 off, 2 on.
   // The next byte of the same padding.
   uint8_t  fc_expose_headers;
-  uint8_t  fc_pad3[2];
+  // Holding a client that half-closed after its request: 0 inherits, 1 off,
+  // 2 hold (enum sp_hold_mode). The next byte of the same padding.
+  uint8_t  half_close_mode;
+  uint8_t  fc_pad3[1];
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
@@ -1221,6 +1224,7 @@ struct dp_proxy_tacts {
 //   asserts shift by +16 (2944→2960, 2936→2952, 3720→3736, 3712→3728).
 // fc_tenant_share_pct(1)+fc_pad3[3] replace the u32 fc_pad3: no size change.
 // fc_expose_headers(1)+fc_pad3[2] replace fc_pad3[3]: no size change.
+// half_close_mode(1)+fc_pad3[1] replace fc_pad3[2]: no size change.
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
 _Static_assert(sizeof(struct dp_proxy_tacts) == 2960,

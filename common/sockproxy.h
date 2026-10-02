@@ -601,6 +601,7 @@ typedef struct proxy_epval {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  uint8_t  hold_mode;              // enum sp_hold_mode: hold a client that half-closed after its request
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   /* P/D orchestration engine flavor. Stamped at proxy_add FROM the rule's
@@ -1081,7 +1082,10 @@ struct proxy_fd_ent {
   _Atomic uint16_t cresp_head;
 
   /* Half-close observation on the CLIENT entry (sockproxy_hc.c). Nothing
-   * decides anything from these; they feed metrics only.
+   * decides anything from these, with one exception: hc_accel is also the
+   * history the half-close hold is gated on (sockproxy_hold.c). It is set
+   * only where a verdict entry is added and never cleared, which is what a
+   * gate needs. The rest feed metrics only.
    *
    * Written on the client's worker: the request-side stamps, the FIN stamp,
    * the User-Agent capture and the park kind. Written under this entry's lock:
@@ -1110,6 +1114,25 @@ struct proxy_fd_ent {
   uint64_t hc_first_write_ns;
   uint64_t hc_last_write_ns;
   uint64_t hc_max_gap_ns;
+
+  /* Half-close hold on the CLIENT entry (sockproxy_hold.c). Unlike the hc_*
+   * fields above, which only feed metrics, these decide what happens to the
+   * connection. Read the hold itself through sp_eof_held().
+   *
+   * All atomic, accessed relaxed: the client's worker writes them - under
+   * this entry's lock, or from the backend's worker, which is pinned to the
+   * same thread - and the 1 Hz health pass reads them holding PROXY_LOCK
+   * only. The one ordering: a hold is published by storing eof_hold last,
+   * with release, and the health pass takes an acquire fence once it reads
+   * one as held. */
+  _Atomic uint8_t  eof_hold;          // held on EOF: FIN read, kept open for an owed answer
+  _Atomic uint8_t  cresp_answer_open; // the response framer is inside an answer (1xx excluded)
+  _Atomic uint8_t  hold_answer_began; // an answer to the held request has begun
+  _Atomic uint8_t  hold_end;          // enum sp_hold_end; the first reason recorded wins
+  _Atomic uint32_t hold_leg_ended;    // requests framed when the answer's leg ended, plus one (0: none)
+  _Atomic uint64_t hold_start_ns;     // when the hold began (the FIN was read)
+  _Atomic uint64_t hold_handoff_ns;   // when the request was known to have reached the backend
+  _Atomic uint64_t hold_progress_ns;  // last successful write of the answer to the client
 
   // sockmap peer_map ownership (HAVE_SOCKOPS). Set on the BACKEND pfe by
   // setup_proxy_path once the client<->backend pairing is decided.
@@ -1570,6 +1593,19 @@ struct proxy_fd_ent {
 };
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 
+/* Whether this client is held on EOF (sockproxy_hold.c): its FIN has been read
+ * and it is being kept open for an answer still owed. Every place that treats
+ * a held client differently asks this and nothing else, so they cannot
+ * disagree. A client whose FIN was only seen as RDHUP while its reads were
+ * paused, and not yet read, is not held on EOF. Inline: the notifier asks it
+ * on every event and every arming. */
+static inline int
+sp_eof_held(const proxy_fd_ent_t *pfe)
+{
+  return pfe && pfe->odir == 0 &&
+         atomic_load_explicit(&pfe->eof_hold, memory_order_relaxed);
+}
+
 /* The receive buffer is recycled (sockproxy_rcvbuf.h): its next user gets the
  * span this one wrote zeroed, and nothing more, so every site that writes
  * into rcvbuf past the current offset records how far it got. */
@@ -1933,6 +1969,9 @@ struct proxy_arg {
   // P/D Disaggregation configuration
   uint8_t  pd_disagg_mode;          // 1=P/D mode enabled
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
+  // Half-close hold mode, same hop as the admission fields: enum
+  // sp_hold_mode (0 = the process default).
+  uint8_t  half_close_mode;
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
   // SGLang bootstrap port on prefill EPs (0 ⇒ PD_SG_BOOTSTRAP_PORT_DFL at

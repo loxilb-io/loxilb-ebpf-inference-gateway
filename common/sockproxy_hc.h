@@ -66,7 +66,7 @@ void hc_tls_read_failed(struct proxy_fd_ent *client, int ssl_err, int rval, int 
 
 /* A client connection was reset (read error or pending socket error). */
 void hc_client_reset_seen(struct proxy_fd_ent *client);
-void hc_client_reset_check(struct proxy_fd_ent *client);
+int hc_client_reset_check(struct proxy_fd_ent *client);   /* returns the error read */
 
 /* An answer began (response framer, client's lock held) or ended (the framer
  * under the same lock, or a backend's close without it). Interim responses

@@ -44,6 +44,7 @@
 #include "sockproxy_cache.h"
 #include "sockproxy_conn.h"
 #include "sockproxy_hc.h"
+#include "sockproxy_hold.h"
 #ifdef HAVE_HTTP_TRACE
 #include "lxb_trace_event.h"
 #include "sockproxy_trace.h"
@@ -180,7 +181,7 @@ proxy_add_xmitcache(proxy_fd_ent_t *ent, uint8_t *cache, size_t len)
 
   // Enable EPOLLOUT AFTER releasing lock (prevents deadlock)
   if (need_epollout) {
-    notify_add_ent(proxy_struct->ns, ent->fd,
+    sp_notify_arm(proxy_struct->ns, ent->fd,
         NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, ent, ent->gen);
   }
 
@@ -302,7 +303,7 @@ proxy_check_release_backpressure(proxy_fd_ent_t *ent)
         // Always re-enable reading, regardless of read_paused flag
         // This ensures data flow resumes even if pause flag got out of sync
         source_pfe->read_paused = 0;
-        notify_add_ent(proxy_struct->ns, source_pfe->fd,
+        sp_notify_arm(proxy_struct->ns, source_pfe->fd,
                       NOTI_TYPE_IN|NOTI_TYPE_HUP, source_pfe, source_pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_warn("[BACKPRESSURE_RESUME_SOURCE] src_fd=%d (odir=%d) → dst_fd=%d (odir=%d): "
@@ -347,7 +348,9 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
   // CRITICAL FIX: Timeout enforcement for graceful shutdown
   // If peer EOF was set more than 30 seconds ago, force close to prevent indefinite hang
   #define GRACEFUL_SHUTDOWN_TIMEOUT 30
-  if (ent->peer_eof && ent->eof_timestamp > 0) {
+  /* Not for a held client: its bound is the hold's own idle bound, checked by
+   * the health pass, and a peer_eof set behind it must not cut it at 30 s. */
+  if (ent->peer_eof && ent->eof_timestamp > 0 && !sp_eof_held(ent)) {
     time_t now = time(NULL);
     time_t elapsed = now - ent->eof_timestamp;
 
@@ -393,19 +396,21 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         // which corrupts chunked transfer encoding.
         // The flag will be cleared on successful completion (line 748) or fatal error.
 
+        sp_hold_peer_error(ent, errno);
         PROXY_ENT_CUNLOCK(ent);
 
         // CRITICAL FIX: Re-register EPOLLOUT for plaintext EAGAIN
         // Without this, socket will never wake up to retry cache drain
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
           log_debug("🔄 [EPOLLOUT_REREGISTER] fd=%d: Re-registering EPOLLOUT for plaintext EAGAIN", ent->fd);
-          notify_add_ent(proxy_struct->ns, ent->fd,
+          sp_notify_arm(proxy_struct->ns, ent->fd,
                         NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, ent, ent->gen);
         }
 
         return -1;
       }
       hc_prog_write(ent);
+      sp_hold_progress(ent);
       if (n != curr->len) {
         curr->off += n;
         curr->len -= n;
@@ -454,7 +459,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
           }
 
           PROXY_ENT_CUNLOCK(ent);
-          notify_add_ent(proxy_struct->ns, ent->fd,
+          sp_notify_arm(proxy_struct->ns, ent->fd,
             NOTI_TYPE_IN|NOTI_TYPE_HUP|NOTI_TYPE_OUT, ent, ent->gen);
           return -1;
         case SSL_ERROR_WANT_READ:
@@ -467,7 +472,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
           // CRITICAL FIX: Register EPOLLIN to wake up when SSL can read
           // SSL_ERROR_WANT_READ means SSL needs to read before it can write (e.g., renegotiation)
           log_debug("🔄 [EPOLLIN_REGISTER] fd=%d: SSL_ERROR_WANT_READ - registering EPOLLIN for renegotiation", ent->fd);
-          notify_add_ent(proxy_struct->ns, ent->fd,
+          sp_notify_arm(proxy_struct->ns, ent->fd,
                         NOTI_TYPE_IN|NOTI_TYPE_HUP, ent, ent->gen);
 
           return -1;
@@ -497,6 +502,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
       }
       
       hc_prog_write(ent);
+      sp_hold_progress(ent);
       // CRITICAL FIX: Handle partial writes for SSL (same as plaintext path)
       if (n != curr->len) {
         curr->off += n;
@@ -565,7 +571,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
           if (source_pfe->odir == target_odir && 
               (source_pfe->rfd_ent[0] == ent || source_pfe->rfd_ent[1] == ent)) {
             source_pfe->read_paused = 0;
-            notify_add_ent(proxy_struct->ns, source_pfe->fd,
+            sp_notify_arm(proxy_struct->ns, source_pfe->fd,
                           NOTI_TYPE_IN|NOTI_TYPE_HUP, source_pfe, source_pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
             log_warn("🔓 [FORCE_RESUME_SOURCE] fd=%d: Force re-enabled EPOLLIN on source after full cache drain",
@@ -585,6 +591,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
   /* Drained to empty: a response the framer saw end has now reached the
    * client's socket. The caller holds the entry's lock. */
   hc_prog_settled(ent);
+  sp_hold_handoff(ent);   /* a backend's cache: the request has reached it */
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
   log_debug("✅ [DRAIN_FLAG_CLEAR] fd=%d: cache_draining=0 (drain completed successfully)",
@@ -627,8 +634,16 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
       }
 #endif
 
-      // CRITICAL FIX: Check if peer closed and we should now close gracefully
-      if (ent->peer_eof) {
+      if (sp_eof_held(ent)) {
+        /* A held client closes on the hold's own terms: once nothing is owed,
+         * or once the leg carrying the answer has ended - never on a bare
+         * peer_eof, which a leg that sends nothing to the client can set. */
+        if (sp_hold_settle(ent)) {
+          shutdown(ent->fd, SHUT_RDWR);
+          return -1;
+        }
+      } else if (ent->peer_eof) {
+        // CRITICAL FIX: the peer closed; close gracefully now the cache is out
         log_info("✅ [GRACEFUL_CLOSE] fd=%d: Cache drained after peer EOF - closing connection gracefully",
                  ent->fd);
 
@@ -639,7 +654,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         return -1;
       }
 
-      notify_add_ent(proxy_struct->ns, ent->fd,
+      sp_notify_arm(proxy_struct->ns, ent->fd,
             NOTI_TYPE_IN|NOTI_TYPE_HUP, ent, ent->gen);
 
 #if defined(HAVE_SOCKOPS)
@@ -654,7 +669,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("📬 [CACHE_NOT_EMPTY] fd=%d: Cache partially drained, keeping EPOLLOUT monitoring", ent->fd);
 #endif
-      notify_add_ent(proxy_struct->ns, ent->fd,
+      sp_notify_arm(proxy_struct->ns, ent->fd,
             NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP, ent, ent->gen);
     }
   }

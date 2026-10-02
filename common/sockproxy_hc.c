@@ -353,8 +353,9 @@ hc_client_reset_seen(proxy_fd_ent_t *c)
 
 /* A reset that arrived while nothing was reading (reads paused or disarmed)
  * is only visible as the socket's pending error when the connection is torn
- * down. Reading it clears it; nothing reads it after this. */
-void
+ * down. Reading it clears it, so the value read is returned for the caller
+ * to hand on (the half-close hold reads EPIPE from it); 0 when not read. */
+int
 hc_client_reset_check(proxy_fd_ent_t *c)
 {
   int err = 0;
@@ -362,11 +363,15 @@ hc_client_reset_check(proxy_fd_ent_t *c)
 
   if (!hc_is_client(c) || c->stype != PROXY_SOCK_ACTIVE || c->fd <= 0 ||
       (c->hc_counted & HC_COUNTED_RESET)) {
-    return;
+    return 0;
   }
-  if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == ECONNRESET) {
+  if (getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
+    return 0;
+  }
+  if (err == ECONNRESET) {
     hc_client_reset_seen(c);
   }
+  return err;
 }
 
 /* ---- response progress ---------------------------------------------------- */

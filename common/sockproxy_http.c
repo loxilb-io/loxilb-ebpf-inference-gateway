@@ -78,6 +78,7 @@
 #include "sockproxy_teardown_settle.h"
 #include "sockproxy_ka_leg.h"
 #include "sockproxy_hc.h"         /* half-close observation hooks */
+#include "sockproxy_hold.h"       /* half-close hold: sp_notify_arm */
 /* pure HTTP-message-end detector (chunked "0\r\n\r\n" /
  * SSE "[DONE]") shared with the unit TU. Included AFTER sockproxy.h so the real
  * `struct proxy_fd_ent` is in scope (the helper takes a proxy_fd_ent* in
@@ -1378,7 +1379,9 @@ skip_deferred_masking:
 
     // DEFENSIVE: Check if peer connection is being torn down (EOF deferred)
     // Avoid processing data on connections marked for closure
-    if (rfd_ent->peer_eof) {
+    /* Not for a held client: whatever set its peer_eof, the bytes coming its
+     * way are its answer, and the caller drops what this path skips. */
+    if (rfd_ent->peer_eof && !sp_eof_held(rfd_ent)) {
       log_trace("[PEER_EOF_SKIP] fd=%d: Peer marked for EOF, skipping processing", rfd_ent->fd);
       PROXY_ENT_UNLOCK(rfd_ent);
       return 0;  // Skip processing but don't error
@@ -2513,6 +2516,7 @@ skip_deferred_masking:
     if (n != len) {
       if (n > 0) {
         hc_prog_write(rfd_ent);
+        sp_hold_progress(rfd_ent);
         pfe_ent_accouting(rfd_ent, n, 1);
         if (!sel) {
           if (proxy_add_xmitcache(rfd_ent, (uint8_t *)(msg) + n, len - n) < 0) {
@@ -2535,6 +2539,7 @@ skip_deferred_masking:
           PROXY_ENT_UNLOCK(rfd_ent);
           return 0;
         }
+        sp_hold_peer_error(rfd_ent, errno);
         PROXY_ENT_UNLOCK(rfd_ent);
         return -1;
       }
@@ -2543,6 +2548,10 @@ skip_deferred_masking:
     /* The whole message went out directly, so the cache is empty. */
     hc_prog_write(rfd_ent);
     hc_prog_settled(rfd_ent);
+    sp_hold_progress(rfd_ent);
+    if (sp_hold_settle(rfd_ent)) {
+      shutdown(rfd_ent->fd, SHUT_RDWR);   /* the held client's answer is out */
+    }
     pfe_ent_accouting(rfd_ent, n, 1);
     PROXY_ENT_UNLOCK(rfd_ent);
   }
@@ -2657,6 +2666,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * same way: they may change at runtime, entries waiting keep
          * their order. */
         sp_fc_apply_rule(tepval, arg, new_ent, 0);
+        tepval->hold_mode = arg->half_close_mode;   /* new holds only; held ones stay */
         sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
@@ -2797,6 +2807,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         fc_set_wake_hook(sp_fc_wake);
         fc_state_init(&tepval->fc);
         sp_fc_apply_rule(tepval, arg, new_ent, 1);
+        tepval->hold_mode = arg->half_close_mode;
         /* allocate radix trie for Tier 1 cache affinity */
         if (tepval->pd_cache_aware_mode) {
           tepval->pd_trie = pd_trie_create();
@@ -3254,6 +3265,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   fc_set_wake_hook(sp_fc_wake);
   fc_state_init(&tepval->fc);
   sp_fc_apply_rule(tepval, arg, new_ent, 1);
+  tepval->hold_mode = arg->half_close_mode;
   /* allocate radix trie for Tier 1 cache affinity */
   if (tepval->pd_cache_aware_mode) {
     tepval->pd_trie = pd_trie_create();
@@ -4022,7 +4034,7 @@ qos_park_reader(struct proxy_qos_bucket *b, proxy_fd_ent_t *pfe, int fd)
   pfe->read_paused = 1;
   pfe->qos_park_ns = qos_now_ns();
   atomic_fetch_add_explicit(&b->parks, 1, memory_order_relaxed);
-  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
   return 0;
 }
 
@@ -4072,7 +4084,7 @@ qos_resume_reader(int fd, proxy_fd_ent_t *pfe)
   pfe->qos_park_ns = 0;
   pfe->qos_parked = 0;
   pfe->read_paused = 0;
-  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
   return 1;
 }
 
@@ -5344,7 +5356,7 @@ proxy_pdestroy(void *priv)
 
   /* A client reset that arrived while its reads were paused or disarmed is
    * visible only here, as the socket's pending error. */
-  hc_client_reset_check(pfe);
+  sp_hold_peer_error(pfe, hc_client_reset_check(pfe));
 
   // Log sticky session cleanup
   if (pfe->is_sticky && pfe->session_key[0] != '\0') {
@@ -5776,6 +5788,9 @@ proxy_pdestroy(void *priv)
           continue;
         }
         PROXY_ENT_LOCK(cpfe);
+        /* The leg carrying this client's answer is going: a held client then
+         * closes once its cache is out, whatever is still owed. */
+        sp_hold_leg_ended(cpfe, pfe);
         if (cpfe->fd > 0 && cpfe->cache_head && !cpfe->ssl_err) {
           if (!cpfe->peer_eof) {
             cpfe->peer_eof = 1;
@@ -5803,9 +5818,9 @@ proxy_pdestroy(void *priv)
             pfe->n_rfd--;
           }
           /* Keep the drain moving: the cache flushes on client EPOLLOUT. */
-          notify_add_ent(proxy_struct->ns, cpfe->fd,
-                         NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP,
-                         cpfe, cpfe->gen);
+          sp_notify_arm(proxy_struct->ns, cpfe->fd,
+                        NOTI_TYPE_IN|NOTI_TYPE_OUT|NOTI_TYPE_HUP,
+                        cpfe, cpfe->gen);
         }
         PROXY_ENT_UNLOCK(cpfe);
       }
@@ -6783,6 +6798,19 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
           return 1;
         }
 
+        /* The same half-close where the proxy relays the answer itself: owed
+         * an answer it can follow (plaintext, the kernel never given a
+         * direction, the rule's mode set to hold), the client is kept open
+         * until the answer is out (sockproxy_hold.c). The two branches never
+         * both apply - the one above needs the response direction in the
+         * kernel - and this one comes second so that one reads as today's
+         * path. It comes before the peer-cache block below: that block marks
+         * the backend leg to close once a request still draining to it is
+         * out, which would take away the leg the answer comes on. */
+        if (pfe->odir == 0 && sp_hold_eof(pfe)) {
+          return 1;
+        }
+
         /* A response framed by nothing but this EOF is complete now. No lock:
          * the counter it touches is written only from this connection's backend
          * worker — here and from the relay, which runs on that same worker and
@@ -6795,6 +6823,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             !pfe->pd_sg_drain &&
             pfe->rfd_ent[0]->pd_phase != PD_PHASE_PREFILL_WAITING) {
           cresp_note_backend_eof(pfe->rfd_ent[0]);
+          sp_hold_leg_ended(pfe->rfd_ent[0], pfe);
         }
 
         // Check if peer connection still has data to send
@@ -6990,7 +7019,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
 #endif
         log_trace("ssl-want-wr %s",
           ERR_error_string(ERR_get_error(), NULL));
-        notify_add_ent(proxy_struct->ns, pfe->fd,
+        sp_notify_arm(proxy_struct->ns, pfe->fd,
               NOTI_TYPE_IN|NOTI_TYPE_HUP|NOTI_TYPE_OUT, pfe, pfe->gen);
         return 1;
       case SSL_ERROR_ZERO_RETURN:
@@ -7285,7 +7314,19 @@ setup_proxy_leg_accel(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe,
   if (protocol == IPPROTO_TCP && epprotocol == IPPROTO_TCP) {
     // Case 1: HTTP→HTTP (plaintext only) - SOCKMAP ENABLED
     if (!pfe->ssl && !ssl) {
-      sockmap_eligible = 1;
+#if defined(HAVE_SOCKOPS)
+      uint8_t accel_mode = tepval ? tepval->sockmap_en : ent->val.sockmap_en;
+#else
+      uint8_t accel_mode = ent->val.sockmap_en;
+#endif
+      /* Under a hold-mode rule, a client that has already sent its FIN is not
+       * paired (sp_hold_pairing_allowed). Asked only where a pair could be
+       * installed, so other rules pay nothing for it. The rule's mode is read
+       * from tepval, not pfe->epv: on a connection's first leg the client's
+       * epv is set only after this runs. */
+      sockmap_eligible = !accel_mode ||
+                         sp_hold_pairing_allowed(pfe, tepval ? tepval :
+                                                      (proxy_epval_t *)pfe->epv);
     }
     // Case 2: HTTPS→HTTP (TLS termination) - SOCKMAP DISABLED, kTLS ONLY
     else if (pfe->ssl && !ssl && g_ktls_cfg.enabled) {
@@ -7524,7 +7565,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
   if (psep_rc == PD_SETUP_PARKED) {
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
-      notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
     }
     pfe->pd_phase = PD_PHASE_PARKED;
     hc_note_park(pfe, HC_ENTRY_SETUP_PARK);
@@ -7814,7 +7855,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
      * the admission park uses). */
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
-      notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
     }
     pfe->connect_wait = 1;
     return SP_SETUP_CONNECTING;
@@ -8108,7 +8149,7 @@ sp_fc_h1_park(proxy_fd_ent_t *pfe)
 {
   if (!pfe->read_paused) {
     pfe->read_paused = 1;
-    notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+    sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_HUP, pfe, pfe->gen);
   }
   pfe->pd_phase = PD_PHASE_PARKED;
   hc_note_park(pfe, HC_ENTRY_FC_PARK);
@@ -9494,6 +9535,7 @@ cresp_on_headers_complete(llhttp_t *parser)
     return 0;
   }
   hc_resp_headers(pfe);
+  sp_hold_answer_began(pfe);
   /* A response with neither Content-Length nor chunked framing runs until the
    * backend closes, so its completion arrives as that EOF rather than from
    * llhttp. Record it now, while the flags are the ones for this message. */
@@ -9519,6 +9561,7 @@ cresp_on_message_complete(llhttp_t *parser)
     atomic_fetch_add_explicit(&pfe->cresp_completed, 1, memory_order_relaxed);
     atomic_store_explicit(&pfe->cresp_unframed, 0, memory_order_relaxed);
     hc_resp_done(pfe);
+    sp_hold_answer_ended(pfe);
   }
   return 0;
 }
@@ -9594,6 +9637,7 @@ cresp_note_backend_eof(proxy_fd_ent_t *client)
   if (atomic_exchange_explicit(&client->cresp_unframed, 0, memory_order_relaxed)) {
     atomic_fetch_add_explicit(&client->cresp_completed, 1, memory_order_relaxed);
     hc_resp_done(client);
+    sp_hold_answer_ended(client);
   }
 }
 
@@ -10348,7 +10392,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
 
   // Register with notification system (with retry for fd mapping)
   for (retry = 0; retry < PROXY_MAPFD_RETRIES; retry++) {
-    if (notify_add_ent(proxy_struct->ns, new_sd,
+    if (sp_notify_arm(proxy_struct->ns, new_sd,
             NOTI_TYPE_IN|NOTI_TYPE_HUP, npfe1, npfe1->gen) == 0)  {
       break;
     }
@@ -11022,7 +11066,7 @@ pd_resume_parked(int fd)
 
   /* Un-pause + re-arm EPOLLIN|HUP, capturing the CURRENT gen (gen-guard preserved). */
   pfe->read_paused = 0;
-  notify_add_ent(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, pfe->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
 
   /* A request parked by the capacity gate: its turn came (a unit was
    * released and its entry popped). The wait is recorded and the permit
@@ -11147,12 +11191,12 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
   setup_proxy_leg_accel(&key, &rkey, client, pfe, ent, epv, protocol, epprotocol);
 
   /* Relay events from here on; same priv, so the mask is updated in place. */
-  notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
+  sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_IN | NOTI_TYPE_HUP, pfe, pfe->gen);
 
   client->connect_wait = 0;
   client->read_paused = 0;
-  notify_add_ent(proxy_struct->ns, client->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
-                 client, client->gen);
+  sp_notify_arm(proxy_struct->ns, client->fd, NOTI_TYPE_IN | NOTI_TYPE_HUP,
+                client, client->gen);
 
   /* The held request rides the leg just wired: no re-selection. */
   client->ka_keep_leg = 1;
@@ -11235,7 +11279,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     // Without this, epoll keeps firing because the EPOLLIN event is never consumed
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
-      notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_HUP, pfe, pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_warn("[BACKPRESSURE_PAUSE_READ] fd=%d (odir=%d): DISABLED EPOLLIN due to destination backpressure | "
                "This will BLOCK data flow until cache drains below %.2f MB",
@@ -11253,7 +11297,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     // Tier-1 shaper: a QoS park is released only by the refill wake.
     if (pfe->read_paused && !pfe->qos_parked) {
       pfe->read_paused = 0;
-      notify_add_ent(proxy_struct->ns, fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, pfe, pfe->gen);
+      sp_notify_arm(proxy_struct->ns, fd, NOTI_TYPE_IN|NOTI_TYPE_HUP, pfe, pfe->gen);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_warn("[BACKPRESSURE_RESUME_READ] fd=%d (odir=%d): RE-ENABLED EPOLLIN after backpressure cleared",
                fd, pfe->odir);

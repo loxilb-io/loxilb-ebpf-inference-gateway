@@ -58,6 +58,7 @@
 #include "sockproxy_connect.h"
 #include "sockproxy_cache.h"
 #include "sockproxy_hc.h"
+#include "sockproxy_hold.h"
 #include "sockproxy_lb.h"
 #include "sockproxy_h2_load.h"
 #include "sockproxy_routing.h"
@@ -1304,6 +1305,9 @@ pfe_recycle(proxy_fd_ent_t *pfe)
               (unsigned long)atomic_load_explicit(&pfe->gen, memory_order_relaxed));
     return;
   }
+  /* Every connection's shell comes back here, whichever path tore it down,
+   * so a hold is counted here exactly once. */
+  sp_hold_retire(pfe);
   pfe_trace_op("rec", pfe->head, pfe);
   if (pfe->fdlist_rule) {
     /* Every release unlinks before it recycles; a shell that reaches the
