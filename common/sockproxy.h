@@ -1122,7 +1122,9 @@ struct proxy_fd_ent {
    * All atomic, accessed relaxed: the client's worker writes them - under
    * this entry's lock, or from the backend's worker, which is pinned to the
    * same thread - and the 1 Hz health pass reads them holding PROXY_LOCK
-   * only. */
+   * only. The one ordering: a hold is published by storing eof_hold last,
+   * with release, and the health pass takes an acquire fence once it reads
+   * one as held. */
   _Atomic uint8_t  eof_hold;          // held on EOF: FIN read, kept open for an owed answer
   _Atomic uint8_t  cresp_answer_open; // the response framer is inside an answer (1xx excluded)
   _Atomic uint8_t  hold_answer_began; // an answer to the held request has begun

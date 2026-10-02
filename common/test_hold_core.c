@@ -158,6 +158,12 @@ test_expired(void)
   assert(!sp_hold_expired(t0 - SEC, t0, 0, 0, cap));
   assert(!sp_hold_expired(t0, t0, t0 + SEC, 0, cap));
 
+  /* A hold not yet seen to begin is never expired, however late the clock:
+   * its age would otherwise be counted from 0. */
+  assert(!sp_hold_expired(t0 + 4 * cap, 0, 0, 0, cap));
+  assert(!sp_hold_expired(t0 + 4 * cap, 0, t0, 0, cap));
+  assert(!sp_hold_expired(t0 + 4 * cap, 0, 0, t0, cap));
+
   /* The bound's limits. */
   assert(sp_hold_expired(t0 + SP_HOLD_CAP_MIN_SEC * SEC, t0, 0, 0,
                          SP_HOLD_CAP_MIN_SEC * SEC));

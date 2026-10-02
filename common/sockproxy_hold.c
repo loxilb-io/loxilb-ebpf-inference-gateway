@@ -163,7 +163,6 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
 
   now = hold_now_ns();
   PROXY_ENT_LOCK(pfe);
-  atomic_store_explicit(&pfe->eof_hold, 1, memory_order_relaxed);
   atomic_store_explicit(&pfe->hold_start_ns, now, memory_order_relaxed);
   /* An answer already under way when the FIN came (the client half-closed
    * after the first bytes) is progress from the start. */
@@ -175,6 +174,9 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
   atomic_store_explicit(&pfe->hold_handoff_ns,
                         (be->cache_head == NULL && !be->cache_draining) ? now : 0,
                         memory_order_relaxed);
+  /* Last, and released: the health pass reads the hold without this entry's
+   * lock, and must not find it held with the fields above still unset. */
+  atomic_store_explicit(&pfe->eof_hold, 1, memory_order_release);
   /* We will not read from this client again; its write side stays open for
    * the answer. Armed for OUT only while something is waiting to be written. */
   shutdown(pfe->fd, SHUT_RD);
@@ -371,6 +373,9 @@ sp_hold_sweep(void)
       if (!sp_eof_held(pfe)) {
         continue;
       }
+      /* Pairs with the release that published the hold: its fields are
+       * set by the time it reads as held. */
+      atomic_thread_fence(memory_order_acquire);
       if (release) {
         if (hold_record_end(pfe, SP_HOLD_END_RELEASED)) {
           log_info("[HOLD] fd=%d: released by the operator, closing", pfe->fd);
@@ -397,7 +402,7 @@ sp_hold_sweep(void)
         }
         continue;
       }
-      if (now > start && now - start > oldest) {
+      if (start && now > start && now - start > oldest) {
         oldest = now - start;
       }
     }

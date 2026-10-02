@@ -142,13 +142,18 @@ sp_hold_end_at_release(enum sp_hold_end recorded, int owed, int leg_ended)
  * expires when nothing has been written to the client for cap_ns since the
  * later of the request reaching the backend and the last successful write.
  * Until the request is known to have reached the backend, the clock starts at
- * the hold itself, so a hold whose request never leaves is still bounded. */
+ * the hold itself, so a hold whose request never leaves is still bounded.
+ * A hold whose start reads 0 has not been seen to begin: never expired, or a
+ * reader that caught it being set up would count its age from 0. */
 static inline int
 sp_hold_expired(uint64_t now_ns, uint64_t start_ns, uint64_t handoff_ns,
                 uint64_t progress_ns, uint64_t cap_ns)
 {
   uint64_t base = handoff_ns ? handoff_ns : start_ns;
 
+  if (!start_ns) {
+    return 0;
+  }
   if (progress_ns > base) {
     base = progress_ns;
   }
