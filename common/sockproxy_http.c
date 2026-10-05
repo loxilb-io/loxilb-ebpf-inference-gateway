@@ -2667,6 +2667,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * their order. */
         sp_fc_apply_rule(tepval, arg, new_ent, 0);
         tepval->hold_mode = arg->half_close_mode;   /* new holds only; held ones stay */
+        /* The prefill timeout follows a rule update too: the reaper reads it
+         * on every tick, so requests already waiting get the new value. */
+        tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
         sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
@@ -2766,6 +2769,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         }
         tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
                                     arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
+        /* Per-rule prefill timeout: copied as given, 0 included, so a rule
+         * that drops the argument goes back to the process default on the
+         * live endpoint value. The reaper resolves 0 on every tick. */
+        tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
 
         // US-PD801: P/D Cache-Aware Routing configuration
         tepval->pd_kv_params_max = arg->pd_kv_params_max;
@@ -3218,6 +3225,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   }
   tepval->pd_bootstrap_port = arg->pd_bootstrap_port ?
                               arg->pd_bootstrap_port : PD_SG_BOOTSTRAP_PORT_DFL;
+  /* Per-rule prefill timeout — mirrors the update-existing-tepval branch. */
+  tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
 
   // US-PD801: P/D Cache-Aware Routing configuration
   tepval->pd_kv_params_max = arg->pd_kv_params_max;

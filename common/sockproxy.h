@@ -624,7 +624,9 @@ typedef struct proxy_epval {
   int      n_prefill_eps;          // Count of prefill endpoints
   int      n_decode_eps;           // Count of decode endpoints
   // P/D timeout configuration
-  uint32_t pd_prefill_timeout_sec;  // Prefill response timeout (0 = default 30s)
+  uint32_t pd_prefill_timeout_sec;  /* Prefill response timeout, stamped from the rule at
+                                       proxy_add (0 = process default: 30s or
+                                       LLB_PD_PREFILL_TIMEOUT_SEC) */
   uint32_t pd_decode_timeout_sec;   /* decode stream timeout (0 = use 120s default) */
   uint32_t pd_idle_cap_sec;         /* generic ESTABLISHED-idle P/D reaper cap
                                        (0 = default max(prefill,decode)+slack) */
@@ -1978,6 +1980,10 @@ struct proxy_arg {
   // proxy_add). The nat2proxy hop of the additive chain
   // (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
   uint16_t pd_bootstrap_port;
+  // Per-rule prefill response timeout in seconds (0 ⇒ the process default).
+  // Same hop of the same chain; proxy_add copies it into the endpoint value
+  // the reaper reads.
+  uint16_t pd_prefill_timeout_sec;
   uint8_t  ep_role[MAX_PROXY_EP];  // Per-endpoint role: 0=normal, 1=prefill, 2=decode
 
   // P/D Cache-Aware Routing configuration (US-PD801)

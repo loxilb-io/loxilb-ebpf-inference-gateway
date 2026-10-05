@@ -1107,7 +1107,12 @@ struct dp_proxy_tacts {
   // it per-flow in dp_nat_act.polid so established packets keep policing after the
   // nat_map lookup stops running for the flow.
   uint16_t polid;
-  uint16_t pad3d;                     // Remaining padding (keeps struct 8-byte aligned)
+  // Per-rule P/D prefill response timeout in SECONDS (0 ⇒ the process default:
+  // 30 s, or LLB_PD_PREFILL_TIMEOUT_SEC). Meaningful only when pd_disagg_mode=1
+  // — the Go control plane rejects it on every other rule and bounds it to
+  // 3600. Takes the LAST TWO bytes of the former pad3d(4) — offsets and total
+  // size unchanged, the _Static_asserts below stay as-is (same idiom as polid).
+  uint16_t pd_prefill_timeout_sec;
   // TLS-hardening scalars ( version/cipher pinning, HSTS, backend
   // certIds). Additive + default-off (0/empty ⇒ today's behaviour, -COMPAT). Copied verbatim
   // into the proxy_arg fields added by llb_conv_nat2proxy. Consumed only on the L7_Proxy
