@@ -1161,8 +1161,10 @@ struct dp_proxy_tacts {
   // The admission headers on admitted responses: 0 inherits, 1 off, 2 on.
   // The next byte of the same padding.
   uint8_t  fc_expose_headers;
-  // Holding a client that half-closed after its request: 0 inherits, 1 off,
-  // 2 hold (enum sp_hold_mode). The next byte of the same padding.
+  // Holding a client that half-closed after its request: 0 takes the
+  // process default, 1 off, 2 hold (enum sp_hold_mode). The control plane
+  // sends 1 for a rule that cannot take hold. The next byte of the same
+  // padding.
   uint8_t  half_close_mode;
   uint8_t  fc_pad3[1];
 #ifdef HAVE_MTLS

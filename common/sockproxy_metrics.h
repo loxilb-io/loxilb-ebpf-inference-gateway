@@ -181,8 +181,9 @@ typedef struct proxy_metrics_snapshot {
     /* Half-close hold (sockproxy_hold.c): gauges (held now, age of the oldest
      * in ms, the switch, the bound in s) and counters. hold_ended is by enum
      * sp_hold_end, hold_expired by [answer had begun][enum hc_stream].
-     * TAIL-APPEND ONLY — same three-way lockstep contract as the blocks
-     * above. */
+     * hold_default_mode is the mode a rule that leaves its own unset gets
+     * (enum sp_hold_mode: off or hold). TAIL-APPEND ONLY — same three-way
+     * lockstep contract as the blocks above. */
     uint64_t hold_held;
     uint64_t hold_oldest_ms;
     uint64_t hold_allowed;
@@ -194,6 +195,7 @@ typedef struct proxy_metrics_snapshot {
     uint64_t hold_reentry;
     uint64_t hold_empty_out;
     uint64_t hold_accel_skipped;
+    uint64_t hold_default_mode;
 } proxy_metrics_snapshot_t;
 
 /* =========================================================================
