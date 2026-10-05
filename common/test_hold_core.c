@@ -72,6 +72,30 @@ test_decide(void)
 }
 
 static void
+test_mode_in_force(void)
+{
+  /* A rule that leaves its mode unset gets the process default. */
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_UNSET, SP_HOLD_MODE_OFF) == SP_HOLD_MODE_OFF);
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_UNSET, SP_HOLD_MODE_HOLD) == SP_HOLD_MODE_HOLD);
+
+  /* Its own value wins either way: the default never turns an explicit off
+   * into a hold, nor a hold off. */
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_OFF, SP_HOLD_MODE_HOLD) == SP_HOLD_MODE_OFF);
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_HOLD, SP_HOLD_MODE_OFF) == SP_HOLD_MODE_HOLD);
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_HOLD, SP_HOLD_MODE_HOLD) == SP_HOLD_MODE_HOLD);
+
+  /* A default that is not hold is off, unset included. */
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_UNSET, SP_HOLD_MODE_UNSET) == SP_HOLD_MODE_OFF);
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_UNSET, SP_HOLD_MODE_MAX) == SP_HOLD_MODE_OFF);
+
+  /* A rule byte the control plane never sends holds nothing, whatever the
+   * default. */
+  assert(sp_hold_mode_in_force(SP_HOLD_MODE_MAX, SP_HOLD_MODE_HOLD) == SP_HOLD_MODE_OFF);
+  assert(sp_hold_mode_in_force(0xff, SP_HOLD_MODE_HOLD) == SP_HOLD_MODE_OFF);
+  printf("  mode in force: ok\n");
+}
+
+static void
 test_settle(void)
 {
   /* Nothing closes while the cache still holds bytes ahead of the end. */
@@ -217,6 +241,7 @@ main(void)
 {
   printf("test_hold_core:\n");
   test_decide();
+  test_mode_in_force();
   test_settle();
   test_leg_ended();
   test_end_at_release();
