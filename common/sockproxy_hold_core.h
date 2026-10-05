@@ -25,13 +25,27 @@
 #define SP_HOLD_CAP_MAX_SEC     3600
 
 /* A rule's half-close mode, as the control plane hands it over. Unset falls
- * back to the process default, which is off until a default can be set. */
+ * back to the process default (off unless the control plane sets it to
+ * hold); the control plane sends off, never unset, for a rule that cannot
+ * take hold, so the default only reaches the rules it may. */
 enum sp_hold_mode {
   SP_HOLD_MODE_UNSET = 0,
   SP_HOLD_MODE_OFF,
   SP_HOLD_MODE_HOLD,        /* hold a client that half-closed after its request */
   SP_HOLD_MODE_MAX
 };
+
+/* The mode in force for a rule: its own, or the process default for a rule
+ * that leaves it unset. A value the control plane never sends is off: a
+ * hold is never taken on a byte nobody meant. */
+static inline enum sp_hold_mode
+sp_hold_mode_in_force(uint8_t rule_mode, uint8_t default_mode)
+{
+  if (rule_mode == SP_HOLD_MODE_UNSET) {
+    return default_mode == SP_HOLD_MODE_HOLD ? SP_HOLD_MODE_HOLD : SP_HOLD_MODE_OFF;
+  }
+  return rule_mode == SP_HOLD_MODE_HOLD ? SP_HOLD_MODE_HOLD : SP_HOLD_MODE_OFF;
+}
 
 /* Why a hold ended. The first reason recorded wins; a hold that ends with
  * none recorded is classified when its connection is released. */

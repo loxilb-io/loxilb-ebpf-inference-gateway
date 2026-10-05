@@ -53,9 +53,12 @@
 
 /* Process-wide settings, written by the control plane. A new hold needs the
  * switch on; turning it off stops new holds and leaves the held ones to finish
- * (the release action is what ends those). */
+ * (the release action is what ends those). The default mode is what a rule
+ * that leaves its own unset gets: changing it applies to every such rule at
+ * once, for new holds only. */
 static _Atomic uint32_t hold_allowed = 1;
 static _Atomic uint32_t hold_cap_sec = SP_HOLD_CAP_DEFAULT_SEC;
+static _Atomic uint32_t hold_default_mode = SP_HOLD_MODE_OFF;
 static _Atomic uint32_t hold_release_req;
 
 static struct {
@@ -69,6 +72,17 @@ static struct {
   _Atomic uint64_t empty_out;                   /* a held client woke for OUT with nothing to send */
   _Atomic uint64_t accel_skipped;               /* pairing skipped: the client had already sent FIN */
 } hold_stats;
+
+/* Whether the rule's mode in force is hold. The gate and the pairing check
+ * both ask this, so they cannot disagree on a rule the default reaches. */
+static int
+hold_mode_is_hold(const proxy_epval_t *epv)
+{
+  return epv && sp_hold_mode_in_force(epv->hold_mode,
+                                      (uint8_t)atomic_load_explicit(&hold_default_mode,
+                                                                    memory_order_relaxed)) ==
+                    SP_HOLD_MODE_HOLD;
+}
 
 static inline void
 hold_inc(_Atomic uint64_t *c)
@@ -140,7 +154,7 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
   in.has_leg = be && be->fd > 0;
   in.accel = atomic_load_explicit(&pfe->hc_accel, memory_order_relaxed) != 0;
   in.is_tls = pfe->ssl != NULL;
-  in.mode_hold = epv && epv->hold_mode == SP_HOLD_MODE_HOLD;
+  in.mode_hold = hold_mode_is_hold(epv);
   in.allowed = atomic_load_explicit(&hold_allowed, memory_order_relaxed) != 0;
   in.leg_peer_eof = be && be->peer_eof;
   in.pending = pfe->rcv_off != 0 || pfe->stream_body_remaining != 0;
@@ -420,7 +434,7 @@ sp_hold_pairing_allowed(proxy_fd_ent_t *client, proxy_epval_t *epv)
 
   /* Only where a hold could be taken: elsewhere the pairing keeps today's
    * behaviour. */
-  if (!client || client->fd <= 0 || !epv || epv->hold_mode != SP_HOLD_MODE_HOLD ||
+  if (!client || client->fd <= 0 || !hold_mode_is_hold(epv) ||
       !atomic_load_explicit(&hold_allowed, memory_order_relaxed)) {
     return 1;
   }
@@ -443,16 +457,20 @@ sp_hold_pairing_allowed(proxy_fd_ent_t *client, proxy_epval_t *epv)
 /* ---- control and export ---------------------------------------------------- */
 
 void
-proxy_update_halfclose_config(int allow, uint32_t cap_sec)
+proxy_update_halfclose_config(int allow, uint32_t cap_sec, uint8_t default_mode)
 {
   if (cap_sec < SP_HOLD_CAP_MIN_SEC) {
     cap_sec = SP_HOLD_CAP_MIN_SEC;
   } else if (cap_sec > SP_HOLD_CAP_MAX_SEC) {
     cap_sec = SP_HOLD_CAP_MAX_SEC;
   }
+  /* Only hold turns the default on; anything else is off. */
+  default_mode = default_mode == SP_HOLD_MODE_HOLD ? SP_HOLD_MODE_HOLD : SP_HOLD_MODE_OFF;
   atomic_store_explicit(&hold_allowed, allow ? 1 : 0, memory_order_relaxed);
   atomic_store_explicit(&hold_cap_sec, cap_sec, memory_order_relaxed);
-  log_info("[HOLD] half-close holds %s, bound %u s", allow ? "allowed" : "blocked", cap_sec);
+  atomic_store_explicit(&hold_default_mode, default_mode, memory_order_relaxed);
+  log_info("[HOLD] half-close holds %s, bound %u s, default %s", allow ? "allowed" : "blocked",
+           cap_sec, default_mode == SP_HOLD_MODE_HOLD ? "hold" : "off");
 }
 
 void
@@ -490,6 +508,7 @@ sp_hold_metrics_fill(proxy_metrics_snapshot_t *s)
       atomic_load_explicit(&hold_stats.accel_skipped, memory_order_relaxed);
   s->hold_allowed = atomic_load_explicit(&hold_allowed, memory_order_relaxed);
   s->hold_cap_sec = atomic_load_explicit(&hold_cap_sec, memory_order_relaxed);
+  s->hold_default_mode = atomic_load_explicit(&hold_default_mode, memory_order_relaxed);
 }
 
 _Static_assert(sizeof(((proxy_metrics_snapshot_t *)0)->hold_ended) ==

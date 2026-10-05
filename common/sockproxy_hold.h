@@ -93,8 +93,11 @@ void sp_hold_sweep(void);
  * pair would take its answer out of the hold's reach. */
 int sp_hold_pairing_allowed(struct proxy_fd_ent *client, struct proxy_epval *epv);
 
-/* Control plane. */
-void proxy_update_halfclose_config(int allow, uint32_t cap_sec);
+/* Control plane. allow is the switch for new holds, cap_sec the idle bound
+ * (clamped to SP_HOLD_CAP_MIN_SEC..SP_HOLD_CAP_MAX_SEC) and default_mode the
+ * mode a rule that leaves its own unset gets (enum sp_hold_mode: hold, or
+ * anything else for off). */
+void proxy_update_halfclose_config(int allow, uint32_t cap_sec, uint8_t default_mode);
 void proxy_halfclose_release(void);
 
 void sp_hold_metrics_fill(struct proxy_metrics_snapshot *s);
