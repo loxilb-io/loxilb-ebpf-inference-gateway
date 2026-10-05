@@ -2913,6 +2913,8 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // SGLang bootstrap port (0 ⇒ defaulted at proxy_add) — the nat2proxy hop
   // of the additive chain (dp_proxy_tacts -> proxy_arg -> proxy_add_entry).
   pval->pd_bootstrap_port = dat->pd_bootstrap_port;
+  // Per-rule prefill timeout (0 ⇒ process default at the reaper) — same hop.
+  pval->pd_prefill_timeout_sec = dat->pd_prefill_timeout_sec;
 
   // P/D Buffer: runtime-configurable kv_transfer_params limit
   pval->pd_kv_params_max = dat->pd_kv_params_max;
