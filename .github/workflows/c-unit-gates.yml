@@ -34,7 +34,7 @@ jobs:
       - name: Toolchain and unit dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -y install build-essential libnghttp2-dev
+          sudo apt-get -y install build-essential libnghttp2-dev libssl-dev
 
       - name: Header-field guard (bytes between a header value and the wire)
         run: make -C common test_l7hdr
@@ -76,3 +76,6 @@ jobs:
       # would give that struct two layouts with no compiler diagnostic.
       - name: Conversation stickiness names its pool, and a health signal names its endpoint
         run: make -C common test_conv
+
+      - name: What the backend leg accepts from an endpoint, and what it presents
+        run: make -C common test_betls

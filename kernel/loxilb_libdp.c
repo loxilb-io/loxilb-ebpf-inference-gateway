@@ -2895,6 +2895,10 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->backend_ca_cert_id[sizeof(pval->backend_ca_cert_id) - 1] = '\0';
   strncpy(pval->backend_client_cert_id, dat->backend_client_cert_id, sizeof(pval->backend_client_cert_id) - 1);
   pval->backend_client_cert_id[sizeof(pval->backend_client_cert_id) - 1] = '\0';
+  pval->backend_verify_cert = dat->mtls_backend_verify ? 1 : 0;
+  strncpy(pval->backend_tls_server_name, dat->mtls_backend_server_name,
+          sizeof(pval->backend_tls_server_name) - 1);
+  pval->backend_tls_server_name[sizeof(pval->backend_tls_server_name) - 1] = '\0';
 #endif /* HAVE_MTLS */
 
   // P/D disaggregation configuration

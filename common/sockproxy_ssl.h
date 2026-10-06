@@ -39,6 +39,7 @@
 SSL_CTX *proxy_server_ssl_ctx_init(const proxy_arg_t *arg);
 int proxy_ssl_cfg_opts(SSL_CTX *ctx, const char *site_path, int mtls_en);
 SSL_CTX *proxy_client_ssl_ctx_init(proxy_arg_t *arg);
+int proxy_ssl_cfg_modes(SSL_CTX *ctx);
 
 /* TLS callbacks (used as function pointer arguments in proxy_add_entry) */
 int alpn_select_callback(SSL *ssl,

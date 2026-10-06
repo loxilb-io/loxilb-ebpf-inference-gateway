@@ -857,6 +857,14 @@ proxy_ep_connect_finish_leg(int fd, uint32_t epip, uint16_t epport,
       close(fd);
       return -1;
     }
+#ifdef HAVE_MTLS
+    if (mtls_backend_set_identity(nssl, epip)) {
+      log_error("ssl-identity %s:%u(failed)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
+      close(fd);
+      SSL_free(nssl);
+      return -1;
+    }
+#endif
 
     if (proxy_ssl_connect(fd, nssl)) {
       log_error("ssl-connect %s:%u(failed)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));

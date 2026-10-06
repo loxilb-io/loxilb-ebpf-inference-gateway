@@ -279,6 +279,18 @@ proxy_server_ssl_ctx_init(const proxy_arg_t *arg)
     return ctx;
 }
 
+/* The write modes both legs need on a non-blocking socket: SSL_write may
+ * return a partial count, and a retry may come from a different buffer. */
+int
+proxy_ssl_cfg_modes(SSL_CTX *ctx)
+{
+  if (!SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER)) {
+    log_error("sockproxy: SSL_MODE flags failed");
+    return -EINVAL;
+  }
+  return 0;
+}
+
 int
 proxy_ssl_cfg_opts(SSL_CTX *ctx, const char *site_path, int mtls_en)
 {
@@ -356,16 +368,7 @@ proxy_ssl_cfg_opts(SSL_CTX *ctx, const char *site_path, int mtls_en)
   }
 #endif
 
-  // CRITICAL: Enable both partial writes and moving write buffer for non-blocking sockets
-  // SSL_MODE_ENABLE_PARTIAL_WRITE: Allows SSL_write to return partial byte counts (required!)
-  // SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER: Allows buffer pointer to change between retries (for cache)
-  // Both flags together allow proper cache-based retry logic that works with all browsers
-  if (!SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER)) {
-    log_error("sockproxy: SSL_MODE flags failed");
-    return -EINVAL;
-  }
-
-  return 0;
+  return proxy_ssl_cfg_modes(ctx);
 }
 
 /**
@@ -446,11 +449,12 @@ proxy_client_ssl_ctx_init(proxy_arg_t *arg)
     // Configure backend mTLS (server cert verification + client cert).
     // the backend material is referenced by certId;
     // mtls_configure_backend resolves the certId → managed-dir paths.
-    if (arg->backend_verify_cert || arg->backend_client_cert_id[0] != '\0') {
+    if (arg->backend_verify_cert || arg->backend_client_cert_id[0] != '\0' ||
+        arg->backend_tls_server_name[0] != '\0') {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[mTLS] Backend mTLS enabled in proxy_client_ssl_ctx_init");
       log_debug("[mTLS]   verify_server_cert=%d", arg->backend_verify_cert);
-      log_debug("[mTLS]   backend_ca_cert_id=%s", arg->backend_ca_cert_id[0] ? arg->backend_ca_cert_id : "(system CA)");
+      log_debug("[mTLS]   backend_ca_cert_id=%s", arg->backend_ca_cert_id[0] ? arg->backend_ca_cert_id : "(none)");
       log_debug("[mTLS]   backend_client_cert_id=%s", arg->backend_client_cert_id[0] ? arg->backend_client_cert_id : "(none)");
 #endif
       if (mtls_configure_backend(ctx, arg) != 0) {
@@ -1089,7 +1093,7 @@ proxy_delete_cert(const char *certId)
  * proxy_certid_resolve_backend -: resolve a backend certId into
  * the managed-dir CA / client-cert / client-key paths. A path is emitted only
  * when its file exists under PROXY_SSL_CERTID_DIR/<certId>/; absent files yield
- * "" so the backend builder falls back to its today's behaviour (system CA / no
+ * "" and the backend builder decides what an absent file means (no CA / no
  * client cert). This is the per-service-with-certId-references landing (
  * sanctioned fallback); a true per-pool backend SSL_CTX cache is a documented
  * residual (Open Question 1).

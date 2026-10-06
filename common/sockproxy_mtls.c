@@ -43,6 +43,7 @@
 #include "sockproxy.h"
 #include "sockproxy_mtls.h"
 #include "sockproxy_ssl.h"   /* proxy_certid_resolve_backend */
+#include "sockproxy_betls.h"
 
 // mTLS constants
 #define MTLS_VERIFY_DEPTH_MAX 10     // Max certificate chain depth
@@ -736,157 +737,85 @@ int mtls_configure_frontend(SSL_CTX *ctx, proxy_arg_t *arg)
 // Backend mTLS: Server Certificate Verification
 // ============================================================================
 
-/**
- * mtls_backend_verify_callback - OpenSSL verification callback for backend server certs
- * @preverify_ok: OpenSSL pre-verification result
- * @x509_ctx: X509 store context
- * 
- * Returns: 1 to accept, 0 to reject
- */
-static int mtls_backend_verify_callback(int preverify_ok, X509_STORE_CTX *x509_ctx)
+static void
+betls_event(enum betls_event ev)
 {
-    X509 *cert;
-    int depth;
-    int err;
-    char buf[256];
-
-    cert = X509_STORE_CTX_get_current_cert(x509_ctx);
-    depth = X509_STORE_CTX_get_error_depth(x509_ctx);
-    err = X509_STORE_CTX_get_error(x509_ctx);
-
-    // Log certificate info
-    X509_NAME_oneline(X509_get_subject_name(cert), buf, sizeof(buf));
-    log_debug("[mTLS] Verify backend cert: depth=%d subject=%s preverify=%d",
-              depth, buf, preverify_ok);
-
-    if (!preverify_ok) {
-        log_error("[mTLS] Backend cert verification failed: %s (depth=%d)",
-                  X509_verify_cert_error_string(err), depth);
-        atomic_fetch_add(&global_stats.mtls_backend_verify_failures, 1);
-        return 0;
-    }
-
-    if (depth == 0) {
-        log_info("[mTLS] Backend certificate verified successfully: %s", buf);
+    switch (ev) {
+    case BETLS_EV_VERIFY_OK:
         atomic_fetch_add(&global_stats.mtls_backend_verify_success, 1);
+        break;
+    case BETLS_EV_VERIFY_FAIL:
+        atomic_fetch_add(&global_stats.mtls_backend_verify_failures, 1);
+        break;
+    case BETLS_EV_NAME_MISMATCH:
+        atomic_fetch_add(&global_stats.mtls_hostname_mismatch, 1);
+        break;
     }
-
-    return 1;
 }
 
 /**
  * mtls_configure_backend - Configure backend mTLS for client SSL context
  * @ctx: SSL_CTX for backend connections
  * @arg: Proxy configuration with backend mTLS settings
- * 
+ *
+ * The CA bundle comes from the CA certId only, the client pair from the
+ * client certId only. A requested verification without a CA bundle, and a
+ * named client certificate that does not load, are errors (sockproxy_betls.h).
+ *
  * Returns: 0 on success, negative on error
  */
 int mtls_configure_backend(SSL_CTX *ctx, proxy_arg_t *arg)
 {
+    char ca_path[512] = {0};
+    char client_cert_path[512] = {0};
+    char client_key_path[512] = {0};
+    char unused_a[512] = {0};
+    char unused_b[512] = {0};
+    struct betls_policy pol = {0};
+    const char *why = "";
+    int ret;
+
     if (!ctx || !arg) {
         return -EINVAL;
     }
 
-    // backend CA/client-cert material is referenced
-    // by certId, not inline path strings. Resolve the proxy_arg certId refs into
-    // managed-dir paths (/etc/loxilb/certs/<certId>/{ca,client}.{crt,key}) here,
-    // before the existing load_verify_locations / cert+key load. Absent files
-    // yield "" → today's fallback (system CA / no client cert).
-    char backend_ca_path[512] = {0};
-    char backend_client_cert_path[512] = {0};
-    char backend_client_key_path[512] = {0};
-    proxy_certid_resolve_backend(arg->backend_ca_cert_id,
-                                 backend_ca_path,
-                                 backend_client_cert_path,
-                                 backend_client_key_path,
-                                 sizeof(backend_ca_path));
-    // The CA may live under the client certId dir; if the CA certId resolved no
-    // ca.crt but a separate backend_client_cert_id is set, the client cert/key
-    // come from that id's dir.
-    if (backend_client_cert_path[0] == '\0' && arg->backend_client_cert_id[0] != '\0') {
-        char unused_ca[512] = {0};
-        proxy_certid_resolve_backend(arg->backend_client_cert_id,
-                                     unused_ca,
-                                     backend_client_cert_path,
-                                     backend_client_key_path,
-                                     sizeof(backend_client_cert_path));
+    proxy_certid_resolve_backend(arg->backend_ca_cert_id, ca_path,
+                                 unused_a, unused_b, sizeof(ca_path));
+    proxy_certid_resolve_backend(arg->backend_client_cert_id, unused_a,
+                                 client_cert_path, client_key_path,
+                                 sizeof(client_cert_path));
+
+    pol.verify = arg->backend_verify_cert;
+    pol.ca_file = ca_path;
+    pol.client_id_set = arg->backend_client_cert_id[0] != '\0';
+    pol.client_cert_file = client_cert_path;
+    pol.client_key_file = client_key_path;
+    pol.server_name = arg->backend_tls_server_name;
+
+    ret = betls_ctx_configure(ctx, &pol, &why);
+    if (ret != 0) {
+        log_error("[mTLS] rule %u backend TLS policy refused: %s (ca id '%s', client id '%s') - %s",
+                  arg->_id, why, arg->backend_ca_cert_id, arg->backend_client_cert_id,
+                  ERR_error_string(ERR_peek_last_error(), NULL));
+        return ret;
     }
 
-    // Configure server certificate verification
-    if (arg->backend_verify_cert) {
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-        log_debug("[mTLS] Configuring backend server certificate verification");
-        log_debug("[mTLS] Backend CA path: %s",
-                  backend_ca_path[0] ? backend_ca_path : "(system CA store)");
-#endif
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, mtls_backend_verify_callback);
-        SSL_CTX_set_verify_depth(ctx, MTLS_VERIFY_DEPTH_MAX);
-
-        // Load backend CA bundle
-        if (backend_ca_path[0] != '\0') {
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-            log_debug("[mTLS] Loading backend CA bundle: %s", backend_ca_path);
-#endif
-            if (SSL_CTX_load_verify_locations(ctx, backend_ca_path, NULL) != 1) {
-                log_error("[mTLS] Failed to load backend CA bundle: %s - %s",
-                          backend_ca_path, ERR_error_string(ERR_get_error(), NULL));
-                atomic_fetch_add(&global_stats.mtls_backend_verify_failures, 1);
-                return -EINVAL;
-            }
-            log_info("[mTLS] Loaded backend CA bundle: %s", backend_ca_path);
-        } else {
-            // Use system CA store
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-            log_debug("[mTLS] Loading system default CA paths");
-#endif
-            if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
-                log_error("[mTLS] Failed to load system CA store: %s",
-                          ERR_error_string(ERR_get_error(), NULL));
-                return -EINVAL;
-            }
-            log_info("[mTLS] Using system CA store for backend verification");
-        }
-    } else {
-        // No verification (backward compatible default)
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-        log_debug("[mTLS] Backend server cert verification disabled");
-    }
-
-    // Load client certificate for backend mTLS (if configured)
-    if (backend_client_cert_path[0] != '\0') {
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-        log_debug("[mTLS] Loading backend client certificate: %s", backend_client_cert_path);
-        log_debug("[mTLS] Loading backend client key: %s", backend_client_key_path);
-#endif
-        if (SSL_CTX_use_certificate_chain_file(ctx, backend_client_cert_path) != 1) {
-            log_error("[mTLS] Failed to load backend client cert: %s - %s",
-                      backend_client_cert_path, ERR_error_string(ERR_get_error(), NULL));
-            return -EINVAL;
-        }
-
-        if (SSL_CTX_use_PrivateKey_file(ctx, backend_client_key_path, SSL_FILETYPE_PEM) != 1) {
-            log_error("[mTLS] Failed to load backend client key: %s - %s",
-                      backend_client_key_path, ERR_error_string(ERR_get_error(), NULL));
-            return -EINVAL;
-        }
-
-        // Verify cert and key match
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-        log_debug("[mTLS] Verifying backend client cert/key pair");
-#endif
-        if (SSL_CTX_check_private_key(ctx) != 1) {
-            log_error("[mTLS] Backend client cert and key do not match");
-            return -EINVAL;
-        }
-
-        log_info("[mTLS] Loaded backend client certificate: %s", backend_client_cert_path);
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-        log_debug("[mTLS] Backend client cert/key verification successful");
-#endif
-    }
-
-    log_info("[mTLS] Backend mTLS configured successfully");
+    log_info("[mTLS] rule %u backend TLS policy: verify=%d ca id '%s' client id '%s' server name '%s'",
+             arg->_id, pol.verify, arg->backend_ca_cert_id, arg->backend_client_cert_id,
+             arg->backend_tls_server_name);
     return 0;
+}
+
+/**
+ * mtls_backend_set_identity - name the endpoint one backend connection expects
+ * @ssl: the connection's handle, before its handshake
+ * @epip: the dialled IPv4 address, network byte order
+ *
+ * Returns: 0 on success, negative on error
+ */
+int mtls_backend_set_identity(SSL *ssl, uint32_t epip)
+{
+    return betls_ssl_set_identity(ssl, epip);
 }
 
 // ============================================================================
