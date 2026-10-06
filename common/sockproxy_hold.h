@@ -46,9 +46,12 @@ int sp_notify_arm(void *ns, int fd, notify_type_t type, struct proxy_fd_ent *pfe
                   uint64_t gen);
 
 /* The EOF handling read a client's FIN. Returns 1 when the caller must stop
- * there and keep the connection (the client is now held, or was already),
- * 0 to carry on as today. Called without the entry's lock; takes it. */
-int sp_hold_eof(struct proxy_fd_ent *pfe);
+ * there and keep the connection, its write side open for the answer: the
+ * close deferred to the sweep (the kernel carries the response direction),
+ * or the client held (now, or already). 0 to carry on as today. Called
+ * without the entry's lock; the hold takes it. Shuts the read side only
+ * (check_client_eof_keep.sh). */
+int sp_client_eof_keep(struct proxy_fd_ent *pfe);
 
 /* The response framer saw an answer begin or end (interim responses are not
  * answers). Client's lock held, or the backend's worker at its EOF. */

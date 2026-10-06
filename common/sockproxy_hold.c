@@ -18,7 +18,7 @@
  *
  * Lifecycle
  *   begin    the EOF handling reads the FIN of a client that owes an answer
- *            (sp_hold_eof): read side shut, fd disarmed for reads.
+ *            (sp_client_eof_keep): read side shut, fd disarmed for reads.
  *   settle   after a write to the client that leaves its relay cache empty
  *            (the relay's direct send, the cache drain), close once nothing
  *            is owed, or once the leg carrying the answer has ended.
@@ -30,6 +30,10 @@
  *
  * Every close is a SHUT_RDWR, so the connection goes through the normal
  * teardown and gives back what it holds (capacity units included).
+ *
+ * The begin step shares its function with the one older way of keeping such
+ * a client: where the kernel carries the response direction, its close is
+ * deferred to the sweep instead (sp_client_eof_keep).
  */
 #include <errno.h>
 #include <pthread.h>
@@ -134,8 +138,13 @@ sp_notify_arm(void *ns, int fd, notify_type_t type, proxy_fd_ent_t *pfe, uint64_
 
 /* ---- begin ---------------------------------------------------------------- */
 
+/* The two ways a client that half-closed after a complete request is kept,
+ * its write side open for the answer. Both bodies are here so the build can
+ * check what they share (check_client_eof_keep.sh): each shuts the read side
+ * only. Shutting the write side would raise POLLHUP at once, and the teardown
+ * that follows would take the answer with it. */
 int
-sp_hold_eof(proxy_fd_ent_t *pfe)
+sp_client_eof_keep(proxy_fd_ent_t *pfe)
 {
   struct sp_hold_in in;
   proxy_fd_ent_t *be;
@@ -145,6 +154,59 @@ sp_hold_eof(proxy_fd_ent_t *pfe)
   if (!pfe || pfe->odir != 0) {
     return 0;
   }
+
+  /* A CLIENT that half-closed after a complete request is saying "that
+   * was my last request", not "forget the response". Tearing the pair
+   * down here answers nothing: the request was already parsed and
+   * forwarded, so the backend is generating a response for a client that
+   * will never see it, and the client sees a closed connection instead of
+   * its answer. HTTP/1 requests are not framed by EOF, so the backend
+   * needs no FIN of its own — the response leg simply keeps running.
+   *
+   * Only when a request really is in flight. A half-close on top of a
+   * partial request (rcvbuf still holding bytes, or a streamed body
+   * outstanding) can never complete, and a client with no backend leg is
+   * owed nothing; both keep the immediate teardown of the EOF handling.
+   *
+   * And only where the RESPONSE direction is accelerated. resp_outstanding is cleared by
+   * the response framer, but that framer is not a general signal: it is
+   * installed only under pd_framing_v2 and skips feeds on lock contention.
+   * On every other connection nothing ever clears the flag, so gating on it
+   * alone deferred EVERY close after a first request on EVERY FullProxy
+   * rule — releasing per-endpoint load late enough to move load-aware
+   * selection. An accelerated response is where the deferral is needed
+   * regardless — the kernel may still hold response bytes no userspace
+   * queue can see, the same reason the EOF handling's backend-EOF deferral
+   * keys on peer_map_resp_verdict — so the cost is confined to it. A request-only
+   * rule gains nothing from deferring: its response runs through the
+   * userspace relay exactly as with sockmap off, and a half-closed client's
+   * request entry is dropped at activation anyway (the socket is no longer
+   * ESTABLISHED). Everywhere else a half-close keeps the teardown it had
+   * before. */
+  if (pfe->resp_outstanding && pfe->n_rfd > 0 &&
+      pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0 &&
+      pfe->rfd_ent[0]->peer_map_resp_verdict &&
+      !pfe->rfd_ent[0]->peer_eof &&
+      pfe->rcv_off == 0 && pfe->stream_body_remaining == 0 &&
+      !pfe->client_half_closed) {
+    pfe->client_half_closed = 1;
+    proxy_defer_close_mark(pfe);
+    /* We will not read from this client again, but its write side stays
+     * open for the response. POLLRDHUP is level-triggered, so disarm the
+     * fd or the worker spins on an EOF nobody will consume; it stays
+     * registered and owned, and the backend leg's completion (or the
+     * sweep's bound) finishes the teardown. */
+    shutdown(pfe->fd, SHUT_RD);
+    notify_disarm_ent(proxy_struct->ns, pfe->fd);
+    log_debug("[HALF_CLOSE] fd=%d: client finished its request and is awaiting "
+              "the response; keeping the response leg open", pfe->fd);
+    return 1;
+  }
+
+  /* The hold, where the proxy relays the answer itself: owed an answer it can
+   * follow (plaintext, the kernel never given a direction, the rule's mode
+   * set to hold). The two never both apply - the deferral above needs the
+   * response direction in the kernel. */
   memset(&in, 0, sizeof(in));
   be = pfe->n_rfd > 0 ? pfe->rfd_ent[0] : NULL;
   epv = (proxy_epval_t *)pfe->epv;
