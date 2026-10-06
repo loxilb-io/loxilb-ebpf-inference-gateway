@@ -41,6 +41,19 @@ int mtls_configure_frontend(SSL_CTX *ctx, proxy_arg_t *arg);
 int mtls_configure_backend(SSL_CTX *ctx, proxy_arg_t *arg);
 
 /**
+ * mtls_backend_set_identity - name the endpoint a backend connection expects
+ * @ssl: the connection's handle, before its handshake
+ * @epip: the dialled IPv4 address, network byte order
+ *
+ * Sends the rule's server name as SNI when it has one. On a verifying context
+ * the endpoint's certificate must then carry that name, or without one the
+ * dialled address.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mtls_backend_set_identity(SSL *ssl, uint32_t epip);
+
+/**
  * mtls_match_cn_pattern - Match certificate CN against pattern
  * @cert: X509 certificate
  * @pattern: Pattern to match (supports wildcards like "*.example.com")

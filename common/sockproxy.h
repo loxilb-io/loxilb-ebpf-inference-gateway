@@ -2068,6 +2068,10 @@ struct proxy_arg {
   char backend_ca_cert_id[CERTID_MAX];      // certId of the backend CA bundle (empty ⇒ system default)
   char backend_client_cert_id[CERTID_MAX];  // certId of loxilb's backend client cert+key (empty ⇒ none)
 
+  // Name sent as SNI to the endpoints and expected in their certificate.
+  // Empty: no SNI, and a verified endpoint is matched by its address.
+  char backend_tls_server_name[256];
+
   // Padding for 8-byte alignment (structure size validation)
   uint8_t _pad_mtls[6];
 #endif /* HAVE_MTLS */

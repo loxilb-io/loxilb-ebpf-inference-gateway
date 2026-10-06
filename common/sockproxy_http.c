@@ -3067,7 +3067,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
       PROXY_UNLOCK();
       return PROXY_ADD_ETLS;
     }
-    if (proxy_ssl_cfg_opts(ssl_epctx, NULL, 0)) {
+    /* Only the write modes: the backend context presents what the rule
+     * names, never the listener's default certificate. */
+    if (proxy_ssl_cfg_modes(ssl_epctx)) {
       log_error("sockproxy : %s:%u rule %u backend TLS context setup failed",
           inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
           arg->_id);

@@ -704,6 +704,15 @@ test_fdlist: test_fdlist.c sockproxy_fdlist.h
 test_fdl: test_fdlist
 	./test_fdlist
 
+# What the backend leg accepts from an endpoint and what it presents: real
+# handshakes against certificates made by the test. Header-only and standalone.
+test_backend_tls: test_backend_tls.c sockproxy_betls.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I. -lssl -lcrypto
+
+.PHONY: test_betls
+test_betls: test_backend_tls
+	./test_backend_tls
+
 # Attributing a request to the address it came from: a listener's trusted
 # ranges, the normalised hop list an inbound chain parses into, and the
 # right-most-untrusted walk over it. Header-only and standalone.
@@ -775,7 +784,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core
+	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

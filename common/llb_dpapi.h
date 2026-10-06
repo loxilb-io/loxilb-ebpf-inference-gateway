@@ -1176,12 +1176,19 @@ struct dp_proxy_tacts {
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
   uint8_t  mtls_frontend_mode;      // 0=disabled, 1=optional, 2=required
   uint8_t  mtls_require_client_cn;  // 1=require CN pattern match
-  uint8_t  mtls_pad[6];             // Alignment padding
+  // Backend leg: 1 = verify the endpoint's certificate against the rule's
+  // CA. Takes the first byte of what was padding.
+  uint8_t  mtls_backend_verify;
+  uint8_t  mtls_pad[5];             // Alignment padding
   char     mtls_client_ca_path[256];
   char     mtls_client_cn_pattern[256];
   // explicit client-cert CRL path → proxy_arg.client_crl_path.
   // Additive/default-off — empty ⇒ sibling-crl convention (+256 bytes; HAVE_MTLS asserts).
   char     mtls_client_crl_path[256];
+  // Backend leg: the name sent as SNI and expected in the endpoint's
+  // certificate. Empty: no SNI, and a verified endpoint is matched by its
+  // address (+256 bytes; HAVE_MTLS asserts).
+  char     mtls_backend_server_name[256];
 #endif /* HAVE_MTLS */
 };
 
@@ -1241,12 +1248,14 @@ _Static_assert(sizeof(struct dp_proxy_tacts) == 2952,
               "dp_proxy_tacts DPU ABI changed");
 #endif
 #else /* HAVE_MTLS */
-// mTLS-enabled layout: 2960→3736 bytes, DPU slim 2952→3728 bytes.
+// mTLS-enabled layout: 2960→3992 bytes, DPU slim 2952→3984 bytes
+// (mtls_backend_server_name(256): 3736→3992, 3728→3984; mtls_backend_verify
+// replaced one byte of mtls_pad: no size change).
 #ifndef HAVE_DP_DPU_SLIM
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3736,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3992,
               "dp_proxy_tacts mTLS ABI changed — update Go CGO struct and this check");
 #else
-_Static_assert(sizeof(struct dp_proxy_tacts) == 3728,
+_Static_assert(sizeof(struct dp_proxy_tacts) == 3984,
               "dp_proxy_tacts DPU mTLS ABI changed");
 #endif
 #endif /* HAVE_MTLS */
