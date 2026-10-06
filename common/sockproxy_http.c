@@ -2576,6 +2576,27 @@ static void sp_fc_warm_returning(proxy_epval_t *tepval, const proxy_ent_t *old_e
                                  int old_n);
 static int sp_fc_wake(int fd, uint64_t gen);
 
+/* Drop a listener node that was never put on the proxy list, with the TLS
+ * contexts built for it. The rule's proxy_arg is detached first and stays with
+ * the caller: a frontend context that verifies clients holds it as ex_data,
+ * and that slot's free callback would release it with the context. */
+static void
+proxy_add_entry_abort(proxy_map_ent_t *node, void *ssl_ctx, void *ssl_epctx)
+{
+  if (ssl_epctx) {
+    SSL_CTX_free(ssl_epctx);
+  }
+  if (ssl_ctx) {
+#ifdef HAVE_MTLS
+    if (g_ssl_ctx_proxy_arg_index >= 0) {
+      SSL_CTX_set_ex_data((SSL_CTX *)ssl_ctx, g_ssl_ctx_proxy_arg_index, NULL);
+    }
+#endif
+    SSL_CTX_free(ssl_ctx);
+  }
+  free(node);
+}
+
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 {
@@ -2978,14 +2999,22 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     // pinning is applied to the frontend listener SSL_CTX. arg is byte-for-byte
     // today's behaviour when the TLS-pinning fields are unset (-COMPAT).
     ssl_ctx = proxy_server_ssl_ctx_init(arg);
-    assert(ssl_ctx);
+    if (ssl_ctx == NULL) {
+      log_error("sockproxy : %s:%u rule %u frontend TLS context init failed",
+          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
+          arg->_id);
+      proxy_add_entry_abort(node, NULL, NULL);
+      PROXY_UNLOCK();
+      return PROXY_ADD_ETLS;
+    }
 
     if (proxy_ssl_cfg_opts(ssl_ctx,
           strcmp(arg->host_url, "") ? arg->host_url : NULL, 0)) {
       log_error("[LB Rule] Failed to load SSL certificates for hostname: '%s'",
                 strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+      proxy_add_entry_abort(node, ssl_ctx, NULL);
       PROXY_UNLOCK();
-      return -EINVAL;
+      return PROXY_ADD_ETLS;
     }
 
     // Check if certificate exists in global store
@@ -3014,10 +3043,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
       if (mtls_configure_frontend((SSL_CTX *)ssl_ctx, arg) != 0) {
         log_error("[mTLS] Failed to configure frontend mTLS for %s",
                   strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-        SSL_CTX_free(ssl_ctx);
-        ssl_ctx = NULL;
+        proxy_add_entry_abort(node, ssl_ctx, NULL);
         PROXY_UNLOCK();
-        return -EINVAL;
+        return PROXY_ADD_ETLS;
       }
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[mTLS] Frontend mTLS configured successfully for %s",
@@ -3031,14 +3059,21 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   if (arg->have_epssl) {
     ssl_epctx = proxy_client_ssl_ctx_init(arg);
-    assert(ssl_epctx);
-    if (proxy_ssl_cfg_opts(ssl_epctx, NULL, 0)) {
-      if (ssl_ctx) {
-        SSL_CTX_free(ssl_ctx);
-        ssl_ctx = NULL;
-      }
+    if (ssl_epctx == NULL) {
+      log_error("sockproxy : %s:%u rule %u backend TLS context init failed",
+          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
+          arg->_id);
+      proxy_add_entry_abort(node, ssl_ctx, NULL);
       PROXY_UNLOCK();
-      return -EINVAL;
+      return PROXY_ADD_ETLS;
+    }
+    if (proxy_ssl_cfg_opts(ssl_epctx, NULL, 0)) {
+      log_error("sockproxy : %s:%u rule %u backend TLS context setup failed",
+          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
+          arg->_id);
+      proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
+      PROXY_UNLOCK();
+      return PROXY_ADD_ETLS;
     }
 
 #ifdef HAVE_MTLS
@@ -3062,14 +3097,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   if (lsd <= 0) {
     log_error("sockproxy : %s:%u sock-init failed",
         inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport));
-    if (ssl_epctx) {
-      SSL_CTX_free(ssl_epctx);
-      ssl_epctx = NULL;
-    }
-    if (ssl_ctx) {
-      SSL_CTX_free(ssl_ctx);
-      ssl_ctx = NULL;
-    }
+    proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
     PROXY_UNLOCK();
     return -1;
   }
@@ -3112,6 +3140,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     pthread_rwlock_destroy(&tepval->chwbl_state_lock);
     free(tepval);
     close(lsd);
+    pthread_rwlock_destroy(&node->val.conv_lock);
+    proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
     PROXY_UNLOCK();
     return -ENOMEM;
   }
@@ -3136,6 +3166,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
                               fd_ctx, fd_ctx->gen)) {
     log_error("sockproxy : %s:%u notify failed",
         inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport));
+    /* The listener shell leaves the node's list before both go away. */
+    proxy_reset_fd_list(node, fd_ctx);
+    fd_ctx->head = NULL;
     PROXY_UNLOCK();
     close(lsd);
 #ifdef HAVE_DP_GPU_ROUTING
@@ -3144,10 +3177,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     pthread_rwlock_destroy(&tepval->chwbl_state_lock);
     free(tepval);
     pfe_recycle(fd_ctx);
-    if (node->val.ssl_ctx) {
-      SSL_CTX_free(node->val.ssl_ctx);
-      node->val.ssl_ctx = NULL;
-    }
+    pthread_rwlock_destroy(&node->val.conv_lock);
+    proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
     return -1;
   }
   fd_ctx->used++;

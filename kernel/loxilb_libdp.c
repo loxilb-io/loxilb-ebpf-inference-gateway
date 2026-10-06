@@ -3204,6 +3204,15 @@ llb_add_map_elem(int tbl, void *k, void *v)
       llb_conv_nat2proxy(k, v, &pk, pv);
       // FIXME
       ret = proxy_add_entry(&pk, pv);
+      if (ret != 0) {
+        /* Nothing of the rule was installed and no context kept pv. The
+         * caller only learns that the add failed; the reason stays here. */
+        log_error("[Proxy] rule %u vip port %u not installed: %s (%d)",
+                  nv->ca.cidx, ntohs(nk->dport),
+                  ret == PROXY_ADD_ETLS ? "TLS context" : "listener", ret);
+        free(pv);
+        pv = NULL;
+      }
       /* sockmap portsets, fail-open: proxy_add_entry() returns 0 for both a
        * new pool and an in-place refresh of a live one, so the loader cannot
        * tell whether a rollback via proxy_delete_entry() would tear down a
@@ -3215,9 +3224,9 @@ llb_add_map_elem(int tbl, void *k, void *v)
                   ntohs(nk->dport), nv->ca.cidx);
       }
       
-      // Note: pv is intentionally NOT freed here!
-      // - mTLS mode: SSL_CTX stores pointer, OpenSSL auto-frees when SSL_CTX destroyed
-      // - Non-mTLS mode: Currently leaks (TODO: track in proxy_map_ent for manual cleanup)
+      // Note: on success pv is intentionally NOT freed here.
+      // - New listener: the proxy entry keeps the pointer and frees it on delete
+      // - Existing listener (pool added or refreshed): not tracked, currently leaks
       goto out;
     }
   }
