@@ -413,6 +413,12 @@ test_hold: test_hold_core
 check_notify_arm:
 	sh ./check_notify_arm.sh
 
+# Source invariant: a client kept open after its FIN (sp_client_eof_keep) has
+# its read side shut, never its write side.
+.PHONY: check_client_eof_keep
+check_client_eof_keep:
+	sh ./check_client_eof_keep.sh
+
 # Phase 76-07 (FR-10): stateless cookie token derive/verify + miss->rehash +
 # constant-time + cross-peer-failover C unit. Standalone — includes only the pure
 # sockproxy_cookie.h primitives, links -lssl -lcrypto (the already-linked HMAC).

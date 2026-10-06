@@ -60,6 +60,9 @@ jobs:
       - name: Every fd arming goes through sp_notify_arm (source invariant)
         run: make -C common check_notify_arm
 
+      - name: A client kept open after its FIN has only its read side shut (source invariant)
+        run: make -C common check_client_eof_keep
+
       - name: The correlation key that joins a request's records across its keep-alive reset
         run: make -C common test_ridjoin
 
