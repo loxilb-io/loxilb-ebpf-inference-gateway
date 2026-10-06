@@ -806,6 +806,36 @@ int mtls_configure_backend(SSL_CTX *ctx, proxy_arg_t *arg)
     return 0;
 }
 
+void mtls_backend_installed(const proxy_arg_t *arg, struct betls_installed *out)
+{
+    char ca_path[512] = {0};
+    char client_cert_path[512] = {0};
+    char client_key_path[512] = {0};
+    char unused_a[512] = {0};
+    char unused_b[512] = {0};
+
+    memset(out, 0, sizeof(*out));
+    proxy_certid_resolve_backend(arg->backend_ca_cert_id, ca_path,
+                                 unused_a, unused_b, sizeof(ca_path));
+    proxy_certid_resolve_backend(arg->backend_client_cert_id, unused_a,
+                                 client_cert_path, client_key_path,
+                                 sizeof(client_cert_path));
+    out->verify = arg->backend_verify_cert ? 1 : 0;
+    out->client_cert_loaded = arg->backend_client_cert_id[0] != '\0';
+    snprintf(out->ca_id, sizeof(out->ca_id), "%s", arg->backend_ca_cert_id);
+    snprintf(out->client_id, sizeof(out->client_id), "%s", arg->backend_client_cert_id);
+    snprintf(out->server_name, sizeof(out->server_name), "%s", arg->backend_tls_server_name);
+    /* Only the files the context reads: the CA when it verifies, the pair
+     * when the rule names one. */
+    if (out->verify) {
+        betls_fp_stat(ca_path, &out->fp[BETLS_FP_CA]);
+    }
+    if (out->client_cert_loaded) {
+        betls_fp_stat(client_cert_path, &out->fp[BETLS_FP_CLIENT_CERT]);
+        betls_fp_stat(client_key_path, &out->fp[BETLS_FP_CLIENT_KEY]);
+    }
+}
+
 /**
  * mtls_backend_set_identity - name the endpoint one backend connection expects
  * @ssl: the connection's handle, before its handshake

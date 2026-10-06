@@ -18,8 +18,11 @@
  *   - the leg is not pinned to a known endpoint (health cannot be judged);
  *   - the pinned endpoint is no longer healthy (health probe, circuit breaker);
  *   - the request names a different model than the one the leg was selected
- *     for (a model-routed pool may serve it from another endpoint).
- * A rule change already takes every connection on the rule down with the
+ *     for (a model-routed pool may serve it from another endpoint);
+ *   - the leg was made with a backend TLS context the listener has since
+ *     replaced (a changed verification policy or certificate): the request
+ *     in flight finished on it, the next one must not start on it.
+ * A rule that is deleted takes every connection on it down with the
  * listener, and a backend that closes its side ends the leg by itself, so
  * neither needs a case here.
  *
@@ -38,6 +41,7 @@
 #define KA_LEG_UNPINNED    2   /* no endpoint index/pool on the connection */
 #define KA_LEG_UNHEALTHY   3   /* the pinned endpoint failed its health check */
 #define KA_LEG_MODEL       4   /* this request names a different model */
+#define KA_LEG_TLS_CTX     5   /* the leg was made under a replaced TLS policy */
 
 /*
  * A connection reduced to what decides reuse. Mirrors the proxy_fd_ent_t
@@ -50,6 +54,7 @@ typedef struct {
   int ep_healthy;           /* is_endpoint_healthy(epv, ep_num) */
   const char *prev_model;   /* model the leg was selected for (resp_model) */
   const char *next_model;   /* this request's effective model */
+  int tls_ctx_stale;        /* the leg's TLS context is no longer the listener's */
 } ka_leg_ctx_t;
 
 static inline int
@@ -76,6 +81,8 @@ ka_leg_reusable(const ka_leg_ctx_t *c, int *reason)
     why = KA_LEG_UNHEALTHY;
   } else if (ka_leg_model_differs(c->prev_model, c->next_model)) {
     why = KA_LEG_MODEL;
+  } else if (c->tls_ctx_stale) {
+    why = KA_LEG_TLS_CTX;
   }
   if (reason) {
     *reason = why;
@@ -92,6 +99,7 @@ ka_leg_reason_str(int reason)
   case KA_LEG_UNPINNED:  return "unpinned";
   case KA_LEG_UNHEALTHY: return "ep-unhealthy";
   case KA_LEG_MODEL:     return "model-changed";
+  case KA_LEG_TLS_CTX:   return "tls-policy-changed";
   default:               return "?";
   }
 }

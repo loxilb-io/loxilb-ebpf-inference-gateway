@@ -54,6 +54,13 @@ int mtls_configure_backend(SSL_CTX *ctx, proxy_arg_t *arg);
 int mtls_backend_set_identity(SSL *ssl, uint32_t epip);
 
 /**
+ * mtls_backend_installed - what a backend context built from @arg now is
+ * @arg: the rule
+ * @out: the policy and the identity of the certificate files behind it
+ */
+void mtls_backend_installed(const proxy_arg_t *arg, struct betls_installed *out);
+
+/**
  * mtls_match_cn_pattern - Match certificate CN against pattern
  * @cert: X509 certificate
  * @pattern: Pattern to match (supports wildcards like "*.example.com")

@@ -2598,6 +2598,98 @@ proxy_add_entry_abort(proxy_map_ent_t *node, void *ssl_ctx, void *ssl_epctx)
 }
 
 int
+proxy_leg_tls_stale(const proxy_map_ent_t *ent, const proxy_fd_ent_t *bpfe)
+{
+  if (!ent || !bpfe || !bpfe->ssl) {
+    return 0;
+  }
+  return (void *)SSL_get_SSL_CTX((SSL *)bpfe->ssl) != proxy_ent_epctx(ent);
+}
+
+#ifdef HAVE_MTLS
+/* PROXY_LOCK held. A rule update reached a listener that already serves: when
+ * the rule's backend TLS policy, or a certificate file behind it, is not what
+ * the listener's context was built from, build the new context and put it in
+ * service. The new one is built first; when that fails nothing changes and
+ * the listener keeps verifying as before. Connections already made keep the
+ * context they were made with; the old context is kept until the listener
+ * goes because a connect that loaded it a moment ago may still be using it.
+ * Returns 0 or PROXY_ADD_ETLS. */
+static int
+proxy_listener_epctx_refresh(proxy_map_ent_t *ent, proxy_arg_t *arg)
+{
+  struct betls_installed want;
+  struct proxy_retired_ctx *old;
+  void *nctx;
+
+  if (!ent->val.ssl_epctx || !arg->have_epssl) {
+    return 0;
+  }
+  mtls_backend_installed(arg, &want);
+  if (betls_installed_same(&ent->val.be_tls, &want)) {
+    return 0;
+  }
+  old = calloc(1, sizeof(*old));
+  if (!old) {
+    return -ENOMEM;
+  }
+  nctx = proxy_client_ssl_ctx_init(arg);
+  if (nctx == NULL || proxy_ssl_cfg_modes(nctx)) {
+    log_error("sockproxy : %s:%u rule %u backend TLS policy not replaced: context init failed, "
+              "generation %u stays in service",
+              inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+              arg->_id, ent->val.be_tls_gen);
+    if (nctx) {
+      SSL_CTX_free(nctx);
+    }
+    free(old);
+    return PROXY_ADD_ETLS;
+  }
+  old->ctx = ent->val.ssl_epctx;
+  old->next = ent->val.ssl_epctx_retired;
+  ent->val.ssl_epctx_retired = old;
+  __atomic_store_n(&ent->val.ssl_epctx, nctx, __ATOMIC_RELEASE);
+  ent->val.be_tls = want;
+  ent->val.be_tls_gen++;
+  log_info("sockproxy : %s:%u rule %u backend TLS policy replaced: generation %u "
+           "verify=%d ca id '%s' client id '%s' server name '%s'",
+           inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+           arg->_id, ent->val.be_tls_gen, want.verify, want.ca_id, want.client_id,
+           want.server_name);
+  return 0;
+}
+#endif /* HAVE_MTLS */
+
+int
+proxy_get_backend_tls_state(proxy_ent_t *key, struct proxy_betls_state *out)
+{
+  proxy_map_ent_t *ent;
+  int ret = -ENOENT;
+
+  if (!key || !out) {
+    return -EINVAL;
+  }
+  memset(out, 0, sizeof(*out));
+  PROXY_LOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (!cmp_proxy_ent(&ent->key, key)) {
+      continue;
+    }
+    out->have_epssl = ent->val.ssl_epctx != NULL;
+    out->verify = ent->val.be_tls.verify;
+    out->client_cert_loaded = ent->val.be_tls.client_cert_loaded;
+    out->generation = ent->val.be_tls_gen;
+    memcpy(out->ca_id, ent->val.be_tls.ca_id, sizeof(out->ca_id));
+    memcpy(out->client_id, ent->val.be_tls.client_id, sizeof(out->client_id));
+    memcpy(out->server_name, ent->val.be_tls.server_name, sizeof(out->server_name));
+    ret = 0;
+    break;
+  }
+  PROXY_UNLOCK();
+  return ret;
+}
+
+int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 {
   int lsd;
@@ -2612,6 +2704,15 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   while (ent) {
     if (cmp_proxy_ent(&ent->key, new_ent)) {
+#ifdef HAVE_MTLS
+      /* Before anything of the listener is touched: a policy that cannot be
+       * built refuses the update and leaves the rule as it was. */
+      int tls_rc = proxy_listener_epctx_refresh(ent, arg);
+      if (tls_rc != 0) {
+        PROXY_UNLOCK();
+        return tls_rc;
+      }
+#endif
       /* a shaper config stored before this add (or surviving a rule
        * re-create) attaches here; no-op when none is stored */
       qos_apply_stored_cfg(ent);
@@ -3107,6 +3208,11 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   node->val.main_fd = lsd;
   node->val.ssl_ctx = ssl_ctx;
   node->val.ssl_epctx = ssl_epctx;
+#ifdef HAVE_MTLS
+  if (ssl_epctx) {
+    mtls_backend_installed(arg, &node->val.be_tls);
+  }
+#endif
   node->val.proxy_mode = arg->proxy_mode;
 
   // Initialize backend protocol capability (default: HTTP/1.1 only for safety)
@@ -5901,6 +6007,12 @@ proxy_pdestroy(void *priv)
         SSL_CTX_free(ent->val.ssl_ctx);
       if (ent->val.ssl_epctx)
         SSL_CTX_free(ent->val.ssl_epctx);
+      while (ent->val.ssl_epctx_retired) {
+        struct proxy_retired_ctx *rc = ent->val.ssl_epctx_retired;
+        ent->val.ssl_epctx_retired = rc->next;
+        SSL_CTX_free(rc->ctx);
+        free(rc);
+      }
       free(ent);
     }
   }
@@ -7548,7 +7660,7 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
                        pfe->has_conv_id ? pfe->conversation_id : NULL,  // P0.3: Pass conversation ID
                        pfe->prefix_key.hash,  // P1.3: Pass prefix hash for CHWBL
                        custom_header,  // NEW: Pass custom session header value
-                       &ep_sel, &tepval, &seltype, &rid, ent->val.ssl_epctx, &ssl, key->dip, pfe,
+                       &ep_sel, &tepval, &seltype, &rid, proxy_ent_epctx(ent), &ssl, key->dip, pfe,
                        (pp2len ? pp2buf : NULL), pp2len);
   /* bounded backpressured admission. The request was enqueued onto a
    * per-EP parked FIFO inside proxy_setup_ep__/pd_select_prefill. SUSPEND the client
@@ -11984,6 +12096,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                                    pfe->ep_num)),
                 .prev_model = pfe->resp_model,
                 .next_model = proxy_effective_model(pfe),
+                .tls_ctx_stale = (pfe->n_rfd > 0 &&
+                                  proxy_leg_tls_stale((proxy_map_ent_t *)pfe->head,
+                                                      pfe->rfd_ent[0])),
               };
               if (ka_leg_reusable(&ka_ctx, &ka_reason)) {
                 pfe->ka_keep_leg = 1;

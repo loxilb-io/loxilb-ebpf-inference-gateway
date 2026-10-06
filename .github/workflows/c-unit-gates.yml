@@ -82,3 +82,6 @@ jobs:
 
       - name: What the backend leg accepts from an endpoint, and what it presents
         run: make -C common test_betls
+
+      - name: Whether a keep-alive request may ride the backend leg its predecessor used
+        run: make -C common test_ka
