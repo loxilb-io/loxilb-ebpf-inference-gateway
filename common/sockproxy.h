@@ -2123,6 +2123,11 @@ typedef int (*verdict_map_cb_t)(const struct llb_sockmap_key *self, int fd,
 typedef void (*proxy_info_cb_t)(struct dp_proxy_ct_ent *pct);
 int proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,
                   uint32_t *epip, uint16_t *epport, uint8_t *epprotocol);
+/* proxy_add_entry() could not build a TLS context for the rule (certificate,
+ * key, version or cipher material). Distinct from a socket or memory failure. */
+#define PROXY_ADD_ETLS (-EKEYREJECTED)
+/* On a non-zero return nothing of the rule is installed and arg stays with the
+ * caller. On 0 for a new listener the entry keeps arg until it is deleted. */
 int proxy_add_entry(struct proxy_ent *new_ent, struct proxy_arg *arg);
 int proxy_delete_entry(struct proxy_ent *ent, struct proxy_arg *arg);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);

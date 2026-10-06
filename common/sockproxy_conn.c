@@ -852,8 +852,12 @@ proxy_ep_connect_finish_leg(int fd, uint32_t epip, uint16_t epport,
     }
     
     void *nssl = SSL_new(ssl_ctx);
-    assert(nssl);
-    
+    if (nssl == NULL) {
+      log_error("ssl-new %s:%u(failed)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
+      close(fd);
+      return -1;
+    }
+
     if (proxy_ssl_connect(fd, nssl)) {
       log_error("ssl-connect %s:%u(failed)", inet_ntoa(*(struct in_addr *)(&epip)), ntohs(epport));
       close(fd);
