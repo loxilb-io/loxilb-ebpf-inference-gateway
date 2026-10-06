@@ -17,6 +17,7 @@
 
 #include "sockproxy_qos.h"  /* Tier-1 byte-shaper config + bucket (proxy_map_ent members) */
 #include "sockproxy_l7trust.h"  /* trusted-proxy ranges + hop list (proxy_map_ent members) */
+#include "sockproxy_betls_state.h"  /* installed backend TLS policy (proxy_val members) */
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
@@ -734,6 +735,11 @@ typedef struct proxy_epval {
   UT_hash_handle hh;
 } proxy_epval_t;
 
+struct proxy_retired_ctx {
+  void *ctx;
+  struct proxy_retired_ctx *next;
+};
+
 // Proxy value - contains per-proxy state
 typedef struct proxy_val {
   int proxy_mode;
@@ -743,7 +749,14 @@ typedef struct proxy_val {
   int ppv2;             /* PROXY protocol v2 emission on backend conns (L7 fullproxy) */
   int sched_free;
   void *ssl_ctx;
+  /* Replaced in place when the rule's backend TLS policy changes. Read it
+   * once per use with proxy_ent_epctx(); a context taken out of service
+   * stays allocated on ssl_epctx_retired until the listener goes, so a
+   * reader that loaded it just before the swap still holds a live one. */
   void *ssl_epctx;
+  struct proxy_retired_ctx *ssl_epctx_retired;
+  struct betls_installed be_tls;     /* what ssl_epctx was built from */
+  uint32_t be_tls_gen;               /* +1 on every replacement */
   uint32_t nfds;
   struct proxy_epval *ephash;
   struct proxy_fd_ent *fdlist;
@@ -2134,6 +2147,18 @@ int proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,
  * caller. On 0 for a new listener the entry keeps arg until it is deleted. */
 int proxy_add_entry(struct proxy_ent *new_ent, struct proxy_arg *arg);
 int proxy_delete_entry(struct proxy_ent *ent, struct proxy_arg *arg);
+/* The backend TLS policy a listener has installed, for reporting. */
+struct proxy_betls_state {
+  uint8_t have_epssl;           /* the backend leg is TLS at all */
+  uint8_t verify;
+  uint8_t client_cert_loaded;
+  uint32_t generation;          /* 0 as created, +1 per in-place replacement */
+  char ca_id[64];
+  char client_id[64];
+  char server_name[256];
+};
+/* Returns 0 and fills *out, or -ENOENT when no listener has this key. */
+int proxy_get_backend_tls_state(struct proxy_ent *key, struct proxy_betls_state *out);
 int proxy_update_ep_health(struct proxy_ent *key, int ep_index, uint8_t inactive);
 /* Health keys on the endpoint ADDRESS, which names the same backend in every
  * pool, rather than on a pool-local index. ep_port 0 matches any port on the

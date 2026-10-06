@@ -706,7 +706,7 @@ test_fdl: test_fdlist
 
 # What the backend leg accepts from an endpoint and what it presents: real
 # handshakes against certificates made by the test. Header-only and standalone.
-test_backend_tls: test_backend_tls.c sockproxy_betls.h
+test_backend_tls: test_backend_tls.c sockproxy_betls.h sockproxy_betls_state.h
 	$(CC) -Wall -Wextra -Werror -o $@ $< -I. -lssl -lcrypto
 
 .PHONY: test_betls

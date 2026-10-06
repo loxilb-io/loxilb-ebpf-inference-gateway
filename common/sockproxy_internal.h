@@ -258,6 +258,16 @@ int proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type);
  * the rest so they re-select instead of stranding until the max-park reap. */
 void pd_parked_drain_ep(proxy_epval_t *tepval, int ep_index, const char *why);
 void proxy_reset_fd_list(proxy_map_ent_t *ent, void *match_pfe);
+
+/* The listener's backend TLS context, loaded once. */
+static inline void *
+proxy_ent_epctx(const proxy_map_ent_t *ent)
+{
+  return __atomic_load_n(&ent->val.ssl_epctx, __ATOMIC_ACQUIRE);
+}
+/* 1 when a TLS backend leg was made with a context the listener no longer
+ * uses. A plaintext leg is never stale: TLS on or off is not swapped in place. */
+int proxy_leg_tls_stale(const proxy_map_ent_t *ent, const proxy_fd_ent_t *bpfe);
 /* PROXY_LOCK held. Put a shell on a rule's connection list; -1 and a log
  * line when the shell is on a list already (the insert is refused). `what`
  * names the leg in that line. */

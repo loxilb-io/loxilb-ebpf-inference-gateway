@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 
 #include "sockproxy_betls.h"
+#include "sockproxy_betls_state.h"
 
 static int failures = 0;
 static int checks   = 0;
@@ -409,6 +410,49 @@ main(void)
   check("files without a named client certificate are not presented", r.ok == 1 &&
         r.client_cert_seen == 0, r.client_cert_seen, 0);
   SSL_CTX_free(ctx);
+
+  /* ---- what counts as a changed policy --------------------------------- */
+  {
+    struct betls_installed a, b;
+
+    memset(&a, 0, sizeof(a));
+    a.verify = 1;
+    snprintf(a.ca_id, sizeof(a.ca_id), "ca-1");
+    betls_fp_stat(path_of("ca.crt"), &a.fp[BETLS_FP_CA]);
+    check("a CA file that exists has an identity", a.fp[BETLS_FP_CA].size > 0,
+          (long)a.fp[BETLS_FP_CA].size, 1);
+
+    b = a;
+    betls_fp_stat(path_of("ca.crt"), &b.fp[BETLS_FP_CA]);
+    check("the same policy over the same files is unchanged",
+          betls_installed_same(&a, &b) == 1, betls_installed_same(&a, &b), 1);
+
+    b = a; b.verify = 0;
+    check("verification switched off is a change", betls_installed_same(&a, &b) == 0,
+          betls_installed_same(&a, &b), 0);
+    b = a; snprintf(b.ca_id, sizeof(b.ca_id), "ca-2");
+    check("another CA ID is a change", betls_installed_same(&a, &b) == 0,
+          betls_installed_same(&a, &b), 0);
+    b = a; snprintf(b.client_id, sizeof(b.client_id), "client-1");
+    check("a client ID added is a change", betls_installed_same(&a, &b) == 0,
+          betls_installed_same(&a, &b), 0);
+    b = a; snprintf(b.server_name, sizeof(b.server_name), "backend.test");
+    check("a server name added is a change", betls_installed_same(&a, &b) == 0,
+          betls_installed_same(&a, &b), 0);
+
+    /* The CA is replaced under the same ID, the way a rotation writes it:
+     * a new file renamed over the old one. */
+    write_cert("ca.crt.new", other_ca);
+    rename(path_of("ca.crt.new"), path_of("ca.crt"));
+    b = a;
+    betls_fp_stat(path_of("ca.crt"), &b.fp[BETLS_FP_CA]);
+    check("a CA replaced under the same ID is a change", betls_installed_same(&a, &b) == 0,
+          betls_installed_same(&a, &b), 0);
+
+    betls_fp_stat(path_of("no-such-file"), &b.fp[BETLS_FP_CA]);
+    check("a file that is gone has no identity", b.fp[BETLS_FP_CA].ino == 0 &&
+          b.fp[BETLS_FP_CA].size == 0, (long)b.fp[BETLS_FP_CA].size, 0);
+  }
 
   printf("\n%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;

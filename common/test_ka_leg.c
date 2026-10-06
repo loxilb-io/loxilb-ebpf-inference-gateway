@@ -108,6 +108,10 @@ main(void)
   c = base; c.ep_healthy = 0;
   expect_release("pinned endpoint unhealthy", c, KA_LEG_UNHEALTHY);
 
+  /* The listener's backend TLS context was replaced since the leg was made. */
+  c = base; c.tls_ctx_stale = 1;
+  expect_release("leg made under a replaced TLS policy", c, KA_LEG_TLS_CTX);
+
   /* The request names another model. */
   c = base; c.next_model = "mistral-7b";
   expect_release("model changed", c, KA_LEG_MODEL);

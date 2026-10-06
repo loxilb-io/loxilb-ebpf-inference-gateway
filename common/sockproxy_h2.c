@@ -4261,8 +4261,11 @@ h2_have_tepval:
   int slot = -1;
   for (int i = 0; i < pfe->n_rfd && i < MAX_PROXY_EP; i++) {
     proxy_fd_ent_t *bpfe = pfe->rfd_ent[i];
+    /* A connection made under a backend TLS policy the listener has since
+     * replaced takes no new stream: the streams on it finish there, this one
+     * gets a connection made with the context in service. */
     if (bpfe && bpfe->epv == (void *)tepval && bpfe->ep_num == ep_idx &&
-        pfe->rfd[i] > 0) {
+        pfe->rfd[i] > 0 && !proxy_leg_tls_stale(ent, bpfe)) {
       slot = i;
       backend_fd = pfe->rfd[i];
       break;
@@ -4333,9 +4336,11 @@ h2_have_tepval:
     //
     // We must provide a valid pointer to store the SSL handle, not NULL!
     
+    /* Loaded once: the context may be replaced while this runs. */
+    void *epctx = proxy_ent_epctx(ent);
     backend_fd = proxy_setup_ep_connect(ep_ip, ep_port, ep_proto,
-                                         ent->val.ssl_epctx,  // SSL context for backend
-                                         ent->val.ssl_epctx ? &backend_ssl : NULL,  // Store SSL handle
+                                         epctx,  // SSL context for backend
+                                         epctx ? &backend_ssl : NULL,  // Store SSL handle
                                          pfe,  // Pass pfe for trace events
                                          (pp2len ? pp2buf : NULL), pp2len);  // L7 fullproxy PPv2
     
