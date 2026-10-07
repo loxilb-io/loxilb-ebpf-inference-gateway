@@ -418,6 +418,16 @@ int proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream);
  */
 void proxy_h2_cleanup_session(proxy_fd_ent_t *pfe);
 
+/**
+ * A backend leg ended before it answered: every client stream it carries
+ * gets a 503. Call with nothing held, while the two entries are linked.
+ *
+ * @param client  Client entry (owns the HTTP/2 session)
+ * @param backend Backend entry whose leg ended
+ * @return Number of streams answered
+ */
+int proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend);
+
 /*
  * One deferred HTTP/2 stream settle, collected on connection teardown.
  *

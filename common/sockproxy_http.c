@@ -379,6 +379,34 @@ proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
       SP_LOCAL_SEND_RETRY_MAX);
 }
 
+/* The answer to a request no backend took. It carries its length, so the
+ * client knows it is whole without waiting for the close that follows. */
+int
+proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
+{
+  char body[192];
+  char resp[384];
+  int blen, n;
+
+  blen = snprintf(body, sizeof(body),
+                  "{\"error\":\"backend_unreachable\",\"detail\":\"%s\"}\r\n",
+                  detail ? detail : "");
+  if (blen < 0 || blen >= (int)sizeof(body)) {
+    return -1;
+  }
+  n = snprintf(resp, sizeof(resp),
+               "HTTP/1.1 502 Bad Gateway\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n"
+               "\r\n"
+               "%s", blen, body);
+  if (n < 0 || n >= (int)sizeof(resp)) {
+    return -1;
+  }
+  return proxy_send_local_response(pfe, resp, (size_t)n);
+}
+
 static int
 proxy_send_local_100_continue(proxy_fd_ent_t *pfe)
 {
@@ -6796,6 +6824,96 @@ proxy_sock_read(proxy_fd_ent_t *pfe, int fd, void *buf, size_t len)
  *
  * Reaching across the pair is fine and already happens, as long as the reach is
  * the only lock held at the time. */
+/* A TLS backend leg failed on a read before one application byte came from
+ * it. The handshake completed, or this read would not have run, so the
+ * endpoint turned the gateway away afterwards: a TLS 1.3 server checks the
+ * client certificate after the client has finished, and answers a missing or
+ * untrusted one with an alert or a reset, whichever its close gets out first.
+ * The request the leg was made for has no answer and cannot get one, so the
+ * client is told what a failed connect tells it, and the endpoint is named
+ * in the log. Call before the error queue is popped, with nothing held. */
+/* The endpoint a backend leg was made to, as "address:port". The pool and the
+ * index are read where the connect path reads them; the socket is asked last,
+ * because a leg that was reset no longer has a peer to name. */
+static void
+proxy_backend_leg_name(proxy_fd_ent_t *pfe, proxy_fd_ent_t *client,
+                       char *out, size_t outlen)
+{
+  proxy_epval_t *epv = NULL;
+  int idx = -1;
+  struct sockaddr_in peer;
+  socklen_t plen = sizeof(peer);
+  char ip[INET_ADDRSTRLEN] = "";
+
+  if (pfe->backend_h2_session) {
+    backend_h2_session_t *bs = (backend_h2_session_t *)pfe->backend_h2_session;
+
+    epv = (proxy_epval_t *)bs->epv;
+    idx = bs->ep_idx;
+  } else if (client && client->epv) {
+    epv = (proxy_epval_t *)client->epv;
+    idx = client->ep_num;
+  }
+  if (epv && idx >= 0 && idx < epv->n_eps) {
+    inet_ntop(AF_INET, &epv->eps[idx].xip, ip, sizeof(ip));
+    snprintf(out, outlen, "%s:%u", ip, ntohs(epv->eps[idx].xport));
+    return;
+  }
+  memset(&peer, 0, sizeof(peer));
+  if (getpeername(pfe->fd, (struct sockaddr *)&peer, &plen) == 0 &&
+      peer.sin_family == AF_INET) {
+    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+    snprintf(out, outlen, "%s:%u", ip, ntohs(peer.sin_port));
+    return;
+  }
+  snprintf(out, outlen, "fd=%d", pfe->fd);
+}
+
+static void
+proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error)
+{
+  proxy_fd_ent_t *client;
+  char ep[INET_ADDRSTRLEN + 16];
+  char why[160];
+  unsigned long e = ERR_peek_error();
+
+  if (pfe->odir != 1 || pfe->leg_rx_seen) {
+    return;
+  }
+  pfe->leg_rx_seen = 1;              /* once per leg */
+
+  client = pfe->n_rfd > 0 ? pfe->rfd_ent[0] : NULL;
+  proxy_backend_leg_name(pfe, client, ep, sizeof(ep));
+  if (ssl_error == SSL_ERROR_SSL && e != 0) {
+    ERR_error_string_n(e, why, sizeof(why));
+  } else {
+    snprintf(why, sizeof(why), "connection closed without a TLS alert");
+  }
+  log_error("ssl-read %s(failed after handshake, before any response): %s", ep, why);
+
+  if (!client || client->odir != 0 || client->fd <= 0 ||
+      client->pd_phase != PD_PHASE_NONE) {
+    return;
+  }
+  if (client->h2_session && client->h2_session->h2_enabled) {
+    (void)proxy_h2_backend_leg_unanswered(client, pfe);
+    return;
+  }
+  PROXY_ENT_LOCK(client);
+  if (!atomic_load_explicit(&client->cresp_answer_open, memory_order_relaxed)) {
+    if (proxy_send_backend_unreachable(client,
+            "the backend endpoint closed the connection before it answered") == 0) {
+      cresp_note_local_answer(client);
+    }
+    /* The answer says Connection: close; a TLS client is told the stream
+     * ended here, so it does not read the close that follows as a cut. */
+    if (client->ssl) {
+      (void)SSL_shutdown(client->ssl);
+    }
+  }
+  PROXY_ENT_UNLOCK(client);
+}
+
 static int
 proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
 {
@@ -7078,6 +7196,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         /* Before the log below pops the error queue: a FIN without
          * close_notify, or a reset, for the half-close observation. */
         hc_tls_read_failed(pfe, ssl_error, rval, errno);
+        proxy_backend_leg_unanswered(pfe, ssl_error);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[SSL_ERROR_SYSCALL] fd=%d odir=%d ssl_error=%d | SSL or syscall error, shutting down",
                   pfe->fd, pfe->odir, ssl_error);
@@ -7717,6 +7836,11 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
      * path that forgot its error body). Nonzero == contract gap. */
     if (!pfe->lb_err_body_sent) {
       atomic_fetch_add(&global_stats.lb_select_failure_shutdown, 1);
+    } else if (pfe->ssl) {
+      /* The error body is the last thing this connection carries. A TLS
+       * client that is not told so reads the close below as a cut-off
+       * response, although it has all of it. */
+      (void)SSL_shutdown(pfe->ssl);
     }
     pfe->lb_err_body_sent = 0;
     proxy_destroy_eps(pfe->fd, &ep_sel);
@@ -11449,6 +11573,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
     int saved_errno = errno;  // Save errno immediately after recv()
     if (rc > 0) {
       pfe_rcv_note_len(pfe, pfe->rcv_off + (size_t)rc);
+      pfe->leg_rx_seen = 1;
     }
 
     if (qos_b) {
