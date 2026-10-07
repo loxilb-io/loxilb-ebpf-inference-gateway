@@ -270,6 +270,10 @@ proxy_ent_epctx(const proxy_map_ent_t *ent)
 /* 1 when a TLS backend leg was made with a context the listener no longer
  * uses. A plaintext leg is never stale: TLS on or off is not swapped in place. */
 int proxy_leg_tls_stale(const proxy_map_ent_t *ent, const proxy_fd_ent_t *bpfe);
+/* Client connections made under a replaced backend TLS policy are closed by
+ * the 1 Hz pass. proxy_betls_drain_sweep runs under PROXY_LOCK. */
+int proxy_betls_drain_due(void);
+void proxy_betls_drain_sweep(void);
 /* PROXY_LOCK held. Put a shell on a rule's connection list; -1 and a log
  * line when the shell is on a list already (the insert is refused). `what`
  * names the leg in that line. */

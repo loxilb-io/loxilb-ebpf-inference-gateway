@@ -757,6 +757,7 @@ typedef struct proxy_val {
   struct proxy_retired_ctx *ssl_epctx_retired;
   struct betls_installed be_tls;     /* what ssl_epctx was built from */
   uint32_t be_tls_gen;               /* +1 on every replacement */
+  uint64_t be_tls_replaced_ms;       /* proxy_mono_ms() of the last one; 0: never */
   uint32_t nfds;
   struct proxy_epval *ephash;
   struct proxy_fd_ent *fdlist;

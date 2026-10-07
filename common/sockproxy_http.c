@@ -2634,6 +2634,96 @@ proxy_leg_tls_stale(const proxy_map_ent_t *ent, const proxy_fd_ent_t *bpfe)
   return (void *)SSL_get_SSL_CTX((SSL *)bpfe->ssl) != proxy_ent_epctx(ent);
 }
 
+/* ---- client connections made under a replaced backend TLS policy -----------
+ *
+ * A replaced policy reaches a connection when its backend leg is dialled, and
+ * a relayed HTTP/1.1 client keeps the leg it has for as long as it stays
+ * connected: nothing on that path looks at a request to decide where it goes.
+ * So the client connection is ended instead, at a point where that costs the
+ * client a reconnect and nothing else: when every request it sent has been
+ * answered. A connection that never reaches that point (an answer that does
+ * not end, or one this side cannot frame) is ended when the bound is up.
+ *
+ * Not for an HTTP/2 client or an AI-gateway rule: both decide per request,
+ * and move a request to a new leg when the one they hold is stale. */
+#define BETLS_DRAIN_BOUND_MS 30000ull
+/* The pass runs until this time: one bound after the last replacement, and a
+ * little more so that the pass that enforces the bound is still due. */
+#define BETLS_DRAIN_TAIL_MS 5000ull
+static _Atomic uint64_t betls_drain_until_ms;
+
+#ifdef HAVE_MTLS
+/* PROXY_LOCK held, by the replacement itself. */
+static void
+proxy_betls_drain_arm(proxy_map_ent_t *ent)
+{
+  uint64_t now = proxy_mono_ms();
+
+  ent->val.be_tls_replaced_ms = now ? now : 1;
+  atomic_store_explicit(&betls_drain_until_ms,
+                        now + BETLS_DRAIN_BOUND_MS + BETLS_DRAIN_TAIL_MS,
+                        memory_order_relaxed);
+}
+#endif
+
+int
+proxy_betls_drain_due(void)
+{
+  return atomic_load_explicit(&betls_drain_until_ms, memory_order_relaxed) != 0;
+}
+
+void
+proxy_betls_drain_sweep(void)
+{
+  proxy_map_ent_t *node;
+  proxy_fd_ent_t *pfe;
+  uint64_t now = proxy_mono_ms();
+  uint64_t until = atomic_load_explicit(&betls_drain_until_ms, memory_order_relaxed);
+
+  /* Called with PROXY_LOCK held: entries stay on their list, and a leg's SSL
+   * is freed only under it. */
+  for (node = proxy_struct->head; node; node = node->next) {
+    int over;
+
+    if (!node->val.be_tls_replaced_ms) {
+      continue;
+    }
+    over = now - node->val.be_tls_replaced_ms >= BETLS_DRAIN_BOUND_MS;
+    for (pfe = node->val.fdlist; pfe; pfe = pfe->next) {
+      proxy_fd_ent_t *leg0;
+      int owed;
+
+      if (pfe->odir != 0 || pfe->fd <= 0 || pfe->fd == node->val.main_fd ||
+          pfe->h2_session || pfe->ai_gw_mode || pfe->pd_phase != PD_PHASE_NONE) {
+        continue;
+      }
+      /* One load of the leg pointer, as the other 1 Hz passes do. */
+      leg0 = __atomic_load_n(&pfe->rfd_ent[0], __ATOMIC_ACQUIRE);
+      if (pfe->n_rfd <= 0 || !leg0 || !proxy_leg_tls_stale(node, leg0)) {
+        continue;
+      }
+      owed = atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed) !=
+             atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed);
+      if (owed && !over) {
+        continue;
+      }
+      log_info("sockproxy : %s:%u backend TLS policy replaced: closing client fd=%d, "
+               "its backend connection was made under an earlier policy (%s)",
+               inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
+               pfe->fd, owed ? "an answer still owed after the bound" : "no answer owed");
+      shutdown(pfe->fd, SHUT_RDWR);
+      if (leg0->fd > 0) {
+        shutdown(leg0->fd, SHUT_RDWR);
+      }
+    }
+  }
+  if (now >= until) {
+    /* Not cleared when a replacement moved it meanwhile. */
+    atomic_compare_exchange_strong_explicit(&betls_drain_until_ms, &until, 0,
+                                            memory_order_relaxed, memory_order_relaxed);
+  }
+}
+
 #ifdef HAVE_MTLS
 /* PROXY_LOCK held. A rule update reached a listener that already serves: when
  * the rule's backend TLS policy, or a certificate file behind it, is not what
@@ -2679,6 +2769,7 @@ proxy_listener_epctx_refresh(proxy_map_ent_t *ent, proxy_arg_t *arg)
   __atomic_store_n(&ent->val.ssl_epctx, nctx, __ATOMIC_RELEASE);
   ent->val.be_tls = want;
   ent->val.be_tls_gen++;
+  proxy_betls_drain_arm(ent);
   log_info("sockproxy : %s:%u rule %u backend TLS policy replaced: generation %u "
            "verify=%d ca id '%s' client id '%s' server name '%s'",
            inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
