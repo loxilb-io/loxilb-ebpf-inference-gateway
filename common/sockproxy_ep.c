@@ -1333,16 +1333,8 @@ pd_fallback_normal:
             /* All candidates exhausted — a real HTTP error, not a raw reset. */
             log_error("LB mid-cycle failover exhausted all EPs (orig=EP%d) — 502",
                       nx_orig);
-            {
-              const char *lb_502 =
-                  "HTTP/1.1 502 Bad Gateway\r\n"
-                  "Content-Type: application/json\r\n"
-                  "Connection: close\r\n"
-                  "\r\n"
-                  "{\"error\":\"backend_unreachable\","
-                  "\"detail\":\"no healthy backend endpoint accepted the connection\"}\r\n";
-              proxy_send_local_response(pfe, lb_502, strlen(lb_502));
-            }
+            proxy_send_backend_unreachable(pfe,
+                "no healthy backend endpoint accepted the connection");
             pfe->lb_err_body_sent = 1;
           }
 

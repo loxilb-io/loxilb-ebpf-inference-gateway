@@ -178,6 +178,8 @@ void pd_cleanup(proxy_fd_ent_t *fd_ent);
 int proxy_send_local_response(proxy_fd_ent_t *pfe, const void *buf, size_t len);
 int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *pfe,
                                            const void *buf, size_t len);
+/* The 502 of a request no backend took, framed with its length. */
+int proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail);
 void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                            int retry_body, const char *code, const char *msg);
 /* `keep`: the refusal leaves the connection open for its next request (the

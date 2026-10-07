@@ -1033,6 +1033,9 @@ struct proxy_fd_ent {
    * leg, connect_async_ok while its caller can hold the request. */
   uint8_t connect_pending;
   uint8_t connect_wait;
+  /* Backend entry: an application byte was read from this leg. A TLS leg that
+   * fails before the first one never answered the request it was made for. */
+  uint8_t leg_rx_seen;
   uint8_t connect_async_ok;
   uint8_t connect_pp2_len;
   uint8_t connect_pp2[28];

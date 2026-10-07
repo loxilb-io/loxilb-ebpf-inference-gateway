@@ -3099,6 +3099,42 @@ sp_fc_h2_gate_endpoint(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   return ep;
 }
 
+/* See sockproxy_h2.h. The stream IDs are collected first: answering a stream
+ * ends it, and its end may take the mapping it was found through. */
+int
+proxy_h2_backend_leg_unanswered(proxy_fd_ent_t *client, proxy_fd_ent_t *backend)
+{
+  backend_h2_session_t *bs;
+  stream_mapping_t *mapping, *tmp;
+  int32_t ids[64];
+  int n = 0, answered = 0;
+
+  if (!client || !backend || !client->h2_session || !client->h2_session->session) {
+    return 0;
+  }
+  bs = (backend_h2_session_t *)backend->backend_h2_session;
+  if (!bs) {
+    return 0;
+  }
+  HASH_ITER(hh, bs->stream_map, mapping, tmp) {
+    if (n < (int)(sizeof(ids) / sizeof(ids[0]))) {
+      ids[n++] = mapping->client_stream_id;
+    }
+  }
+  for (int i = 0; i < n; i++) {
+    proxy_h2_stream_t *stream = find_stream(client->h2_session, ids[i]);
+
+    if (!stream) {
+      continue;
+    }
+    if (proxy_h2_send_ai_deny(client, stream, 503, 0, 0, "backend_unreachable",
+            "the backend endpoint closed the connection before it answered") == 0) {
+      answered++;
+    }
+  }
+  return answered;
+}
+
 /**
  * Cleanup HTTP/2 session and all streams
  *
@@ -4380,16 +4416,10 @@ h2_have_tepval:
       int32_t failed_stream_id = stream ? stream->stream_id : -1;
       
       if (pfe && pfe->h2_session && pfe->h2_session->session && failed_stream_id > 0) {
-        // Send HTTP/2 headers with 503 status + END_STREAM flag (no body needed)
-        nghttp2_nv hdrs[] = {
-          {(uint8_t *)":status", (uint8_t *)"503", 7, 3, NGHTTP2_NV_FLAG_NONE},
-          {(uint8_t *)"content-length", (uint8_t *)"0", 14, 1, NGHTTP2_NV_FLAG_NONE},
-        };
-        
-        nghttp2_submit_response(pfe->h2_session->session, failed_stream_id,
-                                hdrs, 2, NULL);  // NULL data provider = no body
-        
-        nghttp2_session_send(pfe->h2_session->session);
+        /* The same error name the HTTP/1.1 answer carries, so a client can
+         * tell this 503 from a capacity refusal. */
+        proxy_h2_send_ai_deny(pfe, stream, 503, 0, 0, "backend_unreachable",
+                              "no healthy backend endpoint accepted the connection");
       }
       
       return -1;
