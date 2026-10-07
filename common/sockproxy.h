@@ -749,6 +749,9 @@ typedef struct proxy_val {
   int ppv2;             /* PROXY protocol v2 emission on backend conns (L7 fullproxy) */
   int sched_free;
   void *ssl_ctx;
+  /* The frontend context a kept listener had before a rule took it over
+   * again: out of service, freed at the next takeover or with the listener. */
+  void *ssl_ctx_retired;
   /* Replaced in place when the rule's backend TLS policy changes. Read it
    * once per use with proxy_ent_epctx(); a context taken out of service
    * stays allocated on ssl_epctx_retired until the listener goes, so a

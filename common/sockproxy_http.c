@@ -2625,6 +2625,212 @@ proxy_add_entry_abort(proxy_map_ent_t *node, void *ssl_ctx, void *ssl_epctx)
   free(node);
 }
 
+/* Free a frontend context that is not in service. The rule's proxy_arg is
+ * detached first, as in proxy_add_entry_abort(). */
+static void
+proxy_frontend_ctx_drop(void *ssl_ctx)
+{
+  if (!ssl_ctx) {
+    return;
+  }
+#ifdef HAVE_MTLS
+  if (g_ssl_ctx_proxy_arg_index >= 0) {
+    SSL_CTX_set_ex_data((SSL_CTX *)ssl_ctx, g_ssl_ctx_proxy_arg_index, NULL);
+  }
+#endif
+  SSL_CTX_free(ssl_ctx);
+}
+
+/* Build the frontend TLS context of a listener from the rule's arguments:
+ * the certificate, the SNI callback and, when the rule asks for it, client
+ * certificate verification (which stores arg in the context). NULL when any
+ * part cannot be set up; the reason is logged. */
+static void *
+proxy_frontend_ctx_build(const proxy_ent_t *key, proxy_arg_t *arg)
+{
+  void *ssl_ctx;
+
+  // thread the rule's proxy_arg so version/cipher
+  // pinning is applied to the frontend listener SSL_CTX. arg is byte-for-byte
+  // today's behaviour when the TLS-pinning fields are unset (-COMPAT).
+  ssl_ctx = proxy_server_ssl_ctx_init(arg);
+  if (ssl_ctx == NULL) {
+    log_error("sockproxy : %s:%u rule %u frontend TLS context init failed",
+        inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+        arg->_id);
+    return NULL;
+  }
+
+  if (proxy_ssl_cfg_opts(ssl_ctx,
+        strcmp(arg->host_url, "") ? arg->host_url : NULL, 0)) {
+    log_error("[LB Rule] Failed to load SSL certificates for hostname: '%s'",
+              strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+    proxy_frontend_ctx_drop(ssl_ctx);
+    return NULL;
+  }
+
+  // Register SNI callback for dynamic certificate selection (GLOBAL STORE)
+  SSL_CTX_set_tlsext_servername_callback((SSL_CTX *)ssl_ctx, sni_servername_callback);
+  SSL_CTX_set_tlsext_servername_arg((SSL_CTX *)ssl_ctx, NULL);  // Not used - callback uses global store
+
+#ifdef HAVE_MTLS
+  // Configure frontend mTLS (client certificate verification)
+  if (arg->frontend_mtls_mode > 0) {
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    log_debug("[mTLS] Frontend mTLS enabled in proxy_add_entry");
+    log_debug("[mTLS]   mode=%d (1=Optional, 2=Required)", arg->frontend_mtls_mode);
+    log_debug("[mTLS]   client_ca_path=%s", arg->client_ca_path[0] ? arg->client_ca_path : "(none)");
+    log_debug("[mTLS]   require_client_cn=%d, pattern=%s",
+              arg->require_client_cn, arg->client_cn_pattern[0] ? arg->client_cn_pattern : "(none)");
+    log_debug("[mTLS]   host_url=%s", strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+#endif
+    if (mtls_configure_frontend((SSL_CTX *)ssl_ctx, arg) != 0) {
+      log_error("[mTLS] Failed to configure frontend mTLS for %s",
+                strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+      proxy_frontend_ctx_drop(ssl_ctx);
+      return NULL;
+    }
+#ifdef HAVE_PROXY_EXTRA_DEBUG
+    log_debug("[mTLS] Frontend mTLS configured successfully for %s",
+              strcmp(arg->host_url, "") ? arg->host_url : "(default)");
+    log_debug("[mTLS] Stored proxy_arg=%p in SSL_CTX=%p with index=%d",
+              (void*)arg, (void*)ssl_ctx, g_ssl_ctx_proxy_arg_index);
+#endif
+  }
+#endif
+  return ssl_ctx;
+}
+
+/* Build the backend TLS context of a listener from the rule's arguments.
+ * Only the write modes are set on it: the backend context presents what the
+ * rule names, never the listener's default certificate. NULL when it cannot
+ * be set up; the reason is logged. */
+static void *
+proxy_backend_ctx_build(const proxy_ent_t *key, proxy_arg_t *arg)
+{
+  void *ssl_epctx = proxy_client_ssl_ctx_init(arg);
+
+  if (ssl_epctx == NULL) {
+    log_error("sockproxy : %s:%u rule %u backend TLS context init failed",
+        inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+        arg->_id);
+    return NULL;
+  }
+  if (proxy_ssl_cfg_modes(ssl_epctx)) {
+    log_error("sockproxy : %s:%u rule %u backend TLS context setup failed",
+        inet_ntoa(*(struct in_addr *)&key->xip), ntohs(key->xport),
+        arg->_id);
+    SSL_CTX_free(ssl_epctx);
+    return NULL;
+  }
+  return ssl_epctx;
+}
+
+/* ---- a listener kept without rules gets a rule again -----------------------
+ *
+ * Deleting the last pool of a listener keeps the listener (it answers 503) and
+ * frees the rule's proxy_arg, which the frontend context held for client
+ * certificate verification. The rule that comes back, the same one after an
+ * endpoint change or another one on the address, brings its own arguments:
+ * the listener takes them, and with them a frontend and a backend context
+ * built from them. The contexts left over from the deleted rule are not
+ * reconfigured: the frontend one verifies nothing any more (its arguments are
+ * gone) or verifies what the deleted rule asked for, and the backend one
+ * offers the endpoints the protocol and the certificate of the deleted rule.
+ *
+ * The accept path reads val.ssl_ctx without PROXY_LOCK, so the context taken
+ * out of service is not freed here. It is kept until the listener is revived
+ * once more or goes: a reader that loaded it just before the swap still holds
+ * a live one. The backend context goes on the retired list, as it does when a
+ * policy is replaced. */
+struct proxy_takeover {
+  void *ssl_ctx;                      /* NULL: the rule does not terminate TLS */
+  void *ssl_epctx;                    /* NULL: the rule does not re-encrypt */
+  struct proxy_retired_ctx *retire;   /* holds the backend context in service */
+};
+
+static void
+proxy_takeover_drop(struct proxy_takeover *t)
+{
+  proxy_frontend_ctx_drop(t->ssl_ctx);
+  if (t->ssl_epctx) {
+    SSL_CTX_free(t->ssl_epctx);
+  }
+  free(t->retire);
+  memset(t, 0, sizeof(*t));
+}
+
+/* Everything that can fail, before anything of the listener is touched. */
+static int
+proxy_takeover_prepare(proxy_map_ent_t *ent, proxy_arg_t *arg, struct proxy_takeover *t)
+{
+  memset(t, 0, sizeof(*t));
+  if (ent->val.ssl_epctx) {
+    t->retire = calloc(1, sizeof(*t->retire));
+    if (!t->retire) {
+      return -ENOMEM;
+    }
+  }
+  if (arg->have_ssl) {
+    t->ssl_ctx = proxy_frontend_ctx_build(&ent->key, arg);
+    if (t->ssl_ctx == NULL) {
+      proxy_takeover_drop(t);
+      return PROXY_ADD_ETLS;
+    }
+  }
+  if (arg->have_epssl) {
+    t->ssl_epctx = proxy_backend_ctx_build(&ent->key, arg);
+    if (t->ssl_epctx == NULL) {
+      proxy_takeover_drop(t);
+      return PROXY_ADD_ETLS;
+    }
+  }
+  return 0;
+}
+
+static void
+proxy_listener_revive(proxy_map_ent_t *ent, proxy_arg_t *arg, struct proxy_takeover *t)
+{
+  void *old = ent->val.ssl_ctx;
+  void *nctx = t->ssl_ctx;
+  int client_cert_mode = 0;
+
+#ifdef HAVE_MTLS
+  client_cert_mode = arg->frontend_mtls_mode;
+#endif
+
+  if (t->retire) {
+    t->retire->ctx = ent->val.ssl_epctx;
+    t->retire->next = ent->val.ssl_epctx_retired;
+    ent->val.ssl_epctx_retired = t->retire;
+    ent->val.be_tls_gen++;
+  }
+  __atomic_store_n(&ent->val.ssl_epctx, t->ssl_epctx, __ATOMIC_RELEASE);
+#ifdef HAVE_MTLS
+  memset(&ent->val.be_tls, 0, sizeof(ent->val.be_tls));
+  if (t->ssl_epctx) {
+    mtls_backend_installed(arg, &ent->val.be_tls);
+  }
+#endif
+
+  /* What the rule's backends speak decides what the listener offers. */
+  ent->val.backend_protocol_cap = arg->backend_protocol_cap;
+  if (nctx) {
+    SSL_CTX_set_alpn_select_cb(nctx, alpn_select_callback, &ent->val.backend_protocol_cap);
+  }
+  __atomic_store_n(&ent->val.ssl_ctx, nctx, __ATOMIC_RELEASE);
+  ent->val.have_ssl = arg->have_ssl;
+  proxy_frontend_ctx_drop(ent->val.ssl_ctx_retired);
+  ent->val.ssl_ctx_retired = old;
+  ent->arg_ptr = arg;
+  log_info("sockproxy : %s:%u rule %u takes over the kept listener: frontend TLS %s, "
+           "client certificate mode %d, backend TLS %s",
+           inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+           arg->_id, nctx ? "context built" : "off", client_cert_mode,
+           t->ssl_epctx ? "context built" : "off");
+  memset(t, 0, sizeof(*t));
+}
+
 int
 proxy_leg_tls_stale(const proxy_map_ent_t *ent, const proxy_fd_ent_t *bpfe)
 {
@@ -2823,10 +3029,25 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 
   while (ent) {
     if (cmp_proxy_ent(&ent->key, new_ent)) {
+      /* A listener kept without rules holds no arguments. The frontend
+       * context of the rule that takes it over is built before anything of
+       * the listener is touched, and put in service once nothing below can
+       * refuse the rule any more. */
+      int revive = ent->arg_ptr == NULL;
+      struct proxy_takeover takeover = { 0 };
+
+      if (revive) {
+        int trc = proxy_takeover_prepare(ent, arg, &takeover);
+        if (trc != 0) {
+          PROXY_UNLOCK();
+          return trc;
+        }
+      }
 #ifdef HAVE_MTLS
       /* Before anything of the listener is touched: a policy that cannot be
-       * built refuses the update and leaves the rule as it was. */
-      int tls_rc = proxy_listener_epctx_refresh(ent, arg);
+       * built refuses the update and leaves the rule as it was. A takeover
+       * has built its backend context already. */
+      int tls_rc = revive ? 0 : proxy_listener_epctx_refresh(ent, arg);
       if (tls_rc != 0) {
         PROXY_UNLOCK();
         return tls_rc;
@@ -2868,6 +3089,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         candidate.select = arg->select;
         memcpy(candidate.eps, arg->eps, sizeof(arg->eps));
         if (chwbl_prepare_runtime(&candidate, arg, tepval) < 0) {
+          proxy_takeover_drop(&takeover);
           PROXY_UNLOCK();
           log_error("sockproxy: rejected CHWBL/WRR_HASH candidate for rule %u", arg->_id);
           return -ENOMEM;
@@ -2912,6 +3134,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * on every tick, so requests already waiting get the new value. */
         tepval->pd_prefill_timeout_sec = arg->pd_prefill_timeout_sec;
         sp_fc_warm_returning(tepval, fc_old_eps, fc_old_n);
+        if (revive) {
+          proxy_listener_revive(ent, arg, &takeover);
+        }
         PROXY_UNLOCK();
         log_info("sockproxy : %s:%u (%s) updated",
                  inet_ntoa(*(struct in_addr *)&new_ent->xip),
@@ -2930,6 +3155,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         if (chwbl_prepare_runtime(tepval, arg, NULL) < 0) {
           pthread_rwlock_destroy(&tepval->chwbl_state_lock);
           free(tepval);
+          proxy_takeover_drop(&takeover);
           PROXY_UNLOCK();
           return -ENOMEM;
         }
@@ -3180,6 +3406,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
                         tepval->ephash_key, strlen(tepval->ephash_key),
                         tepval);
 
+        if (revive) {
+          proxy_listener_revive(ent, arg, &takeover);
+        }
         PROXY_UNLOCK();
         return 0;
       }
@@ -3215,85 +3444,18 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 #endif
 
   if (arg->have_ssl) {
-    // thread the rule's proxy_arg so version/cipher
-    // pinning is applied to the frontend listener SSL_CTX. arg is byte-for-byte
-    // today's behaviour when the TLS-pinning fields are unset (-COMPAT).
-    ssl_ctx = proxy_server_ssl_ctx_init(arg);
+    ssl_ctx = proxy_frontend_ctx_build(&node->key, arg);
     if (ssl_ctx == NULL) {
-      log_error("sockproxy : %s:%u rule %u frontend TLS context init failed",
-          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
-          arg->_id);
       proxy_add_entry_abort(node, NULL, NULL);
       PROXY_UNLOCK();
       return PROXY_ADD_ETLS;
     }
-
-    if (proxy_ssl_cfg_opts(ssl_ctx,
-          strcmp(arg->host_url, "") ? arg->host_url : NULL, 0)) {
-      log_error("[LB Rule] Failed to load SSL certificates for hostname: '%s'",
-                strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-      proxy_add_entry_abort(node, ssl_ctx, NULL);
-      PROXY_UNLOCK();
-      return PROXY_ADD_ETLS;
-    }
-
-    // Check if certificate exists in global store
-    if (strcmp(arg->host_url, "") != 0) {
-      ssl_cert_entry_t *cert_entry = NULL;
-      pthread_rwlock_rdlock(&proxy_struct->global_cert_lock);
-      HASH_FIND_STR(proxy_struct->global_cert_map, arg->host_url, cert_entry);
-      pthread_rwlock_unlock(&proxy_struct->global_cert_lock);
-    }
-
-    // Register SNI callback for dynamic certificate selection (GLOBAL STORE)
-    SSL_CTX_set_tlsext_servername_callback((SSL_CTX *)ssl_ctx, sni_servername_callback);
-    SSL_CTX_set_tlsext_servername_arg((SSL_CTX *)ssl_ctx, NULL);  // Not used - callback uses global store
-
-#ifdef HAVE_MTLS
-    // Configure frontend mTLS (client certificate verification)
-    if (arg->frontend_mtls_mode > 0) {
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-      log_debug("[mTLS] Frontend mTLS enabled in proxy_add_entry");
-      log_debug("[mTLS]   mode=%d (1=Optional, 2=Required)", arg->frontend_mtls_mode);
-      log_debug("[mTLS]   client_ca_path=%s", arg->client_ca_path[0] ? arg->client_ca_path : "(none)");
-      log_debug("[mTLS]   require_client_cn=%d, pattern=%s",
-                arg->require_client_cn, arg->client_cn_pattern[0] ? arg->client_cn_pattern : "(none)");
-      log_debug("[mTLS]   host_url=%s", strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-#endif
-      if (mtls_configure_frontend((SSL_CTX *)ssl_ctx, arg) != 0) {
-        log_error("[mTLS] Failed to configure frontend mTLS for %s",
-                  strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-        proxy_add_entry_abort(node, ssl_ctx, NULL);
-        PROXY_UNLOCK();
-        return PROXY_ADD_ETLS;
-      }
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-      log_debug("[mTLS] Frontend mTLS configured successfully for %s",
-                strcmp(arg->host_url, "") ? arg->host_url : "(default)");
-      log_debug("[mTLS] Stored proxy_arg=%p in SSL_CTX=%p with index=%d",
-                (void*)arg, (void*)ssl_ctx, g_ssl_ctx_proxy_arg_index);
-#endif
-    }
-#endif
   }
 
   if (arg->have_epssl) {
-    ssl_epctx = proxy_client_ssl_ctx_init(arg);
+    ssl_epctx = proxy_backend_ctx_build(&node->key, arg);
     if (ssl_epctx == NULL) {
-      log_error("sockproxy : %s:%u rule %u backend TLS context init failed",
-          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
-          arg->_id);
       proxy_add_entry_abort(node, ssl_ctx, NULL);
-      PROXY_UNLOCK();
-      return PROXY_ADD_ETLS;
-    }
-    /* Only the write modes: the backend context presents what the rule
-     * names, never the listener's default certificate. */
-    if (proxy_ssl_cfg_modes(ssl_epctx)) {
-      log_error("sockproxy : %s:%u rule %u backend TLS context setup failed",
-          inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport),
-          arg->_id);
-      proxy_add_entry_abort(node, ssl_ctx, ssl_epctx);
       PROXY_UNLOCK();
       return PROXY_ADD_ETLS;
     }
@@ -6124,6 +6286,8 @@ proxy_pdestroy(void *priv)
               ntohs(ent->key.xport));
       if (ent->val.ssl_ctx)
         SSL_CTX_free(ent->val.ssl_ctx);
+      if (ent->val.ssl_ctx_retired)
+        SSL_CTX_free(ent->val.ssl_ctx_retired);
       if (ent->val.ssl_epctx)
         SSL_CTX_free(ent->val.ssl_epctx);
       while (ent->val.ssl_epctx_retired) {
@@ -10489,11 +10653,13 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   proxy_sock_set_opts(new_sd, protocol);
 
   // SSL handshake if configured
-  if (ent->val.ssl_ctx) {
+  /* Read once: a rule taking over a kept listener replaces the context. */
+  void *front_ctx = __atomic_load_n(&ent->val.ssl_ctx, __ATOMIC_ACQUIRE);
+  if (front_ctx) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
-    log_debug("[SSL_HANDSHAKE_START] fd=%d: ssl_ctx=%p, starting SSL_accept", new_sd, ent->val.ssl_ctx);
+    log_debug("[SSL_HANDSHAKE_START] fd=%d: ssl_ctx=%p, starting SSL_accept", new_sd, front_ctx);
 #endif
-    ssl = SSL_new(ent->val.ssl_ctx);
+    ssl = SSL_new(front_ctx);
     assert(ssl);
     SSL_set_fd(ssl, new_sd);
     if (proxy_ssl_accept(ssl, new_sd) < 0) {
