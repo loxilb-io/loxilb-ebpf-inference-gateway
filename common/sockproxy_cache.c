@@ -430,7 +430,7 @@ proxy_xmit_cache(proxy_fd_ent_t *ent)
         int ssl_err = SSL_get_error(ent->ssl, n);
         log_trace("ssl-write-cache-retry fd=%d ssl_err=%d", ent->fd, ssl_err);
 
-        switch (SSL_get_error(ent->ssl, n)) {
+        switch (ssl_err) {
         case SSL_ERROR_NONE:
           // CRITICAL: DON'T clear cache_draining here either!
           // SSL_ERROR_NONE means this write succeeded, but we might have more cache entries.
