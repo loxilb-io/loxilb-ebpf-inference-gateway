@@ -485,6 +485,13 @@ proxy_drain_checker_thread(void *arg)
       sp_hold_sweep();
       PROXY_UNLOCK();
     }
+    /* Client connections whose backend leg was made under a backend TLS
+     * policy that has since been replaced. An atomic read while none was. */
+    if (proxy_betls_drain_due()) {
+      PROXY_LOCK();
+      proxy_betls_drain_sweep();
+      PROXY_UNLOCK();
+    }
     check_draining_endpoints();
 
     /* : bounded-footprint soak observability. Every ~10s emit a
