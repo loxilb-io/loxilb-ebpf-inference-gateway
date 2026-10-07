@@ -298,6 +298,12 @@ static void cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void cresp_note_backend_eof(proxy_fd_ent_t *client);
 static void cresp_note_local_answer(proxy_fd_ent_t *client);
+/* What proxy_backend_leg_unanswered did for the client of the leg. */
+#define PROXY_LEG_NOT_ANSWERED 0
+#define PROXY_LEG_ANSWERED_H1  1
+#define PROXY_LEG_ANSWERED_H2  2
+static int proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
+                                        const char *op, int sys_errno);
 
 static ssize_t
 proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
@@ -2406,23 +2412,17 @@ skip_deferred_masking:
     } else {
       n = SSL_write(rfd_ent->ssl, msg, len);
       if (n <= 0) {
+        /* Read once, before anything can disturb either: the verdict of
+         * SSL_get_error depends on the thread's error queue, and the queue
+         * is popped only by the one log line that reports it below. */
+        int wr_errno = errno;
         int ssl_err = SSL_get_error(rfd_ent->ssl, n);
+
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_warn("ssl-write-fail fd=%d: err=%d (%s)", rfd_ent->fd, ssl_err,
                  ssl_err == SSL_ERROR_WANT_WRITE ? "WANT_WRITE" :
                  ssl_err == SSL_ERROR_WANT_READ ? "WANT_READ" : "ERROR");
 #endif
-        if (ssl_err == SSL_ERROR_SSL || ssl_err == SSL_ERROR_SYSCALL) {
-          unsigned long err_code = ERR_get_error();
-          char err_buf[256];
-          ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
-          log_error("   OpenSSL error details: %s (code=0x%lx)", err_buf, err_code);
-        }
-      }
-      if (n <= 0) {
-        int ssl_err;
-        ssl_err = SSL_get_error(rfd_ent->ssl, n);
-
         switch (ssl_err) {
           case SSL_ERROR_WANT_WRITE:
             // CRITICAL: SSL has buffered data internally, we MUST retry with same buffer
@@ -2503,7 +2503,6 @@ skip_deferred_masking:
             return 0;
           case SSL_ERROR_SSL:
           case SSL_ERROR_SYSCALL:
-            log_error("ssl-error fd=%d: %s", rfd_ent->fd, ERR_error_string(ERR_get_error(), NULL));
           default:
 #ifdef HAVE_HTTP_TRACE
             // CRITICAL: Emit REQ_END for SSL errors before closing connection
@@ -2528,15 +2527,37 @@ skip_deferred_masking:
 
             if (ssl_err != SSL_ERROR_SSL && ssl_err != SSL_ERROR_SYSCALL) {
               SSL_shutdown(rfd_ent->ssl);
+              PROXY_ENT_UNLOCK(rfd_ent);
             } else {
+              int answered;
+
               rfd_ent->ssl_err = 1;
+              PROXY_ENT_UNLOCK(rfd_ent);
+              /* A backend leg that fails here before it answered anything
+               * turned the gateway away after the handshake, as a leg that
+               * fails on its first read did. The client is answered before
+               * its connection is closed, with nothing held and before the
+               * log below pops the error queue. */
+              answered = proxy_backend_leg_unanswered(rfd_ent, ssl_err,
+                                                      "ssl-write", wr_errno);
+              if (wr_errno != 0 && ERR_peek_error() == 0) {
+                log_error("ssl-error fd=%d: %s", rfd_ent->fd, strerror(wr_errno));
+              } else {
+                log_error("ssl-error fd=%d: %s", rfd_ent->fd,
+                          ERR_error_string(ERR_get_error(), NULL));
+              }
+              ERR_clear_error();   /* nothing of this failure is left for the next call */
+              if (answered == PROXY_LEG_ANSWERED_H2) {
+                /* The client's other streams live on: only the leg goes. */
+                shutdown(rfd_ent->fd, SHUT_RDWR);
+                return -1;
+              }
             }
             if (rfd_ent->odir) {
               shutdown(ent->fd, SHUT_RDWR);
             } else {
               shutdown(rfd_ent->fd, SHUT_RDWR);
             }
-            PROXY_ENT_UNLOCK(rfd_ent);
             return -1;
         }
       }
@@ -7079,14 +7100,6 @@ proxy_sock_read(proxy_fd_ent_t *pfe, int fd, void *buf, size_t len)
  *
  * Reaching across the pair is fine and already happens, as long as the reach is
  * the only lock held at the time. */
-/* A TLS backend leg failed on a read before one application byte came from
- * it. The handshake completed, or this read would not have run, so the
- * endpoint turned the gateway away afterwards: a TLS 1.3 server checks the
- * client certificate after the client has finished, and answers a missing or
- * untrusted one with an alert or a reset, whichever its close gets out first.
- * The request the leg was made for has no answer and cannot get one, so the
- * client is told what a failed connect tells it, and the endpoint is named
- * in the log. Call before the error queue is popped, with nothing held. */
 /* The endpoint a backend leg was made to, as "address:port". The pool and the
  * index are read where the connect path reads them; the socket is asked last,
  * because a leg that was reset no longer has a peer to name. */
@@ -7124,41 +7137,67 @@ proxy_backend_leg_name(proxy_fd_ent_t *pfe, proxy_fd_ent_t *client,
   snprintf(out, outlen, "fd=%d", pfe->fd);
 }
 
-static void
-proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error)
+/* A TLS backend leg failed before one application byte came from it, on a
+ * read or on a write. The handshake completed, or neither would have run, so
+ * the endpoint turned the gateway away afterwards: a TLS 1.3 server checks
+ * the client certificate after the client has finished, and answers a missing
+ * or untrusted one with an alert or a reset, whichever its close gets out
+ * first. A reset that arrives before the request is written fails the write;
+ * one that arrives after it fails the read of the answer. Either way the
+ * request the leg was made for has no answer and cannot get one, so the
+ * client is told what a failed connect tells it, and the endpoint is named
+ * in the log.
+ *
+ * `op` is the operation that failed, as the log names it, and `sys_errno`
+ * what the system said when no alert came (0 when it said nothing). Call
+ * before the error queue is popped, with nothing held. The read and the
+ * write of one leg can fail on two workers at once, so the leg is claimed
+ * atomically and answered once.
+ *
+ * Returns PROXY_LEG_ANSWERED_H1 when the HTTP/1.1 client was given its 502
+ * and told the stream ends, PROXY_LEG_ANSWERED_H2 when the HTTP/2 client was
+ * handed the leg's streams to answer, and PROXY_LEG_NOT_ANSWERED otherwise. */
+static int
+proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
+                             const char *op, int sys_errno)
 {
   proxy_fd_ent_t *client;
   char ep[INET_ADDRSTRLEN + 16];
   char why[160];
   unsigned long e = ERR_peek_error();
+  int answered = PROXY_LEG_NOT_ANSWERED;
 
-  if (pfe->odir != 1 || pfe->leg_rx_seen) {
-    return;
+  if (pfe->odir != 1 ||
+      __atomic_exchange_n(&pfe->leg_rx_seen, 1, __ATOMIC_ACQ_REL)) {
+    return PROXY_LEG_NOT_ANSWERED;   /* once per leg */
   }
-  pfe->leg_rx_seen = 1;              /* once per leg */
 
   client = pfe->n_rfd > 0 ? pfe->rfd_ent[0] : NULL;
   proxy_backend_leg_name(pfe, client, ep, sizeof(ep));
   if (ssl_error == SSL_ERROR_SSL && e != 0) {
     ERR_error_string_n(e, why, sizeof(why));
+  } else if (sys_errno != 0) {
+    snprintf(why, sizeof(why), "connection closed without a TLS alert (%s)",
+             strerror(sys_errno));
   } else {
     snprintf(why, sizeof(why), "connection closed without a TLS alert");
   }
-  log_error("ssl-read %s(failed after handshake, before any response): %s", ep, why);
+  log_error("%s %s(failed after handshake, before any response): %s", op, ep, why);
 
   if (!client || client->odir != 0 || client->fd <= 0 ||
       client->pd_phase != PD_PHASE_NONE) {
-    return;
+    return PROXY_LEG_NOT_ANSWERED;
   }
   if (client->h2_session && client->h2_session->h2_enabled) {
     (void)proxy_h2_backend_leg_unanswered(client, pfe);
-    return;
+    return PROXY_LEG_ANSWERED_H2;
   }
   PROXY_ENT_LOCK(client);
   if (!atomic_load_explicit(&client->cresp_answer_open, memory_order_relaxed)) {
     if (proxy_send_backend_unreachable(client,
             "the backend endpoint closed the connection before it answered") == 0) {
       cresp_note_local_answer(client);
+      answered = PROXY_LEG_ANSWERED_H1;
     }
     /* The answer says Connection: close; a TLS client is told the stream
      * ended here, so it does not read the close that follows as a cut. */
@@ -7167,6 +7206,7 @@ proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error)
     }
   }
   PROXY_ENT_UNLOCK(client);
+  return answered;
 }
 
 static int
@@ -7451,7 +7491,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
         /* Before the log below pops the error queue: a FIN without
          * close_notify, or a reset, for the half-close observation. */
         hc_tls_read_failed(pfe, ssl_error, rval, errno);
-        proxy_backend_leg_unanswered(pfe, ssl_error);
+        (void)proxy_backend_leg_unanswered(pfe, ssl_error, "ssl-read", 0);
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[SSL_ERROR_SYSCALL] fd=%d odir=%d ssl_error=%d | SSL or syscall error, shutting down",
                   pfe->fd, pfe->odir, ssl_error);
@@ -8132,7 +8172,46 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
       memset(rkey, 0, sizeof(*rkey));
       connecting_legs++;
     } else if (proxy_skmap_key_from_fd(ep_cfd, rkey, &epprotocol)) {
+      char lost_ep[INET_ADDRSTRLEN + 16] = "?";
+
       log_error("skmap key from ep_cfd failed");
+      /* The leg was connected, and a TLS leg had finished its handshake, and
+       * it has no peer any more: the endpoint reset it before the request
+       * could be written. A TLS 1.3 server that refuses the client
+       * certificate does that, and this is the earliest of the three places
+       * the gateway can learn of it (the write of the request and the read
+       * of an answer are the other two). The request has no answer and
+       * cannot get one, so the client is told what a failed connect tells
+       * it before its connection is closed. Only a client that is owed an
+       * answer is given one: a request of its was framed and not answered
+       * yet, which a connection that carries no HTTP never has. An HTTP/2
+       * client and a request in a prefill/decode phase are answered by
+       * their own paths. */
+      if (tepval && ep_num >= 0 && ep_num < tepval->n_eps) {
+        char lost_ip[INET_ADDRSTRLEN] = "";
+
+        inet_ntop(AF_INET, &tepval->eps[ep_num].xip, lost_ip, sizeof(lost_ip));
+        snprintf(lost_ep, sizeof(lost_ep), "%s:%u", lost_ip,
+                 ntohs(tepval->eps[ep_num].xport));
+      }
+      if (ssl) {
+        log_error("ssl-setup %s(failed after handshake, before any response): "
+                  "connection reset before the request was written", lost_ep);
+      } else {
+        log_error("setup %s(failed after connect, before any response): "
+                  "connection reset before the request was written", lost_ep);
+      }
+      if (!(pfe->h2_session && pfe->h2_session->h2_enabled) &&
+          pfe->pd_phase == PD_PHASE_NONE &&
+          atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed) >
+          atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed) &&
+          proxy_send_backend_unreachable(pfe,
+              "the backend endpoint closed the connection before it answered") == 0 &&
+          pfe->ssl) {
+        /* The answer says Connection: close; a TLS client is told the
+         * stream ended here. */
+        (void)SSL_shutdown(pfe->ssl);
+      }
       proxy_destroy_eps(pfe->fd, &ep_sel);
       if (ssl) {
         SSL_shutdown(ssl);
