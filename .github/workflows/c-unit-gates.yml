@@ -36,6 +36,15 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install build-essential libnghttp2-dev libssl-dev
 
+      - name: Host, listener identity, model and path routing
+        run: |
+          make -C common test_model_routing
+          ./common/test_model_routing
+          gcc -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/test_model_routing_sanitized common/test_model_routing.c \
+            common/sockproxy_routing.c -Icommon
+          ASAN_OPTIONS=detect_leaks=1 /tmp/test_model_routing_sanitized
+
       - name: Header-field guard (bytes between a header value and the wire)
         run: make -C common test_l7hdr
 

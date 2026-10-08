@@ -86,9 +86,9 @@ build_ephash_key(char *key_buf, size_t buf_size,
  * @param model_name AI model name or NULL/empty for wildcard
  * @return Endpoint value or NULL if not found
  */
-proxy_epval_t*
-find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_path,
-                  const char *model_name)
+static proxy_epval_t*
+find_endpoint_for_host(proxy_map_ent_t *ent, const char *host,
+                       const char *request_path, const char *model_name)
 {
   proxy_epval_t *best_match = NULL;
   proxy_epval_t *tepval = NULL;
@@ -219,6 +219,25 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     }
   }
 
+  return best_match;
+}
+
+proxy_epval_t*
+find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_path,
+                  const char *model_name)
+{
+  if (!ent || !host) {
+    return NULL;
+  }
+
+  proxy_epval_t *best_match = find_endpoint_for_host(ent, host, request_path,
+                                                   model_name);
+  if (best_match) {
+    return best_match;
+  }
+  proxy_epval_t *tepval = NULL;
+  char search_key[512];
+
   /* Fallback: listener-identity key. Rules created WITHOUT a host get their
    * host_url substituted with the listener's own "ip:port" before the ephash
    * key is built (llb_conv_nat2proxy, loxilb_libdp.c). No Host-header-derived
@@ -229,21 +248,17 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
    * Keying on the listener identity makes empty-host rules Host-agnostic,
    * which is their intended wildcard semantic. */
   if (!best_match) {
-    char self_key[256];   /* "ip:port||model" — model_name alone can be 128 */
     char ab1[INET_ADDRSTRLEN];
     if (inet_ntop(AF_INET, (struct in_addr *)&ent->key.xip, ab1, sizeof(ab1))) {
       char self_host[64];
       snprintf(self_host, sizeof(self_host), "%s:%u", ab1, ntohs(ent->key.xport));
-      if (model_name && model_name[0] != '\0') {
-        /* model-specific pool under the listener identity first */
-        build_ephash_key(self_key, sizeof(self_key), self_host, "", model_name);
-        HASH_FIND_STR(ent->val.ephash, self_key, tepval);
-        if (tepval) return tepval;
-      }
-      build_ephash_key(self_key, sizeof(self_key), self_host, "", "");
-      HASH_FIND_STR(ent->val.ephash, self_key, tepval);
-      if (tepval) {
-        return tepval;
+      /* A no-host rule can carry the same model/path constraints as a
+       * host rule. Reuse the complete lookup instead of checking only
+       * pathless keys, preserving exact and longest-prefix semantics. */
+      best_match = find_endpoint_for_host(ent, self_host, request_path,
+                                         model_name);
+      if (best_match) {
+        return best_match;
       }
     }
   }
