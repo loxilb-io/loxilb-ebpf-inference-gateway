@@ -85,3 +85,9 @@ jobs:
 
       - name: Whether a keep-alive request may ride the backend leg its predecessor used
         run: make -C common test_ka
+
+      - name: UC-5 terminal admission framing (exact length, split input, overflow rejection)
+        run: make -C common test_admit
+
+      - name: UC-5 unchanged L2 split horizon (all VLAN values, routing/NAT/tunnel exceptions)
+        run: make -C common test_l2_reflection
