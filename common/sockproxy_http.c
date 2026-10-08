@@ -2838,6 +2838,7 @@ proxy_listener_revive(proxy_map_ent_t *ent, proxy_arg_t *arg, struct proxy_takeo
   ent->val.backend_protocol_cap = arg->backend_protocol_cap;
   if (nctx) {
     SSL_CTX_set_alpn_select_cb(nctx, alpn_select_callback, &ent->val.backend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(nctx, &ent->val.backend_protocol_cap);
   }
   __atomic_store_n(&ent->val.ssl_ctx, nctx, __ATOMIC_RELEASE);
   ent->val.have_ssl = arg->have_ssl;
@@ -3526,6 +3527,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   // Configure ALPN callback with backend protocol capability
   if (ssl_ctx) {
     SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_callback, &node->val.backend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(ssl_ctx, &node->val.backend_protocol_cap);
     const char *proto_str = (node->val.backend_protocol_cap == 0) ? "http/1.1 only" :
                             (node->val.backend_protocol_cap == 1) ? "h2 only" : "h2+http/1.1";
     log_info("[ALPN] Configured for backend capability: %s", proto_str);

@@ -85,6 +85,18 @@
  * 
  * See: HTTP2_TRANSIT_MODE_CRITICAL_FIXES.md for implementation details
  */
+/* Certificate contexts are shared across listeners. Keep the listener's ALPN
+ * capability on the connection before SNI switches contexts; never mutate a
+ * shared certificate context with a listener-owned callback argument. */
+static pthread_once_t alpn_conn_once = PTHREAD_ONCE_INIT;
+static int alpn_conn_index = -1;
+
+static void
+alpn_conn_index_init(void)
+{
+  alpn_conn_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+}
+
 int
 alpn_select_callback(SSL *ssl,
                       const unsigned char **out,
@@ -93,11 +105,15 @@ alpn_select_callback(SSL *ssl,
                       unsigned int inlen,
                       void *arg)
 {
-  (void)ssl;  // Unused parameter
-  
   // Extract backend protocol capability from arg (passed from SSL_CTX_set_alpn_select_cb)
   uint8_t *backend_cap_ptr = (uint8_t *)arg;
   uint8_t backend_cap = backend_cap_ptr ? *backend_cap_ptr : 2;  // Default: h2+http/1.1
+  pthread_once(&alpn_conn_once, alpn_conn_index_init);
+  if (ssl && alpn_conn_index >= 0) {
+    uintptr_t saved = (uintptr_t)SSL_get_ex_data(ssl, alpn_conn_index);
+    if (saved)
+      backend_cap = (uint8_t)(saved - 1);
+  }
   
   // backend_protocol_cap == 0: HTTP/1.1 only
   if (backend_cap == 0) {
@@ -244,6 +260,9 @@ proxy_server_ssl_ctx_init(const proxy_arg_t *arg)
       log_error("sockproxy: ssl-ctx creation failed");
       return NULL;
     }
+    /* Also installed on certificate-only SNI contexts. The connection's
+     * snapshot supplies its policy after SSL_set_SSL_CTX. */
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_callback, NULL);
 
     // version-range + cipher pinning from the L7 rule when
     // set; falls back to today's TLS1.2..TLS1.3 + hardcoded ciphers when arg is
@@ -489,10 +508,16 @@ sni_servername_callback(SSL *ssl, int *ad, void *arg)
   const char *servername = NULL;
 
   (void)ad;   // Unused parameter
-  (void)arg;  // Unused - we use global certificate store
 
   if (!ssl) {
     log_error("SNI callback: Invalid SSL object");
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+  }
+  pthread_once(&alpn_conn_once, alpn_conn_index_init);
+  if (alpn_conn_index < 0 ||
+      SSL_set_ex_data(ssl, alpn_conn_index,
+                     (void *)(uintptr_t)((arg ? *(uint8_t *)arg : 2) + 1)) != 1) {
+    log_error("SNI callback: cannot preserve listener ALPN policy");
     return SSL_TLSEXT_ERR_ALERT_FATAL;
   }
 
