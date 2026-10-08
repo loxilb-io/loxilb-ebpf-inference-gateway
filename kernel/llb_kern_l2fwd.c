@@ -4,6 +4,8 @@
  * 
  * SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
  */
+#include "../common/llb_l2_reflection.h"
+
 static int __always_inline
 dp_do_smac_lkup(void *ctx, struct xfi *xf, void *fc)
 {
@@ -173,6 +175,29 @@ dp_do_dmac_lkup(void *ctx, struct xfi *xf, void *fa_)
     BPF_DBG_PRINTK("[DMAC] not found");
     LLBS_PPLN_PASSC(xf, LLB_PIPE_RC_NODMAC);
     return 0;
+  }
+
+  /* A learned neighbor on this ingress port is not a hairpin service.
+   * Reflecting unchanged foreign unicast poisons the upstream bridge FDB.
+   * Keep routed/NAT/tunnel traffic and explicit VLAN translation intact.
+   */
+  if (dma->ca.act_type == DP_SET_RDR_PORT ||
+      dma->ca.act_type == DP_SET_ADD_L2VLAN ||
+      dma->ca.act_type == DP_SET_RM_L2VLAN) {
+    __u16 oport = dma->ca.act_type == DP_SET_RDR_PORT ?
+                  dma->port_act.oport : dma->vlan_act.oport;
+    __u16 vlan = dma->ca.act_type == DP_SET_ADD_L2VLAN ?
+                 dma->vlan_act.vlan :
+                 dma->ca.act_type == DP_SET_RM_L2VLAN ? 0 : xf->l2m.vlan[0];
+    if (llb_l2_is_reflection(xf->pm.iport, oport,
+                            xf->l2m.vlan[0], vlan,
+                            (xf->pm.phit & LLB_DP_TMAC_HIT) != 0,
+                            xf->pm.nf || xf->pm.nfc || xf->pm.nh_num,
+                            xf->tm.tun_encap || xf->tm.tun_decap ||
+                            xf->tm.new_tunnel_id)) {
+      LLBS_PPLN_DROPC(xf, LLB_PIPE_RC_ACT_DROP);
+      return 0;
+    }
   }
 
   xf->pm.phit |= LLB_DP_DMAC_HIT;

@@ -85,6 +85,7 @@
  * pd_teardown_legs; pd_detect_http_msg_end here is buffer-only). */
 #include "sockproxy_pd_leak.h"
 #include "sockproxy_stream_fallback.h"
+#include "sockproxy_admit_response.h"
 
 #ifdef HAVE_MTLS
 #include "sockproxy_mtls.h"
@@ -8512,41 +8513,8 @@ sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
 {
   char resp_buf[640];
   int n;
-  const char *status_line =
-    status == 400 ? "400 Bad Request" :
-    status == 401 ? "401 Unauthorized" :
-    status == 403 ? "403 Forbidden" :
-    status == 413 ? "413 Content Too Large" :
-    status == 429 ? "429 Too Many Requests" :
-                    "503 Service Unavailable";
-
-  if (retry_body) {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 %s\r\n"
-      "Content-Type: application/json\r\n"
-      "Retry-After: %d\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"retry_after\":%d}\r\n",
-      status_line, retry_after, code, retry_after);
-  } else if (retry_after > 0) {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 %s\r\n"
-      "Content-Type: application/json\r\n"
-      "Retry-After: %d\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-      status_line, retry_after, code, msg);
-  } else {
-    n = snprintf(resp_buf, sizeof(resp_buf),
-      "HTTP/1.1 %s\r\n"
-      "Content-Type: application/json\r\n"
-      "Connection: close\r\n"
-      "\r\n"
-      "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-      status_line, code, msg);
-  }
+  n = sp_h1_format_admit_deny(resp_buf, sizeof(resp_buf), status,
+                              retry_after, retry_body, code, msg);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
     if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
       log_error("[AIGateway] fd=%d failed to send complete bounded %d "
