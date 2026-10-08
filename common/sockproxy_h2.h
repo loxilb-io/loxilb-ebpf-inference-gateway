@@ -149,6 +149,7 @@ typedef struct proxy_h2_stream {
   uint16_t usage_tail_len;
   uint64_t admit_mono_ns;            // CLOCK_MONOTONIC at admission; latency base
   int      metric_response_status;   // backend :status relayed to the client (0 = unseen)
+  uint8_t  response_is_sse;           // final response media type, per stream
   uint8_t  fc_first_data_seen;       // the first response DATA chunk was looked at for TTFT
   fc_permit_t fc;                    // capacity admission permit of THIS stream (one
                                      // service unit + one endpoint unit); released by
@@ -463,6 +464,7 @@ typedef struct h2_inflight_settle {
    * be inferred from prompt_toks/complet_toks, because a usage object
    * reporting zero tokens leaves those 0 as well. */
   int     usage_missing;
+  int     response_is_sse;
   int64_t res_epoch;
   int64_t latency_ms;
   /* Where the request came from. Copied under the lock with the identity

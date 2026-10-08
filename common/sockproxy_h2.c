@@ -304,7 +304,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
     llb_ai_record_request(stream->tenant_id, stream->effective_model, status,
                           latency_ms, up, uc, 0, 0, "",
                           stream->request_id, stream->auth_user_id,
-                          stream->auth_key_id, stream->svc_ident, 0,
+                          stream->auth_key_id, stream->svc_ident, stream->response_is_sse,
                           notify_worker_id(),
                           pfe ? pfe->l7_peer_ip : "",
                           stream->l7_origin_ip,
@@ -400,6 +400,7 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
     snprintf(e->client_ip, sizeof(e->client_ip), "%s", pfe->l7_peer_ip);
     snprintf(e->origin_ip, sizeof(e->origin_ip), "%s", stream->l7_origin_ip);
     e->trusted_hops = (int)stream->l7_trusted_hops;
+    e->response_is_sse = stream->response_is_sse;
     e->prompt_toks = up;
     e->complet_toks = uc;
     e->reserved_toks = (int)stream->usage_reserved_toks;
@@ -1578,6 +1579,11 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
     }
 
     /* Final response. */
+    for (size_t i = 0; i < mapping->response_headers_count; i++) {
+      nghttp2_nv *nv = &mapping->response_headers[i];
+      if (nv->namelen == 12 && !memcmp(nv->name, "content-type", 12))
+        cstream->response_is_sse = sp_sse_content_type((char *)nv->value, nv->valuelen);
+    }
 
     /* The admission headers, when the stream holds its units on a pool
      * that exposes them. The values are read now, while the stream still
