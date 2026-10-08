@@ -503,6 +503,15 @@ test_sse_observe: test_sse_observe.c sockproxy_sse_observe.h llhttp.c httpapi.c 
 test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
 	$(CC) -ffunction-sections -fdata-sections -I. -I../libbpf/src -I../headers -I../kernel $$(pkg-config --cflags openssl) -o $@ test_sni_alpn.c sockproxy_ssl.c log.c -Wl,--gc-sections $$(pkg-config --libs openssl) -lpthread
 
+test_admit_response: test_admit_response.c sockproxy_admit_response.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
+
+.PHONY: test_admit test_uc5
+test_uc5: test_admit test_stream test_uc3 test_l2_reflection
+
+test_admit: test_admit_response
+	./test_admit_response
+
 .PHONY: test_uc3
 test_uc3: test_model_routing test_sni_alpn test_sse_observe test_resp_framing
 	./test_model_routing
@@ -797,10 +806,15 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls
+	rm -f *.o *.d test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
 # a wildcard is silent on the very first build when no .d exists yet. Keep this as
 # the LAST directive in the Makefile.
 -include $(wildcard *.d)
+
+.PHONY: test_l2_reflection
+test_l2_reflection: test_l2_reflection.c llb_l2_reflection.h
+	$(CC) -g -Wall -Wextra -Werror -fsanitize=address,undefined -o test_l2_reflection test_l2_reflection.c
+	./test_l2_reflection
