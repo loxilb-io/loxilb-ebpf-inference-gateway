@@ -588,6 +588,7 @@ typedef struct proxy_epval {
   
   // P6: Host + Path Prefix Routing - composite key storage
   char ephash_key[512];  // Composite key: "host|path" or "host" (backward compat)
+  uint8_t path_match_mode;  /* 0=disabled, 1=prefix, 2=exact; retained per pool */
   
   // Custom header-based session stickiness configuration
   char session_header_name[128];  // e.g., "mcp-session-id", "x-session-token", "authorization"

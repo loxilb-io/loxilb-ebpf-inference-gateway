@@ -3146,6 +3146,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * peer_map gate in setup_proxy_path would otherwise keep the old mode. */
         ent->val.sockmap_en = arg->sockmap_en;
         tepval->sockmap_en = arg->sockmap_en;
+        tepval->path_match_mode = arg->path_match_mode;
         /* The capacity queue's depth and wait follow a rule update the
          * same way: they may change at runtime, entries waiting keep
          * their order. */
@@ -3185,6 +3186,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         // P6: Store composite key for hash table
         strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
         tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
+        tepval->path_match_mode = arg->path_match_mode;
 
         // Store custom header configuration
         if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
@@ -3603,6 +3605,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   // P6: Store composite key in tepval for hash table
   strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
   tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
+  tepval->path_match_mode = arg->path_match_mode;
 
   // Store custom header configuration
   if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
