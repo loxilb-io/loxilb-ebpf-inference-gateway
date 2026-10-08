@@ -11,6 +11,7 @@
 #include <stdatomic.h>  /* D2 root fix: _Atomic gen stamp on proxy_fd_ent */
 
 #include "llhttp.h"
+#include "sockproxy_sse_observe.h"
 
 #define JSMN_STATIC
 #include "jsmn.h"
@@ -588,6 +589,7 @@ typedef struct proxy_epval {
   
   // P6: Host + Path Prefix Routing - composite key storage
   char ephash_key[512];  // Composite key: "host|path" or "host" (backward compat)
+  uint8_t path_match_mode;  /* 0=disabled, 1=prefix, 2=exact; retained per pool */
   
   // Custom header-based session stickiness configuration
   char session_header_name[128];  // e.g., "mcp-session-id", "x-session-token", "authorization"
@@ -1077,6 +1079,8 @@ struct proxy_fd_ent {
 
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
   uint8_t  cresp_parser_inited;
+  sp_sse_observer_t cresp_sse;
+  uint8_t cresp_payload_observed;
   /* Set by the response framer under this entry's lock, consumed by the backend
    * leg's EOF without it, so it is atomic and the consumer takes it with an
    * exchange: whoever clears it is the one that counts the completion. A

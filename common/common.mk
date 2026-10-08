@@ -304,6 +304,10 @@ $(USER_TARGETS): %: %.c  $(OBJECT_LIBBPF) Makefile $(COMMON_MK) $(COMMON_OBJS) $
 	@touch $@
 endif
 
+# The archive compiles USER_OBJ independently of the debug executable.
+# Its generated skeleton must exist before that compile in a parallel build.
+$(USER_OBJ): %.o: %.skel.h
+
 $(USER_TARGETS_LIB): %: $(USER_OBJ) $(COMMON_OBJS)
 	$(AR) rcu $@ $^
 	ranlib $@

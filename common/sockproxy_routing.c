@@ -102,10 +102,15 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
 
   /* Default to root path if not provided */
   const char *path = (request_path && request_path[0] != '\0') ? request_path : "/";
+  /* Routing compares the URI path, not its query. Keep the original length
+   * so a bounded copy cannot turn a longer URI into an exact match. */
+  size_t path_len = strcspn(path, "?");
+  size_t copy_len = path_len < sizeof(path_copy) - 1
+                      ? path_len : sizeof(path_copy) - 1;
 
   /* Copy path for progressive shortening */
-  strncpy(path_copy, path, sizeof(path_copy) - 1);
-  path_copy[sizeof(path_copy) - 1] = '\0';
+  memcpy(path_copy, path, copy_len);
+  path_copy[copy_len] = '\0';
 
   /* Progressive prefix matching: "/v1/users/profile" → "/v1/users" → "/v1" → "/"
    * IMPORTANT: We try progressively shorter prefixes to find the LONGEST match */
@@ -116,7 +121,8 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
     /* Try to find this prefix */
     HASH_FIND_STR(ent->val.ephash, search_key, tepval);
 
-    if (tepval) {
+    if (tepval && (tepval->path_match_mode != 2 ||
+                   strlen(path_copy) == path_len)) {
       /* Found a match! This is the LONGEST prefix match since we search longest-first */
       best_match = tepval;
       best_match_len = strlen(path_copy);
@@ -139,7 +145,7 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
        * in loop body); when path_copy is "/v1" etc., "/" hasn't been tried yet. */
       build_ephash_key(search_key, sizeof(search_key), host, "/", model_name);
       HASH_FIND_STR(ent->val.ephash, search_key, tepval);
-      if (tepval) {
+      if (tepval && (tepval->path_match_mode != 2 || path_len == 1)) {
         best_match = tepval;
         best_match_len = 1;
         return best_match;
@@ -172,13 +178,14 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
    * Pure C hash-table lookup — zero CGO calls in this path. */
   if (!best_match && model_name && model_name[0] != '\0') {
     /* Re-initialize path_copy for wildcard retry */
-    strncpy(path_copy, path, sizeof(path_copy) - 1);
-    path_copy[sizeof(path_copy) - 1] = '\0';
+    memcpy(path_copy, path, copy_len);
+    path_copy[copy_len] = '\0';
 
     while (strlen(path_copy) > 0) {
       build_ephash_key(search_key, sizeof(search_key), host, path_copy, "");
       HASH_FIND_STR(ent->val.ephash, search_key, tepval);
-      if (tepval) {
+      if (tepval && (tepval->path_match_mode != 2 ||
+                     strlen(path_copy) == path_len)) {
         return tepval;  /* Wildcard pool found */
       }
       char *last_slash = strrchr(path_copy, '/');
@@ -186,7 +193,8 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
         /* Try root "/" as final prefix (harmless re-check when path_copy is "/") */
         build_ephash_key(search_key, sizeof(search_key), host, "/", "");
         HASH_FIND_STR(ent->val.ephash, search_key, tepval);
-        if (tepval) return tepval;
+        if (tepval && (tepval->path_match_mode != 2 || path_len == 1))
+          return tepval;
         break;
       } else if (last_slash) {
         *last_slash = '\0';

@@ -68,9 +68,52 @@ test_unknown_model_uses_wildcard_path(void)
   HASH_DEL(service.val.ephash, &wildcard_path);
 }
 
+/* An exact pool may win the full path, never an ancestor candidate. */
+static void
+test_exact_path_does_not_match_children(void)
+{
+  proxy_map_ent_t service = {0};
+  proxy_epval_t exact, root;
+  add_pool(&service, &exact, "inference.example|/v1/exact|model-a", 401);
+  exact.path_match_mode = 2;
+  add_pool(&service, &root, "inference.example|/|model-a", 402);
+  root.path_match_mode = 1;
+  assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact", "model-a") == &exact);
+  assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact?probe=1", "model-a") == &exact);
+  assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact/child", "model-a") == &root);
+  HASH_DEL(service.val.ephash, &root);
+  assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact/child", "model-a") == NULL);
+  HASH_DEL(service.val.ephash, &exact);
+}
+
+static void
+test_wildcard_exact_and_root_are_exact(void)
+{
+  proxy_map_ent_t service = {0};
+  proxy_epval_t exact, prefix, root;
+  add_pool(&service, &exact, "inference.example|/v1/exact", 501);
+  exact.path_match_mode = 2;
+  add_pool(&service, &prefix, "inference.example|/v1", 502);
+  prefix.path_match_mode = 1;
+  add_pool(&service, &root, "inference.example|/", 503);
+  root.path_match_mode = 2;
+  assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact", "unknown") == &exact);
+  assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact?probe=1", "unknown") == &exact);
+  assert(find_endpoint_lpm(&service, "inference.example", "/v1/exact/child", "unknown") == &prefix);
+  assert(find_endpoint_lpm(&service, "inference.example", "/", "unknown") == &root);
+  assert(find_endpoint_lpm(&service, "inference.example", "/?probe=1", "unknown") == &root);
+  assert(find_endpoint_lpm(&service, "inference.example", "/other", "unknown") == NULL);
+  assert(find_endpoint_lpm(&service, "inference.example", "/other", "") == NULL);
+  HASH_DEL(service.val.ephash, &exact);
+  HASH_DEL(service.val.ephash, &prefix);
+  HASH_DEL(service.val.ephash, &root);
+}
+
 int
 main(void)
 {
+  test_exact_path_does_not_match_children();
+  test_wildcard_exact_and_root_are_exact();
   test_hostname_only_model_pool();
   test_model_pool_precedes_wildcard_path();
   test_unknown_model_uses_wildcard_path();

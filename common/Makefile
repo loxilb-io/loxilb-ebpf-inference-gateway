@@ -497,6 +497,19 @@ test_pd_complete: test_pd_complete.c sockproxy_pd_leak.h
 test_resp_framing: test_resp_framing.c llhttp.c httpapi.c http.c
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< llhttp.c httpapi.c http.c -I.
 
+test_sse_observe: test_sse_observe.c sockproxy_sse_observe.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< llhttp.c httpapi.c http.c -I.
+
+test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
+	$(CC) -ffunction-sections -fdata-sections -I. -I../libbpf/src -I../headers -I../kernel $$(pkg-config --cflags openssl) -o $@ test_sni_alpn.c sockproxy_ssl.c log.c -Wl,--gc-sections $$(pkg-config --libs openssl) -lpthread
+
+.PHONY: test_uc3
+test_uc3: test_model_routing test_sni_alpn test_sse_observe test_resp_framing
+	./test_model_routing
+	./test_sni_alpn
+	./test_sse_observe
+	./test_resp_framing
+
 # Phase 93-02 (D1): proactive circuit-breaker recovery unit. Standalone — includes
 # only circuit_breaker_heal.h (the pure production transition under test, no
 # sockproxy.c machinery). Proves OPEN->HALF_OPEN is driven by the 1Hz health pass

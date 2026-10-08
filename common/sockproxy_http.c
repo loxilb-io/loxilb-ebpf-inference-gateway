@@ -294,6 +294,7 @@ pd_framing_v2_test_set(int on)
 static int handle_resp_headers_complete(llhttp_t *parser);
 static int handle_resp_body(llhttp_t *parser, const char *at, size_t length);
 static int handle_resp_message_complete(llhttp_t *parser);
+static void proxy_sse_activate(proxy_fd_ent_t *pfe);
 static void cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len);
 static void cresp_note_backend_eof(proxy_fd_ent_t *client);
@@ -1847,44 +1848,18 @@ skip_deferred_masking:
     if (ent->odir == 1 && len > 0 && rfd_ent &&
         !ent->pd_sg_drain &&
         rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
+      rfd_ent->cresp_payload_observed = 0;
       cresp_feed(rfd_ent, msg, len);
     }
 
-    /* C-1: SSE stream activation — detect "Content-Type: text/event-stream" in the
-     * first backend response packet and flip sse_active on the client-side pfe.
-     * Only triggered when the LB rule has sse_mode=1 and the stream is not yet live. */
-    if (ent->odir == 1 && rfd_ent->sse_mode == 1 &&
-        !rfd_ent->sse_active && len > 16) {
-      size_t sse_search_len = (len < 2048) ? len : 2048;
-      if (memmem(msg, sse_search_len, "Content-Type: text/event-stream", 31) != NULL ||
-          memmem(msg, sse_search_len, "content-type: text/event-stream", 31) != NULL) {
-        rfd_ent->sse_active = 1;
-        rfd_ent->stream_start_ts = time(NULL);
-        {
-          struct timespec _sse_ts;
-          clock_gettime(CLOCK_MONOTONIC, &_sse_ts);
-          rfd_ent->stream_start_mono_ns = (uint64_t)_sse_ts.tv_sec * 1000000000ULL +
-                                          (uint64_t)_sse_ts.tv_nsec;
-        }
-        /* Effective model: X-Model header > JSON body model > reset-boundary
-         * snapshot > "" */
-        const char *sse_model = proxy_effective_model(rfd_ent);
-        llb_ai_stream_start("", (char *)sse_model);
-        log_debug("[SSE_ACTIVATED] client_fd=%d backend_fd=%d model=%s",
-                 rfd_ent->fd, ent->fd, sse_model);
-
-        /* P/D decode streaming transition — decode EP is now streaming */
-        if (rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING) {
-          rfd_ent->pd_phase = PD_PHASE_DECODE_STREAMING;
-          rfd_ent->pd_phase_start_ts = time(NULL); /* reset for decode stream timeout */
-          /* arm the backend-idle clock for the graceful-[DONE] safety-net
-           * reaper. This read carried the activation bytes, so "now" is the last
-           * backend activity. Refreshed per byte in the [DONE] scanner below. */
-          rfd_ent->pd_last_decode_ts = time(NULL);
-          log_debug("Decode streaming started — client_fd=%d backend_fd=%d",
-                   rfd_ent->fd, ent->fd);
-        }
-      }
+    /* The HTTP_RESPONSE parser observes header fragments and dechunked body.
+     * The raw sniff is only a fallback when that observer could not frame. */
+    if (ent->odir == 1 && !rfd_ent->cresp_payload_observed &&
+        rfd_ent->sse_mode == 1 && !rfd_ent->sse_active && len > 16) {
+      size_t scan = len < 2048 ? len : 2048;
+      if (memmem(msg, scan, "Content-Type: text/event-stream", 31) ||
+          memmem(msg, scan, "content-type: text/event-stream", 31))
+        proxy_sse_activate(rfd_ent);
     }
 
     /* Token accounting: maintain the response tail window and, for
@@ -1898,7 +1873,8 @@ skip_deferred_masking:
      * the NEXT request at the rate-limit gate. */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 &&
         rfd_ent->ai_gw_mode && !rfd_ent->usage_consumed && len > 0) {
-      proxy_usage_tail_update(rfd_ent, (const uint8_t *)msg, len);
+      if (!rfd_ent->cresp_payload_observed)
+        proxy_usage_tail_update(rfd_ent, (const uint8_t *)msg, len);
       if (!rfd_ent->sse_active && rfd_ent->metric_response_status != 0) {
         const pd_dialect_ops_t *uops = proxy_usage_ops(rfd_ent);
         int up = 0, uc = 0;
@@ -2034,7 +2010,8 @@ skip_deferred_masking:
              (const uint8_t *)msg + (len - new_len),
              new_len);
 
-      if (memmem(window, window_len, PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
+      if (rfd_ent->cresp_sse.done ||
+          memmem(window, window_len, PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
           memmem(window, window_len, PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR1, PROXY_SSE_DONE_LEN1) ||
           memmem(msg,    len,        PROXY_SSE_DONE_STR2, PROXY_SSE_DONE_LEN2)) {
@@ -2838,6 +2815,7 @@ proxy_listener_revive(proxy_map_ent_t *ent, proxy_arg_t *arg, struct proxy_takeo
   ent->val.backend_protocol_cap = arg->backend_protocol_cap;
   if (nctx) {
     SSL_CTX_set_alpn_select_cb(nctx, alpn_select_callback, &ent->val.backend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(nctx, &ent->val.backend_protocol_cap);
   }
   __atomic_store_n(&ent->val.ssl_ctx, nctx, __ATOMIC_RELEASE);
   ent->val.have_ssl = arg->have_ssl;
@@ -3146,6 +3124,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * peer_map gate in setup_proxy_path would otherwise keep the old mode. */
         ent->val.sockmap_en = arg->sockmap_en;
         tepval->sockmap_en = arg->sockmap_en;
+        tepval->path_match_mode = arg->path_match_mode;
         /* The capacity queue's depth and wait follow a rule update the
          * same way: they may change at runtime, entries waiting keep
          * their order. */
@@ -3185,6 +3164,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         // P6: Store composite key for hash table
         strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
         tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
+        tepval->path_match_mode = arg->path_match_mode;
 
         // Store custom header configuration
         if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
@@ -3524,6 +3504,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   // Configure ALPN callback with backend protocol capability
   if (ssl_ctx) {
     SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_callback, &node->val.backend_protocol_cap);
+    SSL_CTX_set_tlsext_servername_arg(ssl_ctx, &node->val.backend_protocol_cap);
     const char *proto_str = (node->val.backend_protocol_cap == 0) ? "http/1.1 only" :
                             (node->val.backend_protocol_cap == 1) ? "h2 only" : "h2+http/1.1";
     log_info("[ALPN] Configured for backend capability: %s", proto_str);
@@ -3603,6 +3584,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   // P6: Store composite key in tepval for hash table
   strncpy(tepval->ephash_key, ephash_key, sizeof(tepval->ephash_key) - 1);
   tepval->ephash_key[sizeof(tepval->ephash_key) - 1] = '\0';
+  tepval->path_match_mode = arg->path_match_mode;
 
   // Store custom header configuration
   if (arg->session_header_enabled && arg->session_header_name[0] != '\0') {
@@ -6394,7 +6376,7 @@ proxy_pdestroy(void *priv)
       llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
                             e->prompt_toks, e->complet_toks, 0, 0, "",
                             e->request_id, e->user, e->key, e->svc_ident,
-                            0, notify_worker_id(),
+                            e->response_is_sse, notify_worker_id(),
                             e->client_ip, e->origin_ip, e->trusted_hops);
       /* Recorded as completed with no usage object to read — the H2 twin of
        * the H1 report above. Inside the status guard on purpose: a stream
@@ -10084,6 +10066,75 @@ cresp_is_answer(int status)
   return status >= 200 || status == 101;
 }
 
+static void
+proxy_sse_activate(proxy_fd_ent_t *pfe)
+{
+  if (!pfe || pfe->sse_mode != 1 || pfe->sse_active) return;
+  pfe->sse_active = 1;
+  pfe->stream_start_ts = time(NULL);
+  {
+    struct timespec _sse_ts;
+    clock_gettime(CLOCK_MONOTONIC, &_sse_ts);
+    pfe->stream_start_mono_ns = (uint64_t)_sse_ts.tv_sec * 1000000000ULL +
+                                    (uint64_t)_sse_ts.tv_nsec;
+  }
+  /* Effective model: X-Model header > JSON body model > reset-boundary
+   * snapshot > "" */
+  const char *sse_model = proxy_effective_model(pfe);
+  llb_ai_stream_start("", (char *)sse_model);
+  log_debug("[SSE_ACTIVATED] client_fd=%d backend_fd=%d model=%s",
+           pfe->fd, -1, sse_model);
+
+  /* P/D decode streaming transition — decode EP is now streaming */
+  if (pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
+    pfe->pd_phase = PD_PHASE_DECODE_STREAMING;
+    pfe->pd_phase_start_ts = time(NULL); /* reset for decode stream timeout */
+    /* arm the backend-idle clock for the graceful-[DONE] safety-net
+     * reaper. This read carried the activation bytes, so "now" is the last
+     * backend activity. Refreshed per byte in the [DONE] scanner below. */
+    pfe->pd_last_decode_ts = time(NULL);
+    log_debug("Decode streaming started — client_fd=%d backend_fd=%d",
+             pfe->fd, -1);
+  }
+}
+
+static int
+cresp_on_message_begin(llhttp_t *parser)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+  return 0;
+}
+static int cresp_on_field(llhttp_t *parser, const char *at, size_t len)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) sp_sse_field(&pfe->cresp_sse, at, len);
+  return 0;
+}
+static int cresp_on_value(llhttp_t *parser, const char *at, size_t len)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) sp_sse_value(&pfe->cresp_sse, at, len);
+  return 0;
+}
+static int cresp_on_value_done(llhttp_t *parser)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) sp_sse_header_done(&pfe->cresp_sse);
+  return 0;
+}
+static int cresp_on_body(llhttp_t *parser, const char *at, size_t len)
+{
+  proxy_fd_ent_t *pfe = parser->data;
+  if (pfe) {
+    pfe->cresp_payload_observed = 1;
+    if (pfe->ai_gw_mode && !pfe->usage_consumed)
+      proxy_usage_tail_update(pfe, (const uint8_t *)at, len);
+    sp_sse_body(&pfe->cresp_sse, at, len);
+  }
+  return 0;
+}
+
 static int
 cresp_on_headers_complete(llhttp_t *parser)
 {
@@ -10098,6 +10149,8 @@ cresp_on_headers_complete(llhttp_t *parser)
   if (!cresp_is_answer(parser->status_code)) {
     return 0;
   }
+  pfe->metric_response_status = parser->status_code;
+  if (pfe->cresp_sse.is_sse) proxy_sse_activate(pfe);
   hc_resp_headers(pfe);
   sp_hold_answer_began(pfe);
   /* A response with neither Content-Length nor chunked framing runs until the
@@ -10149,6 +10202,11 @@ cresp_parser_init(proxy_fd_ent_t *pfe)
 {
   if (!cresp_settings_inited) {
     llhttp_settings_init(&cresp_settings);
+    cresp_settings.on_message_begin = cresp_on_message_begin;
+    cresp_settings.on_header_field = cresp_on_field;
+    cresp_settings.on_header_value = cresp_on_value;
+    cresp_settings.on_header_value_complete = cresp_on_value_done;
+    cresp_settings.on_body = cresp_on_body;
     cresp_settings.on_headers_complete = cresp_on_headers_complete;
     cresp_settings.on_message_complete = cresp_on_message_complete;
     cresp_settings_inited = 1;
