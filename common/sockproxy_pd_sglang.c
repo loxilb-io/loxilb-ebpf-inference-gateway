@@ -520,6 +520,7 @@ pd_sg_dual_dispatch(proxy_fd_ent_t *client_pfe)
         PROXY_LOCK();
         proxy_fdlist_link(ent, decode_pfe, "decode");
         PROXY_UNLOCK();
+        decode_pfe->used++;   /* the in-use reference every linked backend leg holds */
         notify_add_ent_pinned(proxy_struct->ns, ep_cfd,
                               NOTI_TYPE_IN|NOTI_TYPE_HUP, decode_pfe,
                               decode_pfe->gen, client_pfe->fd);
@@ -880,6 +881,8 @@ pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
     proxy_fdlist_link(hent, drain_pfe, "prefill drain");
     proxy_fdlist_link(hent, decode_pfe, "decode");
     PROXY_UNLOCK();
+    drain_pfe->used++;    /* the in-use reference every linked backend leg holds */
+    decode_pfe->used++;
     notify_add_ent_pinned(proxy_struct->ns, p_cfd,
                           NOTI_TYPE_IN|NOTI_TYPE_HUP, drain_pfe,
                           drain_pfe->gen, client_pfe->fd);

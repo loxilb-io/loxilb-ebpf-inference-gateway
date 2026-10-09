@@ -427,6 +427,17 @@ libbpf_xdp_attach(struct libbpf_cfg *cfg)
   }
 
   err = xdp_link_attach(cfg->ifindex, cfg->bpf_flags, prog_fd);
+  if (err && cfg->bpf_fallback_flags) {
+    /* The driver would not take the program in the requested mode (native
+     * XDP needs driver support and an MTU it can serve); the same loaded
+     * program is attached in the fallback mode instead. */
+    log_warn("bpfhelper: ifindex(%d) xdp attach with flags 0x%x refused, "
+             "retrying with flags 0x%x", cfg->ifindex, cfg->bpf_flags,
+             cfg->bpf_fallback_flags);
+    cfg->bpf_flags = cfg->bpf_fallback_flags;
+    cfg->bpf_fallback_flags = 0;
+    err = xdp_link_attach(cfg->ifindex, cfg->bpf_flags, prog_fd);
+  }
   if (err) {
     log_error("bpfhelper: link_attach failed");
     return NULL;

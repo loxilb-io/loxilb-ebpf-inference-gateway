@@ -65,6 +65,9 @@ typedef struct llb_dp_link {
   int nm;
   llb_bpf_mnt_t mp[MAX_MPS];
   int valid;
+  /* XDP_FLAGS_* the XDP program is attached with on this link (native or
+   * generic); a detach must name the mode that is live. 0 = not attached. */
+  __u32 xdp_flags;
 } llb_dp_link_t;
   
 typedef struct llb_dp_map {
@@ -2904,6 +2907,9 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // P/D disaggregation configuration
   pval->pd_disagg_mode = dat->pd_disagg_mode;
   pval->ai_gw_mode = dat->ai_gw_mode;
+  /* connectionLimit: a fullproxy rule never reaches the nat_map conn_limit
+   * gate, so the listener enforces it at accept (sockproxy fe_conns). */
+  pval->fe_conn_limit = dat->conn_limit;
   // Per-service X-Api-Key policy. Carried separately from ai_gw_mode because
   // the two answer different questions: ai_gw_mode says "this connection does
   // AI accounting", apikey_auth says "this service enforces a credential".
@@ -3319,6 +3325,12 @@ llb_del_mf_map_elem__(int tbl, void *k)
 
     ret = pdi_rule_delete(xh->ufw4, &new->key, new->data.pref, &nr);
     if (ret != 0) {
+      /* The control plane has already forgotten this rule; a miss here
+       * leaves it enforcing in the kernel table with nothing to delete it
+       * by. Said out loud rather than returned into a caller that ignores
+       * the value. */
+      log_error("fw4: rule delete pref %u rid %u not found in the rule table",
+                new->data.pref, new->data.rid);
       free(new);
       return -1;
     }
@@ -3359,6 +3371,8 @@ llb_del_mf_map_elem__(int tbl, void *k)
 
     ret = pdi_rule_delete(xh->ufw6, &new->key, new->data.pref, &nr);
     if (ret != 0) {
+      log_error("fw6: rule delete pref %u rid %u not found in the rule table",
+                new->data.pref, new->data.rid);
       free(new);
       return -1;
     }
@@ -4255,6 +4269,88 @@ llb_set_rlims(void)
   }
 }
 
+/* --xdp-native: the interfaces whose XDP program is attached in native
+ * (driver) mode rather than the generic (skb) mode every interface gets by
+ * default. A comma-separated list of names, or "all". Native mode needs a
+ * driver with XDP support and, before kernel 5.18, an MTU the driver can
+ * serve in one page; an interface that refuses it falls back to generic
+ * mode with a warning, so turning this on never costs the protection. The
+ * management channel is always generic. */
+static char llb_xdp_native_ifs[1024];
+
+int
+llb_dp_xdp_native_set(const char *ifnames)
+{
+  if (!ifnames) {
+    llb_xdp_native_ifs[0] = '\0';
+    return 0;
+  }
+  if (strlen(ifnames) >= sizeof(llb_xdp_native_ifs)) {
+    return -1;
+  }
+  strncpy(llb_xdp_native_ifs, ifnames, sizeof(llb_xdp_native_ifs) - 1);
+  llb_xdp_native_ifs[sizeof(llb_xdp_native_ifs) - 1] = '\0';
+  return 0;
+}
+
+static int
+llb_xdp_native_wanted(const char *ifname)
+{
+  const char *p = llb_xdp_native_ifs;
+  size_t n = strlen(ifname);
+
+  if (p[0] == '\0' || strcmp(ifname, LLB_MGMT_CHANNEL) == 0) {
+    return 0;
+  }
+  if (strcmp(p, "all") == 0) {
+    return 1;
+  }
+  while (*p) {
+    const char *e = strchr(p, ',');
+    size_t l = e ? (size_t)(e - p) : strlen(p);
+    if (l == n && strncmp(p, ifname, n) == 0) {
+      return 1;
+    }
+    if (!e) break;
+    p = e + 1;
+  }
+  return 0;
+}
+
+static void
+llb_link_xdp_flags_set(const char *ifname, __u32 flags)
+{
+  int n;
+
+  XH_LOCK();
+  for (n = 0; n < LLB_INTERFACES; n++) {
+    llb_dp_link_t *l = &xh->links[n];
+    if (l->valid && strncmp(l->ifname, ifname, IFNAMSIZ) == 0) {
+      l->xdp_flags = flags;
+      break;
+    }
+  }
+  XH_UNLOCK();
+}
+
+static __u32
+llb_link_xdp_flags_get(const char *ifname)
+{
+  int n;
+  __u32 flags = 0;
+
+  XH_LOCK();
+  for (n = 0; n < LLB_INTERFACES; n++) {
+    llb_dp_link_t *l = &xh->links[n];
+    if (l->valid && strncmp(l->ifname, ifname, IFNAMSIZ) == 0) {
+      flags = l->xdp_flags;
+      break;
+    }
+  }
+  XH_UNLOCK();
+  return flags;
+}
+
 static int
 llb_link_prop_add(const char *ifname,
                   void *obj,
@@ -4538,9 +4634,18 @@ llb_dp_link_attach(const char *ifname,
     must_load = 1;
   }
 
-  /* Large MTU not supported until kernel 5.18 */
-  cfg.bpf_flags |= XDP_FLAGS_SKB_MODE;
+  /* Generic (skb) mode is the default on every interface: it needs no
+   * driver support and, before kernel 5.18, no MTU constraint. An interface
+   * listed by --xdp-native asks for native (driver) mode first and falls
+   * back to generic if the driver refuses (libbpf_xdp_attach). */
+  if (mp_type == LL_BPF_MOUNT_XDP && !must_load && llb_xdp_native_wanted(ifname)) {
+    cfg.bpf_flags |= XDP_FLAGS_DRV_MODE;
+    cfg.bpf_fallback_flags = (cfg.bpf_flags & ~XDP_FLAGS_DRV_MODE) | XDP_FLAGS_SKB_MODE;
+  } else {
+    cfg.bpf_flags |= XDP_FLAGS_SKB_MODE;
+  }
   cfg.bpf_flags &= ~XDP_FLAGS_UPDATE_IF_NOEXIST;
+  cfg.bpf_fallback_flags &= ~XDP_FLAGS_UPDATE_IF_NOEXIST;
   cfg.ifname = (char *)&cfg.ifname_buf;
   strncpy(cfg.ifname, ifname, IF_NAMESIZE);
 
@@ -4550,6 +4655,13 @@ llb_dp_link_attach(const char *ifname,
   }
 
   if (unload) {
+    if (mp_type == LL_BPF_MOUNT_XDP) {
+      /* Detach in the mode the program was attached with, not the default. */
+      __u32 live = llb_link_xdp_flags_get(ifname);
+      if (live) {
+        cfg.bpf_flags = live;
+      }
+    }
     llb_ebpf_link_detach(&cfg);
     llb_psec_del(psec);
     llb_link_prop_del(ifname, mp_type);
@@ -4567,12 +4679,27 @@ llb_dp_link_attach(const char *ifname,
     llb_psec_del(psec);
     return -1;
   }
+  if (!bpf_obj) {
+    /* The link keeps its slot (the TC side may still have attached) but
+     * nothing of this program runs on it. For XDP that means no ipfilter
+     * and no security-rate protection on this interface — said out loud,
+     * because the caller used to swallow it. */
+    log_error("%s: %s program %s NOT attached on %s", cfg.filename,
+              mp_type == LL_BPF_MOUNT_XDP ? "xdp" : "tc", psec, ifname);
+  }
 
   if (llb_link_prop_add(ifname, bpf_obj, mp_type) != 0) {
     xdp_link_detach(cfg.ifindex, cfg.bpf_flags, 0);
     llb_psec_del(psec);
     llb_link_prop_del(ifname, mp_type);
     return -1;
+  }
+
+  if (bpf_obj && mp_type == LL_BPF_MOUNT_XDP) {
+    llb_link_xdp_flags_set(ifname, cfg.bpf_flags);
+    log_info("xdp: %s attached in %s mode on %s", psec,
+             (cfg.bpf_flags & XDP_FLAGS_DRV_MODE) ? "native (driver)" : "generic (skb)",
+             ifname);
   }
 
   if (nr == 0) {

@@ -416,6 +416,13 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
     PROXY_LOCK();
     proxy_fdlist_link(ent, decode_pfe, "decode");
     PROXY_UNLOCK();
+    /* In use before the notifier can hand the leg's first event, and with it
+     * a teardown, to its worker -- the same reference the ordinary backend leg
+     * takes (handle_new_connection). Without it the pooled-shell guard saw a
+     * release at count zero, neither freed nor unlinked the shell, and every
+     * P/D request leaked one shell: under LLB_PD_MAX_TOTAL_INFLIGHT the
+     * footprint gauge never came back down and the listener stayed paused. */
+    decode_pfe->used++;
 
     /* Option A: pin the decode backend fd to the CLIENT fd's notify
      * worker so this connection's relay (proxy_notifier) and teardown
@@ -667,6 +674,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
         PROXY_LOCK();
         proxy_fdlist_link(hent, bpfe, "prefill");
         PROXY_UNLOCK();
+        bpfe->used++;   /* the in-use reference every linked backend leg holds */
         /* Option-A pinning: relay + teardown for the new leg serialize on the
          * client fd's worker, like every other backend leg. */
         notify_add_ent_pinned(proxy_struct->ns, ep_cfd,
