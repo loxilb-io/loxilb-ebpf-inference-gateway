@@ -55,6 +55,39 @@ extern void llb_ai_normal_session_hit(char *model_name);
 /* P/D disaggregation: pd_select_prefill, pd_select_decode, pd_session_store,
  * pd_session_evict, pd_trie_evict_lru are declared in sockproxy.h */
 
+/* The single-role Tier-1.5 KV load unit (pd_ep_loads[].active_conns, one
+ * per request on a KV hit, claimed through kv_sr_load_held) is taken at the
+ * hit, before the capacity gate. These two keep it honest across the gate's
+ * outcomes; pd_cleanup's __atomic_exchange release stays the teardown owner
+ * and is a no-op once the flag is cleared here. */
+static void
+sp_kv_sr_unit_release(proxy_fd_ent_t *pfe, proxy_epval_t *tepval)
+{
+  if (!pfe || !tepval)
+    return;
+  if (__atomic_exchange_n(&pfe->kv_sr_load_held, 0, __ATOMIC_ACQ_REL)) {
+    int ep = pfe->kv_sr_ep_idx;
+    if (ep >= 0 && ep < tepval->n_eps) {
+      uint32_t cur = atomic_load(&tepval->pd_ep_loads[ep].active_conns);
+      if (cur > 0)
+        atomic_fetch_sub(&tepval->pd_ep_loads[ep].active_conns, 1);
+    }
+    pfe->kv_sr_ep_idx = -1;
+  }
+}
+
+static void
+sp_kv_sr_unit_move(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, int to)
+{
+  if (!pfe || !tepval || !pfe->kv_sr_load_held || to < 0 || to >= tepval->n_eps ||
+      pfe->kv_sr_ep_idx == to)
+    return;
+  sp_kv_sr_unit_release(pfe, tepval);
+  atomic_fetch_add(&tepval->pd_ep_loads[to].active_conns, 1);
+  pfe->kv_sr_load_held = 1;
+  pfe->kv_sr_ep_idx = to;
+}
+
 /* =========================================================================
  * sockproxy HA state-sync emit helper (conversation_mapping_t).
  *
@@ -67,6 +100,7 @@ extern void llb_ai_normal_session_hit(char *model_name);
  *
  * Returns 1 on emit-ready, 0 on resolution miss (caller MUST not emit).
  * ========================================================================= */
+
 static int
 conv_build_sync_event(proxy_sync_event_t *ev,
                       const proxy_map_ent_t *ent,
@@ -801,7 +835,11 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             /* RES-02: Fallback to any healthy EP in normal (non-P/D) mode */
             int fallback_ep = -1;
             if (pd_select_any_healthy(tepval, &fallback_ep) == 0) {
-              if (pfe) pfe->pd_phase = PD_PHASE_NONE;
+              if (pfe) {
+                pfe->pd_phase = PD_PHASE_NONE;
+                /* normal mode takes no decode unit; drop any Tier-0 hint */
+                pfe->pd_decode_ep_idx = -1;
+              }
               atomic_fetch_add(&global_stats.pd_fallback_to_normal, 1);
               log_info("P/D fallback: all prefill/decode EPs unhealthy, using EP[%d] in normal mode",
                        fallback_ep);
@@ -820,6 +858,9 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                 "\"detail\":\"no healthy prefill or decode endpoint\"}\r\n";
               proxy_send_local_response(pfe, pd_503_resp, strlen(pd_503_resp));
               pfe->lb_err_body_sent = 1;
+              /* A decode hint the Tier-0 lookup may have written is not a
+               * unit (none was taken); see the role-gate exit below. */
+              pfe->pd_decode_ep_idx = -1;
             }
             return -1;
           }
@@ -829,8 +870,17 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
            * BEFORE the load counters move so a refusal leaves them untouched. */
           if (pfe &&
               (sp_fc_h1_gate_role(pfe, tepval, pd_prefill, FC_ROLE_PREFILL, 0) != 0 ||
-               sp_fc_h1_gate_role(pfe, tepval, pd_decode, FC_ROLE_DECODE, 0) != 0))
+               sp_fc_h1_gate_role(pfe, tepval, pd_decode, FC_ROLE_DECODE, 0) != 0)) {
+            /* The decode pick pd_select_decode (or the Tier-0 hint before it)
+             * wrote into the connection is not held yet: the units are taken
+             * below, after the gate. Left in place, pd_cleanup — on this
+             * teardown, on a park reap, or on the next request of a kept
+             * connection — would hand back a decode unit this request never
+             * took, stealing it from the request that holds it. */
+            pfe->pd_decode_ep_idx = -1;
+            pfe->pd_prefill_ep_idx = -1;
             return -1;
+          }
           /* INTG-06: Increment active_conns for selected EPs */
           atomic_fetch_add(&tepval->pd_ep_loads[pd_prefill].active_conns, 1);
           atomic_fetch_add(&tepval->pd_ep_loads[pd_decode].active_conns, 1);
@@ -1060,6 +1110,17 @@ pd_fallback_normal:
              * not set yet). */
             chwbl_dec_runtime(tepval, sel);
           }
+          if (fc_sel < 0) {
+            /* The single-role KV unit was taken at the Tier-1.5 hit above,
+             * before this gate, so it follows the same rule as the CHWBL
+             * unit: a request that parks, is refused or keeps its connection
+             * never reaches the endpoint and holds nothing. A parked request
+             * re-selects on resume and takes the unit again on a hit; a kept
+             * connection's next request does the same. Without this the KV
+             * endpoint carried phantom load for the park, and a kept
+             * connection held the unit until its next hit or teardown. */
+            sp_kv_sr_unit_release(pfe, tepval);
+          }
           if (fc_sel == SP_FC_H1_QUEUED)
             return PD_SETUP_PARKED;
           if (fc_sel == SP_FC_H1_KEPT)
@@ -1073,6 +1134,9 @@ pd_fallback_normal:
               chwbl_dec_runtime(tepval, sel);
               chwbl_inc_runtime(tepval, fc_sel);
             }
+            /* So does the single-role KV unit: the request executes on
+             * fc_sel, and that is the endpoint whose concurrency it adds to. */
+            sp_kv_sr_unit_move(pfe, tepval, fc_sel);
             log_info("[AIGateway] fd=%d capacity moved the pick: ep[%d] -> ep[%d]",
                      pfe->fd, sel, fc_sel);
             sel = fc_sel;

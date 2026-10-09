@@ -456,6 +456,15 @@ test_hdr_deadline: sockproxy_hdr_deadline_test.c sockproxy_hdr_deadline.h
 .PHONY: test_hdrdl
 test_hdrdl: test_hdr_deadline
 	./test_hdr_deadline
+
+# connectionLimit on a fullproxy listener: the accept-time ceiling. Standalone
+# — includes only the pure sockproxy_fe_limit.h.
+test_fe_limit: sockproxy_fe_limit_test.c sockproxy_fe_limit.h
+	$(CC) -Wall -Wextra -pthread -o $@ $< -I.
+
+.PHONY: test_felimit
+test_felimit: test_fe_limit
+	./test_fe_limit
 # Clearing a pooled connection shell for reuse. The clear skips the
 # transfer-params buffer, so the unit has to prove both that everything around
 # it is zeroed and that the buffer itself is not -- a clear that quietly went
@@ -806,7 +815,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls
+	rm -f *.o *.d test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_sockproxy_sync_emit test_h2_inject test_ai_security test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_fe_limit
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

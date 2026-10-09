@@ -68,6 +68,10 @@ struct ebpfcfg {
 
 void loxilb_set_loglevel(struct ebpfcfg *cfg);
 int loxilb_main(struct ebpfcfg *cfg);
+/* Interfaces to attach XDP in native (driver) mode on: a comma-separated
+ * list or "all"; empty/NULL = generic (skb) mode everywhere (the default).
+ * Call before the links are attached. */
+int llb_dp_xdp_native_set(const char *ifnames);
 
 
 #endif

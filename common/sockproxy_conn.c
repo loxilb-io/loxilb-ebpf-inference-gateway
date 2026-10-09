@@ -54,6 +54,7 @@
 #include "common_pdi.h"
 #include "llb_dpapi.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_fe_limit.h"   /* connectionLimit unit release */
 #include "sockproxy_conn.h"
 #include "sockproxy_connect.h"
 #include "sockproxy_cache.h"
@@ -1712,6 +1713,17 @@ proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
      * and never frees), so it is correct and safe when fd == -1. The node free
      * remains owned by proxy_try_free_fd_ctx (refcounted), unchanged. */
     log_trace("sockproxy fd %d reset", fd_ent->fd);
+    /* The fe_conns unit (connectionLimit) this client leg took at accept.
+     * The listener node outlives every leg on its fdlist (it is freed only
+     * once the list is empty), so head is valid here; the flag makes the
+     * release run once however many times this teardown is reached. */
+    if (fd_ent->fe_counted) {
+      proxy_map_ent_t *fe_ent = (proxy_map_ent_t *)fd_ent->head;
+      fd_ent->fe_counted = 0;
+      if (fe_ent) {
+        fe_limit_release(&fe_ent->fe_conns);
+      }
+    }
     proxy_reset_fd_list(fd_ent->head, fd_ent);
     if (fd_ent->fd > 0) {
       close(fd_ent->fd);

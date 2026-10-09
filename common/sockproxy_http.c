@@ -57,6 +57,7 @@
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
 #include "sockproxy_l7hdr_guard.h" /* last check before a field is spliced */
 #include "sockproxy_internal.h"
+#include "sockproxy_fe_limit.h"   /* connectionLimit at accept */
 #include "sockproxy_fdlist.h"
 #include "sockproxy_metrics.h"
 #include "sockproxy_routing.h"
@@ -3014,6 +3015,34 @@ proxy_get_backend_tls_state(proxy_ent_t *key, struct proxy_betls_state *out)
   return ret;
 }
 
+/* connectionLimit observability for a fullproxy listener: the live client
+ * gauge, the ceiling in force and the refusals so far. The control plane
+ * reads it per rule (DpCtStatsRollup) so activeConns reports the same count
+ * the gate enforces, as nat_ep_map.conc_conns does for NAT rules. */
+int
+proxy_get_fe_conn_stats(struct proxy_ent *key, uint32_t *conns, uint32_t *limit,
+                        uint64_t *refused)
+{
+  proxy_map_ent_t *ent;
+  int rc = -1;
+
+  if (!proxy_struct || !key) {
+    return -1;
+  }
+  PROXY_LOCK();
+  for (ent = proxy_struct->head; ent; ent = ent->next) {
+    if (cmp_proxy_ent(&ent->key, key)) {
+      if (conns) *conns = atomic_load_explicit(&ent->fe_conns, memory_order_relaxed);
+      if (limit) *limit = atomic_load_explicit(&ent->fe_conn_limit, memory_order_relaxed);
+      if (refused) *refused = atomic_load_explicit(&ent->fe_conn_refused, memory_order_relaxed);
+      rc = 0;
+      break;
+    }
+  }
+  PROXY_UNLOCK();
+  return rc;
+}
+
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 {
@@ -3195,6 +3224,11 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
         tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
         tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
+
+        /* connectionLimit of the rule taking this listener (0 = unlimited).
+         * The gauge itself stays: units live connections hold are theirs. */
+        atomic_store_explicit(&ent->fe_conn_limit, arg->fe_conn_limit,
+                              memory_order_relaxed);
 
         // P/D disaggregation configuration
         tepval->pd_disagg_enabled = arg->pd_disagg_mode;
@@ -3611,6 +3645,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   tepval->max_stream_duration_sec = arg->max_stream_duration_sec;
   tepval->backend_keepalive_sec = arg->backend_keepalive_sec;
   tepval->inactive_timeout_sec = arg->inactive_timeout_sec;
+
+  /* connectionLimit (0 = unlimited); the gauge starts at zero with the node. */
+  atomic_store_explicit(&node->fe_conn_limit, arg->fe_conn_limit,
+                        memory_order_relaxed);
 
   // P/D disaggregation configuration (new entry path)
   tepval->pd_disagg_enabled = arg->pd_disagg_mode;
@@ -5462,8 +5500,17 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
       /* Bug3-fix (US-H201): guard against uint32_t underflow on double-cleanup */
       uint32_t cur_dec = atomic_load(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns);
 
-      if (cur_dec > 0)
+      if (cur_dec > 0) {
         atomic_fetch_sub(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns, 1);
+      } else {
+        /* A decode index on a connection whose unit was never taken (the
+         * selection was refused after pd_select_decode wrote it) used to be
+         * released here — stealing a unit when the gauge was above zero and
+         * masked by this guard when it was not. The refusal exits now clear
+         * the index; this line is the canary that they did. */
+        log_warn("[PD_LOAD] decode EP%d unit release with zero gauge (never taken) fd=%d",
+                 fd_ent->pd_decode_ep_idx, fd_ent->fd);
+      }
     }
   }
 
@@ -8488,6 +8535,19 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->effective_model[0] = '\0';
     pfe->json_stream_route_pending = 0;
     pfe->json_stream_continue_sent = 0;
+    /* The routing keys the body of request N yielded are request N's too.
+     * user_id (the JSON "user" field) is the Tier-0 session key fallback and
+     * the normal-mode session key; it was set once and never cleared, so a
+     * keyless request N+1 on this connection — a different user behind the
+     * same upstream proxy — was pinned to request N's session and endpoint.
+     * is_chat/body_off/body_len locate the body for the KV-exact tokenize
+     * stage and were only ever assigned when a body was present, so a
+     * bodyless request N+1 could hand the tokenizer request N's span. */
+    pfe->user_id[0] = '\0';
+    pfe->has_user_id = 0;
+    pfe->is_chat = 0;
+    pfe->body_off = 0;
+    pfe->body_len = 0;
     /* Token-accounting state is per-response: without this reset, request
      * N+1 on a reused connection would inherit request N's consumed flag
      * (never charging again) or its stale counts. */
@@ -10691,6 +10751,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   int retry;
   proxy_fd_ent_t *npfe1 = NULL;
   SSL *ssl = NULL;
+  uint8_t fe_counted = 0;  /* this accept holds one fe_conns unit (connectionLimit) */
 
   /* : global total-footprint ingress backpressure (knob
    * LLB_PD_MAX_TOTAL_INFLIGHT). BEFORE accept(), if the bound is enabled
@@ -10743,6 +10804,36 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
     return PROXY_ACCEPT_DONE; // backlog drained, or an error poll re-reports
   }
 
+  /* connectionLimit of the rule (proxy_map_ent.fe_conn_limit): the per-rule
+   * client-connection ceiling the NAT datapath enforces at SYN time for NAT
+   * rules and could never see for this listener. The unit is taken here, the
+   * one point where a client leg comes into being, with a single fetch_add so
+   * concurrent accept shards cannot both slip under the ceiling; it is
+   * released once, in proxy_release_fd_ctx(reset=1), keyed on fe_counted.
+   * Over the ceiling the connection is reset at once (SO_LINGER 0): an LLM
+   * client learns in one RTT instead of waiting on a timeout, and no
+   * listener pause/re-arm state is needed. With the limit unset (0) this
+   * block is a no-op and the accept path is byte-identical to before. */
+  {
+    uint32_t fe_lim = atomic_load_explicit(&ent->fe_conn_limit, memory_order_relaxed);
+    uint64_t refused = 0;
+    enum fe_limit_rc fe_rc = fe_limit_take(&ent->fe_conns, fe_lim,
+                                           &ent->fe_conn_refused, &refused);
+    if (fe_rc == FE_LIMIT_REFUSED) {
+      struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+      setsockopt(new_sd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+      close(new_sd);
+      if ((refused & 1023u) == 1u) {
+        log_info("[FE_CONN_LIMIT] %s:%u refused accept at limit=%u "
+                 "(refused_total=%lu)",
+                 inet_ntoa(*(struct in_addr *)&ent->key.xip), ntohs(ent->key.xport),
+                 fe_lim, (unsigned long)refused);
+      }
+      return PROXY_ACCEPT_NEXT;
+    }
+    fe_counted = (fe_rc == FE_LIMIT_TAKEN);
+  }
+
   new_sd = get_mapped_proxy_fd(new_sd, 1);
 
   if (proxy_skmap_key_from_fd(new_sd, key, &protocol)) {
@@ -10752,6 +10843,9 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       SSL_free(ssl);
     }
     close(new_sd);
+    if (fe_counted) {
+      fe_limit_release(&ent->fe_conns);
+    }
     return PROXY_ACCEPT_NEXT;
   }
 
@@ -10774,6 +10868,9 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
       SSL_free(ssl);
       close(new_sd);
       ssl = NULL;
+      if (fe_counted) {
+        fe_limit_release(&ent->fe_conns);
+      }
       return PROXY_ACCEPT_NEXT;
     }
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -10804,6 +10901,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->head = ent;
   npfe1->ssl = ssl;
   npfe1->odir = 0;  // Client-facing connection
+  npfe1->fe_counted = fe_counted;  // the fe_conns unit now belongs to this leg
 
   /* The address this connection came from, in text, for everything that
    * reports a request on it. Captured HERE rather than where the header
@@ -11085,8 +11183,24 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       if (g == SP_FC_H1_QUEUED) {
         /* Parked: the kept leg is let go so the resumed request selects
          * afresh (the way the P/D boundary releases a stale leg), and the
-         * client is suspended until its turn. */
+         * client is suspended until its turn. The endpoint pin goes with
+         * the leg: the resumed request runs setup_proxy_path, whose
+         * selection takes a fresh bounded-load unit and overwrites ep_num,
+         * and the parse-phase stale-unit guard does not run on the resume
+         * path — so the unit this connection holds on ep_num is handed
+         * back here, exactly as that guard would have. */
         proxy_release_rfd_ctx(pfe);
+#ifdef HAVE_DP_GPU_ROUTING
+        if (pfe->ep_num >= 0 && pfe->epv) {
+          if ((ka_epv->select == PROXY_SEL_CHWBL ||
+               ka_epv->select == PROXY_SEL_WRR_HASH) &&
+              ka_epv->chwbl_config) {
+            chwbl_dec_runtime(ka_epv, pfe->ep_num);
+          }
+          pfe->ep_num = -1;
+          pfe->epv = NULL;
+        }
+#endif
         sp_fc_h1_park(pfe);
         return SP_FWD_PARKED;
       }
