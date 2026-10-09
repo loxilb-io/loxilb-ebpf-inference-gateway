@@ -800,9 +800,10 @@ typedef struct proxy_map_ent {
    * sockproxy is the one place that knows how many client connections a
    * listener holds, so it is the gate: fe_conns is the live gauge (one unit
    * per accepted client leg, taken in handle_new_connection and released
-   * exactly once in proxy_release_fd_ctx(reset=1)), fe_conn_limit the
-   * ceiling copied from the rule (0 = unlimited; the accept path is then
-   * byte-identical to before), fe_conn_refused the running count of
+   * exactly once in proxy_release_fd_ctx(reset=1); taken with or without a
+   * ceiling because it is also the rule's activeConnections), fe_conn_limit
+   * the ceiling copied from the rule (0 = unlimited: nothing is ever
+   * refused), fe_conn_refused the running count of
    * connections reset at accept because the ceiling was reached. They live
    * on the listener node rather than on the pool value, so a rule refresh
    * neither resets the gauge nor loses the units live connections hold. */
@@ -1220,8 +1221,13 @@ struct proxy_fd_ent {
   size_t rcv_hwm;     // Furthest byte this user wrote into rcvbuf (sockproxy_rcvbuf.h)
   size_t parsed_off;  // How much of rcvbuf has been parsed
   int http_pok;
-  int http_hok;
+  int http_hok;       /* a Host header NAME was parsed (legacy "host ok"), NOT headers complete */
   int http_hvok;
+  /* The request's header block is complete (llhttp on_headers_complete on the
+   * client leg). Reset at every request boundary, never per read: the
+   * header-completion deadline (timeoutTcpInspect) keys on it, and http_hok
+   * flips on the first "Host:" name, which every slowloris sends first. */
+  int http_hdrs_done;
   int http_body_complete;
   size_t http_content_length;
   int is_streamable;  // Flag: Content can be streamed (not JSON/form-urlencoded)
@@ -1407,6 +1413,13 @@ struct proxy_fd_ent {
   time_t session_created;        // When session was created
   int affinity_type;             // Type of affinity (IP-based, content-based, etc.)
   time_t last_activity;         // Last activity timestamp for session timeout
+  /* The per-rule inactiveTimeout clock of a CLIENT leg: the last moment a
+   * byte moved on this connection in either direction (armed at accept,
+   * stamped on every client read and on every backend read relayed to it).
+   * Its own field because last_activity is the sticky-session / L7
+   * timeoutMemberData clock: a plain connection never arms that one, so the
+   * idle pass keyed on it never reaped an ordinary keep-alive connection. */
+  time_t idle_since;
 #ifdef HAVE_PII_DETECTION
   // PII Masking Deferred State (prevents parser corruption)
   char *pii_masked_text;         // Temporarily stores masked body text

@@ -58,9 +58,19 @@ PDI_DEF_ARR_FIELD(8, 16);
 #define PDI_MATCH_ALL(v1, v2) \
 (((v2)->valid == (v1)->valid) && (((v1)->val & (v2)->valid) == (v2)->val))
 
+/* Exact equality of two range-capable fields, the rule-table lookup used by
+ * insert (duplicate check) and delete. The two encodings of the union are
+ * compared member for member: a range by its bounds, a value by value and
+ * mask. The previous form read a value-encoded field through the range
+ * overlay (val against max, i.e. the port against its mask) and required
+ * has_range to be set in its value branch, so no rule carrying a port match,
+ * exact or range, could ever be found again: its delete left the entry live
+ * in the kernel table while the control plane had forgotten it. */
 #define PDI_RMATCH_ALL(v1, v2) \
-((((v2)->has_range == (v1)->has_range) && ((v1)->u.v.val == (v2)->u.r.min && (v1)->u.v.val == (v2)->u.r.max)) || \
- (((v2)->has_range != 0) &&(((v2)->u.v.valid == (v1)->u.v.valid) && (((v1)->u.v.val & (v2)->u.v.valid) == (v2)->u.v.val))))
+(((v1)->has_range == (v2)->has_range) && \
+ ((v2)->has_range ? \
+  ((v1)->u.r.min == (v2)->u.r.min && (v1)->u.r.max == (v2)->u.r.max) : \
+  ((v1)->u.v.valid == (v2)->u.v.valid && (v1)->u.v.val == (v2)->u.v.val)))
 
 #define PDI_MATCH6(v1, v2) ({ \
     int match = 1; \

@@ -7,7 +7,9 @@
  *
  * Includes ONLY the pure header, so it runs without the proxy object graph:
  *
- *   T1  limit 0 is unlimited: nothing is taken, nothing is counted.
+ *   T1  limit 0 is unlimited: every take is granted and COUNTED, nothing is
+ *       refused (the gauge is activeConnections for a rule with no limit;
+ *       a take that counted nothing read 0 with live connections open).
  *   T2  exactly `limit` units are granted, the (limit+1)th is refused with
  *       the gauge untouched and the refusal counted.
  *   T3  a release frees one slot; the next take succeeds again.
@@ -45,11 +47,15 @@ t1_unlimited(void)
 
   printf("T1 limit 0 is unlimited\n");
   for (int i = 0; i < 1000; i++) {
-    if (fe_limit_take(&conns, 0, &refused, &n) != FE_LIMIT_UNLIMITED) g_failures++;
+    if (fe_limit_take(&conns, 0, &refused, &n) != FE_LIMIT_TAKEN) g_failures++;
   }
-  CHECK(atomic_load(&conns) == 0, "gauge untouched with no ceiling");
+  CHECK(atomic_load(&conns) == 1000, "every take counted with no ceiling (gauge == 1000)");
   CHECK(atomic_load(&refused) == 0, "nothing refused with no ceiling");
   CHECK(n == 99, "refused_total not written with no ceiling");
+  for (int i = 0; i < 1000; i++) {
+    fe_limit_release(&conns);
+  }
+  CHECK(atomic_load(&conns) == 0, "every release returns its unit");
 }
 
 static void

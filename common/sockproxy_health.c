@@ -946,7 +946,7 @@ check_draining_endpoints(void)
         proxy_fd_ent_t *pfe_next = pfe->next;
         if (pfe->odir == 0 && pfe->fd > 0 && pfe->fd != hd_node->val.main_fd &&
             pfe->l7_hdr_accum_start > 0 &&
-            (pfe->h2_session || pfe->http_hok == 0) &&
+            (pfe->h2_session || !pfe->http_hdrs_done) &&
             proxy_hdr_deadline_expired(hd_node, pfe, now)) {
           atomic_fetch_add(&global_stats.hdr_deadline_drops, 1);
           log_debug("[TCP_INSPECT] fd=%d: header-completion deadline %ums exceeded "
@@ -990,22 +990,29 @@ check_draining_endpoints(void)
 
         /* L7 member-data deadline overrides the per-rule idle deadline when configured. */
         uint32_t idle_to_s = (l7_data_to_s > 0) ? l7_data_to_s : pfe->inactive_timeout_sec;
+        /* Two clocks: the L7 member-data deadline runs on last_activity (armed when a
+         * request is fully received, cleared when the member answers); the per-rule
+         * inactiveTimeout runs on idle_since (a client leg's last byte either way, armed
+         * at accept). last_activity is otherwise the sticky-session clock, which a plain
+         * connection never arms — keyed on it, the per-rule reap never ran for an
+         * ordinary keep-alive connection. */
+        time_t idle_anchor = (l7_data_to_s > 0) ? pfe->last_activity : pfe->idle_since;
 
         /* for the L7 timeoutMemberData deadline use >= so a deadline rounded UP to N whole
          * seconds fires AT the Nth 1Hz tick (e.g. 1500ms→2s fires at the 2s pass, landing inside the
          * gate's configured-ms window), rather than only after N+1 seconds. The legacy per-rule
          * inactive_timeout_sec path keeps its original strict > semantics (behaviour-preserving). */
-        time_t idle_elapsed = now - pfe->last_activity;
+        time_t idle_elapsed = now - idle_anchor;
         int idle_expired = (l7_data_to_s > 0)
                                ? (idle_elapsed >= (time_t)idle_to_s)
                                : (idle_elapsed > (time_t)idle_to_s);
 
         if (idle_to_s > 0 &&
             pfe->sse_active == 0 &&         /* do not kill active SSE streams */
-            pfe->last_activity > 0 &&
+            idle_anchor > 0 &&
             idle_expired) {
           log_debug("[IDLE_TIMEOUT] fd=%d: idle=%lds >= timeout=%us%s, closing connection",
-                   pfe->fd, (long)(now - pfe->last_activity), idle_to_s,
+                   pfe->fd, (long)idle_elapsed, idle_to_s,
                    (l7_data_to_s > 0) ? " (L7 timeoutMemberData)" : "");
           if (pfe->fd > 0) {
             shutdown(pfe->fd, SHUT_RDWR);

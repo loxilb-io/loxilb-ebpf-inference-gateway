@@ -3325,6 +3325,12 @@ llb_del_mf_map_elem__(int tbl, void *k)
 
     ret = pdi_rule_delete(xh->ufw4, &new->key, new->data.pref, &nr);
     if (ret != 0) {
+      /* The control plane has already forgotten this rule; a miss here
+       * leaves it enforcing in the kernel table with nothing to delete it
+       * by. Said out loud rather than returned into a caller that ignores
+       * the value. */
+      log_error("fw4: rule delete pref %u rid %u not found in the rule table",
+                new->data.pref, new->data.rid);
       free(new);
       return -1;
     }
@@ -3365,6 +3371,8 @@ llb_del_mf_map_elem__(int tbl, void *k)
 
     ret = pdi_rule_delete(xh->ufw6, &new->key, new->data.pref, &nr);
     if (ret != 0) {
+      log_error("fw6: rule delete pref %u rid %u not found in the rule table",
+                new->data.pref, new->data.rid);
       free(new);
       return -1;
     }
