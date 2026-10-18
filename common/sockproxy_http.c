@@ -1876,6 +1876,9 @@ skip_deferred_masking:
         rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
       rfd_ent->cresp_payload_observed = 0;
       cresp_feed(rfd_ent, msg, len);
+      if(rfd_ent->pd_phase==PD_PHASE_DECODE_STREAMING ||
+         rfd_ent->pd_phase==PD_PHASE_DECODE_SENDING)
+        sp_pd_wire_feed(&rfd_ent->pd_client_wire,(const char *)msg,len);
     }
 
     /* The HTTP_RESPONSE parser observes header fragments and dechunked body.
@@ -1989,10 +1992,10 @@ skip_deferred_masking:
     if (ent->odir == 1 && rfd_ent->sse_active == 1 &&
         rfd_ent->stream_end_ts == 0 && len > 0) {
       /* refresh the backend-idle clock on every relayed decode byte.
-       * The graceful-[DONE] safety-net reaper (sockproxy_health.c) measures idle
+       * The decode-idle failure reaper (sockproxy_health.c) measures idle
        * from THIS timestamp, so a stream that is still producing tokens — however
        * slowly — keeps pushing its reap deadline out and is never truncated; only a
-       * stream whose backend has gone genuinely silent (vLLM dropped its [DONE])
+       * stream whose backend has gone silent without a terminal event
        * crosses the cap. */
       rfd_ent->pd_last_decode_ts = time(NULL);
 
@@ -7380,6 +7383,12 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             pfe->fd, pfe->odir, rval, pfe->ssl, pfe->ktls_enabled);
 #endif
 
+  /* SSL WANT_READ/WANT_WRITE and interrupted reads are not backend EOF.
+   * Classify with the transport's own result before scheduling a terminal. */
+  if (rval<=0 && (!pfe->ssl || pfe->ktls_enabled) &&
+      (rval==0 || (errno!=EAGAIN && errno!=EWOULDBLOCK && errno!=EINTR)) &&
+      sp_pd_backend_end(pfe)) return -1;
+
   if (!pfe->ssl || pfe->ktls_enabled) {
     // Plaintext or kTLS path
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -7631,6 +7640,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
     }
 
     int ssl_error = SSL_get_error(pfe->ssl, rval);
+    if ((ssl_error==SSL_ERROR_ZERO_RETURN || ssl_error==SSL_ERROR_SSL ||
+         (ssl_error==SSL_ERROR_SYSCALL && errno!=EINTR)) &&
+        sp_pd_backend_end(pfe)) return -1;
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[SSL_GET_ERROR] fd=%d odir=%d rval=%d ssl_error=%d | "
               "SSL_ERROR_NONE=%d SSL_ERROR_ZERO_RETURN=%d SSL_ERROR_WANT_READ=%d SSL_ERROR_WANT_WRITE=%d SSL_ERROR_SYSCALL=%d SSL_ERROR_SSL=%d",
@@ -10258,7 +10270,7 @@ handle_resp_body(llhttp_t *parser, const char *at, size_t length)
  *
  * Reaper interlock (Pitfall #3): set stream_end_ts on the CLIENT pfe
  * so the sockproxy_health.c:451 graceful-[DONE] reaper short-circuits
- * (pd_should_graceful_complete returns 0 when stream_end_ts != 0,
+ * (pd_should_decode_idle_fail returns 0 when stream_end_ts != 0,
  * sockproxy_pd_leak.h:240) — the framed case must NOT also be reaped (no
  * double-completion). The reaper STAYS unchanged; it nets the no-terminator
  * keep-alive-silent case llhttp cannot frame (test_resp_framing.c case 5).
@@ -10548,7 +10560,7 @@ proxy_sse_activate(proxy_fd_ent_t *pfe)
   if (pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
     pfe->pd_phase = PD_PHASE_DECODE_STREAMING;
     pfe->pd_phase_start_ts = time(NULL); /* reset for decode stream timeout */
-    /* arm the backend-idle clock for the graceful-[DONE] safety-net
+    /* arm the backend-idle clock for the decode-idle failure
      * reaper. This read carried the activation bytes, so "now" is the last
      * backend activity. Refreshed per byte in the [DONE] scanner below. */
     pfe->pd_last_decode_ts = time(NULL);
@@ -10563,6 +10575,7 @@ cresp_on_message_begin(llhttp_t *parser)
   proxy_fd_ent_t *pfe = parser->data;
   if (pfe) {
     memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+    memset(&pfe->pd_client_wire,0,sizeof(pfe->pd_client_wire));
     creq_block_msg_begin(&pfe->cresp_blk);
   }
   return 0;
@@ -10614,6 +10627,10 @@ cresp_on_headers_complete(llhttp_t *parser)
   }
   pfe->metric_response_status = parser->status_code;
   if (pfe->cresp_sse.is_sse) proxy_sse_activate(pfe);
+  if(pfe->pd_phase==PD_PHASE_DECODE_STREAMING) {
+    pfe->pd_client_wire.chunked=(parser->flags & F_CHUNKED)!=0;
+    pfe->pd_client_wire.fixed=(parser->flags & F_CONTENT_LENGTH)!=0;
+  }
   hc_resp_headers(pfe);
   sp_hold_answer_began(pfe);
   /* A response with neither Content-Length nor chunked framing runs until the
@@ -10643,7 +10660,8 @@ cresp_on_message_complete(llhttp_t *parser)
    * into a running stream. */
   if (pfe) {
     creq_block_msg_done(&pfe->cresp_blk);
-    sp_sse_message_done(&pfe->cresp_sse);
+    if(pfe->pd_phase!=PD_PHASE_DECODE_STREAMING)
+      sp_sse_message_done(&pfe->cresp_sse);
   }
   if (pfe && cresp_is_answer(parser->status_code)) {
     /* Capture ownership survives a policy change and names modern H1

@@ -1060,7 +1060,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_pd_reservation test_pd_queue_generation test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free
+	rm -f *.o *.d test_pd_terminal test_pd_reservation test_pd_queue_generation test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
@@ -1112,7 +1112,7 @@ test_cb_tsan:
 test_cb_mutation:
 	CC="$(CC)" python3 test_sockproxy_cb_concurrent.py --mutation-check
 
-# I18: only reservation/admission lifecycle regression, not the full C suite.
+# P/D reservation and admission lifecycle regression.
 .PHONY: test_i18
 test_i18: test_pd_reservation test_pd_admission test_pd_queue_generation
 	./test_pd_reservation
@@ -1130,3 +1130,13 @@ sockproxy_ep.o sockproxy_http.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockpr
 
 test_pd_queue_generation: test_pd_queue_generation.c notify.c notify.h log.c sockproxy_qsbr.c
 	$(CC) -Wall -Wextra -Werror -fsanitize=address,undefined -g -o $@ $< log.c sockproxy_qsbr.c -I. -lpthread
+
+# P/D terminal error delivery regression.
+.PHONY: test_pd_terminal_failure
+test_pd_terminal_failure: test_pd_terminal test_pd_complete test_sse_observe
+	./test_pd_terminal
+	./test_pd_complete
+	./test_sse_observe
+
+test_pd_terminal: test_pd_terminal.c sockproxy_pd_terminal.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.

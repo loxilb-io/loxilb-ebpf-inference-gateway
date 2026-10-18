@@ -45,6 +45,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "common_pdi.h"
@@ -59,6 +60,8 @@ static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
 #include "sockproxy_ai_gw.h"
 #include "sockproxy_hold.h"
 #include "notify.h"
+#include "sockproxy_cache.h"
+#include "sockproxy_stream_fallback.h"
 /* pure two-leg teardown helper shared with the unit TU.
  * Included AFTER the headers that define `struct proxy_fd_ent` and
  * notify_delete_ent so the helper's pfe* signature resolves here. */
@@ -256,7 +259,8 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "Connection: close\r\n"
                    "\r\n"
                    "{\"error\":\"pd_admission_park_timeout\"}", 1, 0),
-  [SP_REAP_PD_GRACEFUL_DONE] = SP_REAP_TEXT("data: [DONE]\n\n", 1, 1),
+  [SP_REAP_PD_DECODE_IDLE] = SP_REAP_TEXT("data: {\"error\":\"pd_decode_idle_timeout\"}\n\n", 1, 1),
+  [SP_REAP_PD_DECODE_EOF] = SP_REAP_TEXT("data: {\"error\":\"pd_decode_eof\"}\n\n", 1, 1),
   [SP_REAP_PD_STREAM_TIMEOUT] =
       SP_REAP_TEXT("HTTP/1.1 502 Bad Gateway\r\n"
                    "Content-Type: application/json\r\n"
@@ -289,6 +293,18 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
   [SP_REAP_SSE_STALL] =
       SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
 };
+
+static void sp_pd_stream_failed(proxy_fd_ent_t *client, int error_phase)
+{
+  if(client->sse_active && !client->stream_end_ts) {
+    llb_ai_stream_end("",(char *)proxy_effective_model(client));
+    client->sse_active=0;
+    client->stream_end_ts=time(NULL);
+  }
+  llb_ai_pd_record((char *)proxy_effective_model(client),0,0,
+                  client->pd_kv_params_len>0,error_phase);
+  client->pd_phase=PD_PHASE_ERROR;
+}
 
 /* End a client this thread decided against, answering it first.
  *
@@ -336,7 +352,14 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
       log_warn("[REAPER] fd=%d: TLS client ended without the response body "
                "(no owner hand-off)", pfe->fd);
     } else {
-      send(pfe->fd, t->text, t->len, MSG_DONTWAIT | MSG_NOSIGNAL);
+      if(kind==SP_REAP_PD_DECODE_IDLE || kind==SP_REAP_PD_DECODE_EOF) {
+        char terminal[SP_PD_TERMINAL_PAD_MAX+512];
+        size_t n=pfe->cache_count ? 0 : sp_pd_terminal_format(&pfe->pd_client_wire,
+            kind==SP_REAP_PD_DECODE_IDLE?"pd_decode_idle_timeout":"pd_decode_eof",terminal,sizeof(terminal));
+        if(n) send(pfe->fd,terminal,n,MSG_DONTWAIT|MSG_NOSIGNAL);
+      } else {
+        send(pfe->fd, t->text, t->len, MSG_DONTWAIT | MSG_NOSIGNAL);
+      }
     }
   }
   if (t->teardown) {
@@ -344,6 +367,30 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
   } else if (pfe->fd > 0) {
     shutdown(pfe->fd, SHUT_RDWR);
   }
+}
+
+int sp_pd_backend_end(proxy_fd_ent_t *backend)
+{
+  int handled=0;
+  if(!backend || backend->odir!=1 || backend->backend_h2_session) return 0;
+  PROXY_LOCK();
+  proxy_fd_ent_t *client=backend->n_rfd>0 ? backend->rfd_ent[0] : NULL;
+  if(client && (client->pd_phase==PD_PHASE_DECODE_STREAMING ||
+                client->pd_phase==PD_PHASE_DECODE_SENDING) &&
+      !client->stream_end_ts &&
+      !(client->n_rfd>1 && client->rfd_ent[0]==backend)) {
+    log_warn("[PD_DECODE_EOF] client_fd=%d backend_fd=%d reqid=%s",
+             client->fd,backend->fd,client->vllm_request_id);
+    sp_pd_stream_failed(client,2); /* decode transport error */
+    for(int i=0;i<client->n_rfd;i++) if(client->rfd_ent[i]==backend) {
+      client->rfd_ent[i]=NULL; client->rfd[i]=-1;
+    }
+    backend->rfd_ent[0]=NULL; backend->rfd[0]=-1; backend->n_rfd=0;
+    pd_reap_respond(client,SP_REAP_PD_DECODE_EOF);
+    handled=1;
+  }
+  PROXY_UNLOCK();
+  return handled;
 }
 
 void
@@ -366,12 +413,8 @@ sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind)
 static int
 sp_reap_client_chunked(proxy_fd_ent_t *pfe)
 {
-  proxy_fd_ent_t *leg;
-
-  if (pfe->n_rfd <= 0)
-    return 0;
-  leg = __atomic_load_n(&pfe->rfd_ent[0], __ATOMIC_ACQUIRE);
-  return leg && leg->is_chunked_response;
+  return pfe->pd_client_wire.headers ? pfe->pd_client_wire.chunked :
+      (pfe->cresp_parser_inited && (pfe->cresp_parser.flags & F_CHUNKED));
 }
 
 /* A request ended while it waited in the capacity queue (the deadline, or
@@ -437,7 +480,7 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
 {
   uint8_t kind = pfe->reap_resp;
   const sp_reap_text_t *t;
-  char framed[512];
+  char framed[SP_PD_TERMINAL_PAD_MAX + 512];
   const char *buf;
   size_t len;
 
@@ -464,6 +507,31 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
     if (n > 0 && n < (int)sizeof(framed)) {
       buf = framed;
       len = (size_t)n;
+    }
+  }
+  if (kind==SP_REAP_PD_DECODE_IDLE || kind==SP_REAP_PD_DECODE_EOF) {
+    const char *code=kind==SP_REAP_PD_DECODE_IDLE ? "pd_decode_idle_timeout" : "pd_decode_eof";
+    /* The backend stopped. Drain previously accepted client bytes before adding
+     * the terminal event. A blocked/departed client gets a bounded failure. */
+    for(unsigned i=0; pfe->cache_count && i<SP_LOCAL_SEND_RETRY_MAX; i++) {
+      if(proxy_xmit_cache(pfe)<0) break;
+      if(pfe->cache_count) { struct pollfd wait={.fd=pfe->fd,.events=POLLOUT}; poll(&wait,1,50); }
+    }
+    len=pfe->cache_count ? 0 : sp_pd_terminal_format(&pfe->pd_client_wire,code,framed,sizeof(framed));
+    if(!len && !pfe->pd_client_wire.header_tail && !pfe->metric_response_status &&
+        !pfe->cache_count) {
+      char body[128];
+      int b=snprintf(body,sizeof(body),"{\"error\":\"%s\"}",code);
+      int n=snprintf(framed,sizeof(framed),"HTTP/1.1 502 Bad Gateway\r\n"
+          "Content-Type: application/json\r\nContent-Length: %d\r\n"
+          "Connection: close\r\n\r\n%s",b,body);
+      if(n>0 && (size_t)n<sizeof(framed)) len=(size_t)n;
+    }
+    buf=len ? framed : NULL;
+    if(!len) {
+      log_warn("[PD_TERMINAL_UNDELIVERABLE] fd=%d kind=%u cache=%u state=%u",
+               pfe->fd,kind,pfe->cache_count,pfe->pd_client_wire.state);
+      shutdown(pfe->fd,SHUT_RDWR);
     }
   }
   if (pfe->fd > 0 && buf) {
@@ -1499,86 +1567,21 @@ check_draining_endpoints(void)
     }
   }
 
-  /* (RESOLVED): graceful [DONE]-synthesis safety-net — the real
-   * deliverable. Diagnosis: vLLM's P/D-disagg path FINISHES generation but omits
-   * the closing "data: [DONE]" SSE chunk for ~2.5% of streams under concurrency
-   * (loxilb's :1198 scanner completes 100% of TERMINATED streams — exonerated).
-   * Such a stream sits in PD_PHASE_DECODE_STREAMING with sse_active==1 and its
- * backend leg silent forever, eventually hit by the 502 / 504
-   * backstops below — both of which inject a malformed HTTP status line into a
-   * body the client already saw "200 OK" for.
-   *
- * This sweep runs FIRST (before) and, when the BACKEND leg has been
-   * idle past PROXY_PD_DECODE_IDLE_CAP_SEC (gated on pd_last_decode_ts, refreshed
-   * per relayed byte in sockproxy_http.c — NOT wall-clock-since-start, so a
-   * slow-but-live stream is never truncated), synthesizes the protocol-correct
-   * "data: [DONE]\n\n" terminator and completes the flow exactly as the :1198
-   * SSE_DONE path would have: stream-end gauge, P/D metrics, COMPLETE, then the
-   * same single-owner pd_teardown_conn as the other reapers.
-   * Converts a forever-hang into a clean completion. */
-  {
-    proxy_map_ent_t *pd_node = proxy_struct->head;
-    while (pd_node) {
-      proxy_fd_ent_t *pfe = pd_node->val.fdlist;
-      while (pfe) {
-        proxy_fd_ent_t *pfe_next = pfe->next;
-
-        uint32_t decode_idle_cap = PROXY_PD_DECODE_IDLE_CAP_SEC;
-        proxy_epval_t *epv = sp_pool_holder_peek(&pfe->epv);
-        if (epv) {
-          if (epv->pd_decode_idle_cap_sec > 0) {
-            decode_idle_cap = epv->pd_decode_idle_cap_sec;
-          }
-        }
-
-        if (pd_should_graceful_complete(
-                pfe->pd_phase == PD_PHASE_DECODE_STREAMING,
-                pfe->sse_active, pfe->stream_end_ts, pfe->pd_last_decode_ts,
-                now, decode_idle_cap)) {
-          log_debug("[PD_GRACEFUL_DONE] fd=%d backend-idle=%lds >= cap=%us — "
-                   "synthesizing data: [DONE] (vLLM dropped terminator)",
-                   pfe->fd, (long)(now - pfe->pd_last_decode_ts), decode_idle_cap);
-
-          const char *gc_model = proxy_effective_model(pfe);
-
-          /* 1) The synthesized SSE terminator goes out before the teardown,
-           * both written by the socket's owner worker (pd_reap_respond, step 4). */
-
-          /* 2) End the active-streams gauge (balances llb_ai_stream_start at
-           * SSE activation), then reset sse_active so eviction-suppression no
-           * longer blocks cleanup — mirrors the [SSE_CAP] path. */
-          llb_ai_stream_end("", (char *)gc_model);
-          pfe->stream_end_ts = now;
-          pfe->sse_active = 0;
-
-          /* 3) Record P/D metrics, mirroring the :1255 SSE_DONE success path. */
-          {
-            struct timespec _pdts;
-            clock_gettime(CLOCK_MONOTONIC, &_pdts);
-            uint64_t pd_now_ns = (uint64_t)_pdts.tv_sec * 1000000000ULL +
-                                 (uint64_t)_pdts.tv_nsec;
-            int64_t prefill_ms = 0, decode_ms = 0;
-            if (pfe->pd_prefill_start_ns > 0 && pfe->pd_decode_start_ns > 0) {
-              prefill_ms = (int64_t)((pfe->pd_decode_start_ns -
-                                      pfe->pd_prefill_start_ns) / 1000000ULL);
-            }
-            if (pfe->pd_decode_start_ns > 0) {
-              decode_ms = (int64_t)((pd_now_ns - pfe->pd_decode_start_ns) /
-                                    1000000ULL);
-            }
-            int pd_kv = (pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)gc_model, prefill_ms, decode_ms, pd_kv, 0);
-          }
-
-          /* 4) Mark COMPLETE and tear down with the same leak-proof sequence as
- * (held under PROXY_LOCK; pfe_next-safe). */
-          pfe->pd_phase = PD_PHASE_COMPLETE;
-          pd_reap_respond(pfe, SP_REAP_PD_GRACEFUL_DONE);
-        }
-
-        pfe = pfe_next;
+  /* A silent decode is a failed stream, even if some content was delivered.
+   * Only an observed terminal event can complete it successfully. */
+  for (proxy_map_ent_t *node=proxy_struct->head; node; node=node->next) {
+    for (proxy_fd_ent_t *pfe=node->val.fdlist, *next; pfe; pfe=next) {
+      next=pfe->next;
+      uint32_t cap=PROXY_PD_DECODE_IDLE_CAP_SEC;
+      proxy_epval_t *epv=sp_pool_holder_peek(&pfe->epv);
+      if(epv && epv->pd_decode_idle_cap_sec>0) cap=epv->pd_decode_idle_cap_sec;
+      if(pd_should_decode_idle_fail(pfe->pd_phase==PD_PHASE_DECODE_STREAMING,
+          pfe->sse_active,pfe->stream_end_ts,pfe->pd_last_decode_ts,now,cap)) {
+        log_warn("[PD_DECODE_IDLE] fd=%d reqid=%s idle=%lds cap=%us",
+                 pfe->fd,pfe->vllm_request_id,(long)(now-pfe->pd_last_decode_ts),cap);
+        sp_pd_stream_failed(pfe,3); /* decode timeout */
+        pd_reap_respond(pfe,SP_REAP_PD_DECODE_IDLE);
       }
-      pd_node = pd_node->next;
     }
   }
 

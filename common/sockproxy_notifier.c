@@ -492,7 +492,7 @@ restart:
       }
       /* Non-ACTIVE socks (listeners) never see RDHUP: ignore. */
     } else {
-      /* Unhandled */
+      if(type & (NOTI_TYPE_HUP|NOTI_TYPE_ERROR)) sp_pd_backend_end(pfe);
       return 0;
     }
   }

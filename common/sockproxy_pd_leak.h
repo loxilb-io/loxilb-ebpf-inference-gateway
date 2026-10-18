@@ -215,48 +215,18 @@ pd_scan_msg_end_window(uint8_t *tail, uint8_t *tail_len,
   return 0;
 }
 
-/* PROXY_PD_DECODE_IDLE_CAP_SEC - default backend-idle window (seconds) after which
- * a decode-streaming SSE connection whose backend leg has gone silent is reaped
- * with a SYNTHESIZED graceful "data: [DONE]\n\n" terminator instead of hanging.
- *
- * (RESOLVED): vLLM's P/D-disagg path FINISHES generation but omits the
- * closing "data: [DONE]" SSE chunk for ~2.5% of streams under concurrency (loxilb
- * exonerated — its :1198 scanner completes 100% of TERMINATED streams). Without a
- * terminator the decode leg never reaches PD_PHASE_COMPLETE and the client hangs
- * until a wall-clock backstop ( 502 @120s / 504 @180s) injects a
- * malformed HTTP status line into a live SSE body. This safety-net converts that
- * forever-hang into a protocol-correct completion.
- *
- * Chosen ~25s: a healthy decode stream emits a token every few hundred ms, so 25s
- * of TOTAL backend silence strongly implies generation is over. Gated on the
- * LAST-BACKEND-BYTE timestamp (pd_last_decode_ts), NOT wall-clock-since-start, so a
- * legitimately slow-but-still-streaming response is never truncated. */
+/* Default silence deadline for a decode SSE stream without an observed
+ * terminal. Silence produces an error, never a synthesized successful DONE.
+ * Each backend byte refreshes the clock; active streams are not duration capped. */
 #ifndef PROXY_PD_DECODE_IDLE_CAP_SEC
 #define PROXY_PD_DECODE_IDLE_CAP_SEC 25
 #endif
 
-/*
- * pd_should_graceful_complete - decide whether a P/D decode-streaming connection
- * should be force-completed with a synthesized SSE [DONE] terminator.
- *
- * Pure predicate (no proxy machinery) so the reaper's decision is unit-testable.
- * Returns nonzero IFF ALL hold:
- *   - is_decode_streaming : pd_phase == PD_PHASE_DECODE_STREAMING (the only phase
- *     where the client has already received "200 OK" + SSE chunks, making a
- *     synthesized "data: [DONE]" the protocol-correct termination);
- *   - sse_active          : this is a live SSE stream (not a non-SSE JSON body —
- *     injecting "data: [DONE]" into a non-SSE body would be garbage);
- *   - stream_end_ts == 0  : the real [DONE] has not already been seen;
- *   - last_decode_ts  > 0 : at least one backend byte was relayed (we have a
- *     meaningful idle clock to measure against);
- *   - idle_cap_sec    > 0 : the safety-net is enabled;
- *   - (now - last_decode_ts) >= idle_cap_sec : the BACKEND leg has been silent
- *     past the cap. Measuring from last_decode_ts (refreshed per relayed byte),
- *     NOT from stream_start_ts, is what guarantees a still-streaming response is
- *     not truncated.
- */
+/* A decode's idle deadline is a failure deadline. It never supplies evidence
+ * that generation finished; the successful path requires a backend terminal.
+ * Activity refreshes last_decode_ts, so slow, live streams stay open. */
 static inline int
-pd_should_graceful_complete(int is_decode_streaming, int sse_active,
+pd_should_decode_idle_fail(int is_decode_streaming, int sse_active,
                             time_t stream_end_ts, time_t last_decode_ts,
                             time_t now, uint32_t idle_cap_sec)
 {

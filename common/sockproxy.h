@@ -13,6 +13,7 @@
 
 #include "llhttp.h"
 #include "sockproxy_sse_observe.h"
+#include "sockproxy_pd_terminal.h"
 
 #define JSMN_STATIC
 #include "jsmn.h"
@@ -1159,6 +1160,7 @@ struct proxy_fd_ent {
   llhttp_t cresp_parser;           // HTTP_RESPONSE; settings are one shared static
   uint8_t  cresp_parser_inited;
   sp_sse_observer_t cresp_sse;
+  sp_pd_wire_t pd_client_wire; /* decode HTTP framing, independent of prefill slot */
   uint8_t cresp_payload_observed;
   /* Set by the response framer under this entry's lock, consumed by the backend
    * leg's EOF without it, so it is atomic and the consumer takes it with an

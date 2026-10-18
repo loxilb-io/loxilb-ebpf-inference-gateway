@@ -215,7 +215,8 @@ enum sp_reap_resp {
   SP_REAP_PD_PREFILL_TIMEOUT,   /* 504 pd_prefill_timeout; teardown */
   SP_REAP_PD_DECODE_TIMEOUT,    /* 504 pd_decode_timeout; teardown */
   SP_REAP_PD_PARK_TIMEOUT,      /* 504 pd_admission_park_timeout; teardown */
-  SP_REAP_PD_GRACEFUL_DONE,     /* SSE terminator the backend dropped; teardown */
+  SP_REAP_PD_DECODE_IDLE,       /* SSE failure: decode idle; teardown */
+  SP_REAP_PD_DECODE_EOF,        /* SSE failure: premature decode EOF; teardown */
   SP_REAP_PD_STREAM_TIMEOUT,    /* 502 pd_decode_stream_timeout; teardown */
   SP_REAP_PD_IDLE_TIMEOUT,      /* 504 pd_idle_timeout; teardown */
   SP_REAP_FC_QUEUE_TIMEOUT,     /* 504 admission_queue_timeout; teardown */
@@ -230,6 +231,8 @@ enum sp_reap_resp {
  * gateway (sockproxy_abandon.h). */
 uint32_t sp_sse_stall_abort_sec(void);
 void sp_reap_finish(proxy_fd_ent_t *pfe);
+/* Backend worker terminal path; detaches the failed decode before teardown. */
+int sp_pd_backend_end(proxy_fd_ent_t *backend);
 /* Hand a response of `kind` to the connection's owner worker and end the
  * connection there (sockproxy_health.c; the reaper's own entry point). The
  * caller holds PROXY_LOCK. */
