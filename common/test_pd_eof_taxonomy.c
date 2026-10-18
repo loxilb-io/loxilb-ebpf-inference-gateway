@@ -30,6 +30,26 @@ int notify_wake_worker(void *ctx, int worker, int fd)
   return -1;
 }
 
+/* PR-D's real cleanup can inspect the scheduler for a parked waiter.
+ * This fixture has no scheduler or parked clients; any wake is a failure. */
+void *notify_priv_of_fd(void *ctx, int fd, uint64_t *gen)
+{
+  (void)ctx;
+  (void)fd;
+  (void)gen;
+  assert(0);
+  return NULL;
+}
+int notify_wake_worker_gen(void *ctx, int worker, int fd, uint64_t gen)
+{
+  (void)ctx;
+  (void)worker;
+  (void)fd;
+  (void)gen;
+  assert(0);
+  return -1;
+}
+
 void llb_ai_pd_record(char *m, int64_t p, int64_t d, int kv, int error)
 {
   (void)m;
