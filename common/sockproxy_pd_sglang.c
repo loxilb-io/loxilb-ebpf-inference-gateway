@@ -37,6 +37,7 @@
 #include "llhttp.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy.h"
+#include "sockproxy_pd_reservation.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
 
@@ -627,14 +628,13 @@ pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
   size_t req_len = 0;
   uint64_t new_room = 0;
   uint64_t old_room = 0;
-  int old_d_idx = -1;
   int p_idx = -1, d_idx = -1;
   int p_cfd = -1, d_cfd = -1;
+  uint32_t reserved = 0;
 
   if (!client_pfe || !client_pfe->epv) goto fail;
   tepval = (proxy_epval_t *)client_pfe->epv;
   old_room = client_pfe->pd_sg_room;
-  old_d_idx = client_pfe->pd_decode_ep_idx;
 
   if (!client_pfe->pd_sg_active ||
       client_pfe->pd_phase != PD_PHASE_DECODE_SENDING ||
@@ -681,11 +681,12 @@ pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
 
     for (int attempt = 0; attempt < tepval->n_prefill_eps; attempt++) {
       int cand = -1;
-      int rc = pd_select_prefill(tepval, client_pfe, &cand, excluded);
+      int rc = pd_reserve_prefill(tepval, client_pfe, &cand, excluded, 0);
       client_pfe->pd_decode_ep_idx = saved_decode;
       if (rc != 0 || cand < 0)
         break;  /* no healthy candidates (park/shed count as none mid-request) */
 
+      reserved = (uint32_t)cand + 1;
       uint8_t pp2buf[28];
       int pp2len = 0;
       {
@@ -707,6 +708,7 @@ pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
                                      IPPROTO_TCP, NULL, NULL, client_pfe,
                                      (pp2len ? pp2buf : NULL), pp2len);
       if (p_cfd >= 0) { p_idx = cand; break; }
+      pd_load_release(tepval, &reserved);
       circuit_breaker_record_failure(tepval, cand);
       if (cand >= 0 && cand < 32) excluded |= 1u << (unsigned)cand;
     }
@@ -783,22 +785,13 @@ pd_sg_retry_pair(proxy_fd_ent_t *client_pfe, int dead_idx,
     pd_update_content_length(req, &req_len, req_cap, inj_len);
   }
 
-  /* 5. Move the admission active_conns units dead->replacement (both roles)
-   * so pd_cleanup's decrement of the FINAL indexes stays balanced. */
-  if (dead_idx >= 0 && dead_idx < tepval->n_eps) {
-    uint32_t cur = atomic_load(&tepval->pd_ep_loads[dead_idx].active_conns);
-    if (cur > 0)
-      atomic_fetch_sub(&tepval->pd_ep_loads[dead_idx].active_conns, 1);
+  if (!pd_load_try_reserve(tepval, d_idx, 0)) {
+    close(p_cfd); close(d_cfd); p_cfd = d_cfd = -1;
+    goto fail;
   }
-  atomic_fetch_add(&tepval->pd_ep_loads[p_idx].active_conns, 1);
-  if (d_idx != old_d_idx) {
-    if (old_d_idx >= 0 && old_d_idx < tepval->n_eps) {
-      uint32_t cur = atomic_load(&tepval->pd_ep_loads[old_d_idx].active_conns);
-      if (cur > 0)
-        atomic_fetch_sub(&tepval->pd_ep_loads[old_d_idx].active_conns, 1);
-    }
-    atomic_fetch_add(&tepval->pd_ep_loads[d_idx].active_conns, 1);
-  }
+  pd_load_commit(tepval, &client_pfe->pd_prefill_load_token, p_idx);
+  reserved = 0;
+  pd_load_commit(tepval, &client_pfe->pd_decode_load_token, d_idx);
   client_pfe->pd_prefill_ep_idx = p_idx;
   client_pfe->pd_decode_ep_idx = d_idx;
 
@@ -956,6 +949,7 @@ counted:
   goto done;
 
 fail:
+  if (reserved) pd_load_release(tepval, &reserved);
   if (client_pfe) {
     log_error("[PD_SG] pair retry exhausted — aborting (client_fd=%d "
               "dead EP%d)", client_pfe->fd, dead_idx);

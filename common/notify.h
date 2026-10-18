@@ -109,6 +109,8 @@ void *notify_priv_of_fd(void *ctx, int fd, uint64_t *gen_out);
  * cbs.resume(fd) on its own thread. Returns 0 on success, <0 on error (bad thr_id,
  * queue full, or wake-fd write failure). MPSC-safe: any thread may call it. */
 int notify_wake_worker(void *ctx, int thr_id, int fd);
+/* Generation-qualified legacy P/D queue wake; stale fd reuse is dropped on owner. */
+int notify_wake_worker_gen(void *ctx, int thr_id, int fd, uint64_t gen);
 int notify_start(void *ctx);
 void *notify_ctx_new(notify_cbs_t *cbs, int n_thrs);
 

@@ -163,6 +163,9 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
         proxy_fd_ent_t *pfe = node->val.fdlist;
         while (pfe) {
             snapshot.active_connections++;
+            if (pfe->pd_phase == PD_PHASE_PARKED) {
+                snapshot.pd_parked_connections++;
+            }
             if (pfe->ssl) {
                 snapshot.active_ssl_connections++;
             }
@@ -190,6 +193,15 @@ proxy_metrics_snapshot_t proxy_get_metrics(void) {
             proxy_epval_t *tepval, *tmp_epval;
             HASH_ITER(hh, node->val.ephash, tepval, tmp_epval) {
                 if (tepval->pd_disagg_enabled) {
+                    /* Read actual request-owned admission units, not sessions. */
+                    for (int ep = 0; ep < tepval->n_eps; ep++) {
+                        uint64_t units = atomic_load(&tepval->pd_ep_loads[ep].active_conns);
+                        if (tepval->ep_role[ep] == 1) {
+                            snapshot.pd_prefill_inflight += units;
+                        } else if (tepval->ep_role[ep] == 2) {
+                            snapshot.pd_decode_inflight += units;
+                        }
+                    }
                     pthread_rwlock_rdlock(&tepval->pd_session_lock);
                     snapshot.pd_sessions_active += HASH_COUNT(tepval->pd_session_map);
                     pthread_rwlock_unlock(&tepval->pd_session_lock);
