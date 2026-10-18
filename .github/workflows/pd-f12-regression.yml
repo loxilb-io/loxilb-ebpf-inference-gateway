@@ -1,0 +1,54 @@
+name: F12-Decode-Retry
+
+# Keep this gate independent of the broad main-only C-Unit-Gates workflow.
+# F12 is reviewed above the unmerged I18 reservation PR; both bases must run it.
+on:
+  pull_request:
+    branches:
+      - main
+      - 'codex/pd-reservation-review-*'
+    paths:
+      - 'common/**'
+      - '.github/workflows/pd-f12-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: f12-retry-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  f12-regression:
+    name: F12 P/D retry regression (ASan + UBSan)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - name: Check out the exact candidate and libbpf headers
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: true
+          persist-credentials: false
+
+      - name: Install only the linked C fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libnghttp2-dev libssl-dev
+
+      - name: Build only F12 and reservation-cleanup fixtures
+        run: |
+          make -C common test_pd_retry_lifecycle test_pd_reservation test_pd_queue_generation
+
+      - name: Decode connect budget, exclusion, rollback, cancel and no replay
+        run: ./common/test_pd_retry_lifecycle
+
+      - name: Concurrent P/D ownership, rollback and FIFO conservation
+        run: ./common/test_pd_reservation
+
+      - name: Cancelled and recycled notifier generations
+        run: ./common/test_pd_queue_generation
