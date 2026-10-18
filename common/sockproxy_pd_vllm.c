@@ -75,6 +75,72 @@ pd_receipt_rewrite(uint8_t *buf, size_t *len, size_t cap, const char *n_addr)
   return 0;
 }
 
+/* No backend request has been sent at this boundary. Once sending/streaming
+ * starts, callers must use the terminal-error path, never replay the request. */
+static int
+pd_decode_connect_valid(proxy_fd_ent_t *c, int fd, uint64_t gen)
+{
+  return c->fd == fd && atomic_load(&c->gen) == gen && !c->reap_resp &&
+         c->pd_phase == PD_PHASE_PREFILL_DONE && !c->pd_last_decode_ts &&
+         !c->pd_decode_bytes_received && !c->pd_decode_content_length;
+}
+
+/* At most two TCP connects, excluding failed endpoints for THIS request even
+ * before health polling notices the failure. Hold an alternate reservation
+ * privately until connect succeeds; cleanup cannot return it prematurely or
+ * resurrect a canceled request's token. The old reservation stays owned until
+ * the atomic handoff succeeds. No retry is allowed after a request write. */
+static int
+pd_connect_decode(proxy_fd_ent_t *c, int fd, uint64_t gen, int *selected,
+                  const void *pp2, int pp2len)
+{
+  proxy_epval_t *t = c->epv;
+  int original = *selected;
+  uint32_t owned = __atomic_load_n(&c->pd_decode_load_token, __ATOMIC_ACQUIRE);
+  uint32_t excluded = 0;
+  int attempts = 0;
+  while (attempts < 2 && pd_decode_connect_valid(c, fd, gen)) {
+    int ep = -1;
+    if (pd_select_decode_excluding(t, c, &ep, excluded) < 0)
+      break;
+    c->pd_decode_ep_idx = original; /* Selection is not ownership publication. */
+    int provisional = ep != original || !owned;
+    if (provisional && !pd_load_try_reserve(t, ep, 0)) {
+      excluded |= UINT32_C(1) << ep;
+      continue; /* Saturated candidates do not consume a dial attempt. */
+    }
+    attempts++;
+    int connected = proxy_setup_ep_connect(t->eps[ep].xip, t->eps[ep].xport,
+                                            IPPROTO_TCP, NULL, NULL, c, pp2, pp2len);
+    int valid = pd_decode_connect_valid(c, fd, gen);
+    if (connected < 0 || !valid) {
+      if (provisional) pd_load_put(t, ep);
+      if (connected >= 0) close(connected);
+      if (!valid) return -1;
+      excluded |= UINT32_C(1) << ep;
+      log_warn("[PD_DECODE_CONNECT] client_fd=%d failed_ep=%d attempt=%d/2",
+               fd, ep, attempts);
+      continue;
+    }
+    uint32_t expected = owned;
+    if (provisional &&
+        !__atomic_compare_exchange_n(&c->pd_decode_load_token, &expected,
+                                     (uint32_t)ep + 1, 0,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      pd_load_put(t, ep);
+      close(connected);
+      return -1;
+    }
+    if (provisional && owned) pd_load_put(t, (int)owned - 1);
+    c->pd_decode_ep_idx = *selected = ep;
+    if (attempts > 1 || ep != original)
+      log_info("[PD_DECODE_CONNECT] client_fd=%d selected_ep=%d attempts=%d/2",
+               fd, ep, attempts);
+    return connected;
+  }
+  return -1;
+}
+
 /* Initiate decode phase after prefill completes.
  * Creates a new backend connection to the decode EP, builds the decode request
  * (original body + kv_params), and sends it. The decode response will flow to
@@ -84,14 +150,15 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
 {
   proxy_epval_t *tepval;
   int d_idx;
-  uint32_t epip;
-  uint16_t epport;
   int ep_cfd;
   int ret = -1;
   uint8_t *decode_body = NULL;
   uint8_t *decode_req = NULL;
 
   if (!client_pfe || !client_pfe->epv) return -1;
+  int client_fd = client_pfe->fd;
+  uint64_t client_gen = atomic_load(&client_pfe->gen);
+  if (!pd_decode_connect_valid(client_pfe, client_fd, client_gen)) return -1;
 
   tepval = (proxy_epval_t *)client_pfe->epv;
   d_idx = client_pfe->pd_decode_ep_idx;
@@ -99,42 +166,6 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
   if (d_idx < 0 || d_idx >= tepval->n_eps) {
     log_error("Invalid decode EP index %d", d_idx);
     return -1;
-  }
-
-  /* the decode EP was picked at ADMISSION but is only connected NOW,
-   * after prefill completed — a seconds-wide window under long-context
-   * prefill during which the EP can die. Until this check, only index
-   * bounds were re-validated, so a decode node dying during prefill meant a
-   * connect to a known-dead EP (sync 503, or async zero-byte EOF =).
-   * Re-check inv/CB and re-select via pd_select_decode (min-load among
-   * healthy decode EPs — the admission scorer) with the stale hint cleared.
-   * On re-selection, MOVE the admission-time active_conns unit so
-   * pd_cleanup's decrement of the final pd_decode_ep_idx stays balanced.
-   * Runs BEFORE the buffer claims below, so the -1 path (no healthy decode
-   * EP) leaves saved body/headers for the caller's 503+cleanup. */
-  if (tepval->eps[d_idx].inv ||
-      (tepval->cb_enabled &&
-       tepval->circuit_breakers[d_idx].state == CB_STATE_OPEN)) {
-    int stale_idx = d_idx;
-    int re_idx = -1;
-    client_pfe->pd_decode_ep_idx = -1;  /* clear hint: force fresh min-load pick */
-    if (pd_select_decode(tepval, client_pfe, &re_idx) == 0) {
-      log_error("decode EP%d went unhealthy during prefill — "
-                "re-selected healthy decode EP%d (client_fd=%d)",
-                stale_idx, re_idx, client_pfe->fd);
-      if (!pd_load_try_reserve(tepval, re_idx, 0)) {
-        client_pfe->pd_decode_ep_idx = stale_idx;
-        return -1;
-      }
-      pd_load_commit(tepval, &client_pfe->pd_decode_load_token, re_idx);
-      d_idx = re_idx;  /* pd_select_decode already stored it in the pfe */
-    } else {
-      client_pfe->pd_decode_ep_idx = stale_idx;  /* restore for cleanup/logs */
-      log_error("decode EP%d unhealthy after prefill and NO healthy "
-                "replacement — failing decode init (client_fd=%d)",
-                stale_idx, client_pfe->fd);
-      return -1;
-    }
   }
 
   /* (conc=128 UAF fix): pd_initiate_decode runs on the PREFILL worker
@@ -312,8 +343,6 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
                         "cl_rewrite_decode");
 
   /* 4. Connect to decode EP */
-  epip = tepval->eps[d_idx].xip;
-  epport = tepval->eps[d_idx].xport;
 
   /* PROXY protocol v2 (L7 fullproxy, P/D decode leg): prepend the client 4-tuple
    * when the rule enables ppv2, consistent with the prefill/HTTP1/HTTP2 backend
@@ -334,8 +363,8 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
       }
     }
   }
-  ep_cfd = proxy_setup_ep_connect(epip, epport, IPPROTO_TCP, NULL, NULL, client_pfe,
-                                  (dpp2len ? dpp2buf : NULL), dpp2len);
+  ep_cfd = pd_connect_decode(client_pfe, client_fd, client_gen, &d_idx,
+                               (dpp2len ? dpp2buf : NULL), dpp2len);
   if (ep_cfd < 0) {
     log_error("Failed to connect to decode EP%d", d_idx);
     goto out;

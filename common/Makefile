@@ -1146,8 +1146,11 @@ pd_resv_vllm_test.o: sockproxy_pd_vllm.c sockproxy.h sockproxy_pd_reservation.h
 	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
 
 PD_RETRY_WRAPS = -Wl,--wrap=malloc,--wrap=calloc,--wrap=write,--wrap=proxy_fdlist_link,--wrap=pd_resp_parser_init,--wrap=handle_on_message_complete
-test_pd_retry_lifecycle: test_pd_retry_lifecycle.c $(PD_RESV_TEST_OBJS) pd_resv_vllm_test.o pd_resv_dialect_test.o sockproxy_pd_trie.c sockproxy_locktrace.c log.c llhttp.c httpapi.c http.c
+test_pd_retry_lifecycle: test_pd_retry_lifecycle.c $(PD_RESV_TEST_OBJS) pd_resv_vllm_test.o pd_resv_dialect_test.o pd_resv_trt_test.o sockproxy_pd_trie.c sockproxy_locktrace.c log.c llhttp.c httpapi.c http.c
 	$(CC) $(PD_RESV_TEST_FLAGS) -Wl,--gc-sections $(PD_RETRY_WRAPS) -o $@ $^ -I. -lpthread -lnghttp2 -lssl -lcrypto
 
 pd_resv_dialect_test.o: sockproxy_pd_core.c sockproxy.h
+	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
+
+pd_resv_trt_test.o: sockproxy_pd_trtllm.c sockproxy.h
 	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<

@@ -2258,11 +2258,13 @@ int pd_reserve_prefill(proxy_epval_t *t, proxy_fd_ent_t *p, int *ep, uint32_t ex
  * Returns 0 on success (*ep_out set), -1 if no healthy decode EP found.
  */
 int
-pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
+pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
+                           uint32_t excluded)
 {
   /* Session-pinned decode EP from Tier 0 */
   if (pfe->pd_decode_ep_idx >= 0 &&
       pfe->pd_decode_ep_idx < tepval->n_eps &&
+      !(excluded & (UINT32_C(1) << pfe->pd_decode_ep_idx)) &&
       tepval->ep_role[pfe->pd_decode_ep_idx] == 2 &&
       !tepval->eps[pfe->pd_decode_ep_idx].inv &&
       !(tepval->cb_enabled &&
@@ -2281,7 +2283,8 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
   uint64_t fresh_q_sum = 0;
   int fresh_q_n = 0;
   for (int i = 0; i < tepval->n_eps; i++) {
-    if (tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
+    if ((excluded & (UINT32_C(1) << i)) ||
+        tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
     if (tepval->cb_enabled &&
         tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
     if (!pd_queued_is_fresh(&tepval->pd_ep_loads[i], q_now_sec, tepval->fc.cfg.telemetry_stale_ms)) continue;
@@ -2290,7 +2293,8 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
   }
   uint32_t stale_fill = fresh_q_n ? (uint32_t)(fresh_q_sum / (uint64_t)fresh_q_n) : 0;
   for (int i = 0; i < tepval->n_eps; i++) {
-    if (tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
+    if ((excluded & (UINT32_C(1) << i)) ||
+        tepval->ep_role[i] != 2 || tepval->eps[i].inv) continue;
     if (tepval->cb_enabled &&
         tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
     uint32_t conns = atomic_load(&tepval->pd_ep_loads[i].active_conns);
@@ -2306,6 +2310,12 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
   *ep_out = best_ep;
   pfe->pd_decode_ep_idx = best_ep;
   return 0;
+}
+
+int
+pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
+{
+  return pd_select_decode_excluding(tepval, pfe, ep_out, 0);
 }
 
 /**

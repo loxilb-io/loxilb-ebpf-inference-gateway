@@ -2600,6 +2600,8 @@ int pd_accept_valve_open(void);
 /* Re-arm the listeners the valve paused when its gate is open. */
 void pd_accept_valve_rearm(void);
 int pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out);
+int pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
+                               int *ep_out, uint32_t excluded);
 int pd_select_any_healthy(proxy_epval_t *tepval, int *ep_out);
 
 /* Radix trie API (sockproxy_pd_trie.c) -- NOT thread-safe, caller must hold pd_trie_lock */

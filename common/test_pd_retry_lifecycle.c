@@ -25,6 +25,7 @@ static int nshells, sockets[32], socket_ep[16], nsockets, registrations, deletio
 static int fail_all_p, fail_first_p, fail_decode, fail_shell_at, p_dials, shell_calls;
 static int allocation_armed, allocation_at, allocation_calls, write_failure;
 static int no_decode, all_p_full;
+static int initiate_mode, d_dials, d_order[4], cancel_at, first_d_fails;
 
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t n, size_t size);
@@ -74,8 +75,20 @@ int proxy_setup_ep_connect(uint32_t ip, uint16_t port, uint8_t protocol, void *s
     assert(ep != 0 && atomic_load(&pool->pd_ep_loads[ep].active_conns) == 1);
     if (fail_all_p || (fail_first_p && p_dials == 1))
       return -1;
-  } else if (fail_decode) {
-    return -1;
+  } else {
+    if (initiate_mode) {
+      assert(d_dials < 4);
+      d_order[d_dials++] = ep;
+      /* The old owned unit remains while the alternate is private. */
+      if (d_dials == 2) {
+        assert(ep == 4);
+        assert(atomic_load(&pool->pd_ep_loads[3].active_conns) ==
+               1u + (client->pd_decode_load_token == 4));
+        assert(atomic_load(&pool->pd_ep_loads[4].active_conns) == 1);
+      }
+      if (cancel_at == d_dials) pd_cleanup(client);
+    }
+    if (fail_decode || (initiate_mode && first_d_fails && d_dials == 1)) return -1;
   }
   int pair[2];
   assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
@@ -174,6 +187,14 @@ void circuit_breaker_record_origin_error(proxy_epval_t *t, int ep)
   (void)t;
   (void)ep;
   assert(0); /* All injected failures are transport or allocation failures. */
+}
+void pd_kv_overflow_inc(void)
+{
+  assert(0); /* Fixture transfer parameters fit the production capacity. */
+}
+void circuit_breaker_record_origin_success(proxy_epval_t *t, int ep)
+{
+  assert(t && ep >= 0);
 }
 void llb_ai_pd_record(char *m, int64_t p, int64_t d, int kv, int error)
 {
@@ -344,6 +365,88 @@ static void run_case(int sg, int owns_decode, int invalid_body, int nth_alloc,
   free(c);
   allocation_calls = calls;
 }
+/* Actual sequential Decode entry: keep all production selection, buffer
+ * rewriting, ownership and cleanup paths. Inject only external boundaries. */
+static void run_decode_case(int owned, int mode, int nth_alloc)
+{
+  reset_pool();
+  pool->pd_engine = PD_ENGINE_VLLM;
+  initiate_mode = 1; d_dials = 0;
+  first_d_fails = mode != 1 && mode != 8;
+  fail_decode = mode == 2;
+  cancel_at = mode == 3 ? 1 : mode == 4 ? 2 : 0;
+  if (mode == 5) pool->eps[4].inv = 1;
+  if (mode == 6) pool->circuit_breakers[4].state = CB_STATE_OPEN;
+  if (mode == 7) atomic_store(&pool->pd_ep_loads[4].active_conns, UINT32_MAX);
+  if (mode == 8) pool->eps[3].inv = 1;
+  /* A third healthy Decode must not extend the two-connect budget. */
+  if (mode == 2) {
+    pool->n_eps = 6; pool->ep_role[5] = 2;
+    pool->eps[5].xip = htonl(0xc0000206u);
+    atomic_store(&pool->pd_ep_loads[5].active_conns, 10);
+  }
+  proxy_fd_ent_t *c = calloc(1, sizeof(*c));
+  proxy_map_ent_t *head = calloc(1, sizeof(*head));
+  int client[2]; assert(c && head && !socketpair(AF_UNIX, SOCK_STREAM, 0, client));
+  c->fd = client[0]; atomic_store(&c->gen, 42);
+  c->head = head; c->epv = pool; c->park_ep_idx = -1;
+  c->pd_prefill_ep_idx = 0; c->pd_prefill_load_token = 1;
+  c->pd_decode_ep_idx = 3; c->pd_decode_load_token = owned ? 4 : 0;
+  c->pd_phase = PD_PHASE_PREFILL_DONE;
+  atomic_store(&pool->pd_ep_loads[0].active_conns, 1);
+  atomic_store(&pool->pd_ep_loads[3].active_conns, 1 + owned);
+  const char *body = "{\"model\":\"fixture\",\"messages\":[{\"role\":\"user\",\"content\":\"retry\"}],\"max_tokens\":32,\"stream\":true}";
+  const char *headers = "POST /v1/chat/completions HTTP/1.1\r\nHost: fixture\r\nX-Request-ID: stable-retry-id\r\nContent-Length: 0\r\n\r\n";
+  const char *prefill = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"kv_transfer_params\":{\"remote_engine_id\":\"fixture-kv\"}}";
+  c->pd_saved_body = (uint8_t *)strdup(body); c->pd_saved_body_len = strlen(body);
+  c->pd_saved_headers = (uint8_t *)strdup(headers); c->pd_saved_headers_len = strlen(headers);
+  c->pd_prefill_resp_buf = (uint8_t *)strdup(prefill); c->pd_prefill_resp_len = strlen(prefill);
+  if (mode >= 9) {
+    if (mode == 9) c->pd_phase = PD_PHASE_DECODE_SENDING;
+    if (mode == 10) c->pd_phase = PD_PHASE_DECODE_STREAMING;
+    if (mode == 11) c->pd_decode_bytes_received = 1;
+    if (mode == 12) c->pd_last_decode_ts = 1;
+    if (mode == 13) c->reap_resp = 1;
+    if (mode == 14) c->pd_decode_content_length = 1;
+  }
+  allocation_calls = 0; allocation_at = nth_alloc; allocation_armed = 1;
+  int result = pd_initiate_decode(c);
+  allocation_armed = 0;
+  int allocations = allocation_calls;
+  if (mode >= 9) {
+    assert(result < 0 && !d_dials && c->pd_saved_body && c->pd_prefill_resp_buf);
+  } else if (!nth_alloc && !fail_shell_at && !write_failure) {
+    if (mode == 0 || mode == 1 || mode == 8) {
+      assert(!result && registrations == 1 && !p_dials);
+      int selected = mode == 1 ? 3 : 4;
+      assert(c->pd_decode_load_token == (unsigned)selected + 1);
+      assert(c->pd_decode_ep_idx == selected && c->pd_prefill_load_token == 1);
+      assert(d_dials == (mode == 0 ? 2 : 1));
+      assert(d_order[0] == (mode == 8 ? 4 : 3));
+      char wire[8192] = {0};
+      assert(recv(sockets[1], wire, sizeof(wire)-1, MSG_DONTWAIT) > 0);
+      assert(strstr(wire, "stable-retry-id") && strstr(wire, "fixture-kv"));
+    } else {
+      assert(result < 0 && !registrations);
+      assert(d_dials == (mode == 2 || mode == 4 ? 2 : 1));
+    }
+  }
+  pd_cleanup(c); pd_cleanup(c);
+  assert(!c->pd_prefill_load_token && !c->pd_decode_load_token);
+  for (int i = 0; i < pool->n_eps; i++) {
+    unsigned expected = i == 3 ? 1 : mode == 7 && i == 4 ? UINT32_MAX : mode == 2 && i == 5 ? 10 : 0;
+    assert(atomic_load(&pool->pd_ep_loads[i].active_conns) == expected);
+  }
+  for (int i = 0; i < nsockets; i++) close(sockets[i]);
+  for (int i = 0; i < nshells; i++) {pthread_rwlock_destroy(&shells[i]->lock); free(shells[i]);}
+  close(client[0]); close(client[1]);
+  pthread_rwlock_destroy(&pool->pd_session_lock);
+  pthread_rwlock_destroy(&pool->pd_trie_lock);
+  pthread_mutex_destroy(&pool->pd_parked_lock);
+  free(c); free(head); free(pool);
+  initiate_mode = first_d_fails = cancel_at = fail_decode = 0;
+  allocation_calls = allocations;
+}
 int main(void)
 {
   setenv("LLB_PD_MAX_INFLIGHT_PER_EP", "1", 1);
@@ -387,6 +490,14 @@ int main(void)
       }
       write_failure = 0;
     }
+  }
+  for (int owned = 0; owned <= 1; owned++) {
+    run_decode_case(owned, 0, 0);
+    int allocations = allocation_calls;
+    for (int nth = 1; nth <= allocations; nth++) run_decode_case(owned, 0, nth);
+    for (int mode = 1; mode <= 14; mode++) run_decode_case(owned, mode, 0);
+    fail_shell_at = 1; run_decode_case(owned, 0, 0); fail_shell_at = 0;
+    write_failure = 2; run_decode_case(owned, 0, 0); write_failure = 0;
   }
   pthread_rwlock_destroy(&instance.lock);
   puts("real retry TUs: commit, alternate dial, all-P/decode failure, invalid JSON, "
