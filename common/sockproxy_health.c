@@ -30,37 +30,37 @@
  *     select_healthy_endpoint
  */
 
-#include "circuit_breaker_heal.h" /* (D1): shared proactive-heal predicate (also unit-tested) */
-#include "common_pdi.h"
-#include "llb_dpapi.h"
-#include "log.h"
-#include "sockproxy_ai_admit.h" /* the refusal record of a request ended while it waited */
-#include "sockproxy_conn.h"
-#include "sockproxy_internal.h"
 #include "uthash.h"
-#include <arpa/inet.h>
-#include <bpf.h>
-#include <errno.h>
+#include "log.h"
 #include <linux/types.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdatomic.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
+#include <bpf.h>
+#include <pthread.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
-#include <sys/socket.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <poll.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "common_pdi.h"
+#include "llb_dpapi.h"
+#include "sockproxy_internal.h"
+#include "sockproxy_ai_admit.h"   /* the refusal record of a request ended while it waited */
+#include "sockproxy_conn.h"
+#include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
 static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
-#include "circuit_breaker_origin.h" /* origin-5xx demotion predicate (also unit-tested) */
-#include "notify.h"
-#include "sockproxy_ai_gw.h"
-#include "sockproxy_cache.h"
+#include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
 #include "sockproxy_health.h"
+#include "sockproxy_ai_gw.h"
 #include "sockproxy_hold.h"
+#include "notify.h"
+#include "sockproxy_cache.h"
 #include "sockproxy_stream_fallback.h"
 /* pure two-leg teardown helper shared with the unit TU.
  * Included AFTER the headers that define `struct proxy_fd_ent` and
