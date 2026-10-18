@@ -25,6 +25,8 @@ int main(void)
     assert(s.finished);
   }
   const char *negative[] = {
+      "data\n\n",
+      "data",
       "data: {\"choices\":[{\"finish_reason\":null}]}\n\n",
       "data: {\"choices\":[]}\n\n",
       "data: {\"choices\":[{\"delta\":{\"content\":\"finish_reason: stop\"}}]}\n\n",

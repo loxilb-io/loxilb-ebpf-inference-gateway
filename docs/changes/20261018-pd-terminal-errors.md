@@ -23,3 +23,6 @@ Terminal extensions remain bounded. Fixed-length, ended, malformed or oversized
 interrupted chunks, undrainable caches and unavailable owners may require closing
 without an injectable event. No content is replayed. The owner makes one
 nonblocking cache flush; the new failure path adds no cache-drain poll loop.
+
+The last-event tracker uses two bounded4KiB buffers plus bookkeeping per proxy
+fd; it makes no engine allocator or engine-memory change.

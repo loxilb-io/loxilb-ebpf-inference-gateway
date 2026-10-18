@@ -78,8 +78,9 @@ static void finish_line(sp_pd_finish_t *s)
   } else if (s->line_overflow) {
     s->event_bad = 1;
     s->finished = 0;
-  } else if (n >= 5 && !memcmp(s->line, "data:", 5)) {
-    size_t start = 5;
+  } else if ((n == 4 && !memcmp(s->line, "data", 4)) ||
+             (n >= 5 && !memcmp(s->line, "data:", 5))) {
+    size_t start = n == 4 ? 4 : 5;
     if (start < n && s->line[start] == ' ')
       start++;
     if (s->event_len + n - start + 1 > sizeof(s->event)) {
@@ -102,7 +103,7 @@ void sp_pd_finish_feed(sp_pd_finish_t *s, const char *data, size_t len)
       finish_line(s);
     } else if (s->line_len < sizeof(s->line)) {
       s->line[s->line_len++] = data[i];
-      if (s->line_len == 5 && !memcmp(s->line, "data:", 5))
+      if (s->line_len == 4 && !memcmp(s->line, "data", 4))
         s->finished = 0;
     } else {
       s->line_overflow = 1;
