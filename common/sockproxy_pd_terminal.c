@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "sockproxy_pd_terminal.h"
+#define JSMN_STRICT
 #define JSMN_STATIC
 #include "jsmn.h"
 
@@ -32,6 +33,8 @@ static int last_event_finished(const char *json, size_t len)
     if (json[i] != ' ' && json[i] != '\r' && json[i] != '\n' && json[i] != '\t')
       return 0;
   for (int i = 1; i + 1 < count && tokens[i].start < tokens[0].end;) {
+    if (key_is(json, &tokens[i], "error"))
+      return 0;
     if (key_is(json, &tokens[i], "choices")) {
       if (array >= 0 || tokens[i + 1].type != JSMN_ARRAY)
         return 0;

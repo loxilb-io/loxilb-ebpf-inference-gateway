@@ -26,6 +26,8 @@ int main(void)
   }
   const char *negative[] = {
       "data\n\n",
+      "data: {\"error\":\"failed\",\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+      "data: {\"choices\" [{\"finish_reason\":\"stop\"}]}\n\n",
       "data",
       "data: {\"choices\":[{\"finish_reason\":null}]}\n\n",
       "data: {\"choices\":[]}\n\n",
