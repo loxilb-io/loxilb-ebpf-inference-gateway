@@ -43,6 +43,7 @@
 #include "llhttp.h"
 #include "sockproxy_ai_gw.h"
 #include "sockproxy.h"
+#include "sockproxy_pd_reservation.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_pd_leak.h"
@@ -121,11 +122,11 @@ pd_initiate_decode(proxy_fd_ent_t *client_pfe)
       log_error("decode EP%d went unhealthy during prefill — "
                 "re-selected healthy decode EP%d (client_fd=%d)",
                 stale_idx, re_idx, client_pfe->fd);
-      uint32_t cur_stale =
-          atomic_load(&tepval->pd_ep_loads[stale_idx].active_conns);
-      if (cur_stale > 0)
-        atomic_fetch_sub(&tepval->pd_ep_loads[stale_idx].active_conns, 1);
-      atomic_fetch_add(&tepval->pd_ep_loads[re_idx].active_conns, 1);
+      if (!pd_load_try_reserve(tepval, re_idx, 0)) {
+        client_pfe->pd_decode_ep_idx = stale_idx;
+        return -1;
+      }
+      pd_load_commit(tepval, &client_pfe->pd_decode_load_token, re_idx);
       d_idx = re_idx;  /* pd_select_decode already stored it in the pfe */
     } else {
       client_pfe->pd_decode_ep_idx = stale_idx;  /* restore for cleanup/logs */
@@ -498,6 +499,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
   size_t req_len = 0;
   int new_idx = -1;
   int ep_cfd = -1;
+  uint32_t reserved = 0;
 
   if (!client_pfe || !client_pfe->epv) goto fail;
   tepval = (proxy_epval_t *)client_pfe->epv;
@@ -512,7 +514,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
 
     for (int attempt = 0; attempt < tepval->n_prefill_eps; attempt++) {
       int cand = -1;
-      int rc = pd_select_prefill(tepval, client_pfe, &cand, excluded);
+      int rc = pd_reserve_prefill(tepval, client_pfe, &cand, excluded, 0);
       /* A Tier-0 session hit inside pd_select_prefill may overwrite the
        * decode hint; the decode EP for THIS request was already chosen at
        * admission and its selection must stand — always restore it. */
@@ -520,6 +522,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
       if (rc != 0 || cand < 0)
         break;  /* no healthy candidates (park/shed count as none mid-request) */
 
+      reserved = (uint32_t)cand + 1;
       /* PROXY protocol v2 parity with the admission-time prefill leg. */
       uint8_t pp2buf[28];
       int pp2len = 0;
@@ -542,6 +545,7 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
                                       IPPROTO_TCP, NULL, NULL, client_pfe,
                                       (pp2len ? pp2buf : NULL), pp2len);
       if (ep_cfd >= 0) { new_idx = cand; break; }
+      pd_load_release(tepval, &reserved);
       /* Sync connect failure — condemn and try the next candidate. */
       circuit_breaker_record_failure(tepval, cand);
       if (cand >= 0 && cand < 32) excluded |= 1u << (unsigned)cand;
@@ -639,14 +643,8 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
       bpfe->settings.uarg = bpfe;
     }
 
-    /* Move the admission active_conns unit dead -> replacement so
-     * pd_cleanup's decrement of the final pd_prefill_ep_idx stays balanced. */
-    if (dead_idx >= 0 && dead_idx < tepval->n_eps) {
-      uint32_t cur = atomic_load(&tepval->pd_ep_loads[dead_idx].active_conns);
-      if (cur > 0)
-        atomic_fetch_sub(&tepval->pd_ep_loads[dead_idx].active_conns, 1);
-    }
-    atomic_fetch_add(&tepval->pd_ep_loads[new_idx].active_conns, 1);
+    pd_load_commit(tepval, &client_pfe->pd_prefill_load_token, new_idx);
+    reserved = 0; /* ownership moved to the client */
     client_pfe->pd_prefill_ep_idx = new_idx;
 
     /* Link the replacement leg (the dead leg's slot was detached in
@@ -718,6 +716,8 @@ pd_retry_prefill(proxy_fd_ent_t *client_pfe, int dead_idx,
   goto done;
 
 fail:
+  if (reserved)
+    pd_load_release(tepval, &reserved);
   if (client_pfe) {
     static const char pd_prefill_err[] =
         "HTTP/1.1 503 Service Unavailable\r\n"

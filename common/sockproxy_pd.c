@@ -1407,6 +1407,8 @@ pd_kv_loadguard_on(void)
 #define PD_CTRL_WEIGHT(p) ((p) & 0xff)
 #endif
 
+#include "sockproxy_pd_reservation.h"
+
 /* per-EP in-flight admission cap (env LLB_PD_MAX_INFLIGHT_PER_EP, cached
  * getenv-once). 0/unset = DISABLED -> pd_select_prefill is byte-identical to today
  * (back-compat). When >0, pd_select_prefill excludes any prefill EP whose real-time
@@ -1788,10 +1790,15 @@ pd_record_tier_selected(proxy_fd_ent_t *pfe, int tier)
 }
 #endif
 
-int
-pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
-                  uint32_t excluded_mask)
+static int pd_select_prefill_impl(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
+                                  int *ep_out, uint32_t excluded_mask, int reserve,
+                                  int allow_park)
 {
+  const uint32_t original_excluded = excluded_mask;
+  uint32_t rejected = 0;
+select_again:
+  excluded_mask = original_excluded;
+  *ep_out = -1;
   /* --: global-controller advisory fold-in (SNAP-03/04) ---
    * G3 guard order (Pitfall 2): read pd_ctrl_mode FIRST. mode 0 == controller
    * absent/autonomous == ZERO further controller work (no loop, no pd_ctrl_ep
@@ -1849,14 +1856,15 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
             tepval->circuit_breakers[i].state == CB_STATE_OPEN) continue;
         if (pd_ctrl_draining(tepval, i, cmode)) continue;  /* no NEW work */
         healthy_elig++;
-        if (atomic_load(&tepval->pd_ep_loads[i].active_conns) >= cap)
+        if ((rejected & (1u << (unsigned)i)) ||
+            atomic_load(&tepval->pd_ep_loads[i].active_conns) >= cap)
           cap_excl |= (1u << (unsigned)i);
         else
           under_cap++;
       }
       if (healthy_elig > 0 && under_cap == 0) {
         /* All healthy prefill EPs at the in-flight cap. */
-        uint32_t depth = pd_queue_depth_per_ep();
+        uint32_t depth = allow_park ? pd_queue_depth_per_ep() : 0;
         if (depth == 0) {
           /* Default-off: shed (retriable) exactly as . Byte-identical. */
           uint64_t n = atomic_fetch_add(&pd_admission_shed_total, 1) + 1;
@@ -1873,6 +1881,27 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
          * (the cap loop already proved they are all capped & eligible) under
          * pd_parked_lock so the depth read and the enqueue are atomic together. */
         pthread_mutex_lock(&tepval->pd_parked_lock);
+        /* Pair a fresh capacity read with enqueue under the FIFO lock.
+         * A release before this read retries; a release after it wakes the
+         * entry after acquiring the same lock. No lost last-slot wakeup. */
+        if (reserve) {
+          int available = 0;
+          for (int i = 0; i < tepval->n_eps && i < 32; i++) {
+            if (tepval->ep_role[i] != 1 || tepval->eps[i].inv ||
+                (excluded_mask & (1u << (unsigned)i)) ||
+                (tepval->cb_enabled &&
+                 tepval->circuit_breakers[i].state == CB_STATE_OPEN) ||
+                pd_ctrl_draining(tepval, i, cmode))
+              continue;
+            if (atomic_load(&tepval->pd_ep_loads[i].active_conns) < cap)
+              available = 1;
+          }
+          if (available) {
+            pthread_mutex_unlock(&tepval->pd_parked_lock);
+            rejected = 0;
+            goto select_again;
+          }
+        }
         int park_ep = -1;
         uint32_t best_count = depth;  /* only EPs strictly under bound qualify */
         for (int i = 0; i < tepval->n_eps && i < 32; i++) {
@@ -1920,6 +1949,11 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     }
   }
 
+  /* A failed reservation is excluded even when cap0 disables the cap
+   * scan, or a draining session is absent from the NEW-work scan. Each
+   * candidate is tried at most once; never spin on a full pinned owner. */
+  excluded_mask |= rejected;
+
   /* --- Tier 0: Session stickiness (always active for pd_disagg) --- */
   const char *session_key = NULL;
   const char *session_key_src = "none";
@@ -1944,6 +1978,10 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           !tepval->eps[pre].inv &&
           !(tepval->cb_enabled &&
             tepval->circuit_breakers[pre].state == CB_STATE_OPEN)) {
+        if (reserve && !pd_load_try_reserve(tepval, pre, pd_max_inflight_per_ep())) {
+          rejected |= 1u << (unsigned)(pre);
+          goto select_again;
+        }
         pfe->pd_decode_ep_idx = dec;  /* Pass decode hint to pd_select_decode */
         *ep_out = pre;
         /* US-H105: Record Tier-0 session stickiness hit for Prometheus */
@@ -1998,6 +2036,11 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
           !(tepval->cb_enabled &&
             tepval->circuit_breakers[trie_ep].state == CB_STATE_OPEN) &&
           !pd_ctrl_draining(tepval, trie_ep, cmode) /* no NEW work */) {
+        if (reserve &&
+            !pd_load_try_reserve(tepval, trie_ep, pd_max_inflight_per_ep())) {
+          rejected |= 1u << (unsigned)(trie_ep);
+          goto select_again;
+        }
         /* Tier 1 hit — update trie timestamp */
         pthread_rwlock_wrlock(&tepval->pd_trie_lock);
         pd_trie_insert(tepval->pd_trie, pfe->prefix_key.prefix,
@@ -2047,6 +2090,10 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     if (kv_loadguard_ok &&
         pd_kv_exact_select(tepval, pfe, ep_out,
                            excluded_mask | ctrl_drain) == 0) {
+      if (reserve && !pd_load_try_reserve(tepval, *ep_out, pd_max_inflight_per_ep())) {
+        rejected |= 1u << (unsigned)(*ep_out);
+        goto select_again;
+      }
       pd_record_tier_selected(pfe, 15);
       return 0;  /* Tier 1.5 hit */
     }
@@ -2158,12 +2205,18 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
     if (n_cand <= 0) {
       log_error("no healthy prefill candidates (n_eps=%d excluded_mask=0x%x)\n",
                 tepval->n_eps, excluded_mask);
-      return -1;
+      /* A failed reservation is capacity exhaustion, not an invitation to
+       * bypass admission through normal-mode fallback. */
+      return (reserve && rejected) ? PD_PREFILL_NO_CAPACITY : -1;
     }
     /* Bug5-fix: only advance RR counter on genuine tie (n_cand > 1); advancing
      * unconditionally biases even-numbered calls toward candidates[0] */
     uint32_t rr = (n_cand > 1) ? atomic_fetch_add(&tepval->pd_tier2_rr, 1) : 0;
     best_ep = candidates[rr % (uint32_t)n_cand];
+    if (reserve && !pd_load_try_reserve(tepval, best_ep, pd_max_inflight_per_ep())) {
+      rejected |= 1u << (unsigned)(best_ep);
+      goto select_again;
+    }
     *ep_out = best_ep;
     pd_record_tier_selected(pfe, 2);
 
@@ -2179,6 +2232,21 @@ pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
   }
 
   return 0;
+}
+
+/* Selection-only API retained for routing callers/tests. Production P creators
+ * must use pd_reserve_prefill: a successful selection alone owns no unit. */
+int pd_select_prefill(proxy_epval_t *t, proxy_fd_ent_t *p, int *ep, uint32_t excluded)
+{
+  return pd_select_prefill_impl(t, p, ep, excluded, 0, 1);
+}
+
+int pd_reserve_prefill(proxy_epval_t *t, proxy_fd_ent_t *p, int *ep, uint32_t excluded,
+                       int allow_park)
+{
+  if (!p || !t || !ep)
+    return -1;
+  return pd_select_prefill_impl(t, p, ep, excluded, 1, allow_park);
 }
 
 /*

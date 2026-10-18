@@ -54,6 +54,7 @@
 #include "sockproxy_sockmap_gate.h"
 #include "sockproxy_in_ifindex.h"
 #include "sockproxy.h"
+#include "sockproxy_pd_reservation.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
 #include "sockproxy_parser_once.h"
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
@@ -5463,6 +5464,41 @@ cleanup_failed_ssl_connection(proxy_fd_ent_t *pfe)
   }
 }
 
+/* Every P reservation return (rollback/retry/cancel/DONE) may free the
+ * last busy slot. Pop under the enqueue lock, re-drive only on the fd owner.
+ * Existing max-park reap remains the bounded fallback for a failed wake. */
+void pd_wake_parked_one(proxy_epval_t *t, int ep)
+{
+  if (!t || ep < 0 || ep >= t->n_eps || pd_queue_depth_per_ep() == 0 || !proxy_struct ||
+      !proxy_struct->ns)
+    return;
+  for (;;) {
+    pd_parked_ent_t popped = {0};
+    pthread_mutex_lock(&t->pd_parked_lock);
+    int have = pd_parked_pop_head(&t->pd_parked[ep], &popped);
+    pthread_mutex_unlock(&t->pd_parked_lock);
+    if (!have)
+      return;
+    if (popped.fd <= 0)
+      continue;
+    uint64_t registered_gen = 0;
+    if (!notify_priv_of_fd(proxy_struct->ns, popped.fd, &registered_gen) ||
+        registered_gen != popped.gen)
+      continue; /* canceled/recycled head */
+    int owner = notify_owner_thr(proxy_struct->ns, popped.fd);
+    int rc = owner >= 0 ? notify_wake_worker_gen(proxy_struct->ns, owner, popped.fd,
+                                                 popped.gen)
+                        : -1;
+    if (rc != 0)
+      log_warn("[PD_ADMISSION] slot return: wake failed rc=%d fd=%d owner=%d", rc,
+               popped.fd, owner);
+    else
+      log_info("[PD_ADMISSION] slot return: ep=%d fd=%d gen=%lu owner=%d", ep,
+               popped.fd, (unsigned long)popped.gen, owner);
+    return;
+  }
+}
+
 /* Reset P/D orchestration state and free heap buffers.
  * Called on connection close, error, and P/D flow completion. */
 void
@@ -5503,72 +5539,27 @@ pd_cleanup(proxy_fd_ent_t *fd_ent)
    * resets the rest of the body state. */
   fd_ent->pd_prefill_truncated = 0;
 
-  /* INTG-06: Decrement active_conns for P/D EPs at teardown */
+  /* A parked cancellation returns its FIFO position, not an in-flight
+   * unit. Match fd+generation so a late cleanup cannot remove a reused fd. */
+  if (fd_ent->epv && fd_ent->park_ep_idx >= 0) {
+    proxy_epval_t *t = (proxy_epval_t *)fd_ent->epv;
+    int ep = fd_ent->park_ep_idx;
+    if (ep < t->n_eps) {
+      pthread_mutex_lock(&t->pd_parked_lock);
+      pd_parked_remove_fd(&t->pd_parked[ep], fd_ent->fd,
+                          atomic_load_explicit(&fd_ent->gen, memory_order_relaxed));
+      pthread_mutex_unlock(&t->pd_parked_lock);
+    }
+    fd_ent->park_ep_idx = -1;
+    fd_ent->park_start_ts = 0;
+  }
+
+  /* Claim ownership before returning a unit. Decode routing/session hints
+   * and duplicate cleanup are never evidence that a reservation was held. */
   if (fd_ent->epv) {
-    proxy_epval_t *teardown_epval = (proxy_epval_t *)fd_ent->epv;
-    if (fd_ent->pd_prefill_ep_idx >= 0 &&
-        fd_ent->pd_prefill_ep_idx < teardown_epval->n_eps) {
-      /* Bug3-fix (US-H201): guard against uint32_t underflow on double-cleanup */
-      uint32_t cur_pre = atomic_load(&teardown_epval->pd_ep_loads[fd_ent->pd_prefill_ep_idx].active_conns);
-      if (cur_pre > 0)
-        atomic_fetch_sub(&teardown_epval->pd_ep_loads[fd_ent->pd_prefill_ep_idx].active_conns, 1);
-
-      /* (R1) DEQUEUE-ON-SLOT-FREE: a prefill slot on EP `e` just freed.
-       * If the bounded-admission FIFO is enabled and EP `e` has a parked head, pop the
-       * OLDEST entry and WAKE ITS OWNER WORKER to re-drive it (pd_resume_parked). We do
-       * NOT re-dispatch here: pd_cleanup may run on the decode-complete backend worker
-       * (pinned to THIS conn's owner) OR the client-close worker — neither is guaranteed
-       * to be the PARKED conn's owner. Re-dispatching off-owner is the rejected R3
-       * cross-thread UAF; routing to notify_owner_thr(parked_fd) + notify_wake_worker
-       * keeps the re-drive on the parked fd's own worker (Landmine 1). The popped entry's
-       * (fd,gen) is gen-validated at resume time (pd_resume_parked) — a recycled fd is
-       * dropped. Default-off: pd_queue_depth_per_ep()==0 ⇒ the FIFO is never touched ⇒
-       * byte-identical to pre-. No buffer free here, so pd_free_claim is untouched
-       * (Landmine 2). */
-      if (cur_pre > 0 && pd_queue_depth_per_ep() > 0) {
-        int e = fd_ent->pd_prefill_ep_idx;
-        pd_parked_ent_t popped = { 0 };
-        int have = 0;
-        pthread_mutex_lock(&teardown_epval->pd_parked_lock);
-        have = pd_parked_pop_head(&teardown_epval->pd_parked[e], &popped);
-        pthread_mutex_unlock(&teardown_epval->pd_parked_lock);
-        if (have && popped.fd > 0) {
-          int owner = notify_owner_thr(proxy_struct->ns, popped.fd);
-          if (owner >= 0) {
-            int wrc = notify_wake_worker(proxy_struct->ns, owner, popped.fd);
-            if (wrc == 0) {
-              log_info("[PD_ADMISSION] dequeue: slot freed on prefill ep=%d -> waking "
-                       "owner worker %d for parked fd=%d (gen=%lu)",
-                       e, owner, popped.fd, (unsigned long)popped.gen);
-            } else {
-              /* wake failed (ring full / bad owner) — the entry is already popped;
-               * the conn stays parked and the max-park reap will eventually drop it.
-               * No leak of the FIFO slot (it was popped); the conn's fd/rcvbuf are
-               * still bounded by LLB_PD_MAX_PARK_SEC. */
-              log_warn("[PD_ADMISSION] dequeue: wake failed (rc=%d) for parked fd=%d "
-                       "(owner=%d) — relying on max-park reap", wrc, popped.fd, owner);
-            }
-          }
-        }
-      }
-    }
-    if (fd_ent->pd_decode_ep_idx >= 0 &&
-        fd_ent->pd_decode_ep_idx < teardown_epval->n_eps) {
-      /* Bug3-fix (US-H201): guard against uint32_t underflow on double-cleanup */
-      uint32_t cur_dec = atomic_load(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns);
-
-      if (cur_dec > 0) {
-        atomic_fetch_sub(&teardown_epval->pd_ep_loads[fd_ent->pd_decode_ep_idx].active_conns, 1);
-      } else {
-        /* A decode index on a connection whose unit was never taken (the
-         * selection was refused after pd_select_decode wrote it) used to be
-         * released here — stealing a unit when the gauge was above zero and
-         * masked by this guard when it was not. The refusal exits now clear
-         * the index; this line is the canary that they did. */
-        log_warn("[PD_LOAD] decode EP%d unit release with zero gauge (never taken) fd=%d",
-                 fd_ent->pd_decode_ep_idx, fd_ent->fd);
-      }
-    }
+    proxy_epval_t *t = (proxy_epval_t *)fd_ent->epv;
+    pd_load_release(t, &fd_ent->pd_prefill_load_token);
+    pd_load_release(t, &fd_ent->pd_decode_load_token);
   }
 
   /* single-role Tier-1.5 load release — the generic-

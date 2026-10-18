@@ -32,6 +32,7 @@
 #include "uthash.h"
 #include "notify.h"
 #include "sockproxy.h"
+#include "sockproxy_pd_reservation.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_h2_load.h"   /* bounded-load units follow a moved pick */
 #include "sockproxy_metrics.h"
@@ -899,7 +900,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
            * falling to any-healthy/normal mode (which would BYPASS the cap). This
            * shed happens BEFORE the active_conns increment below, so a shed never
            * perturbs the load counters. */
-          int pf_rc = pd_select_prefill(tepval, pfe, &pd_prefill, pd_excl);
+          int pf_rc = pd_reserve_prefill(tepval, pfe, &pd_prefill, pd_excl, 1);
           /* bounded backpressured admission. PARKED means the request
            * was already ENQUEUED onto a per-EP FIFO inside pd_select_prefill (it
            * held + stamped park_start_ts there). Do NOT connect, do NOT 429, do NOT
@@ -929,6 +930,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
           if (pf_rc != 0 ||
               pd_select_decode(tepval, pfe, &pd_decode) != 0) {
+            if (pf_rc == 0)
+              pd_load_put(tepval, pd_prefill);
             /* RES-02: Fallback to any healthy EP in normal (non-P/D) mode */
             int fallback_ep = -1;
             if (pd_select_any_healthy(tepval, &fallback_ep) == 0) {
@@ -974,13 +977,19 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
              * teardown, on a park reap, or on the next request of a kept
              * connection — would hand back a decode unit this request never
              * took, stealing it from the request that holds it. */
+            pd_load_put(tepval, pd_prefill);
             pfe->pd_decode_ep_idx = -1;
             pfe->pd_prefill_ep_idx = -1;
             return -1;
           }
-          /* INTG-06: Increment active_conns for selected EPs */
-          atomic_fetch_add(&tepval->pd_ep_loads[pd_prefill].active_conns, 1);
-          atomic_fetch_add(&tepval->pd_ep_loads[pd_decode].active_conns, 1);
+          /* P was reserved by the selector, before connection/rewrite work. */
+          if (!pd_load_try_reserve(tepval, pd_decode, 0)) {
+            pd_load_put(tepval, pd_prefill);
+            pfe->pd_decode_ep_idx = -1;
+            return -1;
+          }
+          pd_load_commit(tepval, &pfe->pd_prefill_load_token, pd_prefill);
+          pd_load_commit(tepval, &pfe->pd_decode_load_token, pd_decode);
 
           algorithm_selection = pd_prefill;
           if (pfe) {
@@ -1355,20 +1364,13 @@ pd_fallback_normal:
            * prefill EP while recording TCP failures in the circuit breaker.
            * A 503 is sent only when all prefill EPs are exhausted. */
           /* A route's request took no P/D pair (it selects plainly). */
-          if (tepval->pd_disagg_enabled && pfe && !sp_route_subset(pfe, tepval)) {
+          if (tepval->pd_disagg_enabled && pfe && pfe->pd_prefill_load_token &&
+              !sp_route_subset(pfe, tepval)) {
             /* Undo active_conns for the original failed EP pair so the
              * counters remain consistent regardless of retry outcome. */
-            int fc_orig_decode = pfe->pd_decode_ep_idx;
-            {
-              uint32_t cur_sel = atomic_load(&tepval->pd_ep_loads[sel].active_conns);
-              if (cur_sel > 0)
-                atomic_fetch_sub(&tepval->pd_ep_loads[sel].active_conns, 1);
-            }
-            if (fc_orig_decode >= 0 && fc_orig_decode < MAX_PROXY_EP) {
-              uint32_t cur_odc = atomic_load(&tepval->pd_ep_loads[fc_orig_decode].active_conns);
-              if (cur_odc > 0)
-                atomic_fetch_sub(&tepval->pd_ep_loads[fc_orig_decode].active_conns, 1);
-            }
+            pd_load_release(tepval, &pfe->pd_prefill_load_token);
+            pd_load_release(tepval, &pfe->pd_decode_load_token);
+            pfe->pd_prefill_ep_idx = pfe->pd_decode_ep_idx = -1;
 
             uint32_t pd_excluded = 1u << (unsigned)sel;  /* exclude original EP */
 
@@ -1377,13 +1379,16 @@ pd_fallback_normal:
               /* Reset decode hint so pd_select_prefill/pd_select_decode pick
                * a fresh pair unconstrained by the now-evicted session. */
               pfe->pd_decode_ep_idx = -1;
-              if (pd_select_prefill(tepval, pfe, &fc_prefill, pd_excluded) != 0)
+              if (pd_reserve_prefill(tepval, pfe, &fc_prefill, pd_excluded, 0) != 0)
                 break;  /* no more healthy prefill candidates */
-              if (pd_select_decode(tepval, pfe, &fc_decode) != 0)
-                break;  /* no decode EP available */
-
-              atomic_fetch_add(&tepval->pd_ep_loads[fc_prefill].active_conns, 1);
-              atomic_fetch_add(&tepval->pd_ep_loads[fc_decode].active_conns, 1);
+              pd_load_commit(tepval, &pfe->pd_prefill_load_token, fc_prefill);
+              if (pd_select_decode(tepval, pfe, &fc_decode) != 0 ||
+                  !pd_load_try_reserve(tepval, fc_decode, 0)) {
+                pd_load_release(tepval, &pfe->pd_prefill_load_token);
+                pfe->pd_decode_ep_idx = -1;
+                break;
+              }
+              pd_load_commit(tepval, &pfe->pd_decode_load_token, fc_decode);
 
               int fc_fd = proxy_setup_ep_connect(
                   tepval->eps[fc_prefill].xip,
@@ -1409,17 +1414,9 @@ pd_fallback_normal:
                 atomic_fetch_add(&global_stats.pd_connect_failover, 1);
                 goto pd_failover_ok;
               }
-              /* This candidate also unreachable — clean up and try next */
-              {
-                uint32_t cur_fcp = atomic_load(&tepval->pd_ep_loads[fc_prefill].active_conns);
-                if (cur_fcp > 0)
-                  atomic_fetch_sub(&tepval->pd_ep_loads[fc_prefill].active_conns, 1);
-              }
-              {
-                uint32_t cur_fcd = atomic_load(&tepval->pd_ep_loads[fc_decode].active_conns);
-                if (cur_fcd > 0)
-                  atomic_fetch_sub(&tepval->pd_ep_loads[fc_decode].active_conns, 1);
-              }
+              /* Release each candidate once before trying another one. */
+              pd_load_release(tepval, &pfe->pd_prefill_load_token);
+              pd_load_release(tepval, &pfe->pd_decode_load_token);
               circuit_breaker_record_failure(tepval, fc_prefill);
               pd_excluded |= 1u << (unsigned)fc_prefill;
             }

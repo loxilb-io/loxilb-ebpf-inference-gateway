@@ -155,3 +155,6 @@ jobs:
 
       - name: UC-5 unchanged L2 split horizon (all VLAN values, routing/NAT/tunnel exceptions)
         run: make -C common test_l2_reflection
+
+      - name: Atomic P/D reservations, actual cleanup and generation-qualified FIFO wake (ASan + UBSan)
+        run: make -C common test_i18

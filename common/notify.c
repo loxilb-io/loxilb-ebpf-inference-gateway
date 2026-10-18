@@ -116,6 +116,7 @@ typedef struct notify_poll_ctx {
    * sits in poll() idle (one extra fd, never readable) — zero relay-path overhead. */
   int wake_fd;                          /* eventfd; -1 until inited */
   pthread_mutex_t rq_lock;              /* guards rq[]/rq_head/rq_tail/rq_count */
+  uint64_t rq_gen[MAX_NOTIFY_RESUME_PENDING]; /* 0 = legacy unqualified wake */
   int rq[MAX_NOTIFY_RESUME_PENDING];    /* ring of parked client fds awaiting resume */
   int rq_head, rq_tail, rq_count;
 } notify_poll_ctx_t;
@@ -308,8 +309,7 @@ notify_priv_of_fd(void *ctx, int fd, uint64_t *gen_out)
  * by writing its eventfd. MPSC-safe (rq_lock). Returns 0 ok, <0 on bad args / ring
  * full / not-yet-inited wake_fd. On ring-full the caller leaves the conn parked; the
  * next slot-free retries — no loss of correctness, only of promptness. */
-int
-notify_wake_worker(void *ctx, int thr_id, int fd)
+int notify_wake_worker_gen(void *ctx, int thr_id, int fd, uint64_t gen)
 {
   notify_ctx_t *nctx = ctx;
   notify_poll_ctx_t *pctx;
@@ -326,6 +326,7 @@ notify_wake_worker(void *ctx, int thr_id, int fd)
     log_error("notify_wake_worker: resume ring full (thr %d) — leaving fd %d parked", thr_id, fd);
     return -ENOSPC;
   }
+  pctx->rq_gen[pctx->rq_tail] = gen;
   pctx->rq[pctx->rq_tail] = fd;
   pctx->rq_tail = (pctx->rq_tail + 1) % MAX_NOTIFY_RESUME_PENDING;
   pctx->rq_count++;
@@ -338,6 +339,11 @@ notify_wake_worker(void *ctx, int thr_id, int fd)
     (void)w;  /* eventfd counter is coalescing; a missed wake is caught next poll() tick */
   }
   return 0;
+}
+
+int notify_wake_worker(void *ctx, int thr_id, int fd)
+{
+  return notify_wake_worker_gen(ctx, thr_id, fd, 0);
 }
 
 int
@@ -941,8 +947,10 @@ notify_drain_resume(notify_ctx_t *nctx, int thread)
 
   for (;;) {
     int fd = -1;
+    uint64_t gen = 0;
     pthread_mutex_lock(&pctx->rq_lock);
     if (pctx->rq_count > 0) {
+      gen = pctx->rq_gen[pctx->rq_head];
       fd = pctx->rq[pctx->rq_head];
       pctx->rq_head = (pctx->rq_head + 1) % MAX_NOTIFY_RESUME_PENDING;
       pctx->rq_count--;
@@ -952,11 +960,27 @@ notify_drain_resume(notify_ctx_t *nctx, int thread)
     if (fd < 0) {
       break;  /* ring drained */
     }
+    if (gen) {
+      uint64_t registered_gen = 0;
+      if (!notify_priv_of_fd(nctx, fd, &registered_gen) || registered_gen != gen)
+        continue;
+    }
     if (nctx->cbs.resume) {
       nctx->cbs.resume(fd);   /* re-drive dispatch on THIS owner worker */
     }
   }
 }
+
+#ifdef NOTIFY_TEST
+void notify_test_drain(void *ctx, int thread)
+{
+  notify_drain_resume(ctx, thread);
+}
+unsigned notify_test_resume_limit(void)
+{
+  return MAX_NOTIFY_RESUME_PENDING;
+}
+#endif
 
 static void
 notify_run(void *ctx, int thread)

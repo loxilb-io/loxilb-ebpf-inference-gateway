@@ -1679,6 +1679,8 @@ struct proxy_fd_ent {
   // pooled-pfe default) means "not parked". No parallel struct — reuse the pfe.
   int      park_ep_idx;              // prefill EP index this request is parked behind (-1 = not parked)
   uint64_t park_start_ts;            // CLOCK_MONOTONIC ns at park enqueue (max-park reap)
+  uint32_t pd_prefill_load_token;    // Owned legacy load unit: EP+1, zero = none
+  uint32_t pd_decode_load_token;     // Independent of mutable decode routing hint
   int      pd_prefill_ep_idx;        // Selected prefill endpoint index
   int      pd_decode_ep_idx;         // Selected decode endpoint index
   uint8_t *pd_saved_body;            // Heap: original request body for decode phase
@@ -2556,6 +2558,10 @@ void pd_session_evict_key(proxy_epval_t *tepval, const char *key);
 #ifndef SP_SETUP_CONNECTING
 #define SP_SETUP_CONNECTING (3)
 #endif
+/* Success reserves one P unit; caller commits it or rolls it back.
+ * Mid-request retries pass allow_park=0 and never enqueue a live request. */
+int pd_reserve_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
+                       uint32_t excluded_mask, int allow_park);
 int pd_select_prefill(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out,
                       uint32_t excluded_mask);
 /* same-EP reconnect budget on transient backend connect failure
