@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_pd_terminal.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -1060,7 +1060,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f *.o *.d test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free
+	rm -f *.o *.d test_pd_terminal test_pd_finish test_pd_eof_taxonomy test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with
@@ -1111,3 +1111,30 @@ test_cb_tsan:
 
 test_cb_mutation:
 	CC="$(CC)" python3 test_sockproxy_cb_concurrent.py --mutation-check
+
+# Decode terminal framing and last-event policy, linked to the real helper TU.
+.PHONY: test_pd_terminal_failure
+test_pd_terminal_failure: test_pd_terminal test_pd_complete test_sse_observe test_pd_finish test_pd_eof_taxonomy
+	./test_pd_terminal
+	./test_pd_complete
+	./test_sse_observe
+	./test_pd_finish
+	./test_pd_eof_taxonomy
+
+test_pd_terminal: test_pd_terminal.c sockproxy_pd_terminal.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -g -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
+
+test_pd_finish: test_pd_finish.c sockproxy_pd_terminal.c sockproxy_pd_terminal.h
+	$(CC) -Wall -Wextra -Wno-unused-function -g -fsanitize=address,undefined -o $@ test_pd_finish.c sockproxy_pd_terminal.c -I.
+
+sockproxy_http_pd_test.o: sockproxy_http.c sockproxy_internal.h sockproxy.h
+	$(CC) $(CFLAGS) -g -fsanitize=address,undefined -fno-omit-frame-pointer --param asan-globals=0 -ffunction-sections -fdata-sections -c -o $@ $<
+
+sockproxy_pd_sglang_test.o: sockproxy_pd_sglang.c sockproxy_internal.h sockproxy.h
+	$(CC) $(CFLAGS) -g -fsanitize=address,undefined -fno-omit-frame-pointer --param asan-globals=0 -ffunction-sections -fdata-sections -c -o $@ $<
+
+test_pd_eof_taxonomy: test_pd_eof_taxonomy.c sockproxy_http_pd_test.o sockproxy_pd_sglang_test.o sockproxy_pd_gc_test.o
+	$(CC) $(CFLAGS) -g -fsanitize=address,undefined -ffunction-sections -fdata-sections -Wl,--gc-sections -o $@ $^ log.c -I. -lnghttp2 -lssl -lcrypto -lpthread
+
+sockproxy_pd_gc_test.o: sockproxy_pd.c sockproxy.h
+	$(CC) $(CFLAGS) -g -fsanitize=address,undefined --param asan-globals=0 -ffunction-sections -fdata-sections -c -o $@ $<

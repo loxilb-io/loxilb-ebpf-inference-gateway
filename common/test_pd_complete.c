@@ -138,10 +138,10 @@ test_bug_a_fragmented_no_content_type(void)
   printf("  [PASS] Bug-A fragmented Content-Type + split [DONE] -> complete\n");
 }
 
-/* --- (RESOLVED) graceful-[DONE] safety-net predicate ----
- * pd_should_graceful_complete() decides whether a decode-streaming SSE connection
+/* --- (RESOLVED) decode-idle failure deadline predicate ----
+ * pd_should_decode_idle_fail() decides whether a decode-streaming SSE connection
  * whose backend leg went silent (vLLM dropped its closing "data: [DONE]") should
- * be force-completed with a synthesized terminator. The load-bearing property is
+ * be failed with a failure event. The load-bearing property is
  * that the decision is gated on the LAST-BACKEND-BYTE timestamp, NOT
  * wall-clock-since-start — so a slow-but-still-streaming response is never
  * truncated. The helper does not even take a stream-start argument, which is the
@@ -151,52 +151,49 @@ test_bug_a_fragmented_no_content_type(void)
 #define NOW ((time_t)1000000)
 #define CAP 25u
 
-/* ---- Case 6: backend idle past the cap -> reap (graceful complete) ---- */
-static void
-test_graceful_idle_reaped(void)
+/* ---- Case 6: backend idle past the cap -> reap (explicit failure) ---- */
+static void test_idle_reaped(void)
 {
   /* decode streaming, sse active, not yet terminated, last byte 30s ago, cap 25s */
-  assert(pd_should_graceful_complete(1, 1, 0, NOW - 30, NOW, CAP) != 0 &&
+  assert(pd_should_decode_idle_fail(1, 1, 0, NOW - 30, NOW, CAP) != 0 &&
          "30s backend-idle (> 25s cap) must reap");
   /* exact boundary: now - last == cap -> reap (>=) */
-  assert(pd_should_graceful_complete(1, 1, 0, NOW - (time_t)CAP, NOW, CAP) != 0 &&
+  assert(pd_should_decode_idle_fail(1, 1, 0, NOW - (time_t)CAP, NOW, CAP) != 0 &&
          "idle exactly at cap must reap (>=)");
-  printf("  [PASS] backend-idle past cap -> graceful complete\n");
+  printf("  [PASS] backend-idle past cap -> explicit failure\n");
 }
 
 /* ---- Case 7 (THE truncation guard): slow-but-streaming is NOT reaped ----
  * A long-running generation that emitted a token 5s ago must survive, even though
  * the stream started long ago — proven by the helper carrying no start time at
  * all and gating purely on last_decode_ts. */
-static void
-test_graceful_slow_stream_not_reaped(void)
+static void test_idle_slow_stream_not_reaped(void)
 {
-  assert(pd_should_graceful_complete(1, 1, 0, NOW - 5, NOW, CAP) == 0 &&
+  assert(pd_should_decode_idle_fail(1, 1, 0, NOW - 5, NOW, CAP) == 0 &&
          "a stream that relayed a byte 5s ago must NOT be reaped");
   /* just under the boundary */
-  assert(pd_should_graceful_complete(1, 1, 0, NOW - ((time_t)CAP - 1), NOW, CAP) == 0 &&
+  assert(pd_should_decode_idle_fail(1, 1, 0, NOW - ((time_t)CAP - 1), NOW, CAP) == 0 &&
          "idle one second under cap must NOT reap");
   printf("  [PASS] slow-but-streaming (recent backend byte) -> not reaped\n");
 }
 
 /* ---- Case 8: all the guards individually suppress the reap ---- */
-static void
-test_graceful_guards(void)
+static void test_idle_guards(void)
 {
   /* not in decode-streaming phase */
-  assert(pd_should_graceful_complete(0, 1, 0, NOW - 30, NOW, CAP) == 0 &&
+  assert(pd_should_decode_idle_fail(0, 1, 0, NOW - 30, NOW, CAP) == 0 &&
          "non-decode-streaming phase must not reap");
   /* not an SSE stream (would inject [DONE] into a non-SSE body) */
-  assert(pd_should_graceful_complete(1, 0, 0, NOW - 30, NOW, CAP) == 0 &&
-         "non-SSE stream must not get a synthesized [DONE]");
+  assert(pd_should_decode_idle_fail(1, 0, 0, NOW - 30, NOW, CAP) == 0 &&
+         "non-SSE stream must not get an idle SSE error");
   /* the real [DONE] already arrived (stream_end_ts set) */
-  assert(pd_should_graceful_complete(1, 1, NOW - 1, NOW - 30, NOW, CAP) == 0 &&
+  assert(pd_should_decode_idle_fail(1, 1, NOW - 1, NOW - 30, NOW, CAP) == 0 &&
          "already-terminated stream must not be re-completed");
   /* no backend byte ever relayed -> no meaningful idle clock */
-  assert(pd_should_graceful_complete(1, 1, 0, 0, NOW, CAP) == 0 &&
+  assert(pd_should_decode_idle_fail(1, 1, 0, 0, NOW, CAP) == 0 &&
          "last_decode_ts==0 must not reap");
   /* safety-net disabled */
-  assert(pd_should_graceful_complete(1, 1, 0, NOW - 30, NOW, 0u) == 0 &&
+  assert(pd_should_decode_idle_fail(1, 1, 0, NOW - 30, NOW, 0u) == 0 &&
          "cap==0 disables the safety-net");
   printf("  [PASS] guards (phase/sse/terminated/no-byte/disabled) all suppress\n");
 }
@@ -241,15 +238,15 @@ test_http_resp_status(void)
 int
 main(void)
 {
-  printf("test_pd_complete: load-path (windowed completion + graceful [DONE])\n");
+  printf("test_pd_complete: load-path (windowed completion + idle failure)\n");
   test_done_whole_packet();
   test_done_split_across_reads();
   test_chunked_terminator_split();
   test_no_terminator_no_completion();
   test_bug_a_fragmented_no_content_type();
-  test_graceful_idle_reaped();
-  test_graceful_slow_stream_not_reaped();
-  test_graceful_guards();
+  test_idle_reaped();
+  test_idle_slow_stream_not_reaped();
+  test_idle_guards();
   test_http_resp_status();
   printf("ALL PASS (test_pd_complete)\n");
   return 0;

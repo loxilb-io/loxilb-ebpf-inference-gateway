@@ -1875,6 +1875,9 @@ skip_deferred_masking:
         rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
       rfd_ent->cresp_payload_observed = 0;
       cresp_feed(rfd_ent, msg, len);
+      if (rfd_ent->pd_phase == PD_PHASE_DECODE_STREAMING ||
+          rfd_ent->pd_phase == PD_PHASE_DECODE_SENDING)
+        sp_pd_wire_feed(&rfd_ent->pd_client_wire, (const char *)msg, len);
     }
 
     /* The HTTP_RESPONSE parser observes header fragments and dechunked body.
@@ -1988,10 +1991,10 @@ skip_deferred_masking:
     if (ent->odir == 1 && rfd_ent->sse_active == 1 &&
         rfd_ent->stream_end_ts == 0 && len > 0) {
       /* refresh the backend-idle clock on every relayed decode byte.
-       * The graceful-[DONE] safety-net reaper (sockproxy_health.c) measures idle
+       * The decode-idle failure reaper (sockproxy_health.c) measures idle
        * from THIS timestamp, so a stream that is still producing tokens — however
        * slowly — keeps pushing its reap deadline out and is never truncated; only a
-       * stream whose backend has gone genuinely silent (vLLM dropped its [DONE])
+       * stream whose backend has gone silent without a terminal event
        * crosses the cap. */
       rfd_ent->pd_last_decode_ts = time(NULL);
 
@@ -5898,6 +5901,105 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
   }
 }
 
+/* The existing decode-death taxonomy. Kept in the HTTP teardown TU so EOF
+ * classification precedes generic backlink release; also linked by its fixture. */
+void sp_pd_decode_backend_eof(proxy_fd_ent_t *pfe, proxy_fd_ent_t *client_pfe)
+{
+  if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
+      client_pfe->pd_last_decode_ts == 0 && client_pfe->pd_decode_content_length == 0 &&
+      client_pfe->pd_decode_bytes_received == 0) {
+    /* decode backend EOF before ONE response byte was relayed —
+     * the async-connect-failure signature of a dead decode EP. This was
+     * unconditionally treated as "non-streaming decode complete": phase
+     * → COMPLETE, llb_ai_pd_record(status 0), while the client received
+     * ZERO bytes — failover-invisible and metric-corrupting. Send a
+     * real 502 and record errorPhase=2 (decode_error) instead. */
+    static const char pd_decode_err[] =
+        "HTTP/1.1 502 Bad Gateway\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"error\":\"pd_decode_backend_died\","
+        "\"detail\":\"decode backend closed before any response bytes\"}";
+    log_error("decode backend EOF with ZERO response bytes — "
+              "client_fd=%d decode_fd=%d (502 sent, decode_error recorded)",
+              client_pfe->fd, pfe->fd);
+    atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+    atomic_fetch_add(&global_stats.pd_decode_zero_byte_eof, 1);
+    if (client_pfe->fd > 0) {
+      send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
+           MSG_DONTWAIT | MSG_NOSIGNAL);
+    }
+    {
+      const char *pd_model = proxy_effective_model(client_pfe);
+      int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+      llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
+    }
+    /* SGLang: decode-leg death must not orphan the prefill drain leg */
+    pd_sg_close_drain(client_pfe, 1);
+    client_pfe->pd_phase = PD_PHASE_ERROR;
+    pd_cleanup(client_pfe);
+  } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
+    /* Decode backend EOF — non-streaming decode complete */
+    client_pfe->pd_phase = PD_PHASE_COMPLETE;
+    log_debug("Non-streaming decode complete (decode backend EOF) — "
+              "client_fd=%d decode_fd=%d",
+              client_pfe->fd, pfe->fd);
+    {
+      const char *pd_model = proxy_effective_model(client_pfe);
+      struct timespec _pdts;
+      clock_gettime(CLOCK_MONOTONIC, &_pdts);
+      uint64_t pd_now_ns =
+          (uint64_t)_pdts.tv_sec * 1000000000ULL + (uint64_t)_pdts.tv_nsec;
+      int64_t prefill_ms = 0, decode_ms = 0;
+      if (client_pfe->pd_prefill_start_ns > 0 && client_pfe->pd_decode_start_ns > 0) {
+        prefill_ms = (int64_t)((client_pfe->pd_decode_start_ns -
+                                client_pfe->pd_prefill_start_ns) /
+                               1000000ULL);
+      }
+      if (client_pfe->pd_decode_start_ns > 0) {
+        decode_ms =
+            (int64_t)((pd_now_ns - client_pfe->pd_decode_start_ns) / 1000000ULL);
+      }
+      int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
+      log_debug(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms "
+                "decode=%lldms kv=%d",
+                pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
+      llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv, 0);
+    }
+    pd_cleanup(client_pfe);
+  } else if (client_pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
+             pfe->is_pd_decode_backend) {
+    /* Classification runs before the dead leg loses its client backlink. */
+    log_error("decode backend EOF mid-stream — client_fd=%d decode_fd=%d",
+              client_pfe->fd, pfe->fd);
+    atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
+    pd_sg_close_drain(client_pfe, 1);
+    client_pfe->pd_phase = PD_PHASE_ERROR;
+    if (client_pfe->sse_active) {
+      llb_ai_stream_end("", (char *)proxy_effective_model(client_pfe));
+      client_pfe->sse_active = 0;
+    }
+    llb_ai_pd_record((char *)proxy_effective_model(client_pfe), 0, 0,
+                     client_pfe->pd_kv_params_len > 0, 2 /* decode error */);
+    for (int i = 0; i < MAX_PROXY_EP; i++) {
+      if (client_pfe->rfd_ent[i] == pfe) {
+        client_pfe->rfd_ent[i] = NULL;
+        client_pfe->rfd[i] = -1;
+        if (client_pfe->n_rfd > 0)
+          client_pfe->n_rfd--;
+      }
+      if (pfe->rfd_ent[i] == client_pfe) {
+        pfe->rfd_ent[i] = NULL;
+        pfe->rfd[i] = -1;
+        if (pfe->n_rfd > 0)
+          pfe->n_rfd--;
+      }
+    }
+    sp_reap_request(client_pfe, SP_REAP_PD_DECODE_EOF);
+  }
+}
+
 void
 proxy_pdestroy(void *priv)
 {
@@ -6284,86 +6386,8 @@ proxy_pdestroy(void *priv)
           /* Detach client from this backend so proxy_release_rfd_ctx skips it */
           pfe->rfd_ent[pd_i] = NULL;
           pfe->n_rfd--;
-        } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING &&
-                   client_pfe->pd_last_decode_ts == 0 &&
-                   client_pfe->pd_decode_content_length == 0 &&
-                   client_pfe->pd_decode_bytes_received == 0) {
-          /* decode backend EOF before ONE response byte was relayed —
-           * the async-connect-failure signature of a dead decode EP. This was
-           * unconditionally treated as "non-streaming decode complete": phase
-           * → COMPLETE, llb_ai_pd_record(status 0), while the client received
-           * ZERO bytes — failover-invisible and metric-corrupting. Send a
-           * real 502 and record errorPhase=2 (decode_error) instead. */
-          static const char pd_decode_err[] =
-              "HTTP/1.1 502 Bad Gateway\r\n"
-              "Content-Type: application/json\r\n"
-              "Connection: close\r\n"
-              "\r\n"
-              "{\"error\":\"pd_decode_backend_died\","
-              "\"detail\":\"decode backend closed before any response bytes\"}";
-          log_error("decode backend EOF with ZERO response bytes — "
-                    "client_fd=%d decode_fd=%d (502 sent, decode_error recorded)",
-                    client_pfe->fd, pfe->fd);
-          atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
-          atomic_fetch_add(&global_stats.pd_decode_zero_byte_eof, 1);
-          if (client_pfe->fd > 0) {
-            send(client_pfe->fd, pd_decode_err, sizeof(pd_decode_err) - 1,
-                 MSG_DONTWAIT | MSG_NOSIGNAL);
-          }
-          {
-            const char *pd_model = proxy_effective_model(client_pfe);
-            int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            llb_ai_pd_record((char *)pd_model, 0, 0, pd_kv, 2 /*decode_error*/);
-          }
-          /* SGLang: decode-leg death must not orphan the prefill drain leg */
-          pd_sg_close_drain(client_pfe, 1);
-          client_pfe->pd_phase = PD_PHASE_ERROR;
-          pd_cleanup(client_pfe);
-        } else if (client_pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
-          /* Decode backend EOF — non-streaming decode complete */
-          client_pfe->pd_phase = PD_PHASE_COMPLETE;
-          log_debug("Non-streaming decode complete (decode backend EOF) — "
-                   "client_fd=%d decode_fd=%d",
-                   client_pfe->fd, pfe->fd);
-          {
-            const char *pd_model = proxy_effective_model(client_pfe);
-            struct timespec _pdts;
-            clock_gettime(CLOCK_MONOTONIC, &_pdts);
-            uint64_t pd_now_ns = (uint64_t)_pdts.tv_sec * 1000000000ULL +
-                                 (uint64_t)_pdts.tv_nsec;
-            int64_t prefill_ms = 0, decode_ms = 0;
-            if (client_pfe->pd_prefill_start_ns > 0 &&
-                client_pfe->pd_decode_start_ns > 0) {
-              prefill_ms = (int64_t)((client_pfe->pd_decode_start_ns -
-                                      client_pfe->pd_prefill_start_ns) / 1000000ULL);
-            }
-            if (client_pfe->pd_decode_start_ns > 0) {
-              decode_ms = (int64_t)((pd_now_ns -
-                                     client_pfe->pd_decode_start_ns) / 1000000ULL);
-            }
-            int pd_kv = (client_pfe->pd_kv_params_len > 0) ? 1 : 0;
-            log_debug(" llb_ai_pd_record (non-SSE complete): model=%s prefill=%lldms decode=%lldms kv=%d",
-                     pd_model, (long long)prefill_ms, (long long)decode_ms, pd_kv);
-            llb_ai_pd_record((char *)pd_model, prefill_ms, decode_ms, pd_kv, 0);
-          }
-          pd_cleanup(client_pfe);
-        } else if (client_pfe->pd_phase == PD_PHASE_DECODE_STREAMING &&
-                   pfe->is_pd_decode_backend) {
-          /* Decode backend EOF mid-stream. A completed stream leaves
-           * DECODE_STREAMING via the SSE [DONE] scanner before its backend
-           * closes (pd_phase NONE ⇒ the detach branch above), so reaching
-           * here means the stream was CUT with no terminator. Completion
-           * stays with the reaper paths (graceful-[DONE] synthesizes the
-           * terminator after the idle cap), but the EP death itself must be
-           * visible to the failover counters — without this tick a
-           * mid-stream decode crash is recorded as a clean success. */
-          log_error("decode backend EOF mid-stream — client_fd=%d "
-                    "decode_fd=%d (stream cut before [DONE]; reaper will "
-                    "complete the client)",
-                    client_pfe->fd, pfe->fd);
-          atomic_fetch_add(&global_stats.pd_decode_ep_died, 1);
-          /* SGLang: decode-leg death must not orphan the prefill drain leg */
-          pd_sg_close_drain(client_pfe, 1);
+        } else {
+          sp_pd_decode_backend_eof(pfe, client_pfe);
         }
         /* DECODE_STREAMING completion (non-cut) handled by SSE [DONE] scanner */
       }
@@ -10271,7 +10295,7 @@ handle_resp_body(llhttp_t *parser, const char *at, size_t length)
  *
  * Reaper interlock (Pitfall #3): set stream_end_ts on the CLIENT pfe
  * so the sockproxy_health.c:451 graceful-[DONE] reaper short-circuits
- * (pd_should_graceful_complete returns 0 when stream_end_ts != 0,
+ * (pd_should_decode_idle_fail returns 0 when stream_end_ts != 0,
  * sockproxy_pd_leak.h:240) — the framed case must NOT also be reaped (no
  * double-completion). The reaper STAYS unchanged; it nets the no-terminator
  * keep-alive-silent case llhttp cannot frame (test_resp_framing.c case 5).
@@ -10561,7 +10585,7 @@ proxy_sse_activate(proxy_fd_ent_t *pfe)
   if (pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
     pfe->pd_phase = PD_PHASE_DECODE_STREAMING;
     pfe->pd_phase_start_ts = time(NULL); /* reset for decode stream timeout */
-    /* arm the backend-idle clock for the graceful-[DONE] safety-net
+    /* arm the backend-idle clock for the decode-idle failure
      * reaper. This read carried the activation bytes, so "now" is the last
      * backend activity. Refreshed per byte in the [DONE] scanner below. */
     pfe->pd_last_decode_ts = time(NULL);
@@ -10576,6 +10600,8 @@ cresp_on_message_begin(llhttp_t *parser)
   proxy_fd_ent_t *pfe = parser->data;
   if (pfe) {
     memset(&pfe->cresp_sse, 0, sizeof(pfe->cresp_sse));
+    memset(&pfe->pd_client_wire, 0, sizeof(pfe->pd_client_wire));
+    memset(&pfe->pd_client_finish, 0, sizeof(pfe->pd_client_finish));
     creq_block_msg_begin(&pfe->cresp_blk);
   }
   return 0;
@@ -10606,6 +10632,9 @@ static int cresp_on_body(llhttp_t *parser, const char *at, size_t len)
     if (pfe->ai_gw_mode && !pfe->usage_consumed)
       proxy_usage_tail_update(pfe, (const uint8_t *)at, len);
     sp_sse_body(&pfe->cresp_sse, at, len);
+    if (pfe->cresp_sse.is_sse && pfe->pd_phase == PD_PHASE_DECODE_STREAMING) {
+      sp_pd_finish_feed(&pfe->pd_client_finish, at, len);
+    }
   }
   return 0;
 }
@@ -10627,6 +10656,11 @@ cresp_on_headers_complete(llhttp_t *parser)
   }
   pfe->metric_response_status = parser->status_code;
   if (pfe->cresp_sse.is_sse) proxy_sse_activate(pfe);
+  if (pfe->pd_phase == PD_PHASE_DECODE_STREAMING ||
+      pfe->pd_phase == PD_PHASE_DECODE_SENDING) {
+    pfe->pd_client_wire.chunked = (parser->flags & F_CHUNKED) != 0;
+    pfe->pd_client_wire.fixed = (parser->flags & F_CONTENT_LENGTH) != 0;
+  }
   hc_resp_headers(pfe);
   sp_hold_answer_began(pfe);
   /* A response with neither Content-Length nor chunked framing runs until the
