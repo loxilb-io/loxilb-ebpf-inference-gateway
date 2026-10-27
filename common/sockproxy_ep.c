@@ -841,7 +841,7 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
     atomic_fetch_add(&tepval->pd_ep_loads[idx].active_conns, 1);
     pfe->kv_sr_load_held = 1;
     pfe->kv_sr_ep_idx = idx;
-    if (!pfe->epv) pfe->epv = tepval;
+    if (!pfe->epv) sp_pool_hold(&pfe->epv, tepval);
 #ifdef HAVE_DP_GPU_ROUTING
     /* CHWBL/WRR_HASH charge their bounded-load unit inside selection and
      * teardown gives it back by ep_num (proxy_release_fd_ctx). A candidate
