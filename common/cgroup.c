@@ -6,36 +6,52 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <assert.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <linux/limits.h>
 #include <linux/sched.h>
 #include <ftw.h>
 #include "cgroup.h"
 
+#ifndef CGROUP2_SUPER_MAGIC
+#define CGROUP2_SUPER_MAGIC 0x63677270
+#endif
+
+/* A plain directory at the mount path is not a cgroup: a restarted container
+ * keeps the directory from its previous boot but not the mount. Only a
+ * cgroup2 filesystem mounted there carries the cgroup.procs the join needs.
+ */
 static bool
-file_exists(const char *path)
+cgroup2_mounted(const char *path)
 {
   struct stat sb;
+  struct statfs fs;
 
-  if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
-    return true;
-  } else {
+  if (stat(path, &sb) != 0 || !S_ISDIR(sb.st_mode)) {
     return false;
   }
+  if (statfs(path, &fs) != 0) {
+    return false;
+  }
+  return fs.f_type == CGROUP2_SUPER_MAGIC;
 }
 
-#define get_cgroup_path(buf, path)                                                        \
-do {                                                                                      \
-  if (file_exists(CGROUP_MOUNT_PATH)) {                                                   \
-    snprintf(buf, sizeof(buf), "%s%s%s", CGROUP_MOUNT_PATH, CGROUP_WORK_DIR, path);       \
-  } else {                                                                                \
-    assert(0);                                                                            \
-  }                                                                                       \
-} while(0)
+/* Builds the absolute cgroup path for a workdir-relative one. Returns 0, or
+ * -1 (logged) when the mount path is not a cgroup2 mount.
+ */
+static int
+get_cgroup_path(char *buf, size_t len, const char *path)
+{
+  if (!cgroup2_mounted(CGROUP_MOUNT_PATH)) {
+    cgroup_log("cgroup path %s is not a cgroup2 mount", CGROUP_MOUNT_PATH);
+    return -1;
+  }
+  snprintf(buf, len, "%s%s%s", CGROUP_MOUNT_PATH, CGROUP_WORK_DIR, path);
+  return 0;
+}
 
 static int nftwfunc(const char *filename, const struct stat *statptr,
 		    int fileflags, struct FTW *pfwt)
@@ -84,7 +100,8 @@ int cgroup_join(const char *path)
 {
 	char cgroup_path[PATH_MAX + 1];
 
-	get_cgroup_path(cgroup_path, path);
+	if (get_cgroup_path(cgroup_path, sizeof(cgroup_path), path))
+		return 1;
 	return cgroup_join_from_top(cgroup_path);
 }
 
@@ -105,7 +122,8 @@ void cgroup_clean(void)
 {
 	char topdir[PATH_MAX + 1];
 
-	get_cgroup_path(topdir, "");
+	if (get_cgroup_path(topdir, sizeof(topdir), ""))
+		return;
 	cgroup_join_from_top(CGROUP_MOUNT_PATH);
 	nftw(topdir, nftwfunc, MAX_FD_LIMIT, FTW_DEPTH | FTW_MOUNT);
 }
@@ -125,7 +143,8 @@ int cgroup_create_get(const char *path)
 	char cgroup_path[PATH_MAX + 1];
 	int fd;
 
-	get_cgroup_path(cgroup_path, path);
+	if (get_cgroup_path(cgroup_path, sizeof(cgroup_path), path))
+		return -1;
 	if (mkdir(cgroup_path, 0777) && errno != EEXIST) {
 		cgroup_log("mkdiring cgroup %s .. %s", path, cgroup_path);
 		return -1;
@@ -159,7 +178,8 @@ uint64_t get_cgroup_id(const char *path)
 	struct file_handle *fhp, *fhp2;
 	unsigned long long ret = 0;
 
-	get_cgroup_path(topdir, path);
+	if (get_cgroup_path(topdir, sizeof(topdir), path))
+		return 0;
 
 	dirfd = AT_FDCWD;
 	flags = 0;
@@ -255,7 +275,8 @@ int cgroup_mkenv(void)
 {
 	char topdir[PATH_MAX - 24];
 
-	get_cgroup_path(topdir, "");
+	if (get_cgroup_path(topdir, sizeof(topdir), ""))
+		return 1;
 
 	if (unshare(CLONE_NEWNS)) {
 		cgroup_log("unshare");
