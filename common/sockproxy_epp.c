@@ -324,6 +324,10 @@ epp_request_end(proxy_fd_ent_t *pfe)
   epp_pending_drop(pfe->epp_sid);
   pfe->epp_sid = 0;
   pfe->epp_decided = 0;
+  /* The pin belongs to the request that just ended. The next request on
+   * this kept connection starts unpinned, so a submit refused before a
+   * stream id exists (FailOpen) still reaches the P/D ladder's rewrite. */
+  pfe->epp_pinned = 0;
   pfe->epp_deadline_ns = 0;
   pfe->epp_hdrs_reported = 0;
   pfe->epp_served[0] = '\0';

@@ -642,6 +642,7 @@ epp_stage(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, epp_pending_t **out)
                       "the endpoint picker refused the request");
     pfe->epp_sid = sid;
     pfe->epp_decided = 0;
+    pfe->epp_pinned = 0;
     pfe->epp_reported = 0;
     pfe->epp_deadline_ns = epp_now_ns() +
         (uint64_t)tepval->epp_timeout_ms * 1000000ULL + EPP_REAP_GRACE_NS;
@@ -854,6 +855,11 @@ epp_pin(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, const struct epp_result *r,
     ep_sel->ep_cfds[0].ep_cfd = fd;
     ep_sel->ep_cfds[0].connect_pending = 0;
     *sel = idx;
+    /* On a pd_disagg rule the EPP's pick is served plainly: the EPP (and the
+     * decode pod's routing sidecar) orchestrate the prefill leg, so the
+     * gateway's own P/D machine must not rewrite this request. Only a
+     * FailOpen ladder fall-through (no pin) reaches the P/D ladder. */
+    pfe->epp_pinned = 1;
     log_info("[EPP] fd=%d sid=%llu -> %s (ep%d, candidate %d of %d)",
              pfe->fd, (unsigned long long)pfe->epp_sid, r->cands[c], idx, c + 1, r->ncands);
     llb_epp_metric_outcome((char *)"ok");

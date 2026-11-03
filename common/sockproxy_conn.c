@@ -1279,6 +1279,7 @@ pfe_alloc_ex(int with_rcvbuf)
   pfe->epp_decided = 0;
   pfe->epp_reported = 0;
   pfe->epp_hdrs_reported = 0;
+  pfe->epp_pinned = 0;
   pfe->epp_served[0] = '\0';
   pfe->epp_resp_head = NULL;
   pfe->epp_resp_head_len = 0;
