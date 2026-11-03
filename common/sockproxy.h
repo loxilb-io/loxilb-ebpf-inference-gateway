@@ -1760,6 +1760,7 @@ struct proxy_fd_ent {
   uint8_t  epp_decided;
   uint8_t  epp_reported;
   uint8_t  epp_hdrs_reported;        // the response headers went to the EPP
+  uint8_t  epp_pinned;               // the EPP named this request's endpoint: no P/D legs here
   char     epp_served[64];           // "ip:port" that took the request (response phase)
   uint8_t *epp_resp_head;            // response head gathered for the EPP (heap, bounded)
   uint16_t epp_resp_head_len;

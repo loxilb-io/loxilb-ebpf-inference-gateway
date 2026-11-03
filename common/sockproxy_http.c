@@ -12872,9 +12872,12 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * set phase to PREFILL_SENDING. */
     if (pfe->epv) {
       proxy_epval_t *pd_tepval = (proxy_epval_t *)pfe->epv;
-      /* A FORWARD route's request selected one endpoint plainly: no P/D. */
+      /* A FORWARD route's request selected one endpoint plainly: no P/D.
+       * Likewise a request whose endpoint the EPP named (epp_pinned): the
+       * picker's side orchestrates prefill/decode, the gateway relays. */
       if (sp_pd_prepare_eligible(1, pd_tepval->pd_disagg_enabled &&
-                                    !sp_route_subset(pfe, pd_tepval),
+                                    !sp_route_subset(pfe, pd_tepval) &&
+                                    !pfe->epp_pinned,
                                  pfe->odir == 0,
                                  pfe->pd_phase == PD_PHASE_NONE,
                                  pfe->is_streamable)) {
