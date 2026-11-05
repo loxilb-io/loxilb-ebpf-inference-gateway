@@ -14703,14 +14703,19 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 !pfe->json_guard_streaming) {
               size_t hold = pfe->json_guard_chunked ? 5 : 1;
               if (!sp_json_tail_holdable(pfe->rcvbuf, pfe->rcv_off, hold)) {
-                log_debug("[JSON_GUARD_SKIP] fd=%d insufficient buffered body for %zu-byte tail", fd, hold);
-                pfe->json_guard_active = 0;
+                log_debug("[JSON_GUARD_WAIT] fd=%d need %zu body bytes before dispatch", fd, hold);
+                /* model_ready dispatch currently guarantees more body bytes
+                 * than hold. Unit tests exercise this defensive wait directly.
+                 * Preserve scanner/parsed_off for the next burst read. */
+                continue;
               } else {
                 pfe->json_guard_streaming = 1;
                 assert(pfe->rcv_off >= hold); /* documented by the runtime body-span guard */
                 memcpy(pfe->json_guard_tail, pfe->rcvbuf + pfe->rcv_off - hold, hold);
                 pfe->json_guard_tail_len = hold;
                 pfe->rcv_off -= hold;
+                log_debug("[JSON_GUARD_STREAM] fd=%d request_id=%s json_guard_streaming=1 hold=%zu",
+                          fd, proxy_request_id(pfe), hold);
               }
             }
 

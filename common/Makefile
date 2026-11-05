@@ -988,6 +988,7 @@ test_stream_fallback: test_stream_fallback.c sockproxy_stream_fallback.h
 .PHONY: test_stream
 test_stream: test_stream_fallback
 	./test_stream_fallback
+	CC="$(CC)" python3 test_json_tail_wait.py
 
 # Tier-1 byte-shaper bucket primitives (header-only, standalone):
 # grant/credit/refill arithmetic + multi-threaded token-conservation check

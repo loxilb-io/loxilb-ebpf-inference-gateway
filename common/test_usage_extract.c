@@ -221,6 +221,10 @@ test_incremental_metadata(void)
     {"{\"model\":\"ok\",\"a\":1\"model\":\"evil\"}", SP_JSON_INVALID, NULL, NULL},
     {"{\"model\":\"a\",}", SP_JSON_INVALID, NULL, NULL},
     {"{\"a\":tru,\"model\":\"a\"}", SP_JSON_INVALID, NULL, NULL},
+    /* Documented lexical-number scope, at every feed boundary. */
+    {"{\"a\":-}", 0, NULL, NULL},
+    {"{\"a\":1x2}", 0, NULL, NULL},
+    {"{\"a\":truex}", SP_JSON_INVALID, NULL, NULL},
     {"{\"model\":\"m1\",\"a\":true}", 0, "m1", NULL},
     {"{\"model\":\"m1\",\"a\":false }", 0, "m1", NULL},
     {"{\"a\":null,\"model\":\"m1\"}", 0, "m1", NULL},
