@@ -804,6 +804,7 @@ proxy_h2_on_header_callback(nghttp2_session *session,
   } else if (HEADER_MATCHES(":authority")) {
     snprintf(stream->authority, sizeof(stream->authority), "%.*s", (int)valuelen, value);
   } else if (HEADER_MATCHES("content-type")) {
+    if (stream->content_type_count < 2) stream->content_type_count++;
     snprintf(stream->content_type, sizeof(stream->content_type), "%.*s", (int)valuelen, value);
   } else if (HEADER_MATCHES("x-conversation-id")) {
     snprintf(stream->conversation_id, sizeof(stream->conversation_id), "%.*s", (int)valuelen, value);
@@ -4723,6 +4724,18 @@ static int sp_mcp_h2_gate(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   return 0;
 }
 
+/* Same media-type boundary as H1: trim OWS, stop before parameters, and
+ * require an exact case-insensitive application/json match. */
+static int
+sp_h2_json_media(const char *value)
+{
+  const char *end = strchr(value, ';');
+  if (!end) end = value + strlen(value);
+  while (value < end && (*value == ' ' || *value == '\t')) value++;
+  while (end > value && (end[-1] == ' ' || end[-1] == '\t')) end--;
+  return end - value == 16 && strncasecmp(value, "application/json", 16) == 0;
+}
+
 int
 proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
 {
@@ -4765,9 +4778,33 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
    * disagree about the declared authentication mode of the same service.
    * This caller owns only the refusal framing and the stream wiring. */
   char body_model[MAX_MODEL_LEN] = {0};
-  if (stream->data_buf && stream->data_len > 0)
-    extract_model_field((const char *)stream->data_buf, stream->data_len,
-                        body_model, sizeof(body_model));
+  sp_json_scan_t body_scan;
+  sp_json_scan_init(&body_scan);
+  int body_model_rc = -1;
+  int json_media = sp_h2_json_media(stream->content_type);
+  if (json_media && stream->data_buf && stream->data_len) {
+    body_model_rc = sp_json_scan_feed(&body_scan, (const char *)stream->data_buf,
+                                      stream->data_len);
+    if (!body_model_rc)
+      body_model_rc = sp_json_scan_finish(&body_scan);
+    if (!body_model_rc)
+      snprintf(body_model, sizeof(body_model), "%s", body_scan.model);
+  }
+  if (stream->content_type_count > 1 || body_model_rc == SP_JSON_DUPLICATE_MODEL ||
+      body_model_rc == SP_JSON_DUPLICATE_USER || body_model_rc == SP_JSON_INVALID_MODEL ||
+      body_model_rc == SP_JSON_INVALID) {
+    if (!stream->request_id[0])
+      ai_gw_mint_request_id(stream->request_id, sizeof(stream->request_id));
+    h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 400, "",
+                          stream->content_type_count > 1 ? "duplicate_content_type" :
+                          body_model_rc == SP_JSON_DUPLICATE_MODEL ? "duplicate_model_field" :
+                          body_model_rc == SP_JSON_DUPLICATE_USER ? "duplicate_user_field" :
+                          body_model_rc == SP_JSON_INVALID_MODEL ? "invalid_model_field" : "invalid_json_body",
+                          stream->content_type_count <= 1 && body_model_rc == SP_JSON_INVALID_MODEL ?
+                          "model must be a JSON string of at most 127 bytes" :
+                          "ambiguous or invalid request metadata");
+    return 0;
+  }
 
   if (ent_pool0) {
     /* The service identity feeds the QoS ladder (rule-scope defaults and
@@ -4800,6 +4837,10 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .jwt_profile = ent_pool0->jwt_auth_profile,
       .body = (const char *)stream->data_buf,
       .body_len = stream->data_len,
+      /* Media gating scopes framing validation, not model authorization.
+       * Non-JSON bodies retain the shared gate's legacy body-model probe. */
+      .parsed_body_model = json_media ? body_model : NULL,
+      .model_parse_result = body_model_rc,
       .prefix_model = body_model,
       .hdr_model = stream->x_model_header,
       .class_on = ai_gw_class_on(),
@@ -5100,17 +5141,14 @@ h2_have_tepval:
       stream->prefix_key == NULL) {  // Only extract once per stream
     
     // Check if content-type is application/json (case-insensitive)
-    int is_json = 0;
-    if (stream->content_type[0] != '\0') {
-      is_json = (strncasecmp(stream->content_type, "application/json", 16) == 0);
-    }
+    int is_json = json_media;
     
     if (is_json) {
       // Allocate prefix key structure
       llm_prefix_key_t *prefix_key = calloc(1, sizeof(llm_prefix_key_t));
       if (prefix_key) {
         // Extract prefix fields from JSON body
-        if (extract_llm_prefix((char *)stream->data_buf, stream->data_len, prefix_key) == 0) {
+        if (extract_llm_prefix_scanned((char *)stream->data_buf, stream->data_len, &body_scan, prefix_key) == 0) {
           // Compute hash for CHWBL routing
           prefix_key->hash = compute_prefix_hash(prefix_key);
           stream->prefix_key = prefix_key;  // Store for routing

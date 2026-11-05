@@ -381,6 +381,13 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                                       int auth_src, char *net_identity,
                                       ai_gw_decision_t *result);
 
+/* Cancel an unused claim after a late framing refusal. No token charge or
+ * data.ai.settle is emitted; the caller records the single sec.ai.deny and
+ * clears its saved amount/epoch before teardown. */
+extern void llb_ai_token_quota_release(char *tenant_id, char *model_name,
+                                       char *user_id, char *key_id, char *svc_ident,
+                                       int reserved_toks, int64_t res_epoch);
+
 /*
  * llb_ai_token_quota_reserve – pre-admission token reservation.
  *

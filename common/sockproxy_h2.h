@@ -110,6 +110,7 @@ typedef struct proxy_h2_stream {
   char method[16];                   // GET, POST, etc.
   char path[512];                    // Request path
   char authority[256];               // :authority pseudo-header (Host)
+  uint8_t content_type_count;
   char content_type[128];            // Content-Type header
   char x_api_key_raw[256];           // Per-stream gateway credential (never forwarded upstream)
   char x_model_header[128];          // X-Model header (per-stream; H1 keeps it on the pfe,

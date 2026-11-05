@@ -42,7 +42,17 @@ log_log(int level, const char *file, int line, const char *fmt, ...)
   (void)level; (void)file; (void)line; (void)fmt;
 }
 
+
+static int fail_prefix_allocation;
+static void *
+prefix_test_malloc(size_t len)
+{
+  return fail_prefix_allocation ? NULL : malloc(len);
+}
+
+#define malloc prefix_test_malloc
 #include "sockproxy_json.c"
+#undef malloc
 
 static int g_fails = 0;
 static int g_cases = 0;
@@ -126,9 +136,157 @@ expect_inject(const char *name, const char *body, int want_rc,
   printf("ok   %-38s rc=%d len=%zu\n", name, rc, nl);
 }
 
+static void
+test_request_token_budget(void)
+{
+  static const char head[] = "{\"model\":\"Qwen/Qwen3-32B-FP8\",\"tools\":[{\"model\":\"nested\",\"enum\":[";
+  static const char tail[] = "]}],\"messages\":[{\"tool_calls\":[{\"id\":\"x\"}],\"role\":\"user\",\"content\":\"test prompt\"}]}";
+  static const int sizes[] = {2047, 2048, 2049, 3586, 8192, 8193};
+  /* The fixed skeleton contributes 22 tokens. Each enum entry adds one. */
+  for (size_t test = 0; test < sizeof(sizes) / sizeof(sizes[0]); test++) {
+    int elements = sizes[test] - 22;
+    size_t capacity = sizeof(head) + (size_t)elements * 2 + sizeof(tail);
+    char *body = malloc(capacity);
+    if (!body)
+      exit(1);
+    char *end = body;
+    memcpy(end, head, sizeof(head) - 1);
+    end += sizeof(head) - 1;
+    for (int i = 0; i < elements; i++) {
+      if (i)
+        *end++ = ',';
+      *end++ = '0';
+    }
+    memcpy(end, tail, sizeof(tail));
+    size_t length = strlen(body);
+
+    char model[MAX_MODEL_LEN] = {0};
+    llm_prefix_key_t prefix;
+    int model_rc = extract_model_field(body, length, model, sizeof(model));
+    int prefix_rc = extract_llm_prefix(body, length, &prefix);
+    int ok;
+    if (sizes[test] <= 8192) {
+      ok = model_rc == 0 && prefix_rc == 0 && prefix.valid &&
+           strcmp(model, "Qwen/Qwen3-32B-FP8") == 0 &&
+           strcmp(prefix.model, model) == 0 &&
+           strcmp(prefix.prefix, "test prompt") == 0;
+    } else {
+      ok = model_rc == 0 && prefix_rc == LLM_PREFIX_SKIPPED &&
+           !prefix.valid && !strcmp(prefix.model, model);
+    }
+    printf("%s full-request-token-budget-%d\n", ok ? "ok  " : "FAIL", sizes[test]);
+    g_cases++;
+    g_fails += !ok;
+
+    /* Removing the final root delimiter must fail even after a heap retry. */
+    if (sizes[test] == 3586) {
+      ok = extract_model_field(body, length - 1, model, sizeof(model)) < 0 &&
+           extract_llm_prefix(body, length - 1, &prefix) < 0 && !prefix.valid;
+      printf("%s truncated-expanded-request\n", ok ? "ok  " : "FAIL");
+      g_cases++;
+      g_fails += !ok;
+    }
+    if (sizes[test] == 3586) {
+      fail_prefix_allocation = 1;
+      ok = extract_model_field(body, length, model, sizeof(model)) == 0 &&
+           extract_llm_prefix(body, length, &prefix) == LLM_PREFIX_SKIPPED &&
+           !strcmp(prefix.model, model) && !prefix.valid;
+      fail_prefix_allocation = 0;
+      printf("%s prefix-allocation-failure-keeps-model\n", ok ? "ok  " : "FAIL");
+      g_cases++; g_fails += !ok;
+    }
+    free(body);
+  }
+}
+
+
+static void
+test_incremental_metadata(void)
+{
+  char model127[128], model128[129], body127[160], body128[161];
+  memset(model127, 'm', 127); model127[127] = 0;
+  memset(model128, 'm', 128); model128[128] = 0;
+  snprintf(body127, sizeof(body127), "{\"model\":\"%s\"}", model127);
+  snprintf(body128, sizeof(body128), "{\"model\":\"%s\"}", model128);
+  const struct {
+    const char *body;
+    int rc;
+    const char *model, *user;
+  } cases[] = {
+    {"{\"model\":\"m1\",\"user\":\"u\\u0031\",\"x\":[{\"model\":\"nested\"}]}", 0, "m1", "u1"},
+    {"{\"model\":\"m1\",\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"mod\\u0065l\":\"m1\",\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"model\":null,\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"model\":{\"nested\":[]},\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"model\":\"ok\",\"a\":1\"model\":\"evil\"}", SP_JSON_INVALID, NULL, NULL},
+    {"{\"model\":\"a\",}", SP_JSON_INVALID, NULL, NULL},
+    {"{\"a\":tru,\"model\":\"a\"}", SP_JSON_INVALID, NULL, NULL},
+    /* Documented lexical-number scope, at every feed boundary. */
+    {"{\"a\":-}", 0, NULL, NULL},
+    {"{\"a\":1x2}", 0, NULL, NULL},
+    {"{\"a\":truex}", SP_JSON_INVALID, NULL, NULL},
+    {"{\"model\":\"m1\",\"a\":true}", 0, "m1", NULL},
+    {"{\"model\":\"m1\",\"a\":false }", 0, "m1", NULL},
+    {"{\"a\":null,\"model\":\"m1\"}", 0, "m1", NULL},
+    {"{\"a\":-1.5e3,\"model\":\"m1\"}", 0, "m1", NULL},
+    {"{\"user\":\"u1\",\"user\":\"u2\"}", SP_JSON_DUPLICATE_USER, NULL, NULL},
+    {"{\"us\\u0065r\":\"u1\",\"user\":\"u2\"}", SP_JSON_DUPLICATE_USER, NULL, NULL},
+    {"{\"user\":null,\"user\":\"u2\"}", SP_JSON_DUPLICATE_USER, NULL, NULL},
+    {"{\"model\":null}", SP_JSON_INVALID_MODEL, NULL, NULL},
+    {"{\"model\":17}", SP_JSON_INVALID_MODEL, NULL, NULL},
+    {"{\"model\":{\"x\":[]}}", SP_JSON_INVALID_MODEL, NULL, NULL},
+    {body127, 0, model127, NULL},
+    {body128, SP_JSON_INVALID_MODEL, NULL, NULL},
+  };
+  for (size_t test = 0; test < sizeof(cases) / sizeof(cases[0]); test++) {
+    const char *body = cases[test].body;
+    size_t len = strlen(body);
+    int ok = 1;
+    for (size_t split = 0; split <= len + 1; split++) {
+      sp_json_scan_t scan;
+      sp_json_scan_init(&scan);
+      int rc = 0;
+      if (split <= len) {
+        rc = sp_json_scan_feed(&scan, body, split);
+        if (!rc) rc = sp_json_scan_feed(&scan, body + split, len - split);
+      } else {
+        for (size_t i = 0; i < len && !rc; i++)
+          rc = sp_json_scan_feed(&scan, body + i, 1);
+      }
+      if (!rc) rc = sp_json_scan_finish(&scan);
+      ok &= rc == cases[test].rc;
+      if (cases[test].model) ok &= !strcmp(scan.model, cases[test].model);
+      if (cases[test].user) ok &= !strcmp(scan.user, cases[test].user);
+    }
+    printf("%s incremental-metadata-%zu\n", ok ? "ok  " : "FAIL", test);
+    g_cases++; g_fails += !ok;
+  }
+
+  size_t depth = 12000;
+  char *body = malloc(depth * 2 + 128), *at = body;
+  at += sprintf(at, "{\"model\":\"deep\",\"user\":\"session\",\"nested\":");
+  memset(at, '[', depth); at += depth;
+  *at++ = '0';
+  memset(at, ']', depth); at += depth;
+  *at++ = '}'; *at = 0;
+  char model[128], user[128];
+  llm_prefix_key_t prefix;
+  int ok = extract_model_field(body, strlen(body), model, sizeof(model)) == 0 &&
+           extract_user_id(body, strlen(body), user, sizeof(user)) == 0 &&
+           !strcmp(model, "deep") && !strcmp(user, "session") &&
+           extract_llm_prefix(body, strlen(body), &prefix) == LLM_PREFIX_SKIPPED &&
+           !strcmp(prefix.model, "deep") && !prefix.valid;
+  printf("%s deep-metadata-without-token-tree\n", ok ? "ok  " : "FAIL");
+  g_cases++; g_fails += !ok;
+  free(body);
+}
+
 int
 main(void)
 {
+  test_request_token_budget();
+  test_incremental_metadata();
+  printf("scanner storage: %zu bytes per proxy connection\n", sizeof(sp_json_scan_t));
   /* Oversize JSON routing needs a complete direct top-level model before the
    * rest of the document exists. Every truncated key/value remains pending;
    * nested or string-embedded spoof keys never win. */

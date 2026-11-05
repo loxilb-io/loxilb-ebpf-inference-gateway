@@ -47,6 +47,14 @@ sp_http_header_end(const uint8_t *buf, size_t len)
   return NULL;
 }
 
+/* A suffix hold must consume body bytes, never the retained header block. */
+static inline int
+sp_json_tail_holdable(const uint8_t *buf, size_t len, size_t hold)
+{
+  const uint8_t *end = sp_http_header_end(buf, len);
+  return end && len - (size_t)(end + 4 - buf) >= hold;
+}
+
 /* Complete a small local HTTP response without assuming one nonblocking write
  * consumes it. Positive writes advance monotonically; retryable stalls are
  * bounded independently so a peer that never becomes writable cannot pin the

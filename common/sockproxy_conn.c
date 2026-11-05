@@ -321,6 +321,7 @@ proxy_peer_map_activate_req(proxy_fd_ent_t *client_pfe)
   }
 
   if (client_pfe->rcv_off != 0 || client_pfe->stream_body_remaining != 0 ||
+      client_pfe->json_guard_streaming ||
       client_pfe->pd_phase != PD_PHASE_NONE ||
       be->cache_total_size != 0 || be->cache_head != NULL) {
     return;
