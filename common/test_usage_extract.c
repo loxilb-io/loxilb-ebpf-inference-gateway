@@ -126,9 +126,63 @@ expect_inject(const char *name, const char *body, int want_rc,
   printf("ok   %-38s rc=%d len=%zu\n", name, rc, nl);
 }
 
+static void
+test_request_token_budget(void)
+{
+  static const char head[] = "{\"model\":\"Qwen/Qwen3-32B-FP8\",\"tools\":[{\"model\":\"nested\",\"enum\":[";
+  static const char tail[] = "]}],\"messages\":[{\"tool_calls\":[{\"id\":\"x\"}],\"role\":\"user\",\"content\":\"test prompt\"}]}";
+  static const int sizes[] = {2047, 2048, 2049, 3586, 8192, 8193};
+  /* The fixed skeleton contributes 22 tokens. Each enum entry adds one. */
+  for (size_t test = 0; test < sizeof(sizes) / sizeof(sizes[0]); test++) {
+    int elements = sizes[test] - 22;
+    size_t capacity = sizeof(head) + (size_t)elements * 2 + sizeof(tail);
+    char *body = malloc(capacity);
+    if (!body)
+      exit(1);
+    char *end = body;
+    memcpy(end, head, sizeof(head) - 1);
+    end += sizeof(head) - 1;
+    for (int i = 0; i < elements; i++) {
+      if (i)
+        *end++ = ',';
+      *end++ = '0';
+    }
+    memcpy(end, tail, sizeof(tail));
+    size_t length = strlen(body);
+
+    char model[MAX_MODEL_LEN] = {0};
+    llm_prefix_key_t prefix;
+    int model_rc = extract_model_field(body, length, model, sizeof(model));
+    int prefix_rc = extract_llm_prefix(body, length, &prefix);
+    int ok;
+    if (sizes[test] <= 8192) {
+      ok = model_rc == 0 && prefix_rc == 0 && prefix.valid &&
+           strcmp(model, "Qwen/Qwen3-32B-FP8") == 0 &&
+           strcmp(prefix.model, model) == 0 &&
+           strcmp(prefix.prefix, "test prompt") == 0;
+    } else {
+      ok = model_rc < 0 && prefix_rc < 0 && !prefix.valid && !prefix.model[0];
+    }
+    printf("%s full-request-token-budget-%d\n", ok ? "ok  " : "FAIL", sizes[test]);
+    g_cases++;
+    g_fails += !ok;
+
+    /* Removing the final root delimiter must fail even after a heap retry. */
+    if (sizes[test] == 3586) {
+      ok = extract_model_field(body, length - 1, model, sizeof(model)) < 0 &&
+           extract_llm_prefix(body, length - 1, &prefix) < 0 && !prefix.valid;
+      printf("%s truncated-expanded-request\n", ok ? "ok  " : "FAIL");
+      g_cases++;
+      g_fails += !ok;
+    }
+    free(body);
+  }
+}
+
 int
 main(void)
 {
+  test_request_token_budget();
   /* Oversize JSON routing needs a complete direct top-level model before the
    * rest of the document exists. Every truncated key/value remains pending;
    * nested or string-embedded spoof keys never win. */

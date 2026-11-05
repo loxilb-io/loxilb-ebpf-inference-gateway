@@ -464,35 +464,65 @@ compute_rag_doc_ids_hash(const char *json_body, jsmntok_t *token,
   return 0;
 }
 
-/*
- * jsmn_subtree_count - count all tokens in the subtree rooted at tokens[idx].
- *
- * In jsmn, tokens[idx].size is the number of DIRECT children (key-value pairs
- * for OBJECT, elements for ARRAY), NOT the total number of tokens in the
- * subtree.  This helper walks the subtree recursively to compute the exact
- * count, which is needed to correctly skip over a nested value when iterating
- * top-level keys of an outer object.
- */
+/* Tokens are ordered by source offset. A container's end bounds its
+ * descendants even for deeply nested, untrusted requests. */
 static int
 jsmn_subtree_count(jsmntok_t *tokens, int idx, int total)
 {
-  int count = 1; /* the token itself */
-  int j;
-
   if (idx >= total)
     return 0;
-
-  if (tokens[idx].type == JSMN_ARRAY) {
-    for (j = 0; j < tokens[idx].size; j++)
-      count += jsmn_subtree_count(tokens, idx + count, total);
-  } else if (tokens[idx].type == JSMN_OBJECT) {
-    for (j = 0; j < tokens[idx].size; j++) {
-      count += jsmn_subtree_count(tokens, idx + count, total); /* key   */
-      count += jsmn_subtree_count(tokens, idx + count, total); /* value */
-    }
+  int next = idx + 1;
+  if (tokens[idx].type == JSMN_ARRAY || tokens[idx].type == JSMN_OBJECT) {
+    while (next < total && tokens[next].start < tokens[idx].end)
+      next++;
   }
-  /* STRING and PRIMITIVE: no sub-tokens, count stays 1 */
-  return count;
+  return next - idx;
+}
+
+enum {
+  LLM_JSON_STACK_TOKENS = 2048,
+  LLM_JSON_MAX_TOKENS = 8192,
+};
+
+/* Preserve the common path. Only token exhaustion retries; the counting
+ * pass sizes one bounded heap allocation, and a real parse still validates
+ * the request before either caller can use the tokens. On success the
+ * caller owns any non-stack allocation. */
+static int
+parse_llm_json(const char *body, size_t len, jsmntok_t *stack, jsmntok_t **tokens)
+{
+  jsmn_parser parser;
+
+  *tokens = stack;
+  jsmn_init(&parser);
+  int parsed = jsmn_parse(&parser, body, len, stack, LLM_JSON_STACK_TOKENS);
+  if (parsed != JSMN_ERROR_NOMEM)
+    return parsed;
+
+  jsmn_init(&parser);
+  int needed = jsmn_parse(&parser, body, len, NULL, 0);
+  if (needed < 0)
+    return needed;
+  if (needed > LLM_JSON_MAX_TOKENS) {
+    log_debug("[JSON_TOKEN_LIMIT] request needs %d tokens (limit %d)",
+              needed, LLM_JSON_MAX_TOKENS);
+    return JSMN_ERROR_NOMEM;
+  }
+  if (needed <= LLM_JSON_STACK_TOKENS)
+    return JSMN_ERROR_INVAL;
+
+  jsmntok_t *expanded = malloc((size_t)needed * sizeof(*expanded));
+  if (!expanded) {
+    log_warn("[JSON_TOKEN_ALLOC] could not allocate %d request tokens", needed);
+    return JSMN_ERROR_NOMEM;
+  }
+  jsmn_init(&parser);
+  parsed = jsmn_parse(&parser, body, len, expanded, (unsigned int)needed);
+  if (parsed < 0)
+    free(expanded);
+  else
+    *tokens = expanded;
+  return parsed;
 }
 
 // P/D Session stickiness: Extract "user" field from OpenAI-compatible JSON body.
@@ -529,38 +559,29 @@ extract_user_id(const char *body, size_t len, char *out, size_t cap)
   return -1;
 }
 
-// AI Gateway allowed_models: extract the top-level "model" field from an
-// OpenAI-compatible JSON body. Same top-level-only iteration as
-// extract_user_id so nested "model" strings (e.g. inside messages content)
-// are never matched. The token pool must fit the WHOLE body — jsmn fails
-// outright rather than partially when it runs out — so it is sized like
-// extract_llm_prefix's, not extract_user_id's 64.
+// AI Gateway allowed_models: inspect only direct keys on the root object.
 int
 extract_model_field(const char *body, size_t len, char *out, size_t cap)
 {
-  jsmn_parser p;
-  jsmntok_t tokens[2048];
-  int r, i, pair;
+  jsmntok_t stack[LLM_JSON_STACK_TOKENS], *tokens;
+  int result = -1;
 
-  if (!body || len == 0 || !out || cap == 0) return -1;
+  if (!body || len == 0 || !out || cap == 0)
+    return -1;
 
-  jsmn_init(&p);
-  r = jsmn_parse(&p, body, len, tokens, 2048);
-  if (r < 2 || tokens[0].type != JSMN_OBJECT) return -1;
-
-  i = 1;
-  for (pair = 0; pair < tokens[0].size && i + 1 < r; pair++) {
-    if (tokens[i].type == JSMN_STRING &&
-        jsoneq(body, &tokens[i], "model") == 0 &&
-        tokens[i + 1].type == JSMN_STRING) {
-      json_extract_string_decoded(body, &tokens[i + 1], out, cap);
-      return (out[0] != '\0') ? 0 : -1;
+  int parsed = parse_llm_json(body, len, stack, &tokens);
+  if (parsed >= 2 && tokens[0].type == JSMN_OBJECT) {
+    for (int i = 1; i + 1 < parsed; i += 1 + jsmn_subtree_count(tokens, i + 1, parsed)) {
+      if (jsoneq(body, &tokens[i], "model") == 0 && tokens[i + 1].type == JSMN_STRING) {
+        json_extract_string_decoded(body, &tokens[i + 1], out, cap);
+        result = out[0] ? 0 : -1;
+        break;
+      }
     }
-    /* Skip the key token (always 1) then skip the entire value subtree. */
-    i++;
-    i += jsmn_subtree_count(tokens, i, r);
   }
-  return -1;
+  if (tokens != stack)
+    free(tokens);
+  return result;
 }
 
 // AI Gateway token accounting: pull prompt_tokens / completion_tokens out of
@@ -1204,39 +1225,15 @@ llm_user_prefix_fallback_len(void)
 }
 #endif
 
-// Main extraction function for LLM prefix (PHASE 1 ENHANCED)
-int extract_llm_prefix(const char *json_body, size_t len,
-                       llm_prefix_key_t *prefix_key)
+static int
+extract_llm_prefix_tokens(const char *json_body, jsmntok_t *tokens, int r,
+                          llm_prefix_key_t *prefix_key)
 {
-  jsmn_parser parser;
-  jsmntok_t tokens[2048];  // Increased from 512 to handle large system prompts
-  int r, i, pair;
+  int i, pair;
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
   char first_user[MAX_PREFIX_LEN] = {0};
   int has_first_user = 0;
 #endif
-
-  memset(prefix_key, 0, sizeof(*prefix_key));
-  prefix_key->level = 1;  // Default: L1 routing
-  prefix_key->flags = 0;  // No optional fields initially
-  
-  
-  jsmn_init(&parser);
-  r = jsmn_parse(&parser, json_body, len, tokens, 2048);
-  
-  if (r < 0) {
-    // CRITICAL FIX: Don't fail the connection on JSON parse errors
-    // Just log and continue without prefix extraction (round-robin fallback)
-    log_debug("[JSON_PARSE_ERROR] JSMN parse failed with error %d, len=%zu, fallback to round-robin", r, len);
-    log_debug("[JSON_PREVIEW] First 100 bytes: %.100s", json_body);
-    return -1;  // Non-fatal: connection continues without prefix routing
-  }
-  
-  if (r < 1 || tokens[0].type != JSMN_OBJECT) {
-    log_debug("[JSON_INVALID] Parse succeeded but not a JSON object (r=%d, type=%d)", 
-              r, r > 0 ? tokens[0].type : -1);
-    return -1;  // Non-fatal
-  }
 
   /* cache_salt is a top-level request contract. Scan direct object pairs
    * separately so a nested field cannot satisfy the requirement, and reject
@@ -1264,20 +1261,15 @@ int extract_llm_prefix(const char *json_body, size_t len,
   }
   
   // FIRST PASS: Extract model and lora_adapter (top-level fields)
-  for (i = 1; i < r; ) {
-    if (tokens[i].type != JSMN_STRING) {
-      i++;
-      continue;
-    }
+  for (i = 1; i + 1 < r; i += 1 + jsmn_subtree_count(tokens, i + 1, r)) {
     
-    if (jsoneq(json_body, &tokens[i], "model") == 0) {
-      json_extract_string(json_body, &tokens[i+1], 
+    if (jsoneq(json_body, &tokens[i], "model") == 0 &&
+        tokens[i + 1].type == JSMN_STRING) {
+      json_extract_string_decoded(json_body, &tokens[i + 1],
                          prefix_key->model, sizeof(prefix_key->model));
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("P0.2 DEBUG: Extracted model='%s'", prefix_key->model);
 #endif
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "lora_adapter") == 0) {
       json_extract_string(json_body, &tokens[i+1], 
@@ -1288,8 +1280,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[EXTRACT_L1] Found lora_adapter: '%s'", prefix_key->lora_adapter);
 #endif
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "images") == 0) {
       // Compute hash of image content/URLs
@@ -1301,8 +1291,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
         log_debug("[EXTRACT_L1] Computed image_hash: '%s'", prefix_key->image_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "audio") == 0) {
       // Compute hash of audio content
@@ -1314,8 +1302,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
         log_debug("[EXTRACT_L1] Computed audio_hash: '%s'", prefix_key->audio_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "tools") == 0) {
       // Compute hash of tool definitions
@@ -1327,8 +1313,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
         log_debug("[EXTRACT_L1] Computed tool_schemas_hash: '%s'", prefix_key->tool_schemas_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "session_context") == 0) {
       // PHASE 2: Extract session context summary
@@ -1343,8 +1327,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
                   prefix_key->session_context_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "rag_context") == 0) {
       // PHASE 3: RAG context with template and document IDs (L3 routing)
@@ -1353,7 +1335,8 @@ int extract_llm_prefix(const char *json_body, size_t len,
         // Search for rag_template and document_ids within rag_context object
         int rag_items = rag_obj->size;
         int j, rag_start = i + 2;
-        for (j = 0; j < rag_items * 2; j += 2) {
+        for (j = 0; rag_items-- > 0 && rag_start + j + 1 < r;
+             j += 1 + jsmn_subtree_count(tokens, rag_start + j + 1, r)) {
           jsmntok_t *rag_key = &tokens[rag_start + j];
           jsmntok_t *rag_val = &tokens[rag_start + j + 1];
           
@@ -1388,25 +1371,16 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
         }
       }
-      i += 2;
-      continue;
-    }
-    else {
-      i++;
     }
   }
   
   // SECOND PASS: Extract prompt field OR messages array
-  for (i = 1; i < r; ) {
-    if (tokens[i].type != JSMN_STRING) {
-      i++;
-      continue;
-    }
+  for (i = 1; i + 1 < r; i += 1 + jsmn_subtree_count(tokens, i + 1, r)) {
     
     // Check for direct "prompt" field (used in /v1/completions endpoint)
     if (jsoneq(json_body, &tokens[i], "prompt") == 0) {
-      i++;  // Move to prompt value
-      if (tokens[i].type == JSMN_STRING) {
+      jsmntok_t *prompt = &tokens[i + 1];
+      if (prompt->type == JSMN_STRING) {
         // Extract prompt text for prefix hashing.
         // DECODE the JSON escapes while copying (see
         // sockproxy_json_unescape.h). The raw strncpy that used to live here
@@ -1418,8 +1392,8 @@ int extract_llm_prefix(const char *json_body, size_t len,
         // byte-exact prefix of the full decoded prompt (what block-hash
         // prefix routing needs). Pass the FULL raw span — the copy bounds
         // itself by the destination capacity.
-        kv_json_unescape_copy(json_body + tokens[i].start,
-                              (size_t)(tokens[i].end - tokens[i].start),
+        kv_json_unescape_copy(json_body + prompt->start,
+                              (size_t)(prompt->end - prompt->start),
                               prefix_key->prefix, sizeof(prefix_key->prefix));
         prefix_key->valid = 1;
         
@@ -1428,29 +1402,25 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
         return 0;  // Success - found prompt
       }
-      i++;
       continue;
     }
-    
+
     if (jsoneq(json_body, &tokens[i], "messages") == 0) {
       // Found messages array - extract first user message
-      i++;  // Move to messages array token
-      if (tokens[i].type != JSMN_ARRAY) {
+      if (tokens[i + 1].type != JSMN_ARRAY)
         continue;
-      }
-      
-      int array_size = tokens[i].size;
-      int j = i + 1;  // First element in array
+
+      int array_size = tokens[i + 1].size;
+      int j = i + 2;  // First element in array
       
       // Iterate through messages array
-      for (int msg_idx = 0; msg_idx < array_size; msg_idx++) {
-        if (tokens[j].type != JSMN_OBJECT) {
-          j++;
+      for (int msg_idx = 0; msg_idx < array_size && j < r;
+           msg_idx++, j += jsmn_subtree_count(tokens, j, r)) {
+        if (tokens[j].type != JSMN_OBJECT)
           continue;
-        }
-        
+
         int obj_size = tokens[j].size;
-        j++;  // Move into object
+        int field = j + 1;
         
         char role[32] = {0};
         char content[MAX_PREFIX_LEN] = {0};
@@ -1458,23 +1428,17 @@ int extract_llm_prefix(const char *json_body, size_t len,
         int has_content = 0;
         
         // Parse message object fields
-        for (int k = 0; k < obj_size; k++) {
-          if (jsoneq(json_body, &tokens[j], "role") == 0) {
-            json_extract_string(json_body, &tokens[j+1], role, sizeof(role));
+        for (int k = 0; k < obj_size && field + 1 < r; k++) {
+          if (jsoneq(json_body, &tokens[field], "role") == 0) {
+            json_extract_string(json_body, &tokens[field + 1], role, sizeof(role));
             has_role = 1;
-            j += 2;
-          }
-          else if (jsoneq(json_body, &tokens[j], "content") == 0) {
-            json_extract_string(json_body, &tokens[j+1], content, sizeof(content));
+          } else if (jsoneq(json_body, &tokens[field], "content") == 0) {
+            json_extract_string(json_body, &tokens[field + 1], content, sizeof(content));
             has_content = 1;
-            j += 2;
           }
-          else {
-            // Skip unknown field
-            j += 2;
-          }
+          field += 1 + jsmn_subtree_count(tokens, field + 1, r);
         }
-        
+
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
         // Check if this is a system message (what vLLM actually caches!)
         if (has_role && has_content && strcmp(role, "system") == 0) {
@@ -1512,17 +1476,9 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
       }
       
-      // Finished parsing messages array
-      i = j;  // Continue from where messages parsing ended
-      continue;
-    }
-    else {
-      // Skip unknown top-level field (key + value)
-      i += 2;
-      continue;
     }
   }
-  
+
   if (!prefix_key->valid) {
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
     int fb_len = llm_user_prefix_fallback_len();
@@ -1547,6 +1503,27 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
   
   return 0;
+}
+
+int
+extract_llm_prefix(const char *json_body, size_t len, llm_prefix_key_t *prefix_key)
+{
+  jsmntok_t stack[LLM_JSON_STACK_TOKENS], *tokens;
+  int result = -1;
+
+  memset(prefix_key, 0, sizeof(*prefix_key));
+  prefix_key->level = 1;
+
+  int parsed = parse_llm_json(json_body, len, stack, &tokens);
+  if (parsed < 0) {
+    log_debug("[JSON_PARSE_ERROR] JSMN parse failed with error %d, len=%zu",
+              parsed, len);
+  } else if (parsed > 0 && tokens[0].type == JSMN_OBJECT) {
+    result = extract_llm_prefix_tokens(json_body, tokens, parsed, prefix_key);
+  }
+  if (tokens != stack)
+    free(tokens);
+  return result;
 }
 
 // P1.1: Compute hash for prefix-based routing using xxHash (PHASE 1 ENHANCED)
