@@ -1189,9 +1189,9 @@ ai_strip_upstream_api_key(proxy_fd_ent_t *pfe, uint8_t *buf, size_t buflen,
   if (at_gate &&
       ((pfe->auth_jwt_capable && pfe->auth_fwd_identity) ||
        (netid_fwd_svc && pfe->auth_netid_fwd)) && pfe->tenant_id[0]) {
-    size_t scan = (cur < 2048) ? cur : 2048;
-    if (!memmem(buf, scan, "Transfer-Encoding: chunked", 26) &&
-        !memmem(buf, scan, "transfer-encoding: chunked", 26)) {
+    /* Headers-complete saves llhttp's framing state for every media type.
+     * Live parser flags can already be reset after a buffered message ends. */
+    if (!pfe->json_guard_chunked) {
       (void)l7h1_splice_header(buf, &cur, bufsize, "X-Auth-Tenant",
                                pfe->tenant_id);
       if (pfe->auth_user_id[0])

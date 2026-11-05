@@ -363,6 +363,7 @@ test_ai_security: test_ai_security.c sockproxy_ai_security.c sockproxy_ai_securi
 .PHONY: test_aisec
 test_aisec: test_ai_security
 	./test_ai_security
+	CC="$(CC)" python3 test_h1_chunked_identity.py
 
 # Identity-forwarding ABI: the admission gate must transport user/key/service
 # into every ladder call, and keyless traffic must probe the per-VIP shared
