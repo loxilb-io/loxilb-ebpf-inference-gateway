@@ -14405,7 +14405,18 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 // Try to extract LLM prefix from JSON (OpenAI-specific, optional)
                 log_debug("[PREFIX_EXTRACT_ATTEMPT] fd=%d: Trying to extract prefix from JSON body_len=%zu",
                           fd, body_len);
-                if (extract_llm_prefix(body_start, body_len, &pfe->prefix_key) == 0) {
+                int prefix_rc = extract_llm_prefix(body_start, body_len, &pfe->prefix_key);
+                if (prefix_rc == LLM_JSON_TOKEN_LIMIT_EXCEEDED) {
+                  /* The complete request already passed the policy gate.
+                   * Refuse before selecting or reusing any backend leg.
+                   * The refusal sender closes the response record, so
+                   * teardown cannot also emit a successful completion. */
+                  sp_h1_send_framing_deny(pfe, 413, LLM_JSON_TOKEN_LIMIT_CODE,
+                                          LLM_JSON_TOKEN_LIMIT_MESSAGE);
+                  pfe->lb_err_body_sent = 1;
+                  return -1;
+                }
+                if (prefix_rc == 0) {
 
                   // P1.1: Compute hash for CHWBL routing using xxHash
                   uint64_t prefix_hash = compute_prefix_hash(&pfe->prefix_key);

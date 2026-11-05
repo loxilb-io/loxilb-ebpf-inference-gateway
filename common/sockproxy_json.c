@@ -506,7 +506,7 @@ parse_llm_json(const char *body, size_t len, jsmntok_t *stack, jsmntok_t **token
   if (needed > LLM_JSON_MAX_TOKENS) {
     log_debug("[JSON_TOKEN_LIMIT] request needs %d tokens (limit %d)",
               needed, LLM_JSON_MAX_TOKENS);
-    return JSMN_ERROR_NOMEM;
+    return LLM_JSON_TOKEN_LIMIT_EXCEEDED;
   }
   if (needed <= LLM_JSON_STACK_TOKENS)
     return JSMN_ERROR_INVAL;
@@ -570,6 +570,8 @@ extract_model_field(const char *body, size_t len, char *out, size_t cap)
     return -1;
 
   int parsed = parse_llm_json(body, len, stack, &tokens);
+  if (parsed == LLM_JSON_TOKEN_LIMIT_EXCEEDED)
+    return parsed;
   if (parsed >= 2 && tokens[0].type == JSMN_OBJECT) {
     for (int i = 1; i + 1 < parsed; i += 1 + jsmn_subtree_count(tokens, i + 1, parsed)) {
       if (jsoneq(body, &tokens[i], "model") == 0 && tokens[i + 1].type == JSMN_STRING) {
@@ -1516,6 +1518,8 @@ extract_llm_prefix(const char *json_body, size_t len, llm_prefix_key_t *prefix_k
 
   int parsed = parse_llm_json(json_body, len, stack, &tokens);
   if (parsed < 0) {
+    if (parsed == LLM_JSON_TOKEN_LIMIT_EXCEEDED)
+      result = parsed;
     log_debug("[JSON_PARSE_ERROR] JSMN parse failed with error %d, len=%zu",
               parsed, len);
   } else if (parsed > 0 && tokens[0].type == JSMN_OBJECT) {

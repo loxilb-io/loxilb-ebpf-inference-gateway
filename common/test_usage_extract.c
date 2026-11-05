@@ -161,7 +161,9 @@ test_request_token_budget(void)
            strcmp(prefix.model, model) == 0 &&
            strcmp(prefix.prefix, "test prompt") == 0;
     } else {
-      ok = model_rc < 0 && prefix_rc < 0 && !prefix.valid && !prefix.model[0];
+      ok = model_rc == LLM_JSON_TOKEN_LIMIT_EXCEEDED &&
+           prefix_rc == LLM_JSON_TOKEN_LIMIT_EXCEEDED &&
+           !prefix.valid && !prefix.model[0];
     }
     printf("%s full-request-token-budget-%d\n", ok ? "ok  " : "FAIL", sizes[test]);
     g_cases++;

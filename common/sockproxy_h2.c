@@ -4765,9 +4765,10 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
    * disagree about the declared authentication mode of the same service.
    * This caller owns only the refusal framing and the stream wiring. */
   char body_model[MAX_MODEL_LEN] = {0};
+  int body_model_rc = -1;
   if (stream->data_buf && stream->data_len > 0)
-    extract_model_field((const char *)stream->data_buf, stream->data_len,
-                        body_model, sizeof(body_model));
+    body_model_rc = extract_model_field((const char *)stream->data_buf, stream->data_len,
+                                        body_model, sizeof(body_model));
 
   if (ent_pool0) {
     /* The service identity feeds the QoS ladder (rule-scope defaults and
@@ -4925,6 +4926,15 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     }
   }
   
+  /* Preserve the gate's authentication/model-policy precedence and emit
+   * one terminal refusal before any route or backend can consume the body. */
+  if (body_model_rc == LLM_JSON_TOKEN_LIMIT_EXCEEDED) {
+    h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 413,
+                          stream->effective_model, LLM_JSON_TOKEN_LIMIT_CODE,
+                          LLM_JSON_TOKEN_LIMIT_MESSAGE);
+    return 0;
+  }
+
   // ✅ FIX: Use stream->authority for HTTP/2 endpoint lookup (not pfe->host_url)
   // In HTTP/2, hostname comes from :authority pseudo-header stored in stream->authority
   // In HTTP/1.1, hostname comes from Host header stored in pfe->host_url

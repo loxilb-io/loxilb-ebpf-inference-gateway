@@ -18,13 +18,19 @@
 
 #include "sockproxy.h"
 
+/* Distinct from a missing model, malformed JSON, and allocation failure. */
+#define LLM_JSON_TOKEN_LIMIT_EXCEEDED (-4)
+#define LLM_JSON_TOKEN_LIMIT_CODE "json_structure_limit_exceeded"
+#define LLM_JSON_TOKEN_LIMIT_MESSAGE "JSON request exceeds the limit of 8192 structural tokens"
+
 /* Extract the "user" field from an OpenAI-compatible JSON body.
  * Returns 0 on success (found user id in out), -1 on miss.
  */
 int extract_user_id(const char *body, size_t len, char *out, size_t cap);
 
 /* Extract the top-level "model" field from an OpenAI-compatible JSON body.
- * Returns 0 on success (found model in out), -1 on miss.
+ * Returns 0 on success (found model in out), -1 on miss, or
+ * LLM_JSON_TOKEN_LIMIT_EXCEEDED when the complete body's token budget is exceeded.
  */
 int extract_model_field(const char *body, size_t len, char *out, size_t cap);
 
@@ -108,7 +114,8 @@ int json_rename_top_key(char *body, size_t body_len, const char *key, size_t kle
  * @len:       Length of json_body
  * @prefix_key: Output struct filled on success
  * Returns 0 on success, -1 on parse failure (non-fatal; caller falls back
- * to round-robin selection).
+ * to round-robin selection), or LLM_JSON_TOKEN_LIMIT_EXCEEDED when the
+ * complete body exceeds the structural budget and must be refused.
  */
 int extract_llm_prefix(const char *json_body, size_t len,
                        llm_prefix_key_t *prefix_key);
