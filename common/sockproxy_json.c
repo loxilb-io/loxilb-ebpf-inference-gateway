@@ -561,14 +561,17 @@ json_scan_string_end(sp_json_scan_t *scan)
     }
     scan->phase = JSON_COLON;
   } else if (scan->string_kind == JSON_STRING_MODEL) {
-    if (scan->overflow)
-      return SP_JSON_INVALID;
-    size_t n = kv_json_unescape_copy(scan->raw, scan->raw_len,
-                                     scan->model, sizeof(scan->model));
-    if (memchr(scan->model, 0, n) ||
-        !json_str_eq(scan->raw, scan->raw_len, scan->model, n))
-      return SP_JSON_INVALID;
-    scan->model_ready = 1;
+    if (scan->overflow) {
+      scan->model_invalid = 1;
+    } else {
+      size_t n = kv_json_unescape_copy(scan->raw, scan->raw_len,
+                                       scan->model, sizeof(scan->model));
+      if (memchr(scan->model, 0, n) ||
+          !json_str_eq(scan->raw, scan->raw_len, scan->model, n))
+        scan->model_invalid = 1;
+    }
+    scan->model_ready = !scan->model_invalid;
+    if (scan->model_invalid) scan->model[0] = 0;
     scan->phase = JSON_AFTER;
   } else if (scan->string_kind == JSON_STRING_USER) {
     kv_json_unescape_copy(scan->raw, scan->raw_len, scan->user, sizeof(scan->user));
@@ -663,14 +666,15 @@ sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
         return scan->error = SP_JSON_INVALID;
       scan->phase = JSON_VALUE;
     } else if (scan->phase == JSON_VALUE) {
+      /* Continue past an invalid first value so a later model key still
+       * gets the same duplicate verdict as a valid first value. */
+      if (scan->key == 1 && c != '"') scan->model_invalid = 1;
       if (c == '"') {
         scan->string_kind = scan->key == 1 ? JSON_STRING_MODEL :
                             scan->key == 2 ? JSON_STRING_USER :
                             scan->key == 3 ? JSON_STRING_SALT : JSON_STRING_SKIP;
         scan->raw_len = 0;
         scan->overflow = 0;
-      } else if (scan->key == 1) {
-        return scan->error = SP_JSON_INVALID;
       } else if (c == '{' || c == '[') {
         if (scan->key == 3) scan->salt_invalid = 1;
         scan->depth++;
@@ -696,7 +700,8 @@ sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
 int
 sp_json_scan_finish(sp_json_scan_t *scan)
 {
-  return scan->error ? scan->error : scan->done ? 0 : SP_JSON_INVALID;
+  return scan->error ? scan->error :
+         scan->done && !scan->model_invalid ? 0 : SP_JSON_INVALID;
 }
 
 static int
@@ -1052,7 +1057,7 @@ extract_model_field_prefix(const char *body, size_t len, char *out, size_t cap)
   int rc = sp_json_scan_feed(&scan, body, len);
   if (rc == SP_JSON_DUPLICATE_MODEL)
     return rc;
-  if (rc)
+  if (rc || scan.model_invalid)
     return -1;
   if (scan.model_ready && scan.model[0]) {
     snprintf(out, cap, "%s", scan.model);
@@ -1664,7 +1669,7 @@ extract_llm_prefix_scanned(const char *json_body, size_t len,
   prefix_key->level = 1;
   if (scan->error == SP_JSON_DUPLICATE_MODEL)
     return SP_JSON_DUPLICATE_MODEL;
-  if (scan->error || !scan->done)
+  if (scan->error || scan->model_invalid || !scan->done)
     return -1;
 
   int parsed = parse_llm_json(json_body, len, stack, &tokens);

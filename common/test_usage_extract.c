@@ -207,6 +207,8 @@ test_incremental_metadata(void)
     "{\"model\":\"m1\",\"user\":\"u\\u0031\",\"x\":[{\"model\":\"nested\"}]}",
     "{\"model\":\"m1\",\"model\":\"m2\"}",
     "{\"mod\\u0065l\":\"m1\",\"model\":\"m2\"}",
+    "{\"model\":null,\"model\":\"m2\"}",
+    "{\"model\":{\"nested\":[]},\"model\":\"m2\"}",
   };
   for (size_t test = 0; test < sizeof(bodies) / sizeof(bodies[0]); test++) {
     const char *body = bodies[test];

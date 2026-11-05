@@ -4777,12 +4777,14 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
     if (!body_model_rc)
       snprintf(body_model, sizeof(body_model), "%s", body_scan.model);
   }
-  if (stream->content_type_count > 1 || body_model_rc == SP_JSON_DUPLICATE_MODEL) {
+  if (stream->content_type_count > 1 || body_model_rc == SP_JSON_DUPLICATE_MODEL ||
+      body_model_rc == SP_JSON_INVALID) {
     if (!stream->request_id[0])
       ai_gw_mint_request_id(stream->request_id, sizeof(stream->request_id));
     h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 400, "",
                           stream->content_type_count > 1 ? "duplicate_content_type" :
-                          "duplicate_model_field", "ambiguous request metadata");
+                          body_model_rc == SP_JSON_DUPLICATE_MODEL ? "duplicate_model_field" :
+                          "invalid_json_body", "ambiguous or invalid request metadata");
     return 0;
   }
 

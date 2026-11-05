@@ -14,7 +14,7 @@ enum {
 typedef struct sp_json_scan {
   uint32_t depth;
   uint8_t phase, string_kind, escaped, key, overflow;
-  uint8_t model_seen, model_ready, user_seen, done;
+  uint8_t model_seen, model_ready, user_seen, done, model_invalid;
   uint8_t salt_seen, salt_invalid;
   int error;
   size_t raw_len;
