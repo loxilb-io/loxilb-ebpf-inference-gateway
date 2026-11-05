@@ -203,25 +203,56 @@ test_request_token_budget(void)
 static void
 test_incremental_metadata(void)
 {
-  const char *bodies[] = {
-    "{\"model\":\"m1\",\"user\":\"u\\u0031\",\"x\":[{\"model\":\"nested\"}]}",
-    "{\"model\":\"m1\",\"model\":\"m2\"}",
-    "{\"mod\\u0065l\":\"m1\",\"model\":\"m2\"}",
-    "{\"model\":null,\"model\":\"m2\"}",
-    "{\"model\":{\"nested\":[]},\"model\":\"m2\"}",
+  char model127[128], model128[129], body127[160], body128[161];
+  memset(model127, 'm', 127); model127[127] = 0;
+  memset(model128, 'm', 128); model128[128] = 0;
+  snprintf(body127, sizeof(body127), "{\"model\":\"%s\"}", model127);
+  snprintf(body128, sizeof(body128), "{\"model\":\"%s\"}", model128);
+  const struct {
+    const char *body;
+    int rc;
+    const char *model, *user;
+  } cases[] = {
+    {"{\"model\":\"m1\",\"user\":\"u\\u0031\",\"x\":[{\"model\":\"nested\"}]}", 0, "m1", "u1"},
+    {"{\"model\":\"m1\",\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"mod\\u0065l\":\"m1\",\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"model\":null,\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"model\":{\"nested\":[]},\"model\":\"m2\"}", SP_JSON_DUPLICATE_MODEL, NULL, NULL},
+    {"{\"model\":\"ok\",\"a\":1\"model\":\"evil\"}", SP_JSON_INVALID, NULL, NULL},
+    {"{\"model\":\"a\",}", SP_JSON_INVALID, NULL, NULL},
+    {"{\"a\":tru,\"model\":\"a\"}", SP_JSON_INVALID, NULL, NULL},
+    {"{\"model\":\"m1\",\"a\":true}", 0, "m1", NULL},
+    {"{\"model\":\"m1\",\"a\":false }", 0, "m1", NULL},
+    {"{\"a\":null,\"model\":\"m1\"}", 0, "m1", NULL},
+    {"{\"a\":-1.5e3,\"model\":\"m1\"}", 0, "m1", NULL},
+    {"{\"user\":\"u1\",\"user\":\"u2\"}", SP_JSON_DUPLICATE_USER, NULL, NULL},
+    {"{\"us\\u0065r\":\"u1\",\"user\":\"u2\"}", SP_JSON_DUPLICATE_USER, NULL, NULL},
+    {"{\"user\":null,\"user\":\"u2\"}", SP_JSON_DUPLICATE_USER, NULL, NULL},
+    {"{\"model\":null}", SP_JSON_INVALID_MODEL, NULL, NULL},
+    {"{\"model\":17}", SP_JSON_INVALID_MODEL, NULL, NULL},
+    {"{\"model\":{\"x\":[]}}", SP_JSON_INVALID_MODEL, NULL, NULL},
+    {body127, 0, model127, NULL},
+    {body128, SP_JSON_INVALID_MODEL, NULL, NULL},
   };
-  for (size_t test = 0; test < sizeof(bodies) / sizeof(bodies[0]); test++) {
-    const char *body = bodies[test];
+  for (size_t test = 0; test < sizeof(cases) / sizeof(cases[0]); test++) {
+    const char *body = cases[test].body;
     size_t len = strlen(body);
     int ok = 1;
-    for (size_t split = 0; split <= len; split++) {
+    for (size_t split = 0; split <= len + 1; split++) {
       sp_json_scan_t scan;
       sp_json_scan_init(&scan);
-      int rc = sp_json_scan_feed(&scan, body, split);
-      if (!rc) rc = sp_json_scan_feed(&scan, body + split, len - split);
+      int rc = 0;
+      if (split <= len) {
+        rc = sp_json_scan_feed(&scan, body, split);
+        if (!rc) rc = sp_json_scan_feed(&scan, body + split, len - split);
+      } else {
+        for (size_t i = 0; i < len && !rc; i++)
+          rc = sp_json_scan_feed(&scan, body + i, 1);
+      }
       if (!rc) rc = sp_json_scan_finish(&scan);
-      ok &= test ? rc == SP_JSON_DUPLICATE_MODEL :
-                   rc == 0 && !strcmp(scan.model, "m1") && !strcmp(scan.user, "u1");
+      ok &= rc == cases[test].rc;
+      if (cases[test].model) ok &= !strcmp(scan.model, cases[test].model);
+      if (cases[test].user) ok &= !strcmp(scan.user, cases[test].user);
     }
     printf("%s incremental-metadata-%zu\n", ok ? "ok  " : "FAIL", test);
     g_cases++; g_fails += !ok;
@@ -251,6 +282,7 @@ main(void)
 {
   test_request_token_budget();
   test_incremental_metadata();
+  printf("scanner storage: %zu bytes per proxy connection\n", sizeof(sp_json_scan_t));
   /* Oversize JSON routing needs a complete direct top-level model before the
    * rest of the document exists. Every truncated key/value remains pending;
    * nested or string-embedded spoof keys never win. */

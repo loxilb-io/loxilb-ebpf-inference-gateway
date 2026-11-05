@@ -85,6 +85,12 @@ main(void)
 
     memcpy(routed, headers, header_len);
     memset(routed + header_len, 'x', sizeof(routed) - header_len);
+    assert(!sp_json_tail_holdable(routed, header_len, 1));
+    assert(!sp_json_tail_holdable(routed, header_len + 4, 5));
+    assert(sp_json_tail_holdable(routed, header_len + 5, 5));
+    assert(sp_json_tail_holdable(routed, header_len + 1, 1));
+    assert(!sp_json_tail_holdable(routed, header_len - 1, 1));
+    assert(!sp_json_tail_holdable(NULL, 0, 1));
     assert(sp_json_route_body_prefix(routed, header_len + 17, &body,
                                      &prefix_len, &at_limit) == 0);
     assert(body == routed + header_len);
@@ -172,6 +178,6 @@ main(void)
     assert(script.shutdowns == 1);
   }
 
-  puts("ALL PASS (43/43)");
+  puts("ALL PASS (49/49)");
   return 0;
 }

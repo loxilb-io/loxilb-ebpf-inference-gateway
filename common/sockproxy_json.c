@@ -549,8 +549,9 @@ json_scan_string_end(sp_json_scan_t *scan)
       scan->model_seen = 1;
       scan->key = 1;
     } else if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "user", 4)) {
-      if (!scan->user_seen)
-        scan->key = 2;
+      if (scan->user_seen)
+        return SP_JSON_DUPLICATE_USER;
+      scan->key = 2;
       scan->user_seen = 1;
     }
     if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "cache_salt", 10)) {
@@ -591,6 +592,36 @@ json_scan_string_end(sp_json_scan_t *scan)
   return 0;
 }
 
+/* This scanner fences top-level operand boundaries, not the full JSON
+ * number grammar. Literals are exact; number bytes stay in the requested
+ * bounded lexical class so quotes/containers/colons cannot hide a key. */
+static int
+json_scan_primitive_byte(sp_json_scan_t *scan, unsigned char c)
+{
+  static const char *const literal[] = { "", "true", "false", "null" };
+  static const size_t lengths[] = { 0, 4, 5, 4 };
+  if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') || c == '.' || c == '+' || c == '-'))
+    return SP_JSON_INVALID;
+  if (scan->primitive_kind &&
+      (scan->primitive_kind > 3 || scan->raw_len >= lengths[scan->primitive_kind] ||
+       c != (unsigned char)literal[scan->primitive_kind][scan->raw_len]))
+    return SP_JSON_INVALID;
+  scan->raw_len++;
+  return 0;
+}
+
+static int
+json_scan_primitive_end(sp_json_scan_t *scan)
+{
+  static const size_t lengths[] = { 0, 4, 5, 4 };
+  if (scan->primitive_kind &&
+      (scan->primitive_kind > 3 || scan->raw_len != lengths[scan->primitive_kind]))
+    return SP_JSON_INVALID;
+  scan->phase = JSON_AFTER;
+  return 0;
+}
+
 int
 sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
 {
@@ -620,8 +651,10 @@ sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
       continue;
     }
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-      if (scan->phase == JSON_PRIMITIVE)
-        scan->phase = JSON_AFTER;
+      if (scan->phase == JSON_PRIMITIVE) {
+        scan->error = json_scan_primitive_end(scan);
+        if (scan->error) return scan->error;
+      }
       continue;
     }
     if (scan->done)
@@ -646,15 +679,17 @@ sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
       continue;
     }
     if (scan->phase == JSON_PRIMITIVE) {
-      if (c != ',' && c != '}')
-        continue;
-      scan->phase = JSON_AFTER;
+      scan->error = (c == ',' || c == '}') ?
+          json_scan_primitive_end(scan) : json_scan_primitive_byte(scan, c);
+      if (scan->error) return scan->error;
+      if (scan->phase == JSON_PRIMITIVE) continue;
     }
     if (scan->phase == JSON_KEY) {
-      if (c == '}') {
+      if (c == '}' && !scan->after_comma) {
         scan->done = 1;
         scan->depth = 0;
       } else if (c == '"') {
+        scan->after_comma = 0;
         scan->string_kind = JSON_STRING_KEY;
         scan->raw_len = 0;
         scan->overflow = 0;
@@ -682,11 +717,17 @@ sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
       } else {
         if (scan->key == 3) scan->salt_invalid = 1;
         scan->phase = JSON_PRIMITIVE;
+        scan->raw_len = 0;
+        scan->primitive_kind = c == 't' ? 1 : c == 'f' ? 2 : c == 'n' ? 3 :
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ? 4 : 0;
+        scan->error = json_scan_primitive_byte(scan, c);
+        if (scan->error) return scan->error;
       }
     } else if (scan->phase == JSON_AFTER) {
-      if (c == ',')
+      if (c == ',') {
+        scan->after_comma = 1;
         scan->phase = JSON_KEY;
-      else if (c == '}') {
+      } else if (c == '}') {
         scan->done = 1;
         scan->depth = 0;
       } else {
@@ -700,8 +741,9 @@ sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
 int
 sp_json_scan_finish(sp_json_scan_t *scan)
 {
-  return scan->error ? scan->error :
-         scan->done && !scan->model_invalid ? 0 : SP_JSON_INVALID;
+  if (scan->error) return scan->error;
+  if (!scan->done) return SP_JSON_INVALID;
+  return scan->model_invalid ? SP_JSON_INVALID_MODEL : 0;
 }
 
 static int
@@ -720,7 +762,7 @@ extract_model_field(const char *body, size_t len, char *out, size_t cap)
     return -1;
   out[0] = 0;
   int rc = json_scan_body(body, len, &scan);
-  if (rc == SP_JSON_DUPLICATE_MODEL)
+  if (rc == SP_JSON_DUPLICATE_MODEL || rc == SP_JSON_DUPLICATE_USER)
     return rc;
   if (rc || !scan.model_ready || !scan.model[0])
     return -1;
@@ -1055,7 +1097,7 @@ extract_model_field_prefix(const char *body, size_t len, char *out, size_t cap)
   out[0] = 0;
   sp_json_scan_init(&scan);
   int rc = sp_json_scan_feed(&scan, body, len);
-  if (rc == SP_JSON_DUPLICATE_MODEL)
+  if (rc == SP_JSON_DUPLICATE_MODEL || rc == SP_JSON_DUPLICATE_USER)
     return rc;
   if (rc || scan.model_invalid)
     return -1;
@@ -1667,8 +1709,8 @@ extract_llm_prefix_scanned(const char *json_body, size_t len,
   int result = -1;
   memset(prefix_key, 0, sizeof(*prefix_key));
   prefix_key->level = 1;
-  if (scan->error == SP_JSON_DUPLICATE_MODEL)
-    return SP_JSON_DUPLICATE_MODEL;
+  if (scan->error == SP_JSON_DUPLICATE_MODEL || scan->error == SP_JSON_DUPLICATE_USER)
+    return scan->error;
   if (scan->error || scan->model_invalid || !scan->done)
     return -1;
 
@@ -1699,7 +1741,7 @@ extract_llm_prefix(const char *json_body, size_t len, llm_prefix_key_t *prefix_k
   int rc = json_scan_body(json_body, len, &scan);
   memset(prefix_key, 0, sizeof(*prefix_key));
   if (rc)
-    return rc == SP_JSON_DUPLICATE_MODEL ? rc : -1;
+    return rc == SP_JSON_DUPLICATE_MODEL || rc == SP_JSON_DUPLICATE_USER ? rc : -1;
   return extract_llm_prefix_scanned(json_body, len, &scan, prefix_key);
 }
 

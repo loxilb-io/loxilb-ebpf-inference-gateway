@@ -10589,7 +10589,10 @@ sp_h1_json_refuse(proxy_fd_ent_t *pfe, const char *code)
   proxy_release_rfd_ctx(pfe);
   pfe->ai_gw_denied = 1;
   pfe->lb_err_body_sent = 1;
-  sp_h1_send_framing_deny(pfe, 400, code, "ambiguous or invalid JSON request");
+  sp_h1_send_framing_deny(pfe, 400, code,
+      strcmp(code, "invalid_model_field") == 0 ?
+      "model must be a JSON string of at most 127 bytes" :
+      "ambiguous or invalid JSON request");
   return -1;
 }
 
@@ -10598,8 +10601,10 @@ sp_h1_json_scan_result(proxy_fd_ent_t *pfe, int rc)
 {
   if (!rc)
     return 0;
-  return sp_h1_json_refuse(pfe, rc == SP_JSON_DUPLICATE_MODEL ?
-                            "duplicate_model_field" : "invalid_json_body");
+  const char *code = rc == SP_JSON_DUPLICATE_MODEL ? "duplicate_model_field" :
+                     rc == SP_JSON_DUPLICATE_USER ? "duplicate_user_field" :
+                     rc == SP_JSON_INVALID_MODEL ? "invalid_model_field" : "invalid_json_body";
+  return sp_h1_json_refuse(pfe, code);
 }
 
 static int
@@ -14422,6 +14427,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                   &route_body_at_limit);
               char body_model[MAX_MODEL_LEN] = {0};
               int model_rc;
+              if (pfe->json_guard_active && pfe->json_scan.model_invalid)
+                return sp_h1_json_scan_result(pfe, SP_JSON_INVALID_MODEL);
               if (pfe->json_guard_active) {
                 model_rc = pfe->json_scan.model_ready ? 0 : 1;
                 snprintf(body_model, sizeof(body_model), "%s", pfe->json_scan.model);
@@ -14581,8 +14588,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                     extract_llm_prefix_scanned(body_start, body_len, &pfe->json_scan,
                                                &pfe->prefix_key) :
                     extract_llm_prefix(body_start, body_len, &pfe->prefix_key);
-                if (prefix_rc == SP_JSON_DUPLICATE_MODEL)
-                  return sp_h1_json_refuse(pfe, "duplicate_model_field");
+                if (prefix_rc == SP_JSON_DUPLICATE_MODEL || prefix_rc == SP_JSON_DUPLICATE_USER)
+                  return sp_h1_json_scan_result(pfe, prefix_rc);
                 if (prefix_rc == 0) {
 
                   // P1.1: Compute hash for CHWBL routing using xxHash
@@ -14694,12 +14701,17 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
             if (pfe->json_guard_active && !pfe->http_pok &&
                 !pfe->json_guard_streaming) {
-              pfe->json_guard_streaming = 1;
               size_t hold = pfe->json_guard_chunked ? 5 : 1;
-              assert(pfe->rcv_off >= hold);
-              memcpy(pfe->json_guard_tail, pfe->rcvbuf + pfe->rcv_off - hold, hold);
-              pfe->json_guard_tail_len = hold;
-              pfe->rcv_off -= hold;
+              if (!sp_json_tail_holdable(pfe->rcvbuf, pfe->rcv_off, hold)) {
+                log_debug("[JSON_GUARD_SKIP] fd=%d insufficient buffered body for %zu-byte tail", fd, hold);
+                pfe->json_guard_active = 0;
+              } else {
+                pfe->json_guard_streaming = 1;
+                assert(pfe->rcv_off >= hold); /* documented by the runtime body-span guard */
+                memcpy(pfe->json_guard_tail, pfe->rcvbuf + pfe->rcv_off - hold, hold);
+                pfe->json_guard_tail_len = hold;
+                pfe->rcv_off -= hold;
+              }
             }
 
             // Setup backend connection + forward.: the dispatch+forward

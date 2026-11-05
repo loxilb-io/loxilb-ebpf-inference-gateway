@@ -4724,6 +4724,18 @@ static int sp_mcp_h2_gate(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   return 0;
 }
 
+/* Same media-type boundary as H1: trim OWS, stop before parameters, and
+ * require an exact case-insensitive application/json match. */
+static int
+sp_h2_json_media(const char *value)
+{
+  const char *end = strchr(value, ';');
+  if (!end) end = value + strlen(value);
+  while (value < end && (*value == ' ' || *value == '\t')) value++;
+  while (end > value && (end[-1] == ' ' || end[-1] == '\t')) end--;
+  return end - value == 16 && strncasecmp(value, "application/json", 16) == 0;
+}
+
 int
 proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
 {
@@ -4769,7 +4781,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
   sp_json_scan_t body_scan;
   sp_json_scan_init(&body_scan);
   int body_model_rc = -1;
-  if (stream->data_buf && stream->data_len) {
+  int json_media = sp_h2_json_media(stream->content_type);
+  if (json_media && stream->data_buf && stream->data_len) {
     body_model_rc = sp_json_scan_feed(&body_scan, (const char *)stream->data_buf,
                                       stream->data_len);
     if (!body_model_rc)
@@ -4778,13 +4791,18 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       snprintf(body_model, sizeof(body_model), "%s", body_scan.model);
   }
   if (stream->content_type_count > 1 || body_model_rc == SP_JSON_DUPLICATE_MODEL ||
+      body_model_rc == SP_JSON_DUPLICATE_USER || body_model_rc == SP_JSON_INVALID_MODEL ||
       body_model_rc == SP_JSON_INVALID) {
     if (!stream->request_id[0])
       ai_gw_mint_request_id(stream->request_id, sizeof(stream->request_id));
     h2_send_local_refusal(pfe, stream, AI_GW_STAGE_FRAMING, 400, "",
                           stream->content_type_count > 1 ? "duplicate_content_type" :
                           body_model_rc == SP_JSON_DUPLICATE_MODEL ? "duplicate_model_field" :
-                          "invalid_json_body", "ambiguous or invalid request metadata");
+                          body_model_rc == SP_JSON_DUPLICATE_USER ? "duplicate_user_field" :
+                          body_model_rc == SP_JSON_INVALID_MODEL ? "invalid_model_field" : "invalid_json_body",
+                          stream->content_type_count <= 1 && body_model_rc == SP_JSON_INVALID_MODEL ?
+                          "model must be a JSON string of at most 127 bytes" :
+                          "ambiguous or invalid request metadata");
     return 0;
   }
 
@@ -4819,7 +4837,9 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .jwt_profile = ent_pool0->jwt_auth_profile,
       .body = (const char *)stream->data_buf,
       .body_len = stream->data_len,
-      .parsed_body_model = body_model,
+      /* Media gating scopes framing validation, not model authorization.
+       * Non-JSON bodies retain the shared gate's legacy body-model probe. */
+      .parsed_body_model = json_media ? body_model : NULL,
       .model_parse_result = body_model_rc,
       .prefix_model = body_model,
       .hdr_model = stream->x_model_header,
@@ -5121,10 +5141,7 @@ h2_have_tepval:
       stream->prefix_key == NULL) {  // Only extract once per stream
     
     // Check if content-type is application/json (case-insensitive)
-    int is_json = 0;
-    if (stream->content_type[0] != '\0') {
-      is_json = (strncasecmp(stream->content_type, "application/json", 16) == 0);
-    }
+    int is_json = json_media;
     
     if (is_json) {
       // Allocate prefix key structure

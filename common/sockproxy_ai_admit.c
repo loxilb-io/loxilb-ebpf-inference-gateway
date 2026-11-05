@@ -748,9 +748,10 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
   } else if (req->body && req->body_len && !req->prefix_only) {
     model_rc = extract_model_field(req->body, req->body_len, body_model, sizeof(body_model));
   }
-  if (model_rc == SP_JSON_DUPLICATE_MODEL) {
-    set_deny(res, AI_GW_STAGE_FRAMING, 400, 0, 0, "duplicate_model_field",
-             "more than one decoded top-level model key");
+  if (model_rc == SP_JSON_DUPLICATE_MODEL || model_rc == SP_JSON_DUPLICATE_USER) {
+    set_deny(res, AI_GW_STAGE_FRAMING, 400, 0, 0,
+             model_rc == SP_JSON_DUPLICATE_USER ? "duplicate_user_field" : "duplicate_model_field",
+             "more than one decoded top-level routing key");
     return -1;
   }
   if (!enforcing && !netid)
