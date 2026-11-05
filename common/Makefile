@@ -962,7 +962,7 @@ test_kv: test_kv_exact test_model_routing test_pd_ids test_conv_pool_alias test_
 
 # AI-gateway token accounting: usage-object extraction unit tests
 # (compiles sockproxy_json.c into the test TU; log.c is stubbed inside)
-test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h xxhash.c
+test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h sockproxy_json_scan.h xxhash.c
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< xxhash.c -I. -lpthread
 
 .PHONY: test_usage

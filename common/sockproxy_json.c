@@ -494,22 +494,24 @@ parse_llm_json(const char *body, size_t len, jsmntok_t *stack, jsmntok_t **token
   jsmn_parser parser;
 
   *tokens = stack;
-  jsmn_init(&parser);
-  int parsed = jsmn_parse(&parser, body, len, stack, LLM_JSON_STACK_TOKENS);
-  if (parsed != JSMN_ERROR_NOMEM)
-    return parsed;
+  int parsed;
+  if (len <= 64U * 1024U) {
+    jsmn_init(&parser);
+    parsed = jsmn_parse(&parser, body, len, stack, LLM_JSON_STACK_TOKENS);
+    if (parsed != JSMN_ERROR_NOMEM)
+      return parsed;
+  }
 
   jsmn_init(&parser);
   int needed = jsmn_parse(&parser, body, len, NULL, 0);
   if (needed < 0)
     return needed;
-  if (needed > LLM_JSON_MAX_TOKENS) {
-    log_debug("[JSON_TOKEN_LIMIT] request needs %d tokens (limit %d)",
-              needed, LLM_JSON_MAX_TOKENS);
+  if (needed > LLM_JSON_MAX_TOKENS)
     return LLM_JSON_TOKEN_LIMIT_EXCEEDED;
+  if (needed <= LLM_JSON_STACK_TOKENS) {
+    jsmn_init(&parser);
+    return jsmn_parse(&parser, body, len, stack, LLM_JSON_STACK_TOKENS);
   }
-  if (needed <= LLM_JSON_STACK_TOKENS)
-    return JSMN_ERROR_INVAL;
 
   jsmntok_t *expanded = malloc((size_t)needed * sizeof(*expanded));
   if (!expanded) {
@@ -525,67 +527,214 @@ parse_llm_json(const char *body, size_t len, jsmntok_t *stack, jsmntok_t **token
   return parsed;
 }
 
-// P/D Session stickiness: Extract "user" field from OpenAI-compatible JSON body.
-// Iterates ONLY the top-level key-value pairs of the outer object so that
-// nested "user" values (e.g. messages[].role == "user") are never mistaken for
-// the top-level "user" field.  Returns 0 on success, -1 on miss.
-int
-extract_user_id(const char *body, size_t len, char *out, size_t cap)
+enum {
+  JSON_START, JSON_KEY, JSON_COLON, JSON_VALUE, JSON_AFTER, JSON_NESTED, JSON_PRIMITIVE
+};
+enum { JSON_STRING_NONE, JSON_STRING_KEY, JSON_STRING_MODEL, JSON_STRING_USER, JSON_STRING_SALT, JSON_STRING_SKIP };
+
+void
+sp_json_scan_init(sp_json_scan_t *scan)
 {
-  jsmn_parser p;
-  jsmntok_t tokens[64];
-  int r, i, pair;
-
-  if (!body || len == 0 || !out || cap == 0) return -1;
-
-  jsmn_init(&p);
-  r = jsmn_parse(&p, body, len, tokens, 64);
-  if (r < 2 || tokens[0].type != JSMN_OBJECT) return -1;
-
-  /* Iterate only the direct key-value pairs of the top-level object.
-   * tokens[0].size == number of key-value pairs at the top level. */
-  i = 1;
-  for (pair = 0; pair < tokens[0].size && i + 1 < r; pair++) {
-    if (tokens[i].type == JSMN_STRING &&
-        jsoneq(body, &tokens[i], "user") == 0 &&
-        tokens[i + 1].type == JSMN_STRING) {
-      json_extract_string_decoded(body, &tokens[i + 1], out, cap);
-      return (out[0] != '\0') ? 0 : -1;
-    }
-    /* Skip the key token (always 1) then skip the entire value subtree. */
-    i++;
-    i += jsmn_subtree_count(tokens, i, r);
-  }
-  return -1;
+  memset(scan, 0, sizeof(*scan));
 }
 
-// AI Gateway allowed_models: inspect only direct keys on the root object.
-int
-extract_model_field(const char *body, size_t len, char *out, size_t cap)
+static int
+json_scan_string_end(sp_json_scan_t *scan)
 {
-  jsmntok_t stack[LLM_JSON_STACK_TOKENS], *tokens;
-  int result = -1;
+  if (scan->string_kind == JSON_STRING_KEY) {
+    scan->key = 0;
+    if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "model", 5)) {
+      if (scan->model_seen)
+        return SP_JSON_DUPLICATE_MODEL;
+      scan->model_seen = 1;
+      scan->key = 1;
+    } else if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "user", 4)) {
+      if (!scan->user_seen)
+        scan->key = 2;
+      scan->user_seen = 1;
+    }
+    if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "cache_salt", 10)) {
+      if (scan->salt_seen)
+        scan->salt_invalid = 1;
+      scan->salt_seen = 1;
+      scan->key = 3;
+    }
+    scan->phase = JSON_COLON;
+  } else if (scan->string_kind == JSON_STRING_MODEL) {
+    if (scan->overflow)
+      return SP_JSON_INVALID;
+    size_t n = kv_json_unescape_copy(scan->raw, scan->raw_len,
+                                     scan->model, sizeof(scan->model));
+    if (memchr(scan->model, 0, n) ||
+        !json_str_eq(scan->raw, scan->raw_len, scan->model, n))
+      return SP_JSON_INVALID;
+    scan->model_ready = 1;
+    scan->phase = JSON_AFTER;
+  } else if (scan->string_kind == JSON_STRING_USER) {
+    kv_json_unescape_copy(scan->raw, scan->raw_len, scan->user, sizeof(scan->user));
+    scan->phase = JSON_AFTER;
+  } else if (scan->string_kind == JSON_STRING_SALT) {
+    if (scan->overflow || !scan->raw_len || scan->raw_len >= sizeof(scan->salt))
+      scan->salt_invalid = 1;
+    else {
+      memcpy(scan->salt, scan->raw, scan->raw_len);
+      scan->salt[scan->raw_len] = 0;
+    }
+    scan->phase = JSON_AFTER;
+  } else if (scan->depth == 1) {
+    scan->phase = JSON_AFTER;
+  }
+  scan->string_kind = JSON_STRING_NONE;
+  return 0;
+}
 
-  if (!body || len == 0 || !out || cap == 0)
-    return -1;
-
-  int parsed = parse_llm_json(body, len, stack, &tokens);
-  if (parsed == LLM_JSON_TOKEN_LIMIT_EXCEEDED)
-    return parsed;
-  if (parsed >= 2 && tokens[0].type == JSMN_OBJECT) {
-    for (int i = 1; i + 1 < parsed; i += 1 + jsmn_subtree_count(tokens, i + 1, parsed)) {
-      if (jsoneq(body, &tokens[i], "model") == 0 && tokens[i + 1].type == JSMN_STRING) {
-        json_extract_string_decoded(body, &tokens[i + 1], out, cap);
-        result = out[0] ? 0 : -1;
-        break;
+int
+sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
+{
+  if (scan->error)
+    return scan->error;
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)data[i];
+    if (scan->string_kind) {
+      if (!scan->escaped && c == '"') {
+        scan->error = json_scan_string_end(scan);
+        if (scan->error)
+          return scan->error;
+        continue;
+      }
+      if (c < 0x20)
+        return scan->error = SP_JSON_INVALID;
+      if (scan->string_kind != JSON_STRING_SKIP) {
+        if (scan->raw_len < sizeof(scan->raw))
+          scan->raw[scan->raw_len++] = (char)c;
+        else
+          scan->overflow = 1;
+      }
+      if (scan->escaped)
+        scan->escaped = 0;
+      else if (c == '\\')
+        scan->escaped = 1;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      if (scan->phase == JSON_PRIMITIVE)
+        scan->phase = JSON_AFTER;
+      continue;
+    }
+    if (scan->done)
+      return scan->error = SP_JSON_INVALID;
+    if (scan->phase == JSON_START) {
+      if (c != '{')
+        return scan->error = SP_JSON_NOT_OBJECT;
+      scan->depth = 1;
+      scan->phase = JSON_KEY;
+      continue;
+    }
+    if (scan->phase == JSON_NESTED) {
+      if (c == '"')
+        scan->string_kind = JSON_STRING_SKIP;
+      else if (c == '{' || c == '[') {
+        if (++scan->depth == UINT32_MAX)
+          return scan->error = SP_JSON_INVALID;
+      } else if (c == '}' || c == ']') {
+        if (--scan->depth == 1)
+          scan->phase = JSON_AFTER;
+      }
+      continue;
+    }
+    if (scan->phase == JSON_PRIMITIVE) {
+      if (c != ',' && c != '}')
+        continue;
+      scan->phase = JSON_AFTER;
+    }
+    if (scan->phase == JSON_KEY) {
+      if (c == '}') {
+        scan->done = 1;
+        scan->depth = 0;
+      } else if (c == '"') {
+        scan->string_kind = JSON_STRING_KEY;
+        scan->raw_len = 0;
+        scan->overflow = 0;
+      } else {
+        return scan->error = SP_JSON_INVALID;
+      }
+    } else if (scan->phase == JSON_COLON) {
+      if (c != ':')
+        return scan->error = SP_JSON_INVALID;
+      scan->phase = JSON_VALUE;
+    } else if (scan->phase == JSON_VALUE) {
+      if (c == '"') {
+        scan->string_kind = scan->key == 1 ? JSON_STRING_MODEL :
+                            scan->key == 2 ? JSON_STRING_USER :
+                            scan->key == 3 ? JSON_STRING_SALT : JSON_STRING_SKIP;
+        scan->raw_len = 0;
+        scan->overflow = 0;
+      } else if (scan->key == 1) {
+        return scan->error = SP_JSON_INVALID;
+      } else if (c == '{' || c == '[') {
+        if (scan->key == 3) scan->salt_invalid = 1;
+        scan->depth++;
+        scan->phase = JSON_NESTED;
+      } else {
+        if (scan->key == 3) scan->salt_invalid = 1;
+        scan->phase = JSON_PRIMITIVE;
+      }
+    } else if (scan->phase == JSON_AFTER) {
+      if (c == ',')
+        scan->phase = JSON_KEY;
+      else if (c == '}') {
+        scan->done = 1;
+        scan->depth = 0;
+      } else {
+        return scan->error = SP_JSON_INVALID;
       }
     }
   }
-  if (tokens != stack)
-    free(tokens);
-  return result;
+  return 0;
 }
 
+int
+sp_json_scan_finish(sp_json_scan_t *scan)
+{
+  return scan->error ? scan->error : scan->done ? 0 : SP_JSON_INVALID;
+}
+
+static int
+json_scan_body(const char *body, size_t len, sp_json_scan_t *scan)
+{
+  sp_json_scan_init(scan);
+  int rc = sp_json_scan_feed(scan, body, len);
+  return rc ? rc : sp_json_scan_finish(scan);
+}
+
+int
+extract_model_field(const char *body, size_t len, char *out, size_t cap)
+{
+  sp_json_scan_t scan;
+  if (!body || !len || !out || !cap)
+    return -1;
+  out[0] = 0;
+  int rc = json_scan_body(body, len, &scan);
+  if (rc == SP_JSON_DUPLICATE_MODEL)
+    return rc;
+  if (rc || !scan.model_ready || !scan.model[0])
+    return -1;
+  snprintf(out, cap, "%s", scan.model);
+  return 0;
+}
+
+int
+extract_user_id(const char *body, size_t len, char *out, size_t cap)
+{
+  sp_json_scan_t scan;
+  if (!body || !len || !out || !cap)
+    return -1;
+  out[0] = 0;
+  if (json_scan_body(body, len, &scan) || !scan.user[0])
+    return -1;
+  snprintf(out, cap, "%s", scan.user);
+  return 0;
+}
 // AI Gateway token accounting: pull prompt_tokens / completion_tokens out of
 // the OpenAI "usage" object in a response byte window. The window is NOT a
 // complete JSON document — it is the tail of a response stream (SSE events
@@ -895,23 +1044,21 @@ json_stream_flag(const char *body, size_t len)
 int
 extract_model_field_prefix(const char *body, size_t len, char *out, size_t cap)
 {
-  const char *vs = NULL, *ve = NULL, *root_close = NULL;
-  int rc;
-
-  if (!body || len == 0 || !out || cap == 0)
+  sp_json_scan_t scan;
+  if (!body || !len || !out || !cap)
     return -1;
-  out[0] = '\0';
-
-  rc = json_top_find(body, len, "model", 5, &vs, &ve, &root_close);
-  if (rc == -2)
-    return 1;
-  if (rc != 0 || !vs || !ve)
+  out[0] = 0;
+  sp_json_scan_init(&scan);
+  int rc = sp_json_scan_feed(&scan, body, len);
+  if (rc == SP_JSON_DUPLICATE_MODEL)
+    return rc;
+  if (rc)
     return -1;
-  if (ve - vs < 2 || *vs != '"' || ve[-1] != '"')
-    return -1;
-
-  kv_json_unescape_copy(vs + 1, (size_t)(ve - vs - 2), out, cap);
-  return out[0] != '\0' ? 0 : -1;
+  if (scan.model_ready && scan.model[0]) {
+    snprintf(out, cap, "%s", scan.model);
+    return 0;
+  }
+  return scan.done ? -1 : 1;
 }
 
 /* Splice ins_len bytes into body at offset pos. Caller has verified
@@ -1508,26 +1655,47 @@ extract_llm_prefix_tokens(const char *json_body, jsmntok_t *tokens, int r,
 }
 
 int
-extract_llm_prefix(const char *json_body, size_t len, llm_prefix_key_t *prefix_key)
+extract_llm_prefix_scanned(const char *json_body, size_t len,
+                           const sp_json_scan_t *scan, llm_prefix_key_t *prefix_key)
 {
   jsmntok_t stack[LLM_JSON_STACK_TOKENS], *tokens;
   int result = -1;
-
   memset(prefix_key, 0, sizeof(*prefix_key));
   prefix_key->level = 1;
+  if (scan->error == SP_JSON_DUPLICATE_MODEL)
+    return SP_JSON_DUPLICATE_MODEL;
+  if (scan->error || !scan->done)
+    return -1;
 
   int parsed = parse_llm_json(json_body, len, stack, &tokens);
-  if (parsed < 0) {
-    if (parsed == LLM_JSON_TOKEN_LIMIT_EXCEEDED)
-      result = parsed;
-    log_debug("[JSON_PARSE_ERROR] JSMN parse failed with error %d, len=%zu",
-              parsed, len);
+  if (parsed == LLM_JSON_TOKEN_LIMIT_EXCEEDED || parsed == JSMN_ERROR_NOMEM) {
+    result = LLM_PREFIX_SKIPPED;
+    log_debug("[PREFIX_BUDGET_SKIP] optional prefix unavailable: %d", parsed);
   } else if (parsed > 0 && tokens[0].type == JSMN_OBJECT) {
     result = extract_llm_prefix_tokens(json_body, tokens, parsed, prefix_key);
   }
   if (tokens != stack)
     free(tokens);
+
+  /* Routing and salt validation survive optional token-tree exhaustion/OOM. */
+  snprintf(prefix_key->model, sizeof(prefix_key->model), "%s", scan->model);
+  prefix_key->cache_salt_invalid = scan->salt_invalid;
+  if (scan->salt_seen && !scan->salt_invalid) {
+    snprintf(prefix_key->cache_salt, sizeof(prefix_key->cache_salt), "%s", scan->salt);
+    prefix_key->flags |= PREFIX_HAS_CACHE_SALT;
+  }
   return result;
+}
+
+int
+extract_llm_prefix(const char *json_body, size_t len, llm_prefix_key_t *prefix_key)
+{
+  sp_json_scan_t scan;
+  int rc = json_scan_body(json_body, len, &scan);
+  memset(prefix_key, 0, sizeof(*prefix_key));
+  if (rc)
+    return rc == SP_JSON_DUPLICATE_MODEL ? rc : -1;
+  return extract_llm_prefix_scanned(json_body, len, &scan, prefix_key);
 }
 
 // P1.1: Compute hash for prefix-based routing using xxHash (PHASE 1 ENHANCED)

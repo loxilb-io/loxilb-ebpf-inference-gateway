@@ -24,8 +24,8 @@ prefix = r'''
 typedef struct {
   char *rcvbuf;
   int odir, http_hdrs_done;
-  size_t http_header_start, http_header_len;
-  uint8_t http_content_type_field, http_body_media;
+  size_t http_header_start, http_header_len, rcv_off;
+  uint8_t http_content_type_field, http_body_media, http_content_type_count;
 } proxy_fd_ent_t;
 '''
 suffix = r'''
@@ -34,7 +34,7 @@ static int begin(llhttp_t *parser)
   llhttp_settings_t *settings = parser->settings;
   proxy_fd_ent_t *p = settings->uarg;
   p->http_hdrs_done = p->http_header_len = 0;
-  p->http_content_type_field = p->http_body_media = 0;
+  p->http_content_type_field = p->http_body_media = p->http_content_type_count = 0;
   return 0;
 }
 static int field(llhttp_t *parser, const char *at, size_t len)
@@ -73,7 +73,7 @@ static void test(const char *header, int expected)
   settings.on_header_value = value;
   settings.on_header_value_complete = sp_h1_header_value_complete;
   settings.on_headers_complete = headers;
-  proxy_fd_ent_t p = {.rcvbuf = wire};
+  proxy_fd_ent_t p = {.rcvbuf = wire, .rcv_off = len};
   settings.uarg = &p;
   llhttp_t parser;
   for (size_t split = 0; split <= len; split++) {

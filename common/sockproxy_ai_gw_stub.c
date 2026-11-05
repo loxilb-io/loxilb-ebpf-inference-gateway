@@ -252,6 +252,16 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
     return 0;  /* allow — no quota enforcement in C-only debug builds */
 }
 
+__attribute__((weak)) void
+llb_ai_token_quota_release(char *tenant_id, char *model_name,
+                           char *user_id, char *key_id, char *svc_ident,
+                           int reserved_toks, int64_t res_epoch)
+{
+    AI_GW_STUB_TRIPWIRE(warned);
+    (void)tenant_id; (void)model_name; (void)user_id; (void)key_id;
+    (void)svc_ident; (void)reserved_toks; (void)res_epoch;
+}
+
 __attribute__((weak)) int
 llb_ai_token_quota_reserve(char *tenant_id, char *model_name,
                            char *user_id, char *key_id, char *svc_ident,

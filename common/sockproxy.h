@@ -15,6 +15,8 @@
 #include "sockproxy_sse_observe.h"
 #include "sockproxy_answer.h"
 
+#include "sockproxy_json_scan.h"
+
 #define JSMN_STATIC
 #include "jsmn.h"
 
@@ -1379,6 +1381,11 @@ struct proxy_fd_ent {
   size_t http_header_len;
   uint8_t http_content_type_field;
   uint8_t http_body_media;
+  uint8_t http_content_type_count;
+  sp_json_scan_t json_scan;
+  uint8_t json_guard_active, json_guard_streaming, json_guard_chunked;
+  uint8_t json_guard_tail_len;
+  uint8_t json_guard_tail[5];
   size_t http_content_length;
   int is_streamable;  // Flag: Content can be streamed (not JSON/form-urlencoded)
   /* Oversize JSON cannot be routed at headers-only time when the only pool is

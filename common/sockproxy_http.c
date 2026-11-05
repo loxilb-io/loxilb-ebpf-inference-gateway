@@ -8229,7 +8229,7 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
             hc_tls_fin_seen(pfe, HC_TLS_KTLS);
           } else {
             hc_fin_seen(pfe, HC_ENTRY_EOF,
-                        pfe->rcv_off != 0 || pfe->stream_body_remaining != 0);
+                        pfe->rcv_off != 0 || pfe->stream_body_remaining != 0 || pfe->json_guard_streaming);
           }
           log_debug("[CRESP_OWED] fd=%d forwarded=%u completed=%u owed=%d "
                     "resp_outstanding=%u unframed=%u",
@@ -9380,6 +9380,10 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->http_header_len = 0;
     pfe->http_content_type_field = 0;
     pfe->http_body_media = 0;
+    pfe->http_content_type_count = 0;
+    pfe->json_guard_active = pfe->json_guard_streaming = 0;
+    pfe->json_guard_chunked = pfe->json_guard_tail_len = 0;
+    sp_json_scan_init(&pfe->json_scan);
     /* ... and so does its header clock. On request 1 the read path armed
      * it at the first byte already. */
     if (!sp_hdr_armed(&pfe->l7_hdr))
@@ -9436,6 +9440,10 @@ handle_on_message_begin(llhttp_t* parser)
                                   LLB_AI_UMISS_RESPONSE_COMPLETE);
       pfe->metric_ai_recorded = 0;   /* reported once */
     }
+    pfe->metric_response_status = 0;
+    pfe->metric_ai_recorded = 0;
+    pfe->metric_req_start_ns = get_timestamp_ns();
+    resp_note_rearm(&pfe->metric_resp_noted);
     pfe->x_api_key_raw[0] = '\0';
     pfe->bearer_raw[0] = '\0';
     pfe->bearer_len = 0;
@@ -10356,6 +10364,10 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   const proxy_epval_t *pool0 = sp_pool_first(hent);
   req->jwt_profile = pool0 ? pool0->jwt_auth_profile : "";
   req->prefix_model = pfe->prefix_key.model;
+  if (pfe->json_guard_active) {
+    req->parsed_body_model = pfe->json_scan.model;
+    req->model_parse_result = pfe->json_scan.error;
+  }
   req->hdr_model = pfe->x_model_header;
   req->class_on = ai_gw_class_on();
   req->objective_hint = pfe->obj_hint.name;
@@ -10546,11 +10558,75 @@ static int sp_mcp_h1_header_refuse(proxy_fd_ent_t *pfe,int status)
   }
   return sp_mcp_h1_refuse(pfe,status);
 }
+static int
+sp_h1_json_refuse(proxy_fd_ent_t *pfe, const char *code)
+{
+  if (pfe->ai_gw_denied)
+    return -1;
+  if (pfe->json_guard_streaming) {
+    snprintf(pfe->vllm_request_id, sizeof(pfe->vllm_request_id), "%s", pfe->resp_request_id);
+    snprintf(pfe->prefix_key.model, sizeof(pfe->prefix_key.model), "%s", pfe->json_scan.model);
+  }
+  if (!pfe->vllm_request_id[0])
+    generate_vllm_request_id(pfe, NULL, NULL);
+  for (int i = 0; i < pfe->n_rfd; i++) {
+    if (pfe->rfd[i] > 0) {
+      struct linger reset = { .l_onoff = 1, .l_linger = 0 };
+      setsockopt(pfe->rfd[i], SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    }
+  }
+  /* The stream was policy-admitted before its tail was known. Return its
+   * unused claim without a response settlement: this request is refused. */
+  if (pfe->usage_reserved_toks) {
+    char svc_ident[64];
+    proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
+    llb_ai_token_quota_release(pfe->tenant_id, (char *)proxy_effective_model(pfe),
+                              pfe->auth_user_id, pfe->auth_key_id, svc_ident,
+                              (int)pfe->usage_reserved_toks, pfe->usage_res_epoch);
+    pfe->usage_reserved_toks = 0;
+    pfe->usage_res_epoch = 0;
+  }
+  proxy_release_rfd_ctx(pfe);
+  pfe->ai_gw_denied = 1;
+  pfe->lb_err_body_sent = 1;
+  sp_h1_send_framing_deny(pfe, 400, code, "ambiguous or invalid JSON request");
+  return -1;
+}
+
+static int
+sp_h1_json_scan_result(proxy_fd_ent_t *pfe, int rc)
+{
+  if (!rc)
+    return 0;
+  return sp_h1_json_refuse(pfe, rc == SP_JSON_DUPLICATE_MODEL ?
+                            "duplicate_model_field" : "invalid_json_body");
+}
+
+static int
+sp_h1_json_chunk_header(llhttp_t *parser)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe = settings->uarg;
+  if (pfe->json_guard_active && parser->content_length == 0)
+    return sp_h1_json_scan_result(pfe, sp_json_scan_finish(&pfe->json_scan));
+  return 0;
+}
+
 static int sp_mcp_h1_body(llhttp_t *parser, const char *at, size_t len)
 {
   llhttp_settings_t *settings = parser->settings;
   proxy_fd_ent_t *pfe = settings ? settings->uarg : NULL;
-  if (!sp_mcp_enabled(pfe)) return 0;
+  if (!sp_mcp_enabled(pfe)) {
+    if (pfe->json_guard_active) {
+      int rc = sp_json_scan_feed(&pfe->json_scan, at, len);
+      if (rc == SP_JSON_NOT_OBJECT) {
+        pfe->json_guard_active = 0; /* ordinary JSON arrays/scalars retain their relay path */
+        return 0;
+      }
+      return sp_h1_json_scan_result(pfe, rc);
+    }
+    return 0;
+  }
   int status = sp_mcp_capture_body(pfe->mcp_capture, at, len);
   return status ? sp_mcp_h1_refuse(pfe, status) : 0;
 }
@@ -10661,6 +10737,13 @@ handle_on_headers_complete(llhttp_t* parser)
                               parser->content_length : 0;
   }
   pfe->http_hdrs_done = 1;
+  if (pfe->odir == 0 && pfe->http_content_type_count > 1 && !sp_mcp_enabled(pfe))
+    return sp_h1_json_refuse(pfe, "duplicate_content_type");
+  pfe->json_guard_chunked = (parser->flags & F_CHUNKED) != 0;
+  if (pfe->odir == 0 && (pfe->http_body_media & SP_H1_MEDIA_JSON) &&
+      !sp_mcp_enabled(pfe) &&
+      (pfe->http_content_length || pfe->json_guard_chunked))
+    pfe->json_guard_active = 1;
   if (sp_mcp_enabled(pfe)) return sp_mcp_h1_headers(pfe, parser);
   return 0;                          /* 0: parse the body that follows */
 }
@@ -10676,6 +10759,13 @@ handle_on_message_complete(llhttp_t* parser)
 
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
+  if (pfe->json_guard_active) {
+    if (sp_h1_json_scan_result(pfe, sp_json_scan_finish(&pfe->json_scan)))
+      return -1;
+    if (pfe->json_guard_streaming) {
+      return HPE_PAUSED; /* already admitted; release the tail after this callback */
+    }
+  }
   if (sp_mcp_enabled(pfe) && sp_mcp_h1_complete(pfe, parser)) return -1;
   // L7 Metrics: capture request start timestamp for TTFB. Kept independent of
   // HAVE_HTTP_TRACE — the metric_* fields and record_latency_sample() are always
@@ -11812,7 +11902,10 @@ sp_h1_header_span(proxy_fd_ent_t *pfe, const char *at, size_t len)
 {
   if (len == 0)
     return;
-  size_t offset = (size_t)(at - (const char *)pfe->rcvbuf);
+  uintptr_t base = (uintptr_t)pfe->rcvbuf, ptr = (uintptr_t)at;
+  assert(ptr >= base && ptr - base <= pfe->rcv_off);
+  size_t offset = (size_t)(ptr - base);
+  assert(len <= pfe->rcv_off - offset);
   if (pfe->http_header_len == 0)
     pfe->http_header_start = offset;
   pfe->http_header_len = offset + len - pfe->http_header_start;
@@ -11829,6 +11922,8 @@ sp_h1_header_field_complete(llhttp_t *parser)
     const char *name = (const char *)pfe->rcvbuf + pfe->http_header_start;
     pfe->http_content_type_field = pfe->http_header_len == sizeof(field) - 1 &&
                                   strncasecmp(name, field, sizeof(field) - 1) == 0;
+    if (pfe->http_content_type_field && pfe->http_content_type_count < 2)
+      pfe->http_content_type_count++;
     pfe->http_header_len = 0;
   }
   return 0;
@@ -11855,9 +11950,9 @@ sp_h1_header_value_complete(llhttp_t *parser)
 
     size_t len = (size_t)(end - value);
     if (len == sizeof(json) - 1 && strncasecmp(value, json, len) == 0)
-      pfe->http_body_media |= SP_H1_MEDIA_JSON;
+      pfe->http_body_media = SP_H1_MEDIA_JSON;
     if (len == sizeof(form) - 1 && strncasecmp(value, form, len) == 0)
-      pfe->http_body_media |= SP_H1_MEDIA_FORM;
+      pfe->http_body_media = SP_H1_MEDIA_FORM;
     pfe->http_header_len = 0;
   }
   return 0;
@@ -11872,6 +11967,7 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
 
   pfe = settings->uarg;
   assert(pfe);
+  if (pfe->odir == 0 && (parser->flags & F_TRAILING) && !sp_mcp_enabled(pfe)) return 0;
   /* Trailers must never replace already-validated routing operands. */
   if (sp_mcp_enabled(pfe) && (parser->flags & F_TRAILING))
     return sp_mcp_h1_refuse(pfe, 400);
@@ -11917,6 +12013,7 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
 
   pfe = settings->uarg;
   assert(pfe);
+  if (pfe->odir == 0 && (parser->flags & F_TRAILING) && !sp_mcp_enabled(pfe)) return 0;
   if (pfe->odir == 0 && !pfe->http_hdrs_done && pfe->http_content_type_field)
     sp_h1_header_span(pfe, at, length);
 
@@ -12640,6 +12737,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->settings.on_message_begin = handle_on_message_begin;
   npfe1->settings.on_headers_complete = handle_on_headers_complete;
   npfe1->settings.on_body = sp_mcp_h1_body;
+  npfe1->settings.on_chunk_header = sp_h1_json_chunk_header;
   npfe1->settings.on_message_complete = handle_on_message_complete;
   npfe1->settings.on_header_field = handle_header_name;
   npfe1->settings.on_header_field_complete = sp_h1_header_field_complete;
@@ -13165,7 +13263,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                            pfe->rcv_off - sb_hdr_len : 0;
       if (pfe->http_content_length > sb_body_fwd) {
         pfe->stream_body_remaining =
-            sp_stream_body_remaining(pfe->http_content_length, sb_body_fwd);
+            sp_stream_body_remaining(pfe->http_content_length,
+                                     sb_body_fwd + pfe->json_guard_tail_len);
         log_debug("[STREAM_BODY_TRACK] fd=%d streamed request: %zu of %zu body "
                  "bytes forwarded with headers, %zu outstanding — relay mode "
                  "until drained", pfe->fd, sb_body_fwd,
@@ -13286,7 +13385,8 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
       pfe->pd_phase = PD_PHASE_NONE;
     }
 
-    llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
+    if (!pfe->json_guard_streaming)
+      llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
 
     /* The backend now owns this request, so until its response is framed the
      * client is owed an answer. A half-close arriving in that window must not
@@ -13637,11 +13737,62 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
  *
  * Returns: 0 on success, -1 to restart
  */
+/* Scan before relaying this read. A fixed suffix from the previous read is
+ * retained until the HTTP framing and the JSON scanner both complete. */
+static int
+sp_h1_json_stream_read(proxy_fd_ent_t *pfe, const uint8_t *data, size_t len,
+                       size_t *consumed)
+{
+  if (pfe->rfd[0] <= 0)
+    return -1;
+  enum llhttp_errno err = llhttp_execute(&pfe->parser, (const char *)data, len);
+  int complete = err == HPE_PAUSED;
+  if (err != HPE_OK && !complete) {
+    if (!pfe->ai_gw_denied)
+      sp_h1_json_refuse(pfe, "invalid_json_framing");
+    return -1;
+  }
+  *consumed = complete ?
+      (size_t)(llhttp_get_error_pos(&pfe->parser) - (const char *)data) : len;
+  assert(*consumed <= len);
+  size_t old = pfe->json_guard_tail_len;
+  size_t keep = complete ? 0 : pfe->json_guard_chunked ? 5 : 1;
+  size_t total = old + *consumed;
+  if (keep > total)
+    keep = total;
+  size_t forward = total - keep;
+  size_t send_old = forward < old ? forward : old;
+  size_t send_new = forward - send_old;
+  if ((send_old && proxy_multiplexor(pfe, pfe->json_guard_tail, send_old)) ||
+      (send_new && proxy_multiplexor(pfe, (uint8_t *)data, send_new)))
+    return -1;
+  memmove(pfe->json_guard_tail, pfe->json_guard_tail + send_old, old - send_old);
+  memcpy(pfe->json_guard_tail + old - send_old, data + send_new,
+         *consumed - send_new);
+  pfe->json_guard_tail_len = keep;
+  if (!pfe->json_guard_chunked) {
+    assert(*consumed <= pfe->stream_body_remaining);
+    pfe->stream_body_remaining -= *consumed;
+  }
+  if (complete) {
+    pfe->json_guard_active = pfe->json_guard_streaming = 0;
+    pfe->json_guard_chunked = 0;
+    pfe->stream_body_remaining = 0;
+    pfe->http_hdrs_done = pfe->http_pok = pfe->http_body_complete = 0;
+    llhttp_init(&pfe->parser, HTTP_BOTH, &pfe->settings);
+  }
+  return 0;
+}
 int
 handle_client_data(int fd, proxy_fd_ent_t *pfe,
                    struct llb_sockmap_key *key, struct llb_sockmap_key *rkey)
 {
   int j;
+
+  /* A refusal is terminal even if queued readable events arrive before
+   * teardown. Do not parse the same callback error and record it again. */
+  if (!pfe->odir && pfe->ai_gw_denied)
+    return -1;
 
   /* The reaper thread owes this client a response (pd_reap_respond) and has
    * paused its reads without touching the poll set, so a readable event can
@@ -13905,6 +14056,15 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * parser (which would turn body bytes into garbage Tier-2 "requests").
        * Bytes past the declared Content-Length in the same read are the next
        * pipelined request: shift them to the buffer head and fall through. */
+      if (pfe->json_guard_streaming && rc > 0) {
+        size_t consumed = 0;
+        if (sp_h1_json_stream_read(pfe, pfe->rcvbuf, (size_t)rc, &consumed))
+          return -1;
+        if (consumed == (size_t)rc)
+          continue;
+        memmove(pfe->rcvbuf, pfe->rcvbuf + consumed, (size_t)rc - consumed);
+        rc -= (int)consumed;
+      }
       if (pfe->stream_body_remaining > 0 && rc > 0) {
         if (pfe->rfd[0] <= 0) {
           /* backend leg died mid-body: the request is unrecoverable (its
@@ -14242,10 +14402,17 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             needs_body_inspection = 0;
           }
 
+          if (pfe->json_guard_active && pfe->json_guard_chunked) {
+            pfe->json_stream_route_pending = 1;
+            json_stream_fallback = 1;
+            needs_body_inspection = 0;
+          }
+
           int is_streamable = !needs_body_inspection;
 
           if (pfe->http_hdrs_done && is_streamable &&
-              pfe->http_content_length > (64 * 1024)) {
+              (pfe->http_content_length > (64 * 1024) ||
+               (pfe->json_guard_active && pfe->json_guard_chunked))) {
             if (json_stream_fallback) {
               const uint8_t *route_body = NULL;
               size_t route_body_len = 0;
@@ -14254,10 +14421,15 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                   pfe->rcvbuf, pfe->rcv_off, &route_body, &route_body_len,
                   &route_body_at_limit);
               char body_model[MAX_MODEL_LEN] = {0};
-              int model_rc = body_rc == 0 ?
-                  extract_model_field_prefix((const char *)route_body,
-                                             route_body_len,
-                                             body_model, sizeof(body_model)) : 1;
+              int model_rc;
+              if (pfe->json_guard_active) {
+                model_rc = pfe->json_scan.model_ready ? 0 : 1;
+                snprintf(body_model, sizeof(body_model), "%s", pfe->json_scan.model);
+              } else {
+                model_rc = body_rc == 0 ?
+                    extract_model_field_prefix((const char *)route_body, route_body_len,
+                                               body_model, sizeof(body_model)) : 1;
+              }
 
               if (model_rc != 0) {
                 if (proxy_send_local_100_continue(pfe) != 0)
@@ -14405,17 +14577,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 // Try to extract LLM prefix from JSON (OpenAI-specific, optional)
                 log_debug("[PREFIX_EXTRACT_ATTEMPT] fd=%d: Trying to extract prefix from JSON body_len=%zu",
                           fd, body_len);
-                int prefix_rc = extract_llm_prefix(body_start, body_len, &pfe->prefix_key);
-                if (prefix_rc == LLM_JSON_TOKEN_LIMIT_EXCEEDED) {
-                  /* The complete request already passed the policy gate.
-                   * Refuse before selecting or reusing any backend leg.
-                   * The refusal sender closes the response record, so
-                   * teardown cannot also emit a successful completion. */
-                  sp_h1_send_framing_deny(pfe, 413, LLM_JSON_TOKEN_LIMIT_CODE,
-                                          LLM_JSON_TOKEN_LIMIT_MESSAGE);
-                  pfe->lb_err_body_sent = 1;
-                  return -1;
-                }
+                int prefix_rc = pfe->json_guard_active ?
+                    extract_llm_prefix_scanned(body_start, body_len, &pfe->json_scan,
+                                               &pfe->prefix_key) :
+                    extract_llm_prefix(body_start, body_len, &pfe->prefix_key);
+                if (prefix_rc == SP_JSON_DUPLICATE_MODEL)
+                  return sp_h1_json_refuse(pfe, "duplicate_model_field");
                 if (prefix_rc == 0) {
 
                   // P1.1: Compute hash for CHWBL routing using xxHash
@@ -14443,8 +14610,11 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 // P/D Session stickiness: extract "user" field from JSON body.
                 // Note: pfe->epv is not yet set (assigned in setup_proxy_path),
                 // so we extract unconditionally. Harmless for non-P/D services.
-                if (extract_user_id((const char *)body_start, body_len,
-                                    pfe->user_id, sizeof(pfe->user_id)) == 0) {
+                if (pfe->json_guard_active) {
+                  snprintf(pfe->user_id, sizeof(pfe->user_id), "%s", pfe->json_scan.user);
+                  pfe->has_user_id = pfe->user_id[0] != 0;
+                } else if (extract_user_id(body_start, body_len,
+                                           pfe->user_id, sizeof(pfe->user_id)) == 0) {
                   pfe->has_user_id = 1;
                 }
               } else {
@@ -14522,6 +14692,16 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             }
 #endif
 
+            if (pfe->json_guard_active && !pfe->http_pok &&
+                !pfe->json_guard_streaming) {
+              pfe->json_guard_streaming = 1;
+              size_t hold = pfe->json_guard_chunked ? 5 : 1;
+              assert(pfe->rcv_off >= hold);
+              memcpy(pfe->json_guard_tail, pfe->rcvbuf + pfe->rcv_off - hold, hold);
+              pfe->json_guard_tail_len = hold;
+              pfe->rcv_off -= hold;
+            }
+
             // Setup backend connection + forward.: the dispatch+forward
             // sequence is factored into pd_setup_and_forward() so the bounded-admission
             // RESUME path (pd_resume_parked) re-drives the EXACT same code as a fresh
@@ -14588,8 +14768,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
            * client sat holding a refusal. Tear the connection down instead;
            * there is nothing left to salvage on a socket the gate has
            * already shut. */
-          pfe->ai_gw_denied = 0;
-          return -1; // Restart
+          return -1; // Restart; keep the terminal refusal latched
         } else {
           // Parse error.
           //

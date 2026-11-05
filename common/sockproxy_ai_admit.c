@@ -736,19 +736,26 @@ ai_gw_admit_decide(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
    * is known by its identity. */
   int netid = (req->netid_bound & AI_GW_NETID_BOUND) && svc_ident[0];
 
+  if (!enforcing && !netid && !req->parsed_body_model)
+    return admit_keyless(res, svc_ident);
+
+  /* One allocation-free model result is shared by policy and routing. */
+  char body_model[AI_GW_MODEL_LEN] = {0};
+  int model_rc = 0;
+  if (req->parsed_body_model) {
+    snprintf(body_model, sizeof(body_model), "%s", req->parsed_body_model);
+    model_rc = req->model_parse_result;
+  } else if (req->body && req->body_len && !req->prefix_only) {
+    model_rc = extract_model_field(req->body, req->body_len, body_model, sizeof(body_model));
+  }
+  if (model_rc == SP_JSON_DUPLICATE_MODEL) {
+    set_deny(res, AI_GW_STAGE_FRAMING, 400, 0, 0, "duplicate_model_field",
+             "more than one decoded top-level model key");
+    return -1;
+  }
   if (!enforcing && !netid)
     return admit_keyless(res, svc_ident);
 
-  /* allowed_models must bind to the model the backend will actually serve,
-   * which is the one in the JSON body — an X-Model header that differs
-   * from the body is at best a stale hint and at worst a spoof. The body
-   * is complete by the time the gate runs, so parse it here and fall back
-   * to the earlier prefix extraction, then the header, only when the body
-   * carries no model field. */
-  char body_model[AI_GW_MODEL_LEN] = {0};
-  if (req->body && req->body_len > 0 && !req->prefix_only) {
-    extract_model_field(req->body, req->body_len, body_model, sizeof(body_model));
-  }
   const char *body_bound = body_model[0] ? body_model : prefix_model;
   const char *model = body_bound[0] ? body_bound : hdr_model;
 

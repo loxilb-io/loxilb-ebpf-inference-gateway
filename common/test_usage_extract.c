@@ -42,7 +42,17 @@ log_log(int level, const char *file, int line, const char *fmt, ...)
   (void)level; (void)file; (void)line; (void)fmt;
 }
 
+
+static int fail_prefix_allocation;
+static void *
+prefix_test_malloc(size_t len)
+{
+  return fail_prefix_allocation ? NULL : malloc(len);
+}
+
+#define malloc prefix_test_malloc
 #include "sockproxy_json.c"
+#undef malloc
 
 static int g_fails = 0;
 static int g_cases = 0;
@@ -161,9 +171,8 @@ test_request_token_budget(void)
            strcmp(prefix.model, model) == 0 &&
            strcmp(prefix.prefix, "test prompt") == 0;
     } else {
-      ok = model_rc == LLM_JSON_TOKEN_LIMIT_EXCEEDED &&
-           prefix_rc == LLM_JSON_TOKEN_LIMIT_EXCEEDED &&
-           !prefix.valid && !prefix.model[0];
+      ok = model_rc == 0 && prefix_rc == LLM_PREFIX_SKIPPED &&
+           !prefix.valid && !strcmp(prefix.model, model);
     }
     printf("%s full-request-token-budget-%d\n", ok ? "ok  " : "FAIL", sizes[test]);
     g_cases++;
@@ -177,14 +186,69 @@ test_request_token_budget(void)
       g_cases++;
       g_fails += !ok;
     }
+    if (sizes[test] == 3586) {
+      fail_prefix_allocation = 1;
+      ok = extract_model_field(body, length, model, sizeof(model)) == 0 &&
+           extract_llm_prefix(body, length, &prefix) == LLM_PREFIX_SKIPPED &&
+           !strcmp(prefix.model, model) && !prefix.valid;
+      fail_prefix_allocation = 0;
+      printf("%s prefix-allocation-failure-keeps-model\n", ok ? "ok  " : "FAIL");
+      g_cases++; g_fails += !ok;
+    }
     free(body);
   }
+}
+
+
+static void
+test_incremental_metadata(void)
+{
+  const char *bodies[] = {
+    "{\"model\":\"m1\",\"user\":\"u\\u0031\",\"x\":[{\"model\":\"nested\"}]}",
+    "{\"model\":\"m1\",\"model\":\"m2\"}",
+    "{\"mod\\u0065l\":\"m1\",\"model\":\"m2\"}",
+  };
+  for (size_t test = 0; test < sizeof(bodies) / sizeof(bodies[0]); test++) {
+    const char *body = bodies[test];
+    size_t len = strlen(body);
+    int ok = 1;
+    for (size_t split = 0; split <= len; split++) {
+      sp_json_scan_t scan;
+      sp_json_scan_init(&scan);
+      int rc = sp_json_scan_feed(&scan, body, split);
+      if (!rc) rc = sp_json_scan_feed(&scan, body + split, len - split);
+      if (!rc) rc = sp_json_scan_finish(&scan);
+      ok &= test ? rc == SP_JSON_DUPLICATE_MODEL :
+                   rc == 0 && !strcmp(scan.model, "m1") && !strcmp(scan.user, "u1");
+    }
+    printf("%s incremental-metadata-%zu\n", ok ? "ok  " : "FAIL", test);
+    g_cases++; g_fails += !ok;
+  }
+
+  size_t depth = 12000;
+  char *body = malloc(depth * 2 + 128), *at = body;
+  at += sprintf(at, "{\"model\":\"deep\",\"user\":\"session\",\"nested\":");
+  memset(at, '[', depth); at += depth;
+  *at++ = '0';
+  memset(at, ']', depth); at += depth;
+  *at++ = '}'; *at = 0;
+  char model[128], user[128];
+  llm_prefix_key_t prefix;
+  int ok = extract_model_field(body, strlen(body), model, sizeof(model)) == 0 &&
+           extract_user_id(body, strlen(body), user, sizeof(user)) == 0 &&
+           !strcmp(model, "deep") && !strcmp(user, "session") &&
+           extract_llm_prefix(body, strlen(body), &prefix) == LLM_PREFIX_SKIPPED &&
+           !strcmp(prefix.model, "deep") && !prefix.valid;
+  printf("%s deep-metadata-without-token-tree\n", ok ? "ok  " : "FAIL");
+  g_cases++; g_fails += !ok;
+  free(body);
 }
 
 int
 main(void)
 {
   test_request_token_budget();
+  test_incremental_metadata();
   /* Oversize JSON routing needs a complete direct top-level model before the
    * rest of the document exists. Every truncated key/value remains pending;
    * nested or string-embedded spoof keys never win. */
