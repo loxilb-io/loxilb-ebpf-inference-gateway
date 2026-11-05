@@ -1341,8 +1341,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 #endif /* HAVE_DP_GPU_ROUTING */
 
         /* US-PD804: 3-tier P/D selection (replaces first-healthy stub) */
-        if (!l7_subset &&
-            tepval->pd_disagg_enabled && tepval->n_prefill_eps > 0 && tepval->n_decode_eps > 0) {
+        if (!l7_subset && tepval->pd_disagg_enabled) {
           int pd_prefill = -1, pd_decode = -1;
 
           /* KV-T15 /.3: seed the exclusion mask with health/CB state so the
@@ -1363,11 +1362,11 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
 
           /* capture the prefill rc so the in-flight-cap "no capacity"
-           * verdict (PD_PREFILL_NO_CAPACITY) sheds a retriable 429 instead of
-           * falling to any-healthy/normal mode (which would BYPASS the cap). This
-           * shed happens BEFORE the active_conns increment below, so a shed never
-           * perturbs the load counters. */
-          int pf_rc = pd_reserve_prefill(tepval, pfe, &pd_prefill, pd_excl, 1);
+           * verdict (PD_PREFILL_NO_CAPACITY) sheds a retriable 429 before any
+           * load counters move. A missing role makes the pool unavailable. */
+          int pf_rc = -1;
+          if (tepval->n_prefill_eps > 0 && tepval->n_decode_eps > 0)
+            pf_rc = pd_reserve_prefill(tepval, pfe, &pd_prefill, pd_excl, 1);
           /* bounded backpressured admission. PARKED means the request
            * was already ENQUEUED onto a per-EP FIFO inside pd_select_prefill (it
            * held + stamped park_start_ts there). Do NOT connect, do NOT 429, do NOT
@@ -1400,21 +1399,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
               pd_select_decode(tepval, pfe, &pd_decode) != 0) {
             if (pf_rc == 0)
               pd_load_put(tepval, pd_prefill);
-            /* RES-02: Fallback to any healthy EP in normal (non-P/D) mode */
-            int fallback_ep = -1;
-            if (pd_select_any_healthy(tepval, &fallback_ep) == 0) {
-              if (pfe) {
-                pfe->pd_phase = PD_PHASE_NONE;
-                /* normal mode takes no decode unit; drop any Tier-0 hint */
-                pfe->pd_decode_ep_idx = -1;
-              }
-              atomic_fetch_add(&global_stats.pd_fallback_to_normal, 1);
-              log_info("P/D fallback: all prefill/decode EPs unhealthy, using EP[%d] in normal mode",
-                       fallback_ep);
-              algorithm_selection = fallback_ep;
-              goto pd_fallback_normal;
-            }
-            /* No healthy EPs at all — return 503 */
+            /* A P/D request requires both roles, including after EPP FailOpen. */
             log_error("US-PD804: P/D selection failed — no healthy prefill or decode");
             if (pfe) {
               const char *pd_503_resp =
@@ -1564,7 +1549,6 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
         }
 
-pd_fallback_normal:
         /* L7 session-header / IP-persist stickiness overlay (default-off).
          * A configured session header pins the backend to a previously
          * learned binding (PRIORITY 0), else a deterministic hash of the

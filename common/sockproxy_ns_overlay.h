@@ -8,8 +8,8 @@
 
 /*
  * sockproxy_ns_overlay.h — pure resolution of the DFL session-header /
- * IP-persist stickiness overlay (the pd_fallback_normal block of
- * proxy_find_ep in sockproxy_ep.c). Split into a dependency-free helper so
+ * IP-persist stickiness overlay in proxy_find_ep (sockproxy_ep.c).
+ * Split into a dependency-free helper so
  * the P/D gate is unit-testable without the whole proxy_find_ep graph.
  *
  * The overlay is a CONVERGED-rule mechanism. A P/D-disaggregated rule
