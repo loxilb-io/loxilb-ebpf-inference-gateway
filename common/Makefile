@@ -705,7 +705,7 @@ sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h
 # working fakes for the forward path, fake backends, link stand-ins for the
 # rest. It wraps calloc (allocation failure injection).
 H2FX_SRCS = test_h2_fixture.c test_h2_fixture_links.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
-H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h
+H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h sockproxy_json_scan.h
 H2FX_LINK = $(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
 		-ffunction-sections -fdata-sections -I. -Wl,--wrap=calloc -Wl,--gc-sections
 

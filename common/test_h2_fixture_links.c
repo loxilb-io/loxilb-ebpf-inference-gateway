@@ -9,17 +9,46 @@
  * (no identity, no binding, nothing to record: the tests do not depend on
  * them). Every other one has not been reached by any test and aborts with
  * its name, so a test that starts to reach one fails loudly instead of
- * running on a guess. No header here on purpose: these are link stand-ins,
- * called only through the product's own prototypes, and the ones that do
+ * running on a guess. Apart from the standalone scanner types, these are
+ * header-free link stand-ins, called through the product's own prototypes;
+ * the ones that do
  * run return int, void or a pointer, where 0 in the return register is the
  * same answer for each.
  */
+#include <string.h>
+#include "sockproxy_json_scan.h"
+
 int puts(const char *s);
 void abort(void);
 
 #define REACHED(name) long name(void) { return 0; }
 #define NOT_REACHED(name) \
   long name(void) { puts("test_h2_fixture_links: " #name " reached"); abort(); return 0; }
+
+/* Every stream initializes fixed scanner storage, including non-JSON
+ * streams. These fixtures declare no JSON media type: reaching JSON body
+ * inspection would change the lifetime test's setup and must fail loudly. */
+void
+sp_json_scan_init(sp_json_scan_t *scan)
+{
+  memset(scan, 0, sizeof(*scan));
+}
+
+int
+sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
+{
+  (void)scan; (void)data; (void)len;
+  puts("test_h2_fixture_links: sp_json_scan_feed reached");
+  abort();
+}
+
+int
+sp_json_scan_finish(sp_json_scan_t *scan)
+{
+  (void)scan;
+  puts("test_h2_fixture_links: sp_json_scan_finish reached");
+  abort();
+}
 
 /* The header guard: every header value of the test requests is valid. */
 int l7_hdr_value_valid(const char *value) { (void)value; return 1; }
@@ -68,6 +97,7 @@ NOT_REACHED(chwbl_inc_runtime)
 NOT_REACHED(circuit_breaker_candidate)
 NOT_REACHED(compute_prefix_hash)
 NOT_REACHED(extract_llm_prefix)
+NOT_REACHED(extract_llm_prefix_scanned)
 REACHED(extract_model_field)
 NOT_REACHED(get_conversation_mapping)
 REACHED(get_timestamp_ns)
