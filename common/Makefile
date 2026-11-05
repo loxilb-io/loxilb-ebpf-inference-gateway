@@ -827,6 +827,7 @@ test_uc5: test_admit test_stream test_uc3 test_l2_reflection test_backend_failur
 
 test_admit: test_admit_response
 	./test_admit_response
+	python3 test_http_media.py
 
 .PHONY: test_uc3
 test_uc3: test_model_routing test_sni_alpn test_sse_observe test_resp_framing

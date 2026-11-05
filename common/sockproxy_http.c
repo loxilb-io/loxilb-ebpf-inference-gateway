@@ -269,16 +269,10 @@ proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end)
   proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0, end);
 }
 
-static const char *strnstr_portable(const char *haystack, const char *needle, size_t len) {
-    size_t needle_len = strlen(needle);
-    if (needle_len == 0) return haystack;
-    if (len < needle_len) return NULL;
-    for (size_t i = 0; i <= len - needle_len; i++) {
-        if (strncmp(&haystack[i], needle, needle_len) == 0)
-            return &haystack[i];
-    }
-    return NULL;
-}
+enum {
+  SP_H1_MEDIA_JSON = 1,
+  SP_H1_MEDIA_FORM = 2,
+};
 
 /* One P/D lifecycle record, for one request and one completion event: the
  * outcome (llb_ai_pd_record), then the request's first-event time and
@@ -9383,6 +9377,9 @@ handle_on_message_begin(llhttp_t* parser)
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
     pfe->http_hdrs_done = 0;   /* request N+1's header block starts here */
+    pfe->http_header_len = 0;
+    pfe->http_content_type_field = 0;
+    pfe->http_body_media = 0;
     /* ... and so does its header clock. On request 1 the read path armed
      * it at the first byte already. */
     if (!sp_hdr_armed(&pfe->l7_hdr))
@@ -10658,8 +10655,11 @@ handle_on_headers_complete(llhttp_t* parser)
    * it. http_hok cannot stand in for it: it flips on the first "Host:" name,
    * which is the first line every HTTP/1.1 client -- and every slowloris --
    * sends. */
-  if (pfe->odir == 0)
+  if (pfe->odir == 0) {
     sp_hdr_disarm(&pfe->l7_hdr);   /* the block is complete, whatever the parse returns */
+    pfe->http_content_length = (parser->flags & F_CONTENT_LENGTH) ?
+                              parser->content_length : 0;
+  }
   pfe->http_hdrs_done = 1;
   if (sp_mcp_enabled(pfe)) return sp_mcp_h1_headers(pfe, parser);
   return 0;                          /* 0: parse the body that follows */
@@ -10772,28 +10772,7 @@ handle_on_message_complete(llhttp_t* parser)
         }
 
         if (should_scan && presidio_is_initialized()) {
-          // Check if content is JSON (Content-Type detection)
-          int is_json = 0;
-          const char *headers = (const char *)pfe->rcvbuf;
-          size_t headers_len = body_start - headers;
-
-          if (headers_len > 20 && headers_len < 8192) {
-            // Search for Content-Type: application/json (case-insensitive)
-            const char *ct_pos = strnstr_portable(headers, "Content-Type:", headers_len);
-            if (!ct_pos) {
-              ct_pos = strnstr_portable(headers, "content-type:", headers_len);
-            }
-            if (ct_pos) {
-              const char *line_end = strnstr_portable(ct_pos, "\r\n", headers_len - (ct_pos - headers));
-              if (line_end) {
-                size_t ct_line_len = line_end - ct_pos;
-                if (strnstr_portable(ct_pos, "application/json", ct_line_len)) {
-                  is_json = 1;
-                  log_debug("[PII_JSON] JSON Content-Type detected");
-                }
-              }
-            }
-          }
+          int is_json = pfe->http_body_media & SP_H1_MEDIA_JSON;
 
           // Scan with Presidio (JSON-aware or text mode)
           presidio_operators_t ops = {0};
@@ -11826,6 +11805,64 @@ pd_resp_parser_init(proxy_fd_ent_t *pfe)
   pfe->resp_parser_inited = 1;
 }
 
+/* llhttp can split a field or value across reads. Its spans refer to the
+ * retained receive buffer, so remember offsets until the complete callback. */
+static void
+sp_h1_header_span(proxy_fd_ent_t *pfe, const char *at, size_t len)
+{
+  if (len == 0)
+    return;
+  size_t offset = (size_t)(at - (const char *)pfe->rcvbuf);
+  if (pfe->http_header_len == 0)
+    pfe->http_header_start = offset;
+  pfe->http_header_len = offset + len - pfe->http_header_start;
+}
+
+static int
+sp_h1_header_field_complete(llhttp_t *parser)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe = settings->uarg;
+  static const char field[] = "Content-Type";
+
+  if (pfe->odir == 0 && !pfe->http_hdrs_done) {
+    const char *name = (const char *)pfe->rcvbuf + pfe->http_header_start;
+    pfe->http_content_type_field = pfe->http_header_len == sizeof(field) - 1 &&
+                                  strncasecmp(name, field, sizeof(field) - 1) == 0;
+    pfe->http_header_len = 0;
+  }
+  return 0;
+}
+
+static int
+sp_h1_header_value_complete(llhttp_t *parser)
+{
+  llhttp_settings_t *settings = parser->settings;
+  proxy_fd_ent_t *pfe = settings->uarg;
+  static const char json[] = "application/json";
+  static const char form[] = "application/x-www-form-urlencoded";
+
+  if (pfe->odir == 0 && !pfe->http_hdrs_done && pfe->http_content_type_field &&
+      pfe->http_header_len != 0) {
+    const char *value = (const char *)pfe->rcvbuf + pfe->http_header_start;
+    const char *end = memchr(value, ';', pfe->http_header_len);
+    if (!end)
+      end = value + pfe->http_header_len;
+    while (value < end && (*value == ' ' || *value == '\t'))
+      value++;
+    while (end > value && (end[-1] == ' ' || end[-1] == '\t'))
+      end--;
+
+    size_t len = (size_t)(end - value);
+    if (len == sizeof(json) - 1 && strncasecmp(value, json, len) == 0)
+      pfe->http_body_media |= SP_H1_MEDIA_JSON;
+    if (len == sizeof(form) - 1 && strncasecmp(value, form, len) == 0)
+      pfe->http_body_media |= SP_H1_MEDIA_FORM;
+    pfe->http_header_len = 0;
+  }
+  return 0;
+}
+
 int
 handle_header_name(llhttp_t *parser, const char *at, size_t length)
 {
@@ -11838,6 +11875,8 @@ handle_header_name(llhttp_t *parser, const char *at, size_t length)
   /* Trailers must never replace already-validated routing operands. */
   if (sp_mcp_enabled(pfe) && (parser->flags & F_TRAILING))
     return sp_mcp_h1_refuse(pfe, 400);
+  if (pfe->odir == 0 && !pfe->http_hdrs_done)
+    sp_h1_header_span(pfe, at, length);
 
   if (length >= sizeof(str)-1) {
     return 0;
@@ -11878,6 +11917,8 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
 
   pfe = settings->uarg;
   assert(pfe);
+  if (pfe->odir == 0 && !pfe->http_hdrs_done && pfe->http_content_type_field)
+    sp_h1_header_span(pfe, at, length);
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
   // Debug log for header value parsing
@@ -12051,19 +12092,6 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
 #endif
         }
       }
-    }
-  }
-
-  // Check if this is Content-Length header
-  if (!strncasecmp("Content-Length", pfe->last_header_name, 14)) {
-    char len_str[32];
-    if (length < sizeof(len_str) - 1) {
-      strncpy(len_str, at, length);
-      len_str[length] = '\0';
-      pfe->http_content_length = strtoull(len_str, NULL, 10);
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-      log_debug("Content-Length: %zu\n", pfe->http_content_length);
-#endif
     }
   }
 
@@ -12614,7 +12642,9 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->settings.on_body = sp_mcp_h1_body;
   npfe1->settings.on_message_complete = handle_on_message_complete;
   npfe1->settings.on_header_field = handle_header_name;
+  npfe1->settings.on_header_field_complete = sp_h1_header_field_complete;
   npfe1->settings.on_header_value = handle_header_val;
+  npfe1->settings.on_header_value_complete = sp_h1_header_value_complete;
   npfe1->settings.on_url = handle_url;
   npfe1->settings.uarg = npfe1;
   llhttp_init(&npfe1->parser, HTTP_BOTH, &npfe1->settings);
@@ -14186,16 +14216,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           // This includes: multipart/form-data, text/html, text/plain, text/css, 
           //                application/octet-stream, image/*, video/*, application/pdf, etc.
           // 
-          // Detection: Check if Content-Type is one of the types that needs buffering
-          int needs_body_inspection = sp_mcp_enabled(pfe);
-          if (pfe->http_hok && pfe->rcv_off >= 100) {
-            size_t search_len = (pfe->rcv_off < 2048) ? pfe->rcv_off : 2048;
-            // Only these types require full body buffering for routing logic
-            if (memmem(pfe->rcvbuf, search_len, "application/json", 16) != NULL ||
-                memmem(pfe->rcvbuf, search_len, "application/x-www-form-urlencoded", 33) != NULL) {
-              needs_body_inspection = 1;
-            }
-          }
+          int needs_body_inspection = sp_mcp_enabled(pfe) || pfe->http_body_media;
 
           // a JSON body larger than SP_JSON_INSPECT_MAX can NEVER finish
           // buffering — rcvbuf is SP_SOCK_MSG_LEN and the partial-request path
@@ -14223,7 +14244,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
           int is_streamable = !needs_body_inspection;
 
-          if (pfe->http_hok && is_streamable && pfe->http_content_length > (64 * 1024)) {
+          if (pfe->http_hdrs_done && is_streamable &&
+              pfe->http_content_length > (64 * 1024)) {
             if (json_stream_fallback) {
               const uint8_t *route_body = NULL;
               size_t route_body_len = 0;

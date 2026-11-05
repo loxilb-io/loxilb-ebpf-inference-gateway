@@ -1374,6 +1374,11 @@ struct proxy_fd_ent {
    * flips on the first "Host:" name, which every slowloris sends first. */
   int http_hdrs_done;
   int http_body_complete;
+  /* Spans of the current llhttp header field/value in the retained rcvbuf. */
+  size_t http_header_start;
+  size_t http_header_len;
+  uint8_t http_content_type_field;
+  uint8_t http_body_media;
   size_t http_content_length;
   int is_streamable;  // Flag: Content can be streamed (not JSON/form-urlencoded)
   /* Oversize JSON cannot be routed at headers-only time when the only pool is

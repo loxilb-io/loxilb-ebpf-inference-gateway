@@ -7,7 +7,7 @@ source = (root / 'sockproxy_http.c').read_text()
 if os.environ.get('AUDIT_TEST_SOURCE'):
     source = Path(os.environ['AUDIT_TEST_SOURCE']).read_text()
 a = source.index('static int\nproxy_owes_completion(')
-b = source.index('static const char *strnstr_portable', a)
+b = source.index('/* One P/D lifecycle record', a)
 c = source.index('/* ---- responses the gateway writes itself ----')
 d = source.index('\nstatic int\nproxy_send_local_100_continue', c)
 prefix = r'''
