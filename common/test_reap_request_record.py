@@ -87,11 +87,14 @@ reaper = (health[t0:t1] + body(health, 'static int\nsp_reap_client_chunked(')
           + body(health, 'static int\nsp_reap_end(')
           + body(health, 'static void\nsp_reap_record(')
           + body(health, 'void\nsp_reap_finish(proxy_fd_ent_t *pfe)'))
-a = http.index('static int\nproxy_owes_completion(')
-b = http.index('static const char *strnstr_portable', a)
+# Compile the named recorders independently of unrelated neighboring helpers.
 pdleak = (root / 'sockproxy_pd_leak.h').read_text()
 recorders = (body(pdleak, 'static inline int\npd_reap_error_phase(')
-             + http[a:b] + body(http, 'void\nproxy_record_local_completion(')
+             + body(http, 'static int\nproxy_owes_completion(')
+             + body(http, 'static void\nproxy_ai_record_completion_(')
+             + body(http, 'static void\nproxy_ai_record_completion(')
+             + body(http, 'void\nproxy_record_reaped_answer(')
+             + body(http, 'void\nproxy_record_local_completion(')
              + body(http, 'static void\nproxy_teardown_view('))
 
 prefix = r'''
