@@ -95,7 +95,7 @@ jobs:
       - name: Per-direction sockmap gate (what a declaration owns, what still pairs)
         run: make -C common test_smgate
 
-      - name: HTTP/2 upstream header hygiene
+      - name: HTTP/1 and HTTP/2 upstream header hygiene (framing, identity and credentials)
         run: make -C common test_aisec
 
       - name: Admission-gate identity transport and the keyless shared bucket
