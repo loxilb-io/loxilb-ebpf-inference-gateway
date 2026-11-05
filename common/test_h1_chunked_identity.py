@@ -11,6 +11,11 @@ source = (root / "sockproxy_http.c").read_text()
 start = source.index("static size_t\nai_strip_upstream_api_key(")
 end = source.index("\n/*\n * sp_llmd_forward_headers", start)
 production = source[start:end]
+header_start = source.index("handle_on_headers_complete(llhttp_t* parser)")
+header_end = source.index("handle_on_message_complete(llhttp_t* parser)", header_start)
+snapshot = "pfe->json_guard_chunked = (parser->flags & F_CHUNKED) != 0;"
+assert snapshot in source[header_start:header_end]
+assert "npfe1->settings.on_headers_complete = handle_on_headers_complete;" in source
 fixture = r'''
 #define _GNU_SOURCE
 #include <assert.h>
@@ -26,6 +31,7 @@ typedef struct { uint8_t apikey_auth; } proxy_epval_t;
 typedef struct { proxy_epval_t pool; } proxy_map_ent_t;
 typedef struct {
   int odir, auth_jwt_capable, auth_strip_authz, auth_fwd_identity, auth_netid_fwd;
+  int json_guard_chunked;
   char tenant_id[32], auth_user_id[32];
   proxy_map_ent_t *head;
   llhttp_t parser;
@@ -34,10 +40,14 @@ static proxy_epval_t *sp_pool_first(proxy_map_ent_t *node) { return &node->pool;
 static int proxy_svc_forwards_netid(proxy_map_ent_t *node) { (void)node; return 0; }
 static int ai_security_should_strip_api_key(uint8_t policy) { return policy == 3; }
 /* PRODUCTION */
-static int pause_complete(llhttp_t *parser) { (void)parser; return HPE_PAUSED; }
+static int capture_framing(llhttp_t *parser) {
+  proxy_fd_ent_t *pfe = parser->data;
+  /* PRODUCTION_FRAMING_SNAPSHOT */
+  return 0;
+}
 static unsigned passed;
 static void run(const char *name, const char *te, size_t pad,
-                const char *decoy, int chunked, int at_gate, int body_decoy) {
+                const char *decoy, int chunked, int at_gate, int body_decoy, int partial) {
   proxy_map_ent_t node = { .pool = { .apikey_auth = 3 } };
   proxy_fd_ent_t pfe = {
     .auth_jwt_capable = 1, .auth_strip_authz = 1, .auth_fwd_identity = 1,
@@ -53,8 +63,9 @@ static void run(const char *name, const char *te, size_t pad,
   size_t len, wire_body_len, old_header_len;
   uint8_t *header_end;
   llhttp_settings_init(&settings);
-  settings.on_message_complete = pause_complete;
+  settings.on_headers_complete = capture_framing;
   llhttp_init(&pfe.parser, HTTP_REQUEST, &settings);
+  pfe.parser.data = &pfe;
   if (chunked)
     n = snprintf(encoded_body, sizeof(encoded_body), "%zx\r\n%s\r\n0\r\n\r\n", strlen(body), body);
   else
@@ -77,9 +88,11 @@ static void run(const char *name, const char *te, size_t pad,
   assert(n > 0); len += (size_t)n;
   memcpy(buf + len, "\r\n", 2); len += 2;
   old_header_len = len;
+  if (partial && wire_body_len > 25) wire_body_len = 25;
   memcpy(buf + len, encoded_body, wire_body_len); len += wire_body_len;
-  assert(llhttp_execute(&pfe.parser, (const char *)buf, len) == HPE_PAUSED);
-  assert(!!(pfe.parser.flags & F_CHUNKED) == chunked);
+  assert(llhttp_execute(&pfe.parser, (const char *)buf, len) == HPE_OK);
+  assert(pfe.json_guard_chunked == chunked);
+  if (!partial) assert(!(pfe.parser.flags & F_CHUNKED));
   len = ai_strip_upstream_api_key(&pfe, buf, len, sizeof(buf), at_gate);
   header_end = memmem(buf, len, "\r\n\r\n", 4);
   assert(header_end);
@@ -96,22 +109,24 @@ static void run(const char *name, const char *te, size_t pad,
   assert(len - hlen == wire_body_len);
   assert(memcmp(buf + hlen, encoded_body, wire_body_len) == 0);
   assert(hlen < old_header_len + 128);
-  printf("PASS: %s\n", name); fflush(stdout); passed++;
+  printf("PASS: %s (%s)\n", name, partial ? "streaming prefix" : "complete buffered message"); fflush(stdout); passed++;
 }
 int main(void) {
-  run("canonical chunked", "Transfer-Encoding: chunked", 0, "", 1, 1, 0);
-  run("mixed value", "Transfer-Encoding: Chunked", 0, "", 1, 1, 0);
-  run("mixed name/value", "tRaNsFeR-EnCoDiNg: ChUnKeD", 0, "", 1, 1, 0);
-  run("late chunked header", "Transfer-Encoding: chunked", 4096, "", 1, 1, 0);
-  run("late mixed chunked header", "transfer-encoding: CHUNKED", 4096, "", 1, 1, 0);
-  run("Content-Length body decoy still injects", NULL, 0, "", 0, 1, 1);
+  for (int partial = 0; partial < 2; partial++) {
+  run("canonical chunked", "Transfer-Encoding: chunked", 0, "", 1, 1, 0, partial);
+  run("mixed value", "Transfer-Encoding: Chunked", 0, "", 1, 1, 0, partial);
+  run("mixed name/value", "tRaNsFeR-EnCoDiNg: ChUnKeD", 0, "", 1, 1, 0, partial);
+  run("late chunked header", "Transfer-Encoding: chunked", 4096, "", 1, 1, 0, partial);
+  run("late mixed chunked header", "transfer-encoding: CHUNKED", 4096, "", 1, 1, 0, partial);
+  run("Content-Length body decoy still injects", NULL, 0, "", 0, 1, 1, partial);
   run("Content-Length header decoy still injects", NULL, 0,
-      "X-Note: Transfer-Encoding: chunked\r\n", 0, 1, 0);
-  run("relay read never injects", NULL, 0, "", 0, 0, 0);
-  assert(passed == 8);
-  puts("ALL PASS (8/8 H1 framing and identity paths)");
+      "X-Note: Transfer-Encoding: chunked\r\n", 0, 1, 0, partial);
+  run("relay read never injects", NULL, 0, "", 0, 0, 0, partial);
+  }
+  assert(passed == 16);
+  puts("ALL PASS (16/16 H1 framing and identity paths)");
 }
-'''.replace("/* PRODUCTION */", production)
+'''.replace("/* PRODUCTION */", production).replace("/* PRODUCTION_FRAMING_SNAPSHOT */", snapshot)
 with tempfile.TemporaryDirectory(prefix="h1-chunked-identity-") as directory:
     test = Path(directory) / "test.c"
     binary = Path(directory) / "test"
