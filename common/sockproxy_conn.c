@@ -1681,6 +1681,7 @@ proxy_delete_entry__(proxy_ent_t *ent, proxy_arg_t *arg, int *mfd,
 void
 proxy_release_fd_ctx(proxy_fd_ent_t *fd_ent, int reset)
 {
+  fd_ent->pd_reply.active = 0; /* queued refusal handles expire by generation */
   proxy_destroy_xmitcache(fd_ent);
   proxy_connect_pending_clear(fd_ent);
   /* A client that leaves with an EPP stream open: the EPP hears an abort

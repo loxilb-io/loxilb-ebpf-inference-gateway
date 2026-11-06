@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_refusal.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -204,6 +204,10 @@ xxhash.o: xxhash.c xxhash.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_pd.o: sockproxy_pd.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Native P/D non-blocking terminal response/linger state.
+sockproxy_refusal.o: sockproxy_refusal.c sockproxy_refusal.h sockproxy.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # P/D engine-dialect core (ops-table resolution; machine-agnostic glue)
@@ -904,8 +908,8 @@ test_epp_cfg: test_epp_cfg.c llb_dpapi.h sockproxy.h
 	$(CC) -Wall -Wextra -Wno-unused-function -o $@ $< -I. -I../libbpf/src -I../libbpf/include/uapi $(CFLAGS_MTLS)
 
 .PHONY: test_pd_request_limit
-test_pd_request_limit: test_pd_request_limit.c sockproxy_pd_core.c log.c
-	$(CC) -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections -o test_pd_request_limit_bin $^ -I. -lpthread
+test_pd_request_limit: test_pd_request_limit.c sockproxy_pd_core.c sockproxy_fc.c log.c
+	$(CC) -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections -o test_pd_request_limit_bin $^ -I. -lpthread -lssl -lcrypto
 	env -u LLB_PD_MAX_BODY_BYTES ./test_pd_request_limit_bin 786432
 	LLB_PD_MAX_BODY_BYTES=32768 ./test_pd_request_limit_bin 32768
 	LLB_PD_MAX_BODY_BYTES=786432 ./test_pd_request_limit_bin 786432
@@ -1212,7 +1216,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
-	rm -f test_pd_request_limit_bin
+	rm -f test_pd_request_limit_bin test_pd_refusal_bin
 	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
@@ -1298,8 +1302,8 @@ test_pd_queue_generation: test_pd_queue_generation.c notify.c notify.h log.c soc
 pd_resv_vllm_test.o: sockproxy_pd_vllm.c sockproxy.h sockproxy_pd_reservation.h
 	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
 
-PD_RETRY_WRAPS = -Wl,--wrap=malloc,--wrap=calloc,--wrap=write,--wrap=proxy_fdlist_link,--wrap=pd_resp_parser_init,--wrap=handle_on_message_complete
-test_pd_retry_lifecycle: test_pd_retry_lifecycle.c $(PD_RESV_TEST_OBJS) pd_resv_vllm_test.o pd_resv_dialect_test.o pd_resv_trt_test.o sockproxy_pd_trie.c sockproxy_pd_terminal.c sockproxy_locktrace.c log.c llhttp.c httpapi.c http.c
+PD_RETRY_WRAPS = -Wl,--wrap=malloc,--wrap=calloc,--wrap=write,--wrap=proxy_fdlist_link,--wrap=pd_resp_parser_init,--wrap=handle_on_message_complete,--wrap=sp_pd_send_refusal,--wrap=pd_sg_inject_bootstrap
+test_pd_retry_lifecycle: test_pd_retry_lifecycle.c $(PD_RESV_TEST_OBJS) pd_resv_vllm_test.o pd_resv_dialect_test.o pd_resv_trt_test.o sockproxy_pd_trie.c sockproxy_pd_terminal.c sockproxy_locktrace.c log.c llhttp.c httpapi.c http.c sockproxy_fc.c sockproxy_json.c xxhash.c sockproxy_hc.c
 	$(CC) $(PD_RESV_TEST_FLAGS) -Wl,--gc-sections $(PD_RETRY_WRAPS) -o $@ $^ -I. -lpthread -lnghttp2 -lssl -lcrypto
 
 pd_resv_dialect_test.o: sockproxy_pd_core.c sockproxy.h
@@ -1307,3 +1311,10 @@ pd_resv_dialect_test.o: sockproxy_pd_core.c sockproxy.h
 
 pd_resv_trt_test.o: sockproxy_pd_trtllm.c sockproxy.h
 	$(CC) $(PD_RESV_TEST_FLAGS) -c -o $@ $<
+
+# Native P/D terminal response flushing: real writer, faulted I/O boundaries.
+.PHONY: test_pd_refusal
+test_pd_refusal: test_pd_refusal_bin
+	./test_pd_refusal_bin
+test_pd_refusal_bin: test_pd_refusal.c sockproxy_refusal.c log.c
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wl,--wrap=send,--wrap=recv,--wrap=shutdown,--wrap=clock_gettime,--wrap=malloc,--wrap=SSL_write,--wrap=SSL_get_error,--wrap=SSL_read,--wrap=SSL_shutdown -o $@ $^ -I. -lpthread -lssl -lcrypto

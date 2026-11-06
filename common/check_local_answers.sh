@@ -81,6 +81,7 @@ sockproxy_health.c:pd_reap_respond:send:-|1|reaper fallback when the owner worke
 # request that timed out on its legs completes with the status written; the
 # SSE events are body bytes inside a response in progress, not a response.
 RECORDS='
+sockproxy_refusal.c:sp_pd_send_refusal:proxy_note_local_refusal(pfe, status);proxy_record_local_deny(pfe, stage
 sockproxy_http.c:sp_send_local_refusal:proxy_note_local_refusal(pfe, status);proxy_record_local_deny(pfe, stage
 sockproxy_http.c:sp_send_local_outage:proxy_record_local_completion(pfe, status)
 sockproxy_http.c:proxy_send_backend_unreachable:proxy_record_local_completion(pfe, 502)
@@ -260,11 +261,11 @@ fnbody sockproxy_health.c sp_reap_fc_format | grep -q 'ai_gw_record_capacity_den
   { echo "sockproxy_health.c: sp_reap_fc_format must take the queued refusal's deny record"; fail=1; }
 # Every local deny record passes a stage, never NONE.
 bad=$(awk '
-  /(sp_send_local_refusal|proxy_record_local_deny|h2_send_local_refusal|ai_gw_record_local_deny)\(/ &&
+  /(sp_pd_send_refusal|sp_send_local_refusal|proxy_record_local_deny|h2_send_local_refusal|ai_gw_record_local_deny)\(/ &&
   !/^[A-Za-z_]/ && !/^[[:space:]]*(\*|\/\*|\/\/)/ {
     acc = $0; k = 0
     while (acc !~ /;/ && k++ < 4 && (getline nl) > 0) acc = acc " " nl
-    if (acc ~ /(sp_send_local_refusal|proxy_record_local_deny|h2_send_local_refusal)\([a-z_]+, (stream, )?(stage|AI_GW_STAGE_[A-Z]+)/ ||
+    if (acc ~ /(sp_pd_send_refusal|sp_send_local_refusal|proxy_record_local_deny|h2_send_local_refusal)\([a-z_]+, (stream, )?(stage|AI_GW_STAGE_[A-Z]+)/ ||
         acc ~ /ai_gw_record_local_deny\((stage|\(int\)AI_GW_STAGE_[A-Z]+),/) {
       if (acc !~ /AI_GW_STAGE_NONE/) next
     }
@@ -300,6 +301,7 @@ fi
 
 # 6. A started answer takes no new status line.
 for spec in \
+  'sockproxy_refusal.c:sp_pd_send_refusal:sp_answer_is_status_line(response, len) && sp_answer_started(pfe)' \
   'sockproxy_http.c:proxy_send_local_response:sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)' \
   'sockproxy_http.c:proxy_send_local_response_and_shutdown:sp_answer_is_status_line(buf, len) && sp_answer_started(pfe)' \
   'sockproxy_http.c:sp_raw_status_write:if (sp_answer_started(pfe))' \

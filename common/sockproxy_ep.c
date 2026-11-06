@@ -1523,6 +1523,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
 
           log_info("US-PD804: P/D EP selected — prefill=EP%d decode=EP%d", pd_prefill, pd_decode);
+          if (pd_prepare_before_connect(pfe, tepval) != 0)
+            return -1;
         } else if (!l7_subset && tepval->kv_exact_mode == KV_EXACT_MODE_SINGLE_ROLE && pfe) {
           /* single-role Tier-1.5 KV-exact selection — the
            * SIBLING of the P/D block above, structurally parallel and textually
@@ -1898,6 +1900,12 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
               }
               pd_load_commit(tepval, &pfe->pd_decode_load_token, fc_decode);
 
+              if (pfe->pd_sg_active) {
+                pfe->pd_prefill_ep_idx = fc_prefill;
+                pfe->pd_decode_ep_idx = fc_decode;
+                if (pd_prepare_before_connect(pfe, tepval) != 0)
+                  return -1;
+              }
               int fc_fd = proxy_setup_ep_connect(
                   tepval->eps[fc_prefill].xip,
                   tepval->eps[fc_prefill].xport,

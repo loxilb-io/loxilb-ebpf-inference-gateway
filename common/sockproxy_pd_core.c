@@ -17,6 +17,8 @@
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
+#include <sys/socket.h>
+#include <openssl/ssl.h>
 
 #include "uthash.h"
 #include "log.h"
@@ -27,6 +29,7 @@
 #include "sockproxy_json.h"
 #include "sockproxy_ai_admit.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_hc.h"
 
 static pthread_once_t pd_body_limit_once = PTHREAD_ONCE_INIT;
 static size_t pd_body_limit = SP_JSON_INSPECT_MAX;
@@ -38,17 +41,19 @@ pd_read_body_limit(void)
   char *end;
   unsigned long long limit;
 
-  if (!value || !*value)
-    return;
-  errno = 0;
-  limit = strtoull(value, &end, 10);
-  if (value[0] < '0' || value[0] > '9' || *end || errno ||
-      limit == 0 || limit > SP_JSON_INSPECT_MAX) {
-    log_error("Invalid LLB_PD_MAX_BODY_BYTES='%s'; using %u bytes",
-              value, (unsigned)SP_JSON_INSPECT_MAX);
-    return;
+  if (value && *value) {
+    errno = 0;
+    limit = strtoull(value, &end, 10);
+    if (value[0] < '0' || value[0] > '9' || *end || errno ||
+        limit == 0 || limit > SP_JSON_INSPECT_MAX) {
+      log_error("Invalid LLB_PD_MAX_BODY_BYTES='%s'; using %u bytes",
+                value, (unsigned)SP_JSON_INSPECT_MAX);
+    } else {
+      pd_body_limit = (size_t)limit;
+    }
   }
-  pd_body_limit = (size_t)limit;
+  log_info("Native P/D request body limit: %zu bytes (LLB_PD_MAX_BODY_BYTES)",
+           pd_body_limit);
 }
 
 size_t
@@ -58,33 +63,149 @@ pd_max_request_body_bytes(void)
   return pd_body_limit;
 }
 
+
 int
 pd_check_request_body(proxy_fd_ent_t *pfe)
 {
   const char *error = NULL;
   const char *detail = NULL;
+  uint16_t status = 413;
   size_t limit = pd_max_request_body_bytes();
+  size_t content_length = pfe->http_pipelined ? pfe->http_first_content_length :
+                                              pfe->http_content_length;
+  uint8_t media = pfe->http_pipelined ? pfe->http_first_body_media : pfe->http_body_media;
+  uint8_t chunked = pfe->http_pipelined ? pfe->http_first_chunked : pfe->json_guard_chunked;
   const uint8_t *head_end = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
   size_t body_len = head_end ? pfe->rcv_off - (size_t)(head_end + 4 - pfe->rcvbuf) : 0;
+  /* The receive buffer may also contain a pipelined request. Only the
+   * current message's declared body belongs to this byte limit. */
+  if (!chunked && body_len > content_length)
+    body_len = content_length;
 
-  if (pfe->http_content_length > limit || body_len > limit) {
+  if (pfe->http_pipelined) {
+    status = 400;
+    error = "pd_pipelining_unsupported";
+    detail = "send one P/D request at a time on a keep-alive connection";
+  } else if ((content_length || chunked) &&
+      !(media & SP_H1_MEDIA_JSON)) {
+    status = 415;
+    error = "pd_body_unsupported_media";
+    detail = "native prefill/decode requires an application/json request body";
+  } else if (content_length > limit || body_len > limit) {
     error = "pd_body_too_large";
     detail = "request body exceeds the native prefill/decode byte limit";
-  } else if (pfe->is_streamable || pfe->json_guard_chunked) {
+  } else if (pfe->is_streamable || chunked) {
     error = "pd_body_unbufferable";
     detail = "native prefill/decode requires a complete buffered Content-Length body";
+  } else if (content_length && body_len == content_length &&
+             !pd_body_is_object(head_end + 4, body_len)) {
+    status = 400;
+    error = "invalid_json_body";
+    detail = "native prefill/decode requires a JSON object";
   }
   if (error) {
-    char response[512];
-    int len = snprintf(response, sizeof(response),
-        "HTTP/1.1 413 Payload Too Large\r\n"
-        "Content-Type: application/json\r\nConnection: close\r\n\r\n"
+    char body[320];
+    int body_len_out = snprintf(body, sizeof(body),
         "{\"error\":\"%s\",\"detail\":\"%s\",\"max_body_bytes\":%zu}\r\n",
         error, detail, limit);
-    sp_send_local_refusal(pfe, AI_GW_STAGE_FRAMING, 413, error, response, (size_t)len);
-    pfe->lb_err_body_sent = 1;
+    char response[512];
+    int len = snprintf(response, sizeof(response),
+        "HTTP/1.1 %u %s\r\n"
+        "Content-Type: application/json\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n%s",
+        status, status == 415 ? "Unsupported Media Type" :
+                status == 400 ? "Bad Request" : "Payload Too Large",
+        body_len_out, body);
+    size_t unread = content_length > body_len ? content_length - body_len :
+                    chunked && !pfe->http_pok ? 4 * 1024 * 1024 : 0;
+    fc_permit_release(&pfe->fc);
+    sp_pd_send_refusal(pfe, AI_GW_STAGE_FRAMING, status, error,
+                        response, (size_t)len, unread);
     return -1;
   }
+  return 0;
+}
+
+int
+pd_prepare_failed(proxy_fd_ent_t *pfe)
+{
+  static const char body[] =
+      "{\"error\":\"pd_prepare_failed\","
+      "\"detail\":\"native prefill/decode request preparation failed\"}\r\n";
+  char response[512];
+  int len = snprintf(response, sizeof(response),
+      "HTTP/1.1 500 Internal Server Error\r\n"
+      "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+      "Connection: close\r\n\r\n%s", sizeof(body) - 1, body);
+  pd_cleanup(pfe);
+  fc_permit_release(&pfe->fc);
+  pfe->pd_phase = PD_PHASE_ERROR;
+  sp_pd_send_refusal(pfe, AI_GW_STAGE_FRAMING, 500, "pd_prepare_failed",
+                      response, (size_t)len, 0);
+  pfe->lb_err_body_sent = 1;
+  return -1;
+}
+
+void
+pd_request_usage_prepare(proxy_fd_ent_t *pfe, proxy_epval_t *epval)
+{
+  if (!epval || !epval->ai_gw_mode || epval->mcp_stateless ||
+      pfe->odir != 0 || pfe->is_streamable || pfe->json_guard_chunked ||
+      pfe->http_pipelined ||
+      pfe->http_content_length == 0)
+    return;
+  uint8_t *head = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
+  if (!head)
+    return;
+  size_t hdr_len = (size_t)(head + 4 - pfe->rcvbuf);
+  size_t body_len = pfe->http_content_length;
+  if (pfe->rcv_off - hdr_len < body_len)
+    return;
+  char *body = (char *)pfe->rcvbuf + hdr_len;
+  hc_note_stream(pfe, json_stream_flag(body, body_len));
+  size_t new_len = body_len;
+  int injected = inject_include_usage(body, body_len, SP_SOCK_MSG_LEN - hdr_len, &new_len);
+  pfe->usage_est_prompt = (uint32_t)estimate_prompt_tokens(body, new_len);
+  if (injected == 0) {
+    pfe->rcv_off = hdr_len + new_len;
+    pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off, SP_SOCK_MSG_LEN, new_len);
+    pfe->http_content_length = new_len;
+    pfe_rcv_note(pfe);
+  }
+}
+
+int
+pd_prepare_before_connect(proxy_fd_ent_t *pfe, proxy_epval_t *epval)
+{
+  if (pfe->pd_sg_active && pfe->pd_saved_body) {
+    uint8_t *head = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
+    if (!head)
+      return pd_prepare_failed(pfe);
+    size_t hdr_len = (size_t)(head + 4 - pfe->rcvbuf);
+    if (pfe->pd_saved_body_len > SP_SOCK_MSG_LEN - hdr_len)
+      return pd_prepare_failed(pfe);
+    memcpy(pfe->rcvbuf + hdr_len, pfe->pd_saved_body, pfe->pd_saved_body_len);
+    pfe->http_content_length = pfe->pd_saved_body_len;
+    pfe->rcv_off = hdr_len + pfe->pd_saved_body_len;
+    pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
+                             SP_SOCK_MSG_LEN, pfe->pd_saved_body_len);
+    pd_free_claim(&pfe->pd_saved_body);
+    pfe->pd_saved_body_len = 0;
+    pfe->pd_sg_active = 0;
+  }
+  pd_request_usage_prepare(pfe, epval);
+  uint8_t *head = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
+  if (!head || !epval->pd_ops || !epval->pd_ops->prepare_request)
+    return pd_prepare_failed(pfe);
+  size_t hdr_len = (size_t)(head + 4 - pfe->rcvbuf);
+  if (!pfe->http_content_length || pfe->rcv_off - hdr_len < pfe->http_content_length)
+    return pd_prepare_failed(pfe);
+  int rc = epval->pd_ops->prepare_request(pfe, epval, hdr_len,
+                  pfe->rcvbuf + hdr_len, pfe->http_content_length);
+  if (rc < 0)
+    return rc;
+  if (pfe->pd_phase != PD_PHASE_PREFILL_SENDING && !pfe->pd_sg_active)
+    return pd_prepare_failed(pfe);
   return 0;
 }
 

@@ -871,76 +871,55 @@ done:
 
 /* --- Dialect ops --------------------------------------------------------- */
 
-/* Sequential-machine request preparation, parameterized by the dialect's
- * prefill-body rewriter (vLLM probe rewrite vs TRT-LLM context splice).
- * Everything else — original-body save, response-buffer allocation,
- * phase/timestamp arming — is dialect-invariant. Failures log and fall
- * back to plain forwarding of the untouched request (returns 0 — never
- * fails the client here). */
+/* Save and rewrite the complete request before connecting either role. */
 int
 pd_seq_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
                        size_t hdr_len, const uint8_t *body, size_t body_len,
                        pd_body_rewrite_t rewrite)
 {
   (void)epval;
-  /* 1. Save original body for decode phase */
+  uint8_t *prefill_buf = NULL;
+  size_t prefill_body_len = 0;
+  if (!pd_body_is_object(body, body_len))
+    return pd_prepare_failed(pfe);
+
   pfe->pd_saved_body = malloc(body_len);
-  if (pfe->pd_saved_body) {
-    memcpy(pfe->pd_saved_body, body, body_len);
-    pfe->pd_saved_body_len = body_len;
+  if (!pfe->pd_saved_body)
+    goto failed;
+  memcpy(pfe->pd_saved_body, body, body_len);
+  pfe->pd_saved_body_len = body_len;
 
-    /* 2. Rewrite body for the prefill leg (dialect rewriter) */
-    uint8_t *prefill_buf = malloc(body_len + 4096);
-    if (prefill_buf) {
-      size_t prefill_body_len = 0;
-      if (rewrite(body, body_len,
-                  prefill_buf, &prefill_body_len,
-                  body_len + 4096) == 0) {
-        /* Replace body in rcvbuf */
-        memcpy(pfe->rcvbuf + hdr_len, prefill_buf, prefill_body_len);
-        pfe->rcv_off = hdr_len + prefill_body_len;
-        pfe_rcv_note(pfe);
-        pfe->pd_prefill_body_len = prefill_body_len;
+  prefill_buf = malloc(body_len + 4096);
+  if (!prefill_buf || rewrite(body, body_len, prefill_buf,
+              &prefill_body_len, body_len + 4096) != 0 ||
+      hdr_len >= SP_SOCK_MSG_LEN || prefill_body_len > SP_SOCK_MSG_LEN - hdr_len)
+    goto failed;
 
-        /* 3. Allocate prefill response buffer (64KB cap) */
-        pfe->pd_prefill_resp_cap = 64 * 1024;
-        pfe->pd_prefill_resp_buf = malloc(pfe->pd_prefill_resp_cap);
-        if (pfe->pd_prefill_resp_buf) {
-          pfe->pd_prefill_resp_len = 0;
+  pfe->pd_prefill_resp_cap = 64 * 1024;
+  pfe->pd_prefill_resp_buf = malloc(pfe->pd_prefill_resp_cap);
+  if (!pfe->pd_prefill_resp_buf)
+    goto failed;
+  pfe->pd_prefill_resp_len = 0;
 
-          /* 4. Set phase and timestamps */
-          pfe->pd_phase = PD_PHASE_PREFILL_SENDING;
-          pfe->pd_phase_start_ts = time(NULL);
-          {
-            struct timespec _ts;
-            clock_gettime(CLOCK_MONOTONIC, &_ts);
-            pfe->pd_prefill_start_ns =
-                (uint64_t)_ts.tv_sec * 1000000000ULL +
-                (uint64_t)_ts.tv_nsec;
-          }
-
-          log_info("P/D entry — fd=%d prefill_ep=%d "
-                   "decode_ep=%d orig_body=%zu prefill_body=%zu",
-                   pfe->fd, pfe->pd_prefill_ep_idx,
-                   pfe->pd_decode_ep_idx,
-                   body_len, prefill_body_len);
-        } else {
-          log_error("malloc failed for prefill_resp_buf");
-          pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
-        }
-      } else {
-        log_error("pd_prepare_prefill_body failed");
-        pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
-      }
-      free(prefill_buf);
-    } else {
-      log_error("malloc failed for prefill_buf");
-      pd_free_claim(&pfe->pd_saved_body);  /* race-safe */
-    }
-  } else {
-    log_error("malloc failed for pd_saved_body (%zu)", body_len);
-  }
+  memcpy(pfe->rcvbuf + hdr_len, prefill_buf, prefill_body_len);
+  pfe->rcv_off = hdr_len + prefill_body_len;
+  pfe_rcv_note(pfe);
+  pfe->pd_prefill_body_len = prefill_body_len;
+  free(prefill_buf);
+  pfe->pd_phase = PD_PHASE_PREFILL_SENDING;
+  pfe->pd_phase_start_ts = time(NULL);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  pfe->pd_prefill_start_ns = (uint64_t)now.tv_sec * 1000000000ULL + now.tv_nsec;
+  log_info("P/D entry — fd=%d prefill_ep=%d decode_ep=%d orig_body=%zu prefill_body=%zu",
+            pfe->fd, pfe->pd_prefill_ep_idx, pfe->pd_decode_ep_idx,
+            body_len, prefill_body_len);
   return 0;
+
+failed:
+  free(prefill_buf);
+  log_error("P/D sequential request preparation failed — fd=%d", pfe->fd);
+  return pd_prepare_failed(pfe);
 }
 
 /* vLLM sequential machine: the classic prefill probe rewrite

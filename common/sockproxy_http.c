@@ -269,11 +269,6 @@ proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end)
   proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0, end);
 }
 
-enum {
-  SP_H1_MEDIA_JSON = 1,
-  SP_H1_MEDIA_FORM = 2,
-};
-
 /* One P/D lifecycle record, for one request and one completion event: the
  * outcome (llb_ai_pd_record), then the request's first-event time and
  * fallback reason (llb_ai_pd_record_extra), always both and with nothing
@@ -5050,6 +5045,7 @@ void
 proxy_qos_tick(int thread)
 {
   (void)thread;
+  sp_pd_refusal_tick();
   proxy_map_ent_t *ent;
 
   if (!proxy_struct) {
@@ -9015,6 +9011,10 @@ setup_proxy_path(smap_key_t *key, smap_key_t *rkey, proxy_fd_ent_t *pfe, const c
    * hold it open. Do NOT proxy_destroy_eps, do NOT shutdown. The caller translates
    * PD_SETUP_PARKED into "keep fd, do NOT forward to backend, do NOT close". The
    * dequeue+resume (re-arm EPOLLIN + re-drive) is not wired yet. */
+  if (psep_rc && pfe->pd_reply.active) {
+    proxy_destroy_eps(pfe->fd, &ep_sel);
+    return PD_SETUP_KEPT; /* terminal response is still flushing on its owner */
+  }
   if (psep_rc == PD_SETUP_PARKED) {
     if (!pfe->read_paused) {
       pfe->read_paused = 1;
@@ -9376,6 +9376,9 @@ handle_on_message_begin(llhttp_t* parser)
    * the header is present, so without this reset a keyless request N+1 on a
    * reused connection would be validated with request N's key. */
   if (pfe->odir == 0) {
+    if (pfe->http_body_complete && !pfe->json_guard_streaming) {
+      pfe->http_pipelined = 1;
+    }
     pfe->http_hdrs_done = 0;   /* request N+1's header block starts here */
     pfe->http_header_len = 0;
     pfe->http_content_type_field = 0;
@@ -10762,6 +10765,14 @@ handle_on_message_complete(llhttp_t* parser)
   pfe = settings->uarg;
   assert(pfe);
 
+  /* Later pipelined headers may replace the live captures. Retain the first
+   * message's framing for the native P/D body check, without skipping any
+   * per-request authentication, quota or capacity reset. */
+  if (pfe->odir == 0 && !pfe->http_pipelined) {
+    pfe->http_first_content_length = pfe->http_content_length;
+    pfe->http_first_body_media = pfe->http_body_media;
+    pfe->http_first_chunked = pfe->json_guard_chunked;
+  }
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
   if (pfe->json_guard_active) {
@@ -12843,16 +12854,18 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
   pfe->ka_reparse = 0;
   pfe->ka_keep_leg = 0;
 
-  /* An EPP rule decides every request: the kept backend leg of the previous
+  /* EPP decisions and native P/D role selection run for every request.
+   * The kept backend leg of the previous
    * request would carry this one to the same endpoint behind the EPP's
    * back. Give the leg up and take the setup path, where the EPP stage is.
    * Only for a NEXT request (the previous one's EPP phase is reported):
    * a leg whose connect just completed re-enters here for the SAME request
    * (proxy_backend_connect_event) and must ride on. */
   if (ka_keep_leg && pfe->epv &&
-      ((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF &&
+      (((proxy_epval_t *)pfe->epv)->epp_mode != EPP_MODE_OFF ||
+       ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) &&
       (pfe->epp_sid == 0 || pfe->epp_reported)) {
-    log_debug("[EPP] fd=%d keep-alive request on an EPP rule: releasing the kept leg", pfe->fd);
+    log_debug("[PD_SETUP] fd=%d reselecting roles or EPP for the next request", pfe->fd);
     proxy_release_rfd_ctx(pfe);
     ka_keep_leg = 0;
   }
@@ -12944,105 +12957,10 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
                old_len, pfe->rcv_off);
     }
 
-    /* AI-gateway token accounting: force stream_options.include_usage=true
-     * into streaming request bodies BEFORE any dialect rewrite, so the
-     * backend's final SSE chunk carries the usage object the response path
-     * charges from. A client that omits the flag would otherwise stream
-     * tokens invisible to the per-tenant quota. Placement covers every
-     * plane from one site: the plain relay forwards the patched body, the
-     * sequential P/D machines save it for the decode leg (their prefill
-     * rewrites strip stream_options again), and the sglang dual dispatch
-     * inherits it on both legs — exactly what a reference router forwards
-     * when the client itself sets the flag. Chunked or partially
-     * accumulated bodies are left untouched (not contiguous/complete
-     * here); non-streaming requests carry usage without the flag. */
-    if (pfe->epv && pfe->odir == 0 && pfe->rcv_off > 4 && !pfe->is_streamable &&
-        ((proxy_epval_t *)pfe->epv)->ai_gw_mode &&
-        !((proxy_epval_t *)pfe->epv)->mcp_stateless) {
-      size_t ug_scan = pfe->rcv_off < 2048 ? pfe->rcv_off : 2048;
-      if (memmem(pfe->rcvbuf, ug_scan, "Transfer-Encoding: chunked", 26) == NULL &&
-          memmem(pfe->rcvbuf, ug_scan, "transfer-encoding: chunked", 26) == NULL) {
-        char *ug_body = NULL;
-        size_t ug_body_len = 0, ug_hdr_len = 0;
-        for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
-          if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
-              pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
-            ug_hdr_len = i + 4;
-            ug_body = (char *)pfe->rcvbuf + ug_hdr_len;
-            ug_body_len = pfe->rcv_off - ug_hdr_len;
-            break;
-          }
-        }
-        if (ug_body && ug_body_len > 0 && pfe->http_content_length > 0 &&
-            ug_body_len >= (size_t)pfe->http_content_length) {
-          size_t ug_new_len = ug_body_len;
-          /* The whole body is at hand: record whether it asked to stream,
-           * for the half-close observation's stream dimension. */
-          hc_note_stream(pfe, json_stream_flag(ug_body, ug_body_len));
-          if (inject_include_usage(ug_body, ug_body_len,
-                                   SP_SOCK_MSG_LEN - ug_hdr_len,
-                                   &ug_new_len) == 0) {
-            pfe->rcv_off = ug_hdr_len + ug_new_len;
-            pd_update_content_length(pfe->rcvbuf, &pfe->rcv_off,
-                                     SP_SOCK_MSG_LEN, ug_new_len);
-            pfe_rcv_note(pfe);
-            log_debug("[AI_USAGE_INJECT] fd=%d body %zu -> %zu bytes",
-                     pfe->fd, ug_body_len, ug_new_len);
-          }
-          /* Size the prompt-estimate net while the body is at hand — only
-           * ever charged (flagged estimated) when the response's usage
-           * object fails to materialize. */
-          pfe->usage_est_prompt =
-              (uint32_t)estimate_prompt_tokens(ug_body, ug_new_len);
-        }
-      }
-    }
-
-    /* P/D disaggregation body rewriting.
-     * Moved here from handle_on_message_complete because pfe->epv
-     * is only set after setup_proxy_path() runs (line above).
-     * When P/D mode is active: save original body, rewrite for prefill,
-     * set phase to PREFILL_SENDING. */
-    if (pfe->epv) {
-      proxy_epval_t *pd_tepval = (proxy_epval_t *)pfe->epv;
-      /* A FORWARD route's request selected one endpoint plainly: no P/D.
-       * Likewise a request whose endpoint the EPP named (epp_pinned): the
-       * picker's side orchestrates prefill/decode, the gateway relays. */
-      if (sp_pd_prepare_eligible(1, pd_tepval->pd_disagg_enabled &&
-                                    !sp_route_subset(pfe, pd_tepval) &&
-                                    !pfe->epp_pinned,
-                                 pfe->odir == 0,
-                                 pfe->pd_phase == PD_PHASE_NONE,
-                                 pfe->is_streamable)) {
-        /* Client request complete — begin P/D orchestration */
-        const uint8_t *pd_body_start = NULL;
-        size_t pd_body_len = 0;
-        size_t pd_hdr_len = 0;
-
-        /* Find body in rcvbuf */
-        for (size_t i = 0; i + 3 < pfe->rcv_off; i++) {
-          if (pfe->rcvbuf[i] == '\r' && pfe->rcvbuf[i+1] == '\n' &&
-              pfe->rcvbuf[i+2] == '\r' && pfe->rcvbuf[i+3] == '\n') {
-            pd_hdr_len = i + 4;
-            pd_body_start = pfe->rcvbuf + pd_hdr_len;
-            pd_body_len = pfe->rcv_off - pd_hdr_len;
-            break;
-          }
-        }
-
-        /* Engine-dialect body preparation (ops table): the vllm machine
-         * saves the body and rewrites the prefill probe; the sglang machine
-         * injects the bootstrap triple. A negative return means the dialect
-         * terminated the request fail-closed (error response already sent)
-         * — restart the fd. */
-        if (pd_body_start && pd_body_len > 0 && pd_tepval->pd_ops &&
-            pd_tepval->pd_ops->prepare_request(pfe, pd_tepval, pd_hdr_len,
-                                               pd_body_start,
-                                               pd_body_len) < 0) {
-          return SP_FWD_RESTART;
-        }
-      }
-    }
+    /* Native P/D was prepared before its first connect. Plain forwarding
+     * still adds response-usage accounting to its original request here. */
+    if (pfe->pd_phase == PD_PHASE_NONE && !pfe->pd_sg_active)
+      pd_request_usage_prepare(pfe, (proxy_epval_t *)pfe->epv);
 
     // CRITICAL FIX: Detect chunked requests BEFORE calling inject_forwarded_headers()
     // Prevents binary data corruption from scanning chunk data as text
@@ -13458,6 +13376,9 @@ pd_resume_parked(int fd)
     log_warn("[PD_ADMISSION] resume fd=%d: gen mismatch (slot recycled) — drop", fd);
     return;
   }
+
+  if (pfe->pd_reply.active)
+    return; /* no admission/QoS wake may re-enter a terminal refusal */
 
   /* A response the reaper thread owes this client (pd_reap_respond): it is
    * written here, on the socket's owner, and the connection ends. Before the
@@ -14276,6 +14197,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
 
         // Reset flags before parsing
+        if (pfe->parsed_off == 0)
+          pfe->http_pipelined = 0;
         int json_stream_was_pending = pfe->json_stream_route_pending;
         int hdrs_were_done = pfe->http_hdrs_done;  /* header block completed in an earlier read */
         pfe->http_pok = 0;

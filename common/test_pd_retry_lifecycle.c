@@ -10,6 +10,7 @@
 #include "sockproxy_internal.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_pd_reservation.h"
+#include "sockproxy_json.h"
 #include <assert.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -26,6 +27,40 @@ static int fail_all_p, fail_first_p, fail_decode, fail_shell_at, p_dials, shell_
 static int allocation_armed, allocation_at, allocation_calls, write_failure;
 static int no_decode, all_p_full;
 static int initiate_mode, d_dials, d_order[4], cancel_at, first_d_fails;
+static int last_refusal;
+static int rewrite_failure;
+
+static int reject_rewrite(const uint8_t *body, size_t body_len,
+                           uint8_t *out, size_t *out_len, size_t cap)
+{
+  (void)out;
+  (void)out_len;
+  (void)cap;
+  assert(pd_body_is_object(body, body_len));
+  return -1;
+}
+
+int __real_pd_sg_inject_bootstrap(const uint8_t *, size_t, uint8_t *, size_t *,
+                                 size_t, const char *, uint16_t, uint64_t);
+int __wrap_pd_sg_inject_bootstrap(const uint8_t *body, size_t body_len,
+                                 uint8_t *out, size_t *out_len, size_t cap,
+                                 const char *host, uint16_t port, uint64_t room)
+{
+  if (rewrite_failure)
+    return -1;
+  return __real_pd_sg_inject_bootstrap(body, body_len, out, out_len, cap, host, port, room);
+}
+
+int __wrap_sp_pd_send_refusal(proxy_fd_ent_t *p, int stage, uint16_t status,
+                                const char *code, const void *body, size_t len, size_t drain)
+{
+  (void)drain;
+  assert(p && body && len && code && stage >= 0);
+  last_refusal = status;
+  if (status == 500)
+    assert(!strcmp(code, "pd_prepare_failed"));
+  return 0;
+}
 
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t n, size_t size);
@@ -262,10 +297,6 @@ uint64_t get_timestamp_ns(void)
 int notify_worker_id(void)
 {
   return 0;
-}
-void fc_permit_release(fc_permit_t *p)
-{
-  (void)p;
 }
 void record_latency_sample(uint64_t latency_us)
 {
@@ -515,12 +546,129 @@ static void run_decode_case(int owned, int mode, int nth_alloc)
   initiate_mode = first_d_fails = cancel_at = fail_decode = 0;
   allocation_calls = allocations;
 }
+static void run_prepare_case(int engine, int nth_alloc, int invalid)
+{
+  reset_pool();
+  pool->pd_engine = engine;
+  fc_state_init(&pool->fc);
+  fc_cfg_t cfg = {0};
+  cfg.mode = FC_MODE_ENFORCE;
+  cfg.max_outstanding = 4;
+  cfg.ep_cap[FC_ROLE_PREFILL] = cfg.ep_cap[FC_ROLE_DECODE] = 1;
+  fc_state_apply(&pool->fc, &cfg);
+  proxy_fd_ent_t *c = calloc(1, sizeof(*c));
+  assert(c);
+  c->rcvbuf = malloc(SP_SOCK_MSG_LEN);
+  assert(c->rcvbuf);
+  c->epv = pool;
+  c->park_ep_idx = -1;
+  c->pd_prefill_ep_idx = 0;
+  c->pd_decode_ep_idx = 3;
+  c->pd_prefill_load_token = 1;
+  c->pd_decode_load_token = 4;
+  atomic_store(&pool->pd_ep_loads[0].active_conns, 1);
+  atomic_store(&pool->pd_ep_loads[3].active_conns, 1);
+  fc_permit_init(&c->fc);
+  assert(fc_service_acquire(&pool->fc, &c->fc) == FC_ADMIT);
+  assert(fc_ep_acquire(&pool->fc, &c->fc, 0, FC_ROLE_PREFILL) == FC_ADMIT);
+  assert(fc_ep_acquire(&pool->fc, &c->fc, 3, FC_ROLE_DECODE) == FC_ADMIT);
+  const char *body = invalid == 1 ? "[]" : "{\"prompt\":\"hello\",\"max_tokens\":16}";
+  size_t hdr = (size_t)sprintf((char *)c->rcvbuf,
+      "POST /v1/completions HTTP/1.1\r\nContent-Length: %zu\r\n\r\n", strlen(body));
+  memcpy(c->rcvbuf + hdr, body, strlen(body));
+  c->rcv_off = hdr + strlen(body);
+  c->http_content_length = strlen(body);
+  allocation_at = nth_alloc;
+  allocation_calls = 0;
+  last_refusal = 0;
+  rewrite_failure = invalid == 2;
+  allocation_armed = nth_alloc != 0;
+  int rc = engine == PD_ENGINE_SGLANG ?
+      pd_sg_prepare_request(c, pool, hdr, c->rcvbuf + hdr, strlen(body)) :
+      pd_seq_prepare_request(c, pool, hdr, c->rcvbuf + hdr, strlen(body),
+          rewrite_failure ? reject_rewrite :
+          engine == PD_ENGINE_TRTLLM ? pd_trt_prepare_prefill_body : pd_prepare_prefill_body);
+  allocation_armed = 0;
+  rewrite_failure = 0;
+  if (nth_alloc || invalid) {
+    assert(rc < 0 && last_refusal == 500);
+    assert(!c->pd_prefill_load_token && !c->pd_decode_load_token);
+    assert(!fc_inflight(&pool->fc));
+    assert(!fc_ep_inflight(&pool->fc, 0, FC_ROLE_PREFILL));
+    assert(!fc_ep_inflight(&pool->fc, 3, FC_ROLE_DECODE));
+    assert(!atomic_load(&pool->pd_ep_loads[0].active_conns));
+    assert(!atomic_load(&pool->pd_ep_loads[3].active_conns));
+    assert(!p_dials && !d_dials && !registrations);
+  } else {
+    assert(rc == 0 && !last_refusal);
+  }
+  pd_cleanup(c);
+  pd_cleanup(c);
+  fc_permit_release(&c->fc);
+  fc_permit_unbind(&c->fc);
+  assert(!atomic_load(&pool->pd_ep_loads[0].active_conns));
+  assert(!atomic_load(&pool->pd_ep_loads[3].active_conns));
+  free(c->rcvbuf);
+  free(c);
+  fc_state_destroy(&pool->fc);
+  pthread_mutex_destroy(&pool->fc.queue.lock);
+  pthread_rwlock_destroy(&pool->pd_session_lock);
+  pthread_rwlock_destroy(&pool->pd_trie_lock);
+  pthread_mutex_destroy(&pool->pd_parked_lock);
+  free(pool);
+}
+
+static void run_plain_usage_case(void)
+{
+  proxy_fd_ent_t *c = calloc(1, sizeof(*c));
+  proxy_epval_t *ep = calloc(1, sizeof(*ep));
+  assert(c && ep);
+  c->rcvbuf = malloc(SP_SOCK_MSG_LEN);
+  assert(c->rcvbuf);
+  ep->ai_gw_mode = 1; /* explicitly non-P/D */
+  const char *ordinary = "{\"model\":\"alias\",\"prompt\":\"hello world\",\"max_tokens\":16}";
+  const char *stream = "{\"model\":\"alias\",\"prompt\":\"hello world\",\"stream\":true}";
+  for (int mode = 0; mode < 3; mode++) {
+    const char *body = mode == 0 ? ordinary : stream;
+    c->http_content_length = strlen(body);
+    c->rcv_off = (size_t)sprintf((char *)c->rcvbuf,
+        "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+        c->http_content_length, body);
+    c->json_guard_chunked = mode == 2;
+    c->usage_est_prompt = 0;
+    size_t old_len = c->rcv_off;
+    char before[512];
+    memcpy(before, c->rcvbuf, old_len);
+    const int estimate = 3; /* pinned pre-move estimate for "hello world" */
+    pd_request_usage_prepare(c, ep);
+    if (mode == 2) {
+      assert(c->rcv_off == old_len && !memcmp(before, c->rcvbuf, old_len));
+      assert(c->usage_est_prompt == 0);
+    } else {
+      assert(c->usage_est_prompt == (uint32_t)estimate);
+      assert((memmem(c->rcvbuf, c->rcv_off, "include_usage", 13) != NULL) == (mode == 1));
+      printf("non-P/D mode=%d prompt estimate=%d unchanged\n", mode, estimate);
+    }
+  }
+  free(c->rcvbuf); free(c); free(ep);
+  puts("shared non-P/D usage prepare: injection, chunked untouched, prompt estimate PASS");
+}
+
 int main(void)
 {
+  run_plain_usage_case();
   setenv("LLB_PD_MAX_INFLIGHT_PER_EP", "1", 1);
   setenv("LLB_PD_QUEUE_DEPTH_PER_EP", "0", 1);
   log_set_level(LOG_ERROR);
   pthread_rwlock_init(&instance.lock, NULL);
+  for (int engine = 0; engine <= PD_ENGINE_ID_MAX; engine++) {
+    run_prepare_case(engine, 0, 0);
+    run_prepare_case(engine, 0, 1);
+    run_prepare_case(engine, 0, 2);
+    for (int nth = 1; nth <= (engine == PD_ENGINE_SGLANG ? 2 : 3); nth++)
+      run_prepare_case(engine, nth, 0);
+  }
+  puts("P/D preparation fails closed for all dialects and allocation points: PASS");
   for (int sg = 0; sg <= 1; sg++) {
     for (int owned = 0; owned <= 1; owned++) {
       run_case(sg, owned, 0, 0, 1);
