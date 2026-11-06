@@ -16,6 +16,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
 
 #include "uthash.h"
 #include "log.h"
@@ -24,6 +25,68 @@
 #include "sockproxy.h"
 #include "sockproxy_pd.h"
 #include "sockproxy_json.h"
+#include "sockproxy_ai_admit.h"
+#include "sockproxy_internal.h"
+
+static pthread_once_t pd_body_limit_once = PTHREAD_ONCE_INIT;
+static size_t pd_body_limit = SP_JSON_INSPECT_MAX;
+
+static void
+pd_read_body_limit(void)
+{
+  const char *value = getenv("LLB_PD_MAX_BODY_BYTES");
+  char *end;
+  unsigned long long limit;
+
+  if (!value || !*value)
+    return;
+  errno = 0;
+  limit = strtoull(value, &end, 10);
+  if (value[0] < '0' || value[0] > '9' || *end || errno ||
+      limit == 0 || limit > SP_JSON_INSPECT_MAX) {
+    log_error("Invalid LLB_PD_MAX_BODY_BYTES='%s'; using %u bytes",
+              value, (unsigned)SP_JSON_INSPECT_MAX);
+    return;
+  }
+  pd_body_limit = (size_t)limit;
+}
+
+size_t
+pd_max_request_body_bytes(void)
+{
+  pthread_once(&pd_body_limit_once, pd_read_body_limit);
+  return pd_body_limit;
+}
+
+int
+pd_check_request_body(proxy_fd_ent_t *pfe)
+{
+  const char *error = NULL;
+  const char *detail = NULL;
+  size_t limit = pd_max_request_body_bytes();
+  const uint8_t *head_end = memmem(pfe->rcvbuf, pfe->rcv_off, "\r\n\r\n", 4);
+  size_t body_len = head_end ? pfe->rcv_off - (size_t)(head_end + 4 - pfe->rcvbuf) : 0;
+
+  if (pfe->http_content_length > limit || body_len > limit) {
+    error = "pd_body_too_large";
+    detail = "request body exceeds the native prefill/decode byte limit";
+  } else if (pfe->is_streamable || pfe->json_guard_chunked) {
+    error = "pd_body_unbufferable";
+    detail = "native prefill/decode requires a complete buffered Content-Length body";
+  }
+  if (error) {
+    char response[512];
+    int len = snprintf(response, sizeof(response),
+        "HTTP/1.1 413 Payload Too Large\r\n"
+        "Content-Type: application/json\r\nConnection: close\r\n\r\n"
+        "{\"error\":\"%s\",\"detail\":\"%s\",\"max_body_bytes\":%zu}\r\n",
+        error, detail, limit);
+    sp_send_local_refusal(pfe, AI_GW_STAGE_FRAMING, 413, error, response, (size_t)len);
+    pfe->lb_err_body_sent = 1;
+    return -1;
+  }
+  return 0;
+}
 
 /* Wire kv_engine_type → PD_ENGINE_*. Values are equal by construction for
  * the engines the control plane emits today (both sides generate from the

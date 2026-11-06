@@ -184,4 +184,4 @@ jobs:
         run: make -C common test_l2_reflection
 
       - name: Atomic P/D reservations, actual cleanup and generation-qualified FIFO wake (ASan + UBSan)
-        run: make -C common test_i18
+        run: make -C common test_i18 test_pd_request_limit

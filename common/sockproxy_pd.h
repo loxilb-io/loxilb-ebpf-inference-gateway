@@ -33,6 +33,11 @@
 struct proxy_fd_ent;   /* sockproxy.h */
 struct proxy_epval;    /* sockproxy.h */
 
+/* Native P/D requires a buffered body. The process-wide byte limit is read
+ * once from LLB_PD_MAX_BODY_BYTES and bounded by SP_JSON_INSPECT_MAX. */
+size_t pd_max_request_body_bytes(void);
+int pd_check_request_body(struct proxy_fd_ent *pfe);
+
 typedef struct pd_dialect_ops {
   const char *name;              /* "vllm" | "sglang" | "trtllm" */
 
