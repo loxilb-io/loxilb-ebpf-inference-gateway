@@ -53,6 +53,7 @@
 #include "sockproxy_ssl.h"
 #include "sockproxy_trace.h"
 #include "sockproxy_json.h"
+#include "sockproxy_pd.h"
 #include "sockproxy_ktls.h"
 #include "sockproxy_h2.h"
 #include "sockproxy_http.h"
@@ -209,6 +210,11 @@ proxy_notifier(int fd, notify_type_t type, void *priv, uint64_t gen)
                fd, pfe->fd);
       last_stale_log = nowt;
     }
+    return 0;
+  }
+
+  if (pfe->pd_reply.active) {
+    sp_pd_refusal_event(pfe, (int)type);
     return 0;
   }
 
@@ -735,6 +741,7 @@ proxy_main(sockmap_cb_t sockmap_cb, peer_map_cb_t peer_map_cb,
   notify_cbs_t cbs = { 0 };
   const char *mmap_env = getenv(PROXY_MALLOC_MMAP_THRESHOLD_ENV);
   long mmap_thr;
+  (void)pd_max_request_body_bytes();
 
   /* Before the first receive buffer is allocated: keep them private
    * mappings so a connection burst does not leave the heap at its

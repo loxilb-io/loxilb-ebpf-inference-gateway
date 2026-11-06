@@ -37,6 +37,26 @@ struct proxy_epval;    /* sockproxy.h */
  * once from LLB_PD_MAX_BODY_BYTES and bounded by SP_JSON_INSPECT_MAX. */
 size_t pd_max_request_body_bytes(void);
 int pd_check_request_body(struct proxy_fd_ent *pfe);
+int pd_prepare_failed(struct proxy_fd_ent *pfe);
+int pd_prepare_before_connect(struct proxy_fd_ent *pfe, struct proxy_epval *epval);
+int pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
+                          size_t hdr_len, const uint8_t *body, size_t body_len);
+void pd_request_usage_prepare(struct proxy_fd_ent *pfe, struct proxy_epval *epval);
+
+/* The HTTP parser validates JSON syntax. Native dialects require its root
+ * value to be an object, including when called directly by retry code. */
+static inline int
+pd_body_is_object(const uint8_t *body, size_t len)
+{
+  while (len && (*body == ' ' || *body == '\t' || *body == '\r' || *body == '\n')) {
+    body++;
+    len--;
+  }
+  while (len && (body[len - 1] == ' ' || body[len - 1] == '\t' ||
+                 body[len - 1] == '\r' || body[len - 1] == '\n'))
+    len--;
+  return len >= 2 && body[0] == '{' && body[len - 1] == '}';
+}
 
 typedef struct pd_dialect_ops {
   const char *name;              /* "vllm" | "sglang" | "trtllm" */
@@ -45,7 +65,8 @@ typedef struct pd_dialect_ops {
    * (hdr_len/body point into pfe->rcvbuf). vllm: save original +
    * kv_transfer_params prefill rewrite. sglang: bootstrap triple injection.
    * Returns 0 to continue forwarding, <0 when the request was terminated
-   * (fail-closed 503 already sent) and the caller must restart the fd. */
+   * (fail-closed response already sent, reservations released) and the caller
+   * must restart the fd. Preparation runs before any backend connection. */
   int (*prepare_request)(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
                          size_t hdr_len, const uint8_t *body, size_t body_len);
 

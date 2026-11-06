@@ -969,9 +969,9 @@ done:
  * host, bootstrap port, fresh room) into the body — the SAME rewritten body
  * goes to BOTH legs at the dispatch site. The ORIGINAL body is saved for a
  * pair-retry re-injection with a fresh room. Injection failure fails CLOSED
- * (503, returns <0): a bootstrap-less request against a prefill-mode SGLang
+ * (500, returns <0): a bootstrap-less request against a prefill-mode SGLang
  * server parks at the engine until its 300s disaggregation timeout. */
-static int
+int
 pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
                       size_t hdr_len, const uint8_t *body, size_t body_len)
 {
@@ -980,17 +980,14 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
   size_t sg_len = 0;
   char sg_host[INET6_ADDRSTRLEN + 2];
   int sg_pidx = pfe->pd_prefill_ep_idx;
+  if (!pd_body_is_object(body, body_len))
+    return pd_prepare_failed(pfe);
 
-  /* A streamed request was never fully buffered, so the body handed in here
-   * is a truncated fragment — bootstrap injection is impossible by
-   * construction. Refuse honestly as OVERSIZE: the generic prep-failure
-   * below misattributes it to pool health ("pd_pool_unavailable"), and the
-   * paths that skip preparation entirely relay it PLAIN, drawing an engine
-   * 400 that blames the client — or a park on engines that skip the
-   * bootstrap validation. */
+  /* Normal admission rejects streamed requests before this point. A caller
+   * that reaches preparation with an incomplete body violates that contract
+   * and must release its reservations without connecting either role. */
   if (pfe->is_streamable || body_len < pfe->http_content_length) {
-    pd_sg_oversize_reject(pfe);
-    return -1;
+    return pd_prepare_failed(pfe);
   }
 
   if (sg_pidx >= 0 && sg_pidx < epval->n_eps &&
@@ -1004,10 +1001,12 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
                                sg_room) == 0 &&
         hdr_len + sg_len < SP_SOCK_MSG_LEN) {
       pfe->pd_saved_body = malloc(body_len);
-      if (pfe->pd_saved_body) {
-        memcpy(pfe->pd_saved_body, body, body_len);
-        pfe->pd_saved_body_len = body_len;
+      if (!pfe->pd_saved_body) {
+        free(sg_buf);
+        return pd_prepare_failed(pfe);
       }
+      memcpy(pfe->pd_saved_body, body, body_len);
+      pfe->pd_saved_body_len = body_len;
       memcpy(pfe->rcvbuf + hdr_len, sg_buf, sg_len);
       pfe->rcv_off = hdr_len + sg_len;
       pfe->pd_prefill_body_len = sg_len;
@@ -1034,22 +1033,9 @@ pd_sg_prepare_request(struct proxy_fd_ent *pfe, struct proxy_epval *epval,
   free(sg_buf);
 
   if (!pfe->pd_sg_active) {
-    static const char pd_sg_prep_err[] =
-        "HTTP/1.1 503 Service Unavailable\r\n"
-        "Content-Type: application/json\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "{\"error\":\"pd_pool_unavailable\",\"detail\":\"sglang bootstrap injection failed\"}";
     log_error("[PD_SG] bootstrap prep failed — fd=%d prefill_ep=%d "
               "(failing closed)", pfe->fd, sg_pidx);
-    /* The client's answer: completed with the status written. */
-    proxy_record_local_completion(pfe, 503);
-    sp_raw_status_write(pfe, pd_sg_prep_err, sizeof(pd_sg_prep_err) - 1,
-                        MSG_DONTWAIT | MSG_NOSIGNAL);
-    pd_free_claim(&pfe->pd_saved_body);
-    pfe->pd_saved_body_len = 0;
-    shutdown(pfe->fd, SHUT_RDWR);
-    return -1;
+    return pd_prepare_failed(pfe);
   }
   return 0;
 }

@@ -14,6 +14,7 @@
 #include "llhttp.h"
 #include "sockproxy_sse_observe.h"
 #include "sockproxy_answer.h"
+#include "sockproxy_refusal.h"
 
 #include "sockproxy_json_scan.h"
 
@@ -27,6 +28,11 @@
 #include "sockproxy_obj_hint.h"     /* the objective a request asks for by header (proxy_fd_ent member) */
 #include "sockproxy_llmd.h"         /* the llm-d TTL a request asks for by header (proxy_fd_ent member) */
 #include "sockproxy_creq_block.h"   /* where a client read stands in its request (proxy_fd_ent member) */
+
+enum {
+  SP_H1_MEDIA_JSON = 1,
+  SP_H1_MEDIA_FORM = 2,
+};
 
 // Forward declaration for HTTP/2 support
 struct proxy_h2_session;
@@ -1376,6 +1382,10 @@ struct proxy_fd_ent {
    * flips on the first "Host:" name, which every slowloris sends first. */
   int http_hdrs_done;
   int http_body_complete;
+  sp_pd_reply_t pd_reply; /* terminal native refusal output, owner worker only */
+  uint8_t http_pipelined; /* a second message began in the same buffered request */
+  size_t http_first_content_length;
+  uint8_t http_first_body_media, http_first_chunked;
   /* Spans of the current llhttp header field/value in the retained rcvbuf. */
   size_t http_header_start;
   size_t http_header_len;

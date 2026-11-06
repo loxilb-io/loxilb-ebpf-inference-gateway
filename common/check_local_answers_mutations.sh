@@ -313,5 +313,17 @@ mut sockproxy_http.c '    sp_answer_framing_lost(&client->cresp_in_msg);
 ' ''
 expect "rule 6: a framer that lost the framing reads as outside a message" "cresp_feed must hold"
 
+fresh
+mut sockproxy_refusal.c 'sp_answer_is_status_line(response, len) && sp_answer_started(pfe)' '0'
+expect "rule 6: native P/D async refusal overwrites a begun answer" "sp_pd_send_refusal must hold"
+
+fresh
+mut sockproxy_refusal.c '  proxy_note_local_refusal(pfe, status);' ''
+expect "rule 1: native P/D async refusal drops response receipt" "sp_pd_send_refusal must record: proxy_note_local_refusal"
+
+fresh
+mut sockproxy_refusal.c '  proxy_record_local_deny(pfe, stage, status, code);' ''
+expect "rule 1: native P/D async refusal drops staged deny" "sp_pd_send_refusal must record: proxy_record_local_deny"
+
 [ "$survived" = "0" ] || { echo "check_local_answers.sh: a mutation survived"; exit 1; }
 echo "check_local_answers.sh mutations: $n/$n killed"

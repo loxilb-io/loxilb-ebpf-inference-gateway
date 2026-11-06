@@ -7,9 +7,10 @@ import tempfile
 
 root = Path(__file__).resolve().parent
 source = (root / "sockproxy_http.c").read_text()
-start = source.index("enum {\n  SP_H1_MEDIA_JSON")
-end = source.index("};", start) + 2
-media_enum = source[start:end]
+header = (root / "sockproxy.h").read_text()
+start = header.index("enum {\n  SP_H1_MEDIA_JSON")
+end = header.index("};", start) + 2
+media_enum = header[start:end]
 start = source.index("static void\nsp_h1_header_span(")
 end = source.index("\nint\nhandle_header_name(", start)
 callbacks = source[start:end]
@@ -96,6 +97,9 @@ int main(void)
   test("cOnTeNt-TyPe: ApPlIcAtIoN/JsOn \t; charset=utf-8\r\n", SP_H1_MEDIA_JSON);
   test("Content-Type: application/x-www-form-urlencoded; charset=utf-8\r\n", SP_H1_MEDIA_FORM);
   test("X-Content-Type: application/json\r\n", 0);
+  test("Content-Type: application/octet-stream\r\nAccept: application/json\r\n", 0);
+  test("Accept: application/json\r\n", 0);
+  test("Content-Type: multipart/form-data; boundary=x\r\n", 0);
   test("Content-Type-Extra: application/json\r\n", 0);
   test("Content-Type: application/json-extra\r\n", 0);
   test("Content-Type: text/plain; note=\"application/json\"\r\n", 0);

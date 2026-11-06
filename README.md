@@ -30,11 +30,20 @@ role units or P/D load reservations. No usable decode produces
 Native P/D bodies must be fully buffered. The default byte limit is 786432
 (768 KiB). Set `LLB_PD_MAX_BODY_BYTES` before starting the daemon to a positive
 integer up to 786432 to lower it. Unset, invalid, zero, or larger values use the
-default. The setting is read once per process. Oversized bodies produce
+default. The setting is read once per process and logged at daemon startup. Oversized bodies produce
 `413 pd_body_too_large` with `max_body_bytes`. Streamed and chunked bodies
-produce `413 pd_body_unbufferable` before a backend is connected. This includes
-non-JSON uploads taking the existing streaming path above 64 KiB. JSON bodies
-up to the configured limit retain native P/D handling.
+produce `413 pd_body_unbufferable` before a backend is connected. Bodies require
+a JSON Content-Type. Non-JSON bodies of any size produce
+`415 pd_body_unsupported_media`, even if another header mentions JSON.
+JSON bodies up to the configured limit retain native P/D handling.
+All dialects prepare before connecting either role. Rewrite or allocation
+failure produces `500 pd_prepare_failed` and returns the reserved P/D and
+admission units.
+
+This native P/D policy applies to HTTP/1 only. HTTP/2 follows a separate
+bridge path. HTTP/1 pipelining is refused with
+`400 pd_pipelining_unsupported`. Sequential keep-alive requests reselect
+their roles for every request.
 
 These rules apply to the native P/D ladder and EPP FailOpen. An explicit EPP
 endpoint decision and an L7 FORWARD route use their own forwarding contract.
