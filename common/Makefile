@@ -903,6 +903,18 @@ test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.
 test_epp_cfg: test_epp_cfg.c llb_dpapi.h sockproxy.h
 	$(CC) -Wall -Wextra -Wno-unused-function -o $@ $< -I. -I../libbpf/src -I../libbpf/include/uapi $(CFLAGS_MTLS)
 
+.PHONY: test_pd_request_limit
+test_pd_request_limit: test_pd_request_limit.c sockproxy_pd_core.c log.c
+	$(CC) -Wall -Wextra -ffunction-sections -fdata-sections -Wl,--gc-sections -o test_pd_request_limit_bin $^ -I. -lpthread
+	env -u LLB_PD_MAX_BODY_BYTES ./test_pd_request_limit_bin 786432
+	LLB_PD_MAX_BODY_BYTES=32768 ./test_pd_request_limit_bin 32768
+	LLB_PD_MAX_BODY_BYTES=786432 ./test_pd_request_limit_bin 786432
+	LLB_PD_MAX_BODY_BYTES=0 ./test_pd_request_limit_bin 786432
+	LLB_PD_MAX_BODY_BYTES=-1 ./test_pd_request_limit_bin 786432
+	LLB_PD_MAX_BODY_BYTES=786433 ./test_pd_request_limit_bin 786432
+	LLB_PD_MAX_BODY_BYTES=32768bad ./test_pd_request_limit_bin 786432
+	LLB_PD_MAX_BODY_BYTES=999999999999999999999999 ./test_pd_request_limit_bin 786432
+
 .PHONY: test_epp
 test_epp: test_epp_cfg
 	./test_epp_cfg
@@ -1200,6 +1212,7 @@ test_sync: test_sockproxy_sync_emit
 .PHONY: clean
 
 clean:
+	rm -f test_pd_request_limit_bin
 	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header

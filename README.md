@@ -19,6 +19,30 @@ sudo ldconfig
 cd -   
 make  
 
+## Native prefill/decode request bounds
+
+Bodyless HTTP/1 requests on a P/D rule use the first healthy decode endpoint in
+programmed pool order. Connection retries stay within the decode role. These
+requests take ordinary service/endpoint admission units and no prefill/decode
+role units or P/D load reservations. No usable decode produces
+`503 pd_pool_unavailable`.
+
+Native P/D bodies must be fully buffered. The default byte limit is 786432
+(768 KiB). Set `LLB_PD_MAX_BODY_BYTES` before starting the daemon to a positive
+integer up to 786432 to lower it. Unset, invalid, zero, or larger values use the
+default. The setting is read once per process. Oversized bodies produce
+`413 pd_body_too_large` with `max_body_bytes`. Streamed and chunked bodies
+produce `413 pd_body_unbufferable` before a backend is connected. This includes
+non-JSON uploads taking the existing streaming path above 64 KiB. JSON bodies
+up to the configured limit retain native P/D handling.
+
+These rules apply to the native P/D ladder and EPP FailOpen. An explicit EPP
+endpoint decision and an L7 FORWARD route use their own forwarding contract.
+
+Run `make -C common test_pd_request_limit` for environment-limit coverage. The
+gateway EPP datapath lane covers bodyless routing, in-flight role capacity,
+bounded bodies, and refusal before backend traffic.
+
 ## MCP 2026-07-28 FullProxy dataplane
 
 The Gateway may explicitly enable `mcp_stateless` in the existing proxy action ABI for a TCP FullProxy listener. All aliases on that listener must use the same mode. The Gateway API exposes this as `mcp_protocol_version: "2026-07-28"`; omission retains the legacy behavior. Modern requests are validated before per-request RR/WRR selection. Sockmap must remain disabled for this listener.

@@ -52,6 +52,7 @@
 #define SP_MCP_PROXY_SELECTOR
 #include "sockproxy_mcp_rr.h"
 #include "sockproxy_ep.h"       /* own header */
+#include "sockproxy_pd.h"
 #include "sockproxy_ai_admit.h" /* AI_GW_STAGE_* of a local refusal */
 #include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
 
@@ -1196,6 +1197,46 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
               goto pd_failover_ok;
             if (pin < 0)
               return -1;
+          }
+        }
+
+        if (!l7_subset && tepval->pd_disagg_enabled && pfe) {
+          if (pd_check_request_body(pfe) != 0)
+            return -1;
+          if (pfe->http_content_length == 0) {
+            /* Metadata requests use the first healthy decode in configured
+             * order. Take no P/D reservations and never retry another role. */
+            for (sel = 0; sel < tepval->n_eps; sel++) {
+              if (tepval->ep_role[sel] != 2 || !is_endpoint_healthy(tepval, sel))
+                continue;
+              int gate = sp_fc_h1_gate_role(pfe, tepval, sel, FC_ROLE_NORMAL, 1);
+              if (gate == SP_FC_H1_QUEUED)
+                return PD_SETUP_PARKED;
+              if (gate == SP_FC_H1_KEPT)
+                return PD_SETUP_KEPT;
+              if (gate != 0)
+                return -1;
+              int fd = proxy_setup_ep_connect(tepval->eps[sel].xip,
+                  tepval->eps[sel].xport, tepval->eps[sel].protocol,
+                  ssl_ctx, ssl, pfe, pp2hdr, pp2len);
+              if (fd < 0) {
+                fc_release_role(&pfe->fc, FC_ROLE_NORMAL);
+                circuit_breaker_record_failure(tepval, sel);
+                continue;
+              }
+              chwbl_inc_runtime(tepval, sel);
+              ep_sel->ep_cfds[0].ep_cfd = fd;
+              ep_sel->ep_cfds[0].connect_pending = 0;
+              goto pd_failover_ok;
+            }
+            static const char unavailable[] =
+                "HTTP/1.1 503 Service Unavailable\r\n"
+                "Content-Type: application/json\r\nConnection: close\r\n\r\n"
+                "{\"error\":\"pd_pool_unavailable\","
+                "\"detail\":\"no healthy decode endpoint accepted the request\"}\r\n";
+            sp_send_local_outage(pfe, 503, unavailable, sizeof(unavailable) - 1);
+            pfe->lb_err_body_sent = 1;
+            return -1;
           }
         }
 
