@@ -2545,41 +2545,4 @@ pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out)
   return rc;
 }
 
-/**
- * pd_select_any_healthy() - Fallback: select any healthy EP regardless of role.
- * Called when pd_select_prefill or pd_select_decode fails (all role-specific EPs unhealthy).
- * Returns 0 on success (ep_out set), -1 if no healthy EP found.
- */
-int
-pd_select_any_healthy(proxy_epval_t *tepval, int *ep_out)
-{
-  int best = -1;
-  uint32_t min_load = UINT32_MAX;
-
-  for (int i = 0; i < tepval->n_eps; i++) {
-    if (tepval->eps[i].inv)
-      continue;
-    /* P5-fix: skip role-specific EPs (prefill=1, decode=2); only role=0 EPs are
-     * valid fallback candidates.  Without this, a decode EP would be picked as
-     * "any healthy" fallback when the only prefill EP goes inactive, incorrectly
-     * returning 200 instead of 503 for a P/D-only pool. */
-    if (tepval->ep_role[i] != 0)
-      continue;
-    if (tepval->cb_enabled &&
-        tepval->circuit_breakers[i].state == CB_STATE_OPEN)
-      continue;
-    uint32_t load = atomic_load(&tepval->pd_ep_loads[i].active_conns);
-    if (load < min_load) {
-      min_load = load;
-      best = i;
-    }
-  }
-
-  if (best >= 0) {
-    *ep_out = best;
-    return 0;
-  }
-  return -1;
-}
-
 #endif /* !TEST_PD_REWRITER */

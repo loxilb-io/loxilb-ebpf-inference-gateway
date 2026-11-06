@@ -203,7 +203,7 @@ typedef struct proxy_global_stats {
     _Atomic uint64_t latency_count;
     // P/D Buffer: kv_transfer_params overflow counter
     _Atomic uint64_t pd_kv_params_overflow;
-    _Atomic uint64_t pd_fallback_to_normal;  // RES-02: Non-P/D fallback counter
+    _Atomic uint64_t pd_fallback_to_normal;  // Legacy counter retained for metrics compatibility
     _Atomic uint64_t pd_cb_flips;            // OBS-03: Circuit breaker state transition count
     _Atomic uint64_t pd_cb_proactive_heal;   // OPEN→HALF_OPEN driven by the 1Hz health pass (no organic traffic)
     // : global total-footprint admission. pd_admission_total_inflight is a
@@ -2749,8 +2749,6 @@ void pd_accept_valve_rearm(void);
 int pd_select_decode(proxy_epval_t *tepval, proxy_fd_ent_t *pfe, int *ep_out);
 int pd_select_decode_excluding(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
                                int *ep_out, uint32_t excluded);
-int pd_select_any_healthy(proxy_epval_t *tepval, int *ep_out);
-
 /* Radix trie API (sockproxy_pd_trie.c) -- NOT thread-safe, caller must hold pd_trie_lock */
 pd_trie_t *pd_trie_create(void);
 void        pd_trie_free(pd_trie_t *t);

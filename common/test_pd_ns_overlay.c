@@ -5,7 +5,7 @@
  * active_conns accounting and the phase machine's pd_prefill_ep_idx), while
  * on a converged rule the overlay must keep working unchanged.
  *
- * G-1 (UNIFIED-ENGINE-ROUTING-ANALYSIS): the pd_fallback_normal overlay had
+ * G-1 (UNIFIED-ENGINE-ROUTING-ANALYSIS): the stickiness overlay had
  * no P/D gate, so a stale learned binding could override a P/D prefill
  * choice and desync the connect target from the load accounting. The live
  * probe missed it because a single-prefill pair makes the learned value
