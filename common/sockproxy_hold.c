@@ -191,7 +191,7 @@ sp_client_eof_keep(proxy_fd_ent_t *pfe)
       pfe->rfd_ent[0] && pfe->rfd_ent[0]->fd > 0 &&
       pfe->rfd_ent[0]->peer_map_resp_verdict &&
       !pfe->rfd_ent[0]->peer_eof &&
-      pfe->rcv_off == 0 && pfe->stream_body_remaining == 0 &&
+      pfe->rcv_off == 0 && pfe->stream_body_remaining == 0 && !pfe->json_guard_streaming &&
       !pfe->client_half_closed) {
     pfe->client_half_closed = 1;
     proxy_defer_close_mark(pfe);
@@ -223,7 +223,7 @@ sp_client_eof_keep(proxy_fd_ent_t *pfe)
   in.mode_hold = hold_mode_is_hold(epv);
   in.allowed = atomic_load_explicit(&hold_allowed, memory_order_relaxed) != 0;
   in.leg_peer_eof = be && be->peer_eof;
-  in.pending = pfe->rcv_off != 0 || pfe->stream_body_remaining != 0;
+  in.pending = pfe->rcv_off != 0 || pfe->stream_body_remaining != 0 || pfe->json_guard_streaming;
 
   switch (sp_hold_decide(&in)) {
   case SP_HOLD_REENTRY:

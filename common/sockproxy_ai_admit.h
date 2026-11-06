@@ -119,6 +119,8 @@ typedef struct ai_gw_req_ctx {
   const char *jwt_profile;   /* rule jwt_auth_profile ("" when none) */
   const char *body;          /* request body bytes, or NULL */
   size_t      body_len;
+  const char *parsed_body_model; /* non-NULL when the transport scanned metadata */
+  int         model_parse_result;
   const char *prefix_model;  /* body model captured earlier by prefix extraction ("") */
   const char *hdr_model;     /* X-Model header value ("") */
   int         auth_mode;     /* rule api_key_auth wire value (0 unset / 1 apikey

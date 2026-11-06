@@ -363,6 +363,7 @@ test_ai_security: test_ai_security.c sockproxy_ai_security.c sockproxy_ai_securi
 .PHONY: test_aisec
 test_aisec: test_ai_security
 	./test_ai_security
+	CC="$(CC)" python3 test_h1_chunked_identity.py
 
 # Identity-forwarding ABI: the admission gate must transport user/key/service
 # into every ladder call, and keyless traffic must probe the per-VIP shared
@@ -705,7 +706,7 @@ sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h
 # working fakes for the forward path, fake backends, link stand-ins for the
 # rest. It wraps calloc (allocation failure injection).
 H2FX_SRCS = test_h2_fixture.c test_h2_fixture_links.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
-H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h
+H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h sockproxy_json_scan.h
 H2FX_LINK = $(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
 		-ffunction-sections -fdata-sections -I. -Wl,--wrap=calloc -Wl,--gc-sections
 
@@ -827,6 +828,7 @@ test_uc5: test_admit test_stream test_uc3 test_l2_reflection test_backend_failur
 
 test_admit: test_admit_response
 	./test_admit_response
+	python3 test_http_media.py
 
 .PHONY: test_uc3
 test_uc3: test_model_routing test_sni_alpn test_sse_observe test_resp_framing
@@ -961,7 +963,7 @@ test_kv: test_kv_exact test_model_routing test_pd_ids test_conv_pool_alias test_
 
 # AI-gateway token accounting: usage-object extraction unit tests
 # (compiles sockproxy_json.c into the test TU; log.c is stubbed inside)
-test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h xxhash.c
+test_usage_extract: test_usage_extract.c sockproxy_json.c sockproxy_json.h sockproxy_json_scan.h xxhash.c
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< xxhash.c -I. -lpthread
 
 .PHONY: test_usage
@@ -987,6 +989,7 @@ test_stream_fallback: test_stream_fallback.c sockproxy_stream_fallback.h
 .PHONY: test_stream
 test_stream: test_stream_fallback
 	./test_stream_fallback
+	CC="$(CC)" python3 test_json_tail_wait.py
 
 # Tier-1 byte-shaper bucket primitives (header-only, standalone):
 # grant/credit/refill arithmetic + multi-threaded token-conservation check

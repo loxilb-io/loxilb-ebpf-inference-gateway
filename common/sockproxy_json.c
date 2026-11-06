@@ -464,105 +464,324 @@ compute_rag_doc_ids_hash(const char *json_body, jsmntok_t *token,
   return 0;
 }
 
-/*
- * jsmn_subtree_count - count all tokens in the subtree rooted at tokens[idx].
- *
- * In jsmn, tokens[idx].size is the number of DIRECT children (key-value pairs
- * for OBJECT, elements for ARRAY), NOT the total number of tokens in the
- * subtree.  This helper walks the subtree recursively to compute the exact
- * count, which is needed to correctly skip over a nested value when iterating
- * top-level keys of an outer object.
- */
+/* Tokens are ordered by source offset. A container's end bounds its
+ * descendants even for deeply nested, untrusted requests. */
 static int
 jsmn_subtree_count(jsmntok_t *tokens, int idx, int total)
 {
-  int count = 1; /* the token itself */
-  int j;
-
   if (idx >= total)
     return 0;
-
-  if (tokens[idx].type == JSMN_ARRAY) {
-    for (j = 0; j < tokens[idx].size; j++)
-      count += jsmn_subtree_count(tokens, idx + count, total);
-  } else if (tokens[idx].type == JSMN_OBJECT) {
-    for (j = 0; j < tokens[idx].size; j++) {
-      count += jsmn_subtree_count(tokens, idx + count, total); /* key   */
-      count += jsmn_subtree_count(tokens, idx + count, total); /* value */
-    }
+  int next = idx + 1;
+  if (tokens[idx].type == JSMN_ARRAY || tokens[idx].type == JSMN_OBJECT) {
+    while (next < total && tokens[next].start < tokens[idx].end)
+      next++;
   }
-  /* STRING and PRIMITIVE: no sub-tokens, count stays 1 */
-  return count;
+  return next - idx;
 }
 
-// P/D Session stickiness: Extract "user" field from OpenAI-compatible JSON body.
-// Iterates ONLY the top-level key-value pairs of the outer object so that
-// nested "user" values (e.g. messages[].role == "user") are never mistaken for
-// the top-level "user" field.  Returns 0 on success, -1 on miss.
-int
-extract_user_id(const char *body, size_t len, char *out, size_t cap)
+enum {
+  LLM_JSON_STACK_TOKENS = 2048,
+  LLM_JSON_MAX_TOKENS = 8192,
+};
+
+/* Preserve the common path. Only token exhaustion retries; the counting
+ * pass sizes one bounded heap allocation, and a real parse still validates
+ * the request before either caller can use the tokens. On success the
+ * caller owns any non-stack allocation. */
+static int
+parse_llm_json(const char *body, size_t len, jsmntok_t *stack, jsmntok_t **tokens)
 {
-  jsmn_parser p;
-  jsmntok_t tokens[64];
-  int r, i, pair;
+  jsmn_parser parser;
 
-  if (!body || len == 0 || !out || cap == 0) return -1;
-
-  jsmn_init(&p);
-  r = jsmn_parse(&p, body, len, tokens, 64);
-  if (r < 2 || tokens[0].type != JSMN_OBJECT) return -1;
-
-  /* Iterate only the direct key-value pairs of the top-level object.
-   * tokens[0].size == number of key-value pairs at the top level. */
-  i = 1;
-  for (pair = 0; pair < tokens[0].size && i + 1 < r; pair++) {
-    if (tokens[i].type == JSMN_STRING &&
-        jsoneq(body, &tokens[i], "user") == 0 &&
-        tokens[i + 1].type == JSMN_STRING) {
-      json_extract_string_decoded(body, &tokens[i + 1], out, cap);
-      return (out[0] != '\0') ? 0 : -1;
-    }
-    /* Skip the key token (always 1) then skip the entire value subtree. */
-    i++;
-    i += jsmn_subtree_count(tokens, i, r);
+  *tokens = stack;
+  int parsed;
+  if (len <= 64U * 1024U) {
+    jsmn_init(&parser);
+    parsed = jsmn_parse(&parser, body, len, stack, LLM_JSON_STACK_TOKENS);
+    if (parsed != JSMN_ERROR_NOMEM)
+      return parsed;
   }
-  return -1;
+
+  jsmn_init(&parser);
+  int needed = jsmn_parse(&parser, body, len, NULL, 0);
+  if (needed < 0)
+    return needed;
+  if (needed > LLM_JSON_MAX_TOKENS)
+    return LLM_JSON_TOKEN_LIMIT_EXCEEDED;
+  if (needed <= LLM_JSON_STACK_TOKENS) {
+    jsmn_init(&parser);
+    return jsmn_parse(&parser, body, len, stack, LLM_JSON_STACK_TOKENS);
+  }
+
+  jsmntok_t *expanded = malloc((size_t)needed * sizeof(*expanded));
+  if (!expanded) {
+    log_warn("[JSON_TOKEN_ALLOC] could not allocate %d request tokens", needed);
+    return JSMN_ERROR_NOMEM;
+  }
+  jsmn_init(&parser);
+  parsed = jsmn_parse(&parser, body, len, expanded, (unsigned int)needed);
+  if (parsed < 0)
+    free(expanded);
+  else
+    *tokens = expanded;
+  return parsed;
 }
 
-// AI Gateway allowed_models: extract the top-level "model" field from an
-// OpenAI-compatible JSON body. Same top-level-only iteration as
-// extract_user_id so nested "model" strings (e.g. inside messages content)
-// are never matched. The token pool must fit the WHOLE body — jsmn fails
-// outright rather than partially when it runs out — so it is sized like
-// extract_llm_prefix's, not extract_user_id's 64.
+enum {
+  JSON_START, JSON_KEY, JSON_COLON, JSON_VALUE, JSON_AFTER, JSON_NESTED, JSON_PRIMITIVE
+};
+enum { JSON_STRING_NONE, JSON_STRING_KEY, JSON_STRING_MODEL, JSON_STRING_USER, JSON_STRING_SALT, JSON_STRING_SKIP };
+
+void
+sp_json_scan_init(sp_json_scan_t *scan)
+{
+  memset(scan, 0, sizeof(*scan));
+}
+
+static int
+json_scan_string_end(sp_json_scan_t *scan)
+{
+  if (scan->string_kind == JSON_STRING_KEY) {
+    scan->key = 0;
+    if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "model", 5)) {
+      if (scan->model_seen)
+        return SP_JSON_DUPLICATE_MODEL;
+      scan->model_seen = 1;
+      scan->key = 1;
+    } else if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "user", 4)) {
+      if (scan->user_seen)
+        return SP_JSON_DUPLICATE_USER;
+      scan->key = 2;
+      scan->user_seen = 1;
+    }
+    if (!scan->overflow && json_str_eq(scan->raw, scan->raw_len, "cache_salt", 10)) {
+      if (scan->salt_seen)
+        scan->salt_invalid = 1;
+      scan->salt_seen = 1;
+      scan->key = 3;
+    }
+    scan->phase = JSON_COLON;
+  } else if (scan->string_kind == JSON_STRING_MODEL) {
+    if (scan->overflow) {
+      scan->model_invalid = 1;
+    } else {
+      size_t n = kv_json_unescape_copy(scan->raw, scan->raw_len,
+                                       scan->model, sizeof(scan->model));
+      if (memchr(scan->model, 0, n) ||
+          !json_str_eq(scan->raw, scan->raw_len, scan->model, n))
+        scan->model_invalid = 1;
+    }
+    scan->model_ready = !scan->model_invalid;
+    if (scan->model_invalid) scan->model[0] = 0;
+    scan->phase = JSON_AFTER;
+  } else if (scan->string_kind == JSON_STRING_USER) {
+    kv_json_unescape_copy(scan->raw, scan->raw_len, scan->user, sizeof(scan->user));
+    scan->phase = JSON_AFTER;
+  } else if (scan->string_kind == JSON_STRING_SALT) {
+    if (scan->overflow || !scan->raw_len || scan->raw_len >= sizeof(scan->salt))
+      scan->salt_invalid = 1;
+    else {
+      memcpy(scan->salt, scan->raw, scan->raw_len);
+      scan->salt[scan->raw_len] = 0;
+    }
+    scan->phase = JSON_AFTER;
+  } else if (scan->depth == 1) {
+    scan->phase = JSON_AFTER;
+  }
+  scan->string_kind = JSON_STRING_NONE;
+  return 0;
+}
+
+/* This scanner fences top-level operand boundaries, not the full JSON
+ * number grammar. Literals are exact; number bytes stay in the requested
+ * bounded lexical class so quotes/containers/colons cannot hide a key. */
+static int
+json_scan_primitive_byte(sp_json_scan_t *scan, unsigned char c)
+{
+  static const char *const literal[] = { "", "true", "false", "null" };
+  static const size_t lengths[] = { 0, 4, 5, 4 };
+  if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+        (c >= 'a' && c <= 'z') || c == '.' || c == '+' || c == '-'))
+    return SP_JSON_INVALID;
+  if (scan->primitive_kind &&
+      (scan->primitive_kind > 3 || scan->raw_len >= lengths[scan->primitive_kind] ||
+       c != (unsigned char)literal[scan->primitive_kind][scan->raw_len]))
+    return SP_JSON_INVALID;
+  scan->raw_len++;
+  return 0;
+}
+
+static int
+json_scan_primitive_end(sp_json_scan_t *scan)
+{
+  static const size_t lengths[] = { 0, 4, 5, 4 };
+  if (scan->primitive_kind &&
+      (scan->primitive_kind > 3 || scan->raw_len != lengths[scan->primitive_kind]))
+    return SP_JSON_INVALID;
+  scan->phase = JSON_AFTER;
+  return 0;
+}
+
+int
+sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
+{
+  if (scan->error)
+    return scan->error;
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)data[i];
+    if (scan->string_kind) {
+      if (!scan->escaped && c == '"') {
+        scan->error = json_scan_string_end(scan);
+        if (scan->error)
+          return scan->error;
+        continue;
+      }
+      if (c < 0x20)
+        return scan->error = SP_JSON_INVALID;
+      if (scan->string_kind != JSON_STRING_SKIP) {
+        if (scan->raw_len < sizeof(scan->raw))
+          scan->raw[scan->raw_len++] = (char)c;
+        else
+          scan->overflow = 1;
+      }
+      if (scan->escaped)
+        scan->escaped = 0;
+      else if (c == '\\')
+        scan->escaped = 1;
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+      if (scan->phase == JSON_PRIMITIVE) {
+        scan->error = json_scan_primitive_end(scan);
+        if (scan->error) return scan->error;
+      }
+      continue;
+    }
+    if (scan->done)
+      return scan->error = SP_JSON_INVALID;
+    if (scan->phase == JSON_START) {
+      if (c != '{')
+        return scan->error = SP_JSON_NOT_OBJECT;
+      scan->depth = 1;
+      scan->phase = JSON_KEY;
+      continue;
+    }
+    if (scan->phase == JSON_NESTED) {
+      if (c == '"')
+        scan->string_kind = JSON_STRING_SKIP;
+      else if (c == '{' || c == '[') {
+        if (++scan->depth == UINT32_MAX)
+          return scan->error = SP_JSON_INVALID;
+      } else if (c == '}' || c == ']') {
+        if (--scan->depth == 1)
+          scan->phase = JSON_AFTER;
+      }
+      continue;
+    }
+    if (scan->phase == JSON_PRIMITIVE) {
+      scan->error = (c == ',' || c == '}') ?
+          json_scan_primitive_end(scan) : json_scan_primitive_byte(scan, c);
+      if (scan->error) return scan->error;
+      if (scan->phase == JSON_PRIMITIVE) continue;
+    }
+    if (scan->phase == JSON_KEY) {
+      if (c == '}' && !scan->after_comma) {
+        scan->done = 1;
+        scan->depth = 0;
+      } else if (c == '"') {
+        scan->after_comma = 0;
+        scan->string_kind = JSON_STRING_KEY;
+        scan->raw_len = 0;
+        scan->overflow = 0;
+      } else {
+        return scan->error = SP_JSON_INVALID;
+      }
+    } else if (scan->phase == JSON_COLON) {
+      if (c != ':')
+        return scan->error = SP_JSON_INVALID;
+      scan->phase = JSON_VALUE;
+    } else if (scan->phase == JSON_VALUE) {
+      /* Continue past an invalid first value so a later model key still
+       * gets the same duplicate verdict as a valid first value. */
+      if (scan->key == 1 && c != '"') scan->model_invalid = 1;
+      if (c == '"') {
+        scan->string_kind = scan->key == 1 ? JSON_STRING_MODEL :
+                            scan->key == 2 ? JSON_STRING_USER :
+                            scan->key == 3 ? JSON_STRING_SALT : JSON_STRING_SKIP;
+        scan->raw_len = 0;
+        scan->overflow = 0;
+      } else if (c == '{' || c == '[') {
+        if (scan->key == 3) scan->salt_invalid = 1;
+        scan->depth++;
+        scan->phase = JSON_NESTED;
+      } else {
+        if (scan->key == 3) scan->salt_invalid = 1;
+        scan->phase = JSON_PRIMITIVE;
+        scan->raw_len = 0;
+        scan->primitive_kind = c == 't' ? 1 : c == 'f' ? 2 : c == 'n' ? 3 :
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ? 4 : 0;
+        scan->error = json_scan_primitive_byte(scan, c);
+        if (scan->error) return scan->error;
+      }
+    } else if (scan->phase == JSON_AFTER) {
+      if (c == ',') {
+        scan->after_comma = 1;
+        scan->phase = JSON_KEY;
+      } else if (c == '}') {
+        scan->done = 1;
+        scan->depth = 0;
+      } else {
+        return scan->error = SP_JSON_INVALID;
+      }
+    }
+  }
+  return 0;
+}
+
+int
+sp_json_scan_finish(sp_json_scan_t *scan)
+{
+  if (scan->error) return scan->error;
+  if (!scan->done) return SP_JSON_INVALID;
+  return scan->model_invalid ? SP_JSON_INVALID_MODEL : 0;
+}
+
+static int
+json_scan_body(const char *body, size_t len, sp_json_scan_t *scan)
+{
+  sp_json_scan_init(scan);
+  int rc = sp_json_scan_feed(scan, body, len);
+  return rc ? rc : sp_json_scan_finish(scan);
+}
+
 int
 extract_model_field(const char *body, size_t len, char *out, size_t cap)
 {
-  jsmn_parser p;
-  jsmntok_t tokens[2048];
-  int r, i, pair;
-
-  if (!body || len == 0 || !out || cap == 0) return -1;
-
-  jsmn_init(&p);
-  r = jsmn_parse(&p, body, len, tokens, 2048);
-  if (r < 2 || tokens[0].type != JSMN_OBJECT) return -1;
-
-  i = 1;
-  for (pair = 0; pair < tokens[0].size && i + 1 < r; pair++) {
-    if (tokens[i].type == JSMN_STRING &&
-        jsoneq(body, &tokens[i], "model") == 0 &&
-        tokens[i + 1].type == JSMN_STRING) {
-      json_extract_string_decoded(body, &tokens[i + 1], out, cap);
-      return (out[0] != '\0') ? 0 : -1;
-    }
-    /* Skip the key token (always 1) then skip the entire value subtree. */
-    i++;
-    i += jsmn_subtree_count(tokens, i, r);
-  }
-  return -1;
+  sp_json_scan_t scan;
+  if (!body || !len || !out || !cap)
+    return -1;
+  out[0] = 0;
+  int rc = json_scan_body(body, len, &scan);
+  if (rc == SP_JSON_DUPLICATE_MODEL || rc == SP_JSON_DUPLICATE_USER)
+    return rc;
+  if (rc || !scan.model_ready || !scan.model[0])
+    return -1;
+  snprintf(out, cap, "%s", scan.model);
+  return 0;
 }
 
+int
+extract_user_id(const char *body, size_t len, char *out, size_t cap)
+{
+  sp_json_scan_t scan;
+  if (!body || !len || !out || !cap)
+    return -1;
+  out[0] = 0;
+  if (json_scan_body(body, len, &scan) || !scan.user[0])
+    return -1;
+  snprintf(out, cap, "%s", scan.user);
+  return 0;
+}
 // AI Gateway token accounting: pull prompt_tokens / completion_tokens out of
 // the OpenAI "usage" object in a response byte window. The window is NOT a
 // complete JSON document — it is the tail of a response stream (SSE events
@@ -872,23 +1091,21 @@ json_stream_flag(const char *body, size_t len)
 int
 extract_model_field_prefix(const char *body, size_t len, char *out, size_t cap)
 {
-  const char *vs = NULL, *ve = NULL, *root_close = NULL;
-  int rc;
-
-  if (!body || len == 0 || !out || cap == 0)
+  sp_json_scan_t scan;
+  if (!body || !len || !out || !cap)
     return -1;
-  out[0] = '\0';
-
-  rc = json_top_find(body, len, "model", 5, &vs, &ve, &root_close);
-  if (rc == -2)
-    return 1;
-  if (rc != 0 || !vs || !ve)
+  out[0] = 0;
+  sp_json_scan_init(&scan);
+  int rc = sp_json_scan_feed(&scan, body, len);
+  if (rc == SP_JSON_DUPLICATE_MODEL || rc == SP_JSON_DUPLICATE_USER)
+    return rc;
+  if (rc || scan.model_invalid)
     return -1;
-  if (ve - vs < 2 || *vs != '"' || ve[-1] != '"')
-    return -1;
-
-  kv_json_unescape_copy(vs + 1, (size_t)(ve - vs - 2), out, cap);
-  return out[0] != '\0' ? 0 : -1;
+  if (scan.model_ready && scan.model[0]) {
+    snprintf(out, cap, "%s", scan.model);
+    return 0;
+  }
+  return scan.done ? -1 : 1;
 }
 
 /* Splice ins_len bytes into body at offset pos. Caller has verified
@@ -1204,39 +1421,15 @@ llm_user_prefix_fallback_len(void)
 }
 #endif
 
-// Main extraction function for LLM prefix (PHASE 1 ENHANCED)
-int extract_llm_prefix(const char *json_body, size_t len,
-                       llm_prefix_key_t *prefix_key)
+static int
+extract_llm_prefix_tokens(const char *json_body, jsmntok_t *tokens, int r,
+                          llm_prefix_key_t *prefix_key)
 {
-  jsmn_parser parser;
-  jsmntok_t tokens[2048];  // Increased from 512 to handle large system prompts
-  int r, i, pair;
+  int i, pair;
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
   char first_user[MAX_PREFIX_LEN] = {0};
   int has_first_user = 0;
 #endif
-
-  memset(prefix_key, 0, sizeof(*prefix_key));
-  prefix_key->level = 1;  // Default: L1 routing
-  prefix_key->flags = 0;  // No optional fields initially
-  
-  
-  jsmn_init(&parser);
-  r = jsmn_parse(&parser, json_body, len, tokens, 2048);
-  
-  if (r < 0) {
-    // CRITICAL FIX: Don't fail the connection on JSON parse errors
-    // Just log and continue without prefix extraction (round-robin fallback)
-    log_debug("[JSON_PARSE_ERROR] JSMN parse failed with error %d, len=%zu, fallback to round-robin", r, len);
-    log_debug("[JSON_PREVIEW] First 100 bytes: %.100s", json_body);
-    return -1;  // Non-fatal: connection continues without prefix routing
-  }
-  
-  if (r < 1 || tokens[0].type != JSMN_OBJECT) {
-    log_debug("[JSON_INVALID] Parse succeeded but not a JSON object (r=%d, type=%d)", 
-              r, r > 0 ? tokens[0].type : -1);
-    return -1;  // Non-fatal
-  }
 
   /* cache_salt is a top-level request contract. Scan direct object pairs
    * separately so a nested field cannot satisfy the requirement, and reject
@@ -1264,20 +1457,15 @@ int extract_llm_prefix(const char *json_body, size_t len,
   }
   
   // FIRST PASS: Extract model and lora_adapter (top-level fields)
-  for (i = 1; i < r; ) {
-    if (tokens[i].type != JSMN_STRING) {
-      i++;
-      continue;
-    }
+  for (i = 1; i + 1 < r; i += 1 + jsmn_subtree_count(tokens, i + 1, r)) {
     
-    if (jsoneq(json_body, &tokens[i], "model") == 0) {
-      json_extract_string(json_body, &tokens[i+1], 
+    if (jsoneq(json_body, &tokens[i], "model") == 0 &&
+        tokens[i + 1].type == JSMN_STRING) {
+      json_extract_string_decoded(json_body, &tokens[i + 1],
                          prefix_key->model, sizeof(prefix_key->model));
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("P0.2 DEBUG: Extracted model='%s'", prefix_key->model);
 #endif
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "lora_adapter") == 0) {
       json_extract_string(json_body, &tokens[i+1], 
@@ -1288,8 +1476,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #ifdef HAVE_PROXY_EXTRA_DEBUG
       log_debug("[EXTRACT_L1] Found lora_adapter: '%s'", prefix_key->lora_adapter);
 #endif
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "images") == 0) {
       // Compute hash of image content/URLs
@@ -1301,8 +1487,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
         log_debug("[EXTRACT_L1] Computed image_hash: '%s'", prefix_key->image_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "audio") == 0) {
       // Compute hash of audio content
@@ -1314,8 +1498,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
         log_debug("[EXTRACT_L1] Computed audio_hash: '%s'", prefix_key->audio_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "tools") == 0) {
       // Compute hash of tool definitions
@@ -1327,8 +1509,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
         log_debug("[EXTRACT_L1] Computed tool_schemas_hash: '%s'", prefix_key->tool_schemas_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "session_context") == 0) {
       // PHASE 2: Extract session context summary
@@ -1343,8 +1523,6 @@ int extract_llm_prefix(const char *json_body, size_t len,
                   prefix_key->session_context_hash);
 #endif
       }
-      i += 2;
-      continue;
     }
     else if (jsoneq(json_body, &tokens[i], "rag_context") == 0) {
       // PHASE 3: RAG context with template and document IDs (L3 routing)
@@ -1353,7 +1531,8 @@ int extract_llm_prefix(const char *json_body, size_t len,
         // Search for rag_template and document_ids within rag_context object
         int rag_items = rag_obj->size;
         int j, rag_start = i + 2;
-        for (j = 0; j < rag_items * 2; j += 2) {
+        for (j = 0; rag_items-- > 0 && rag_start + j + 1 < r;
+             j += 1 + jsmn_subtree_count(tokens, rag_start + j + 1, r)) {
           jsmntok_t *rag_key = &tokens[rag_start + j];
           jsmntok_t *rag_val = &tokens[rag_start + j + 1];
           
@@ -1388,25 +1567,16 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
         }
       }
-      i += 2;
-      continue;
-    }
-    else {
-      i++;
     }
   }
   
   // SECOND PASS: Extract prompt field OR messages array
-  for (i = 1; i < r; ) {
-    if (tokens[i].type != JSMN_STRING) {
-      i++;
-      continue;
-    }
+  for (i = 1; i + 1 < r; i += 1 + jsmn_subtree_count(tokens, i + 1, r)) {
     
     // Check for direct "prompt" field (used in /v1/completions endpoint)
     if (jsoneq(json_body, &tokens[i], "prompt") == 0) {
-      i++;  // Move to prompt value
-      if (tokens[i].type == JSMN_STRING) {
+      jsmntok_t *prompt = &tokens[i + 1];
+      if (prompt->type == JSMN_STRING) {
         // Extract prompt text for prefix hashing.
         // DECODE the JSON escapes while copying (see
         // sockproxy_json_unescape.h). The raw strncpy that used to live here
@@ -1418,8 +1588,8 @@ int extract_llm_prefix(const char *json_body, size_t len,
         // byte-exact prefix of the full decoded prompt (what block-hash
         // prefix routing needs). Pass the FULL raw span — the copy bounds
         // itself by the destination capacity.
-        kv_json_unescape_copy(json_body + tokens[i].start,
-                              (size_t)(tokens[i].end - tokens[i].start),
+        kv_json_unescape_copy(json_body + prompt->start,
+                              (size_t)(prompt->end - prompt->start),
                               prefix_key->prefix, sizeof(prefix_key->prefix));
         prefix_key->valid = 1;
         
@@ -1428,29 +1598,25 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
         return 0;  // Success - found prompt
       }
-      i++;
       continue;
     }
-    
+
     if (jsoneq(json_body, &tokens[i], "messages") == 0) {
       // Found messages array - extract first user message
-      i++;  // Move to messages array token
-      if (tokens[i].type != JSMN_ARRAY) {
+      if (tokens[i + 1].type != JSMN_ARRAY)
         continue;
-      }
-      
-      int array_size = tokens[i].size;
-      int j = i + 1;  // First element in array
+
+      int array_size = tokens[i + 1].size;
+      int j = i + 2;  // First element in array
       
       // Iterate through messages array
-      for (int msg_idx = 0; msg_idx < array_size; msg_idx++) {
-        if (tokens[j].type != JSMN_OBJECT) {
-          j++;
+      for (int msg_idx = 0; msg_idx < array_size && j < r;
+           msg_idx++, j += jsmn_subtree_count(tokens, j, r)) {
+        if (tokens[j].type != JSMN_OBJECT)
           continue;
-        }
-        
+
         int obj_size = tokens[j].size;
-        j++;  // Move into object
+        int field = j + 1;
         
         char role[32] = {0};
         char content[MAX_PREFIX_LEN] = {0};
@@ -1458,23 +1624,17 @@ int extract_llm_prefix(const char *json_body, size_t len,
         int has_content = 0;
         
         // Parse message object fields
-        for (int k = 0; k < obj_size; k++) {
-          if (jsoneq(json_body, &tokens[j], "role") == 0) {
-            json_extract_string(json_body, &tokens[j+1], role, sizeof(role));
+        for (int k = 0; k < obj_size && field + 1 < r; k++) {
+          if (jsoneq(json_body, &tokens[field], "role") == 0) {
+            json_extract_string(json_body, &tokens[field + 1], role, sizeof(role));
             has_role = 1;
-            j += 2;
-          }
-          else if (jsoneq(json_body, &tokens[j], "content") == 0) {
-            json_extract_string(json_body, &tokens[j+1], content, sizeof(content));
+          } else if (jsoneq(json_body, &tokens[field], "content") == 0) {
+            json_extract_string(json_body, &tokens[field + 1], content, sizeof(content));
             has_content = 1;
-            j += 2;
           }
-          else {
-            // Skip unknown field
-            j += 2;
-          }
+          field += 1 + jsmn_subtree_count(tokens, field + 1, r);
         }
-        
+
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
         // Check if this is a system message (what vLLM actually caches!)
         if (has_role && has_content && strcmp(role, "system") == 0) {
@@ -1512,17 +1672,9 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
       }
       
-      // Finished parsing messages array
-      i = j;  // Continue from where messages parsing ended
-      continue;
-    }
-    else {
-      // Skip unknown top-level field (key + value)
-      i += 2;
-      continue;
     }
   }
-  
+
   if (!prefix_key->valid) {
 #ifdef HAVE_LLM_SYSTEM_PROMPT_HASH
     int fb_len = llm_user_prefix_fallback_len();
@@ -1547,6 +1699,50 @@ int extract_llm_prefix(const char *json_body, size_t len,
 #endif
   
   return 0;
+}
+
+int
+extract_llm_prefix_scanned(const char *json_body, size_t len,
+                           const sp_json_scan_t *scan, llm_prefix_key_t *prefix_key)
+{
+  jsmntok_t stack[LLM_JSON_STACK_TOKENS], *tokens;
+  int result = -1;
+  memset(prefix_key, 0, sizeof(*prefix_key));
+  prefix_key->level = 1;
+  if (scan->error == SP_JSON_DUPLICATE_MODEL || scan->error == SP_JSON_DUPLICATE_USER)
+    return scan->error;
+  if (scan->error || scan->model_invalid || !scan->done)
+    return -1;
+
+  int parsed = parse_llm_json(json_body, len, stack, &tokens);
+  if (parsed == LLM_JSON_TOKEN_LIMIT_EXCEEDED || parsed == JSMN_ERROR_NOMEM) {
+    result = LLM_PREFIX_SKIPPED;
+    log_debug("[PREFIX_BUDGET_SKIP] optional prefix unavailable: %d", parsed);
+  } else if (parsed > 0 && tokens[0].type == JSMN_OBJECT) {
+    result = extract_llm_prefix_tokens(json_body, tokens, parsed, prefix_key);
+  }
+  if (tokens != stack)
+    free(tokens);
+
+  /* Routing and salt validation survive optional token-tree exhaustion/OOM. */
+  snprintf(prefix_key->model, sizeof(prefix_key->model), "%s", scan->model);
+  prefix_key->cache_salt_invalid = scan->salt_invalid;
+  if (scan->salt_seen && !scan->salt_invalid) {
+    snprintf(prefix_key->cache_salt, sizeof(prefix_key->cache_salt), "%s", scan->salt);
+    prefix_key->flags |= PREFIX_HAS_CACHE_SALT;
+  }
+  return result;
+}
+
+int
+extract_llm_prefix(const char *json_body, size_t len, llm_prefix_key_t *prefix_key)
+{
+  sp_json_scan_t scan;
+  int rc = json_scan_body(json_body, len, &scan);
+  memset(prefix_key, 0, sizeof(*prefix_key));
+  if (rc)
+    return rc == SP_JSON_DUPLICATE_MODEL || rc == SP_JSON_DUPLICATE_USER ? rc : -1;
+  return extract_llm_prefix_scanned(json_body, len, &scan, prefix_key);
 }
 
 // P1.1: Compute hash for prefix-based routing using xxHash (PHASE 1 ENHANCED)

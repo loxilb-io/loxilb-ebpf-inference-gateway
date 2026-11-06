@@ -18,13 +18,18 @@
 
 #include "sockproxy.h"
 
+/* The token budget applies only to optional prefix/hash inspection. */
+#define LLM_JSON_TOKEN_LIMIT_EXCEEDED (-4)
+#define LLM_PREFIX_SKIPPED 1
+
 /* Extract the "user" field from an OpenAI-compatible JSON body.
  * Returns 0 on success (found user id in out), -1 on miss.
  */
 int extract_user_id(const char *body, size_t len, char *out, size_t cap);
 
 /* Extract the top-level "model" field from an OpenAI-compatible JSON body.
- * Returns 0 on success (found model in out), -1 on miss.
+ * Returns 0 on success (found model in out), -1 on miss, or
+ * SP_JSON_DUPLICATE_MODEL / SP_JSON_DUPLICATE_USER for duplicated routing keys.
  */
 int extract_model_field(const char *body, size_t len, char *out, size_t cap);
 
@@ -108,10 +113,15 @@ int json_rename_top_key(char *body, size_t body_len, const char *key, size_t kle
  * @len:       Length of json_body
  * @prefix_key: Output struct filled on success
  * Returns 0 on success, -1 on parse failure (non-fatal; caller falls back
- * to round-robin selection).
+ * to ordinary routing), LLM_PREFIX_SKIPPED when the optional inspection
+ * budget is exhausted, or SP_JSON_DUPLICATE_MODEL for an ambiguous model.
  */
 int extract_llm_prefix(const char *json_body, size_t len,
                        llm_prefix_key_t *prefix_key);
+
+/* Reuse metadata already validated by the request's incremental scanner. */
+int extract_llm_prefix_scanned(const char *body, size_t len,
+                               const sp_json_scan_t *scan, llm_prefix_key_t *key);
 
 /* Compute xxHash-64 cache key from a filled llm_prefix_key_t.
  * Returns 0 if pk is NULL or not valid.
