@@ -9511,6 +9511,9 @@ void
 sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
                       int retry_body, const char *code, const char *msg)
 {
+  /* This sender always ends the client request. Queued readable events
+   * must not re-enter admission after its single deny record was emitted. */
+  pfe->ai_gw_denied = 1;
   char resp_buf[640];
   int n;
   n = sp_h1_format_admit_deny(resp_buf, sizeof(resp_buf), status,
