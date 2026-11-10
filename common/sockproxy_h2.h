@@ -597,6 +597,12 @@ int proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
 size_t proxy_h2_drop_resp_header(stream_mapping_t *mapping,
                                  const char *name, size_t namelen);
 
+/* Drop every field of the x-loxilb-refusal- family (any case) from the
+ * response header set collected for a stream: a backend never speaks under
+ * the gateway's refusal mark (sockproxy_refusal_mark.h). Returns the number
+ * of fields dropped. Touches nothing else. */
+size_t proxy_h2_drop_resp_refusal_mark(stream_mapping_t *mapping);
+
 /**
  * Create or get backend HTTP/2 session for endpoint
  * 

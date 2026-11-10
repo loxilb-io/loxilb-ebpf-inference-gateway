@@ -77,6 +77,9 @@ jobs:
       - name: HTTP/2 request body outlives its client stream (ASan)
         run: make -C common test_h2body
 
+      - name: A backend's X-Loxilb-Refusal-* is removed from every response head relayed to an HTTP/2 client (real relay, ASan + UBSan)
+        run: make -C common test_h2rmark
+
       - name: A half-closed HTTP/2 client is never held (ASan + UBSan)
         run: make -C common test_h2hold
 
@@ -106,6 +109,9 @@ jobs:
 
       - name: A request's header block is edited once and a body read never (request framer state, header edits; ASan + UBSan)
         run: make -C common test_creq
+
+      - name: The refusal mark (stage and request ID on a gateway-written refusal, whole or absent; a backend's X-Loxilb-Refusal-* removed from a response head; ASan + UBSan)
+        run: make -C common test_refmark
 
       - name: The objective header's capture, the class headers of an admitted response, and a backend's X-Api-Key in its response head (real framers, ASan + UBSan)
         run: make -C common test_objhint

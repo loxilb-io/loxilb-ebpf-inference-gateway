@@ -142,6 +142,8 @@ static void pd_teardown_conn(proxy_fd_ent_t *p) { (void)p; teardowns++; }
 static ssize_t send(int fd, const void *b, size_t n, int flags) { (void)fd; (void)flags; take(b, n); return (ssize_t)n; }
 static int shutdown(int fd, int how) { (void)fd; (void)how; shuts++; return 0; }
 static size_t sp_reap_fc_format(proxy_fd_ent_t *p, uint8_t k, int keep, char *o, size_t c) { (void)p; (void)k; (void)keep; (void)o; (void)c; return 0; }
+/* The plain texts go out as they are: the request ID the owner worker adds to a refusal is test_refusal_mark.c's. */
+static size_t sp_reap_refusal_wire(proxy_fd_ent_t *p, uint8_t k, char *o, size_t c) { (void)p; (void)k; (void)o; (void)c; return 0; }
 static void sp_reap_record(proxy_fd_ent_t *p, uint8_t k) { (void)p; (void)k; recorded++; }
 static int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *p, const void *b, size_t n) { (void)p; take(b, n); shuts++; return 0; }
 int sp_answer_started(proxy_fd_ent_t *p) { return atomic_load(&p->cresp_in_msg) || atomic_load(&p->cresp_answer_open); }

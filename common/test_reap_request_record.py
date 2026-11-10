@@ -159,6 +159,8 @@ static int proxy_note_local_refusal(proxy_fd_ent_t *p, uint16_t s) {
 }
 static void proxy_record_local_deny(proxy_fd_ent_t *p, int st, int s, const char *c) { (void)p; (void)st; (void)s; (void)c; }
 static size_t sp_reap_fc_format(proxy_fd_ent_t *p, uint8_t k, int keep, char *o, size_t c) { (void)p; (void)k; (void)keep; (void)o; (void)c; return 0; }
+/* The plain texts go out as they are: the request ID the owner worker adds to a refusal is test_refusal_mark.c's. */
+static size_t sp_reap_refusal_wire(proxy_fd_ent_t *p, uint8_t k, char *o, size_t c) { (void)p; (void)k; (void)o; (void)c; return 0; }
 static int sp_answer_started(proxy_fd_ent_t *p) { return atomic_load(&p->cresp_in_msg) || atomic_load(&p->cresp_answer_open); }
 static void sp_end_started_answer(proxy_fd_ent_t *p, const void *b, size_t n) { (void)p; (void)b; (void)n; }
 static int proxy_send_local_response_and_shutdown(proxy_fd_ent_t *p, const void *b, size_t n) { (void)p; (void)b; (void)n; return 0; }

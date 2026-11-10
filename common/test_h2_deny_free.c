@@ -29,6 +29,10 @@
  * And the walk over the ready streams (proxy_h2_handle_client_data): a
  * forward's send can end and free ANOTHER stream whose answer was waiting
  * for the client's window; the walk must not hold that stream.
+ * Every refusal names the stage that refused (x-loxilb-refusal-stage) and
+ * echoes the request's ID (x-request-id) when the stream has one that can
+ * be a field value (sockproxy_refusal_mark.h); the 503 of a draining
+ * gateway says in its body when to come back, as the HTTP/1.1 answer does.
  * Each case checks the answer reached the client AND that the stream was
  * freed (otherwise the case could not catch a read of it). The gateway code
  * is built with ASan here (sockproxy_h2_asan.o), so a read after the free
@@ -48,12 +52,17 @@
 #include "test_h2_fixture.h"
 #include "sockproxy_qsbr.h"
 #include "sockproxy_l7policy.h"
+#include "sockproxy_fc.h"
+#include "sockproxy_llmd.h"
 
 /* What the cases set for the product's seams (the fixture's hooks). */
 enum { CASE_NO_POOL, CASE_ADMIT_DENY, CASE_L7_REJECT, CASE_CAPACITY, CASE_BAD_SALT,
        CASE_SHED_CLASS };
 static int the_case;
 static proxy_epval_t *lpm_pool;   /* what the lookup finds, CASE_CAPACITY */
+/* The request ID the stream has when it is answered (the fixture's
+ * ai_gw_mint_request_id writes none); NULL leaves the stream without one. */
+static const char *the_rid;
 
 static void
 admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
@@ -62,6 +71,7 @@ admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
   if (the_case == CASE_ADMIT_DENY) {
     res->verdict = AI_GW_ADMIT_DENY;
     res->http_status = 401;
+    res->stage = AI_GW_STAGE_AUTH;
     snprintf(res->error_code, sizeof(res->error_code), "invalid_api_key");
     snprintf(res->error_msg, sizeof(res->error_msg), "the key is not known");
   } else if (the_case == CASE_CAPACITY || the_case == CASE_SHED_CLASS) {
@@ -82,6 +92,24 @@ l7_reject(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent, proxy_epval_t **tepval_out)
   if (proxy_h2_send_l7_synthetic(pfe, 403, NULL, NULL) != 0)
     return L7_DISPATCH_FALLTHROUGH;
   return L7_DISPATCH_TERMINATED;
+}
+
+/* An L7 FORWARD route none of whose members can take the request: the
+ * product's dispatch leaves the route on the connection (mcp_route_active
+ * and an empty member mask here), and the endpoint choice then finds no
+ * one. That is an outage, not a refusal. */
+static int
+l7_forward_all_down(proxy_fd_ent_t *pfe, proxy_map_ent_t *ent, proxy_epval_t **tepval_out)
+{
+  /* The route has no cookie persistence, which this fixture does not model
+   * (test_h2_fixture_links.c): the listener's policy flag is what the
+   * forward path asks before it looks for one, so it is down from here to
+   * the end of this dispatch; the case raises it again for its next stream. */
+  ent->has_l7_policy = 0;
+  pfe->mcp_route_active = 1;
+  pfe->mcp_route_mask = 0;
+  *tepval_out = lpm_pool;
+  return L7_DISPATCH_FORWARD;
 }
 
 /* The CHWBL selector refusing the request's cache_salt (CASE_BAD_SALT). */
@@ -140,6 +168,8 @@ run(int which, int want_status, const char *what)
         "%s: the request is complete on stream %d", what, id);
   if (!st)
     return;
+  if (the_rid)
+    snprintf(st->request_id, sizeof(st->request_id), "%s", the_rid);
   rc = proxy_h2_forward_to_backend(h2fx_pfe, st);
   h2fx_deliver();
   CHECK(rc == 0, "%s: answered by the gateway itself (rc %d)", what, rc);
@@ -156,10 +186,35 @@ run(int which, int want_status, const char *what)
         what);
 }
 
+/* What the last answer says of itself: its stage (want_stage NULL: an
+ * answer that names none must carry no field of the family) and the request
+ * ID (want_rid NULL: the field must be absent). The two are independent. */
+static void
+mark_is(const char *what, const char *want_stage, const char *want_rid)
+{
+  const char *v = h2fx_header(last_id, "x-loxilb-refusal-stage");
+
+  if (want_stage)
+    CHECK(v && !strcmp(v, want_stage), "%s: the refusal names its stage, %s (got %s)",
+          what, want_stage, v ? v : "none");
+  else
+    CHECK(v == NULL, "%s: no stage on it (got %s)", what, v ? v : "none");
+  v = h2fx_header(last_id, "x-request-id");
+  if (want_rid)
+    CHECK(v && !strcmp(v, want_rid), "%s: and echoes the request's ID whole (got %zu bytes)",
+          what, v ? strlen(v) : (size_t)0);
+  else
+    CHECK(v == NULL, "%s: and no request ID (got %s)", what, v ? v : "none");
+}
+
 int
 main(void)
 {
   proxy_epval_t *pool;
+  char rid255[256];
+
+  memset(rid255, 'r', 255);
+  rid255[255] = '\0';
 
   h2fx_init();
   h2fx_admit = admit;
@@ -168,8 +223,19 @@ main(void)
 
   /* No pool on the listener (deleted under its streams): no admission, the
    * model has no pool, 503. The model name the log prints is the stream's. */
+  the_rid = "rid-h2-1";
   run(CASE_NO_POOL, 503, "no pool for the model");
   CHECK(h2fx_admit_calls == 0 && h2fx_lpm_calls == 1, "no admission without a pool, one lookup");
+  mark_is("no pool for the model", "route", "rid-h2-1");
+  /* A stream with no ID yet carries the stage alone; an ID that cannot be a
+   * header value (a blank at its end) is left out, never cut. */
+  the_rid = NULL;
+  run(CASE_NO_POOL, 503, "no pool, no request ID");
+  mark_is("no pool, no request ID", "route", NULL);
+  the_rid = "rid-with-a-blank ";
+  run(CASE_NO_POOL, 503, "no pool, an ID that is not a field value");
+  mark_is("no pool, an ID that is not a field value", "route", NULL);
+  the_rid = NULL;
 
   /* Forwarding one stream sends whatever is queued for the others: a stream
    * whose answer was waiting for the client's window ends, and is freed,
@@ -217,13 +283,17 @@ main(void)
   /* The listener has its pool; admission refuses. */
   pool = h2fx_pool("all.example", 0);
   (void)pool;
+  the_rid = rid255;
   run(CASE_ADMIT_DENY, 401, "admission refusal");
   CHECK(h2fx_admit_calls == 1, "admission ran once");
+  mark_is("admission refusal (a 255-byte ID)", "auth", rid255);
+  the_rid = "rid-h2-2";
 
   /* An L7 policy rejects (the flag l7_policy_on reads). */
   h2fx_ent.has_l7_policy = 1;
   run(CASE_L7_REJECT, 403, "L7 reject");
   CHECK(h2fx_l7_calls == 1, "the L7 dispatch ran once");
+  mark_is("L7 reject", "route", "rid-h2-2");
   h2fx_ent.has_l7_policy = 0;
 
   /* An AI pool with a ceiling of one, held by another request: the stream
@@ -245,6 +315,9 @@ main(void)
     fc_state_apply(&lpm_pool->fc, &cfg);
     assert(fc_service_acquire(&lpm_pool->fc, &other) == FC_ADMIT);
     run(CASE_CAPACITY, 429, "capacity refusal");
+    mark_is("capacity refusal", "capacity", "rid-h2-2");
+    CHECK(h2fx_header(last_id, SP_LLMD_REASON_HDR) == NULL,
+          "no llm-d reason on a rule that does not speak the convention");
     CHECK(fc_inflight(&lpm_pool->fc) == 1,
           "only the other request's unit is in flight (inflight %u)",
           fc_inflight(&lpm_pool->fc));
@@ -256,11 +329,20 @@ main(void)
       char want_wait[16];
       const char *v;
 
+      /* The rule speaks the llm-d convention here, so the frame is at its
+       * fullest: the six admission headers and the two of the mark. */
       h2fx_class_on = 1;
+      lpm_pool->fc.cfg.llmd_headers = 1;
       snprintf(want_wait, sizeof(want_wait), "%u",
                fc_band_wait_ms(&lpm_pool->fc, FC_BAND_SHEDDABLE));
       run(CASE_SHED_CLASS, 429, "sheddable at the ceiling");
       h2fx_class_on = 0;
+      lpm_pool->fc.cfg.llmd_headers = 0;
+      mark_is("sheddable at the ceiling", "capacity", "rid-h2-2");
+      v = h2fx_header(last_id, SP_LLMD_REASON_HDR);
+      CHECK(v && !strcmp(v, "rejected-saturated"),
+            "all eight of the frame's extras arrive: the llm-d reason too (got %s)",
+            v ? v : "none");
       v = h2fx_header(last_id, "x-loxilb-admission-inflight");
       CHECK(v && !strcmp(v, "1"), "the refusal names the units in flight (got %s)", v ? v : "none");
       v = h2fx_header(last_id, "x-loxilb-admission-limit");
@@ -274,6 +356,21 @@ main(void)
             v ? v : "none");
       CHECK(fc_inflight(&lpm_pool->fc) == 1, "the refused stream took no unit");
     }
+    /* A draining gateway: the 503's body says when to come back, as the
+     * HTTP/1.1 answer does. */
+    fc_drain_set(1);
+    run(CASE_CAPACITY, 503, "draining");
+    fc_drain_set(0);
+    mark_is("draining", "capacity", "rid-h2-2");
+    {
+      const char *b = h2fx_body(last_id);
+      const char *v = h2fx_header(last_id, "retry-after");
+
+      CHECK(b && !strcmp(b, "{\"error\":\"gateway_draining\",\"message\":\"the gateway is "
+                            "draining for maintenance\",\"retry_after\":5}\r\n"),
+            "the 503 body carries retry_after next to error and message (got %s)", b ? b : "none");
+      CHECK(v && !strcmp(v, "5"), "and it equals the retry-after header (got %s)", v ? v : "none");
+    }
     fc_permit_release(&other);
     CHECK(fc_inflight(&lpm_pool->fc) == 0, "and none after it ends");
     fc_permit_unbind(&other);
@@ -285,8 +382,50 @@ main(void)
    * left open. */
   lpm_pool->select = PROXY_SEL_CHWBL;
   run(CASE_BAD_SALT, 400, "invalid cache_salt");
+  mark_is("invalid cache_salt", "framing", "rid-h2-2");
   CHECK(fc_inflight(&lpm_pool->fc) == 0, "and the refused request holds no unit");
   lpm_pool->select = 0;
+
+  /* An outage (no member of the route can take the request) is answered
+   * through the same frame with no stage: it carries the stream's own
+   * request ID all the same, and nothing when the stream has none. The ID
+   * does not depend on a stage. */
+  {
+    static const char *const rids[] = { "rid-h2-outage", NULL };
+
+    h2fx_l7 = l7_forward_all_down;
+    for (size_t i = 0; i < 2; i++) {
+      const char *what = rids[i] ? "outage, the stream has an ID" : "outage, the stream has no ID";
+      proxy_h2_stream_t *st;
+      const char *b;
+      int32_t id;
+      int rc;
+
+      set_case(CASE_NO_POOL);
+      h2fx_ent.has_l7_policy = 1;
+      id = h2fx_submit("m-gone", NULL, 0);
+      last_id = id;
+      h2fx_to_gateway();
+      st = h2fx_stream(id);
+      CHECK(st && st->data_complete && !st->response_sent, "%s: the request is complete", what);
+      if (!st)
+        continue;
+      st->request_id[0] = '\0';
+      if (rids[i])
+        snprintf(st->request_id, sizeof(st->request_id), "%s", rids[i]);
+      rc = proxy_h2_forward_to_backend(h2fx_pfe, st);
+      h2fx_deliver();
+      b = h2fx_body(id);
+      CHECK(rc == 0 && h2fx_status[id / 2] == 503 && b && strstr(b, "\"no_healthy_backend\""),
+            "%s: answered 503 no_healthy_backend by the gateway (rc %d, status %d, body %s)",
+            what, rc, h2fx_status[id / 2], b ? b : "none");
+      mark_is(what, NULL, rids[i]);
+    }
+    h2fx_pfe->mcp_route_active = 0;
+    h2fx_l7 = l7_reject;
+    h2fx_ent.has_l7_policy = 0;
+    CHECK(fc_inflight(&lpm_pool->fc) == 0, "and the outage holds no unit");
+  }
 
   CHECK(h2fx_connect_calls == 0, "no case reached a backend connect");
 

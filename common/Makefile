@@ -352,7 +352,7 @@ test_h2_inject_obj: sockproxy_h2_inject_test.c sockproxy_h2.h
 		-c -o test_h2_inject.o sockproxy_h2_inject_test.c
 
 # A --gc-sections-friendly build of sockproxy_h2.o for the inject test link.
-sockproxy_h2_gc.o: sockproxy_h2.c sockproxy_h2.h
+sockproxy_h2_gc.o: sockproxy_h2.c sockproxy_h2.h sockproxy_refusal_mark.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -c -o $@ $<
 
 .PHONY: test_h2inj
@@ -702,7 +702,7 @@ test_h2leg: test_h2_leg_end
 # Nothing reads an HTTP/2 stream after an answer that may have freed it. The
 # gateway object itself is built with ASan here: a read after the free inside
 # sockproxy_h2.c is what this test must see.
-sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h
+sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h sockproxy_refusal_mark.h
 	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) -DSP_DEBUG_ASSERTS \
 		-ffunction-sections -fdata-sections -c -o $@ $<
 
@@ -730,6 +730,16 @@ test_h2_body_source: test_h2_body_source.c $(H2FX_DEPS)
 .PHONY: test_h2body
 test_h2body: test_h2_body_source
 	./test_h2_body_source
+
+# A backend's X-Loxilb-Refusal-* is removed from every response head relayed
+# to an HTTP/2 client, interim and final, on a pool with nothing configured.
+test_h2_resp_mark: test_h2_resp_mark.c $(H2FX_DEPS)
+	$(H2FX_LINK) -o $@ test_h2_resp_mark.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2rmark
+test_h2rmark: test_h2_resp_mark
+	./test_h2_resp_mark
 
 # A half-closed HTTP/2 client is never held, and one of its legs ending leaves
 # no mark on it (sockproxy_hold.c). Linked with --gc-sections and the event
@@ -802,7 +812,7 @@ test_sse_observe: test_sse_observe.c sockproxy_sse_observe.h llhttp.c httpapi.c 
 test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
 	$(CC) -ffunction-sections -fdata-sections -I. -I../libbpf/src -I../headers -I../kernel $$(pkg-config --cflags openssl) -o $@ test_sni_alpn.c sockproxy_ssl.c log.c -Wl,--gc-sections $$(pkg-config --libs openssl) -lpthread
 
-test_admit_response: test_admit_response.c sockproxy_admit_response.h llhttp.c httpapi.c http.c
+test_admit_response: test_admit_response.c sockproxy_admit_response.h sockproxy_refusal_mark.h llhttp.c httpapi.c http.c
 	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
 
 # A started answer takes no new status line (sockproxy_answer.h): the framer's
@@ -1052,6 +1062,45 @@ test_creq_block: test_creq_block.c sockproxy_creq_block.h sockproxy_h1_hdr.h soc
 test_creq: test_creq_block
 	./test_creq_block
 
+# The refusal mark (sockproxy_refusal_mark.h): the stage a gateway-written
+# refusal names and the request ID it echoes, whole or absent; the mark
+# spliced into the finished texts, read back by the real response framer at
+# every cut; and the strip of a backend's X-Loxilb-Refusal-* family from a
+# response head (sockproxy_h1_hdr.h). Address and undefined-behaviour
+# sanitizers on.
+test_refusal_mark: test_refusal_mark.c sockproxy_refusal_mark.h sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h sockproxy_stream_fallback.h llhttp.c httpapi.c http.c
+	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -c -o test_refusal_mark.to $< -I.
+	$(CC) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -o $@ test_refusal_mark.to llhttp.c httpapi.c http.c -I.
+	rm -f test_refusal_mark.to
+
+# The strip of a backend's family from a relayed HTTP/1.1 head reads the
+# response framer's mark, which the X-Api-Key strip clears: it has to be the
+# call right before that one, on the same read (source invariant).
+# The request ID an answer echoes is the request's live field, never the
+# audit key (proxy_request_id, whose snapshot can hold the previous
+# keep-alive request's ID): no statement that builds a mark names the key
+# or its snapshot (source invariant). And the one no_route answer written
+# through the outage sender carries its stage in its text (sockproxy_ep.c).
+.PHONY: test_refmark
+test_refmark: test_refusal_mark
+	./test_refusal_mark
+	@awk '/len = sp_resp_strip_refusal_mark\(rfd_ent, / { a = NR } \
+	      /len = sp_resp_strip_api_key\(rfd_ent, / { b = NR; nb++ } \
+	      END { exit !(a && nb == 1 && b == a + 1) }' sockproxy_http.c || \
+	  { echo "FAIL: sockproxy_http.c must call sp_resp_strip_refusal_mark on a relayed head immediately before sp_resp_strip_api_key (which clears the framer's mark)"; exit 1; }
+	@echo "refusal mark: the family strip runs before the X-Api-Key strip PASS"
+	@awk '/sp_refusal_mark_h1\(|sp_refusal_mark_splice\(|sp_h1_format_admit_deny\(/ { on = 1; n++ } \
+	      on && /proxy_request_id|resp_request_id/ { printf "%s:%d: %s\n", FILENAME, FNR, $$0; bad = 1 } \
+	      on && /;/ { on = 0 } \
+	      END { exit bad || n < 10 }' sockproxy_http.c sockproxy_health.c sockproxy_l7policy.c || \
+	  { echo "FAIL: an answer's X-Request-Id is the live field (SP_REFUSAL_LIVE_RID), never proxy_request_id or its snapshot"; exit 1; }
+	@! grep -n 'request_id' sockproxy_h2.c | grep -E 'SP_REFUSAL_RID_HDR_H2|sp_refusal_rid_ok' | grep -v 'stream->request_id' | grep . || \
+	  { echo "FAIL: an HTTP/2 answer's x-request-id is its own stream's request_id"; exit 1; }
+	@echo "refusal mark: every answer echoes the request's live ID, never the audit key PASS"
+	@grep -A2 'static const char no_rule_resp\[\] =' sockproxy_ep.c | grep -q '"X-Loxilb-Refusal-Stage: route\\r\\n"' || \
+	  { echo "FAIL: sockproxy_ep.c no_rule_resp must name the stage every no_route answer names"; exit 1; }
+	@echo "refusal mark: the kept-listener no_route answer names its stage PASS"
+
 # The objective header's capture, the class headers of an admitted response
 # and the strip of a backend's X-Api-Key from its response head, on the
 # real framers under ASan and UBSan.
@@ -1218,7 +1267,7 @@ test_sync: test_sockproxy_sync_emit
 
 clean:
 	rm -f test_pd_request_limit_bin test_pd_refusal_bin
-	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
+	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_refusal_mark test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_h2_resp_mark test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

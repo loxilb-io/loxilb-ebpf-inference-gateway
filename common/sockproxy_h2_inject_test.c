@@ -368,6 +368,49 @@ main(void)
     }
   }
 
+  /* ---- The refusal-mark drop: every field of the x-loxilb-refusal- family
+   *      goes, in any case of the name; the bare prefix, the admission
+   *      family and x-request-id stay; nothing else moves. ---- */
+  {
+    static const char *add[][2] = {
+      { "x-loxilb-refusal-stage", "capacity" }, { "x-request-id", "be-1" },
+      { "X-Loxilb-Refusal-Anything", "x" }, { "x-loxilb-refusal-", "bare" },
+      { "x-loxilb-admission-limit", "4" }, { "x-loxilb-refusal-stage", "queue" },
+    };
+    size_t before = mapping.response_headers_count, i, left = 0, kept = 0;
+    for (i = 0; i < sizeof(add) / sizeof(add[0]); i++) {
+      nghttp2_nv nv = { (uint8_t *)add[i][0], (uint8_t *)add[i][1],
+                        strlen(add[i][0]), strlen(add[i][1]), NGHTTP2_NV_FLAG_NONE };
+      proxy_h2_inject_resp_headers(&mapping, &nv, 1);
+    }
+    size_t dropped = proxy_h2_drop_resp_refusal_mark(&mapping);
+    for (i = 0; i < mapping.response_headers_count; i++) {
+      nghttp2_nv *nv = &mapping.response_headers[i];
+      if (nv->namelen > 17 && !strncasecmp((char *)nv->name, "x-loxilb-refusal-", 17)) left++;
+      if ((nv->namelen == 12 && !memcmp(nv->name, "x-request-id", 12)) ||
+          (nv->namelen == 17 && !memcmp(nv->name, "x-loxilb-refusal-", 17)) ||
+          (nv->namelen == 24 && !memcmp(nv->name, "x-loxilb-admission-limit", 24))) kept++;
+    }
+    if (dropped == 3 && left == 0 && kept == 3 &&
+        mapping.response_headers_count == before + 3 &&
+        mapping.response_headers[0].namelen == 7 &&
+        !memcmp(mapping.response_headers[0].name, ":status", 7) &&
+        mapping.data_source == data_source_before) {
+      printf("[PASS] assert(6) a backend's x-loxilb-refusal-* dropped from the response head in any case; x-request-id, the admission family, order and the body provider unchanged\n");
+    } else {
+      printf("[FAIL] assert(6) refusal-mark drop: dropped=%zu left=%zu kept=%zu count %zu->%zu\n",
+             dropped, left, kept, before, mapping.response_headers_count);
+      failures++;
+    }
+    if (proxy_h2_drop_resp_refusal_mark(&mapping) == 0 &&
+        proxy_h2_drop_resp_refusal_mark(NULL) == 0) {
+      printf("[PASS] assert(7) nothing of the family left, and no mapping: no change\n");
+    } else {
+      printf("[FAIL] assert(7) a second refusal-mark drop changed the set\n");
+      failures++;
+    }
+  }
+
   /* cleanup mapping (free deep-copied headers like the production cleanup). */
   for (size_t i = 0; i < mapping.response_headers_count; i++) {
     free((void *)mapping.response_headers[i].name);

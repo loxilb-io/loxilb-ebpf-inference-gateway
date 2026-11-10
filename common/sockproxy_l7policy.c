@@ -43,6 +43,7 @@
 #include "sockproxy_health.h" /* CB snapshot guard */
 #include "sockproxy_internal.h" /* proxy_struct_t, proxy_struct, PROXY_LOCK/UNLOCK (attach) */
 #include "sockproxy_ai_admit.h" /* AI_GW_STAGE_ROUTE: a REJECT's deny record */
+#include "sockproxy_refusal_mark.h" /* the stage and request ID a REJECT names */
 #include "sockproxy_cache.h"    /* cmp_proxy_ent — entry equality at attach/detach */
 #include "sockproxy_cookie.h"   /* stateless cookie token derive/verify (pure) */
 #include "log.h"                /* log_error — attach diagnostics */
@@ -403,7 +404,8 @@ l7_has_crlf(const char *s)
  */
 int l7_send_reject(struct proxy_fd_ent *pfe, int status_code, const char *body)
 {
-  char resp[512];
+  char resp[512 + SP_REFUSAL_MARK_MAX];
+  char mark[SP_REFUSAL_MARK_MAX + 1];
   const char *safe_body;
   int code = status_code;
   int n;
@@ -427,13 +429,19 @@ int l7_send_reject(struct proxy_fd_ent *pfe, int status_code, const char *body)
   if (proxy_h2_send_l7_synthetic(pfe, code, NULL, safe_body) == 0)
     return 0;
 
+  /* The refusal mark: the stage of the deny record below, and the
+   * request's own ID when it has one. Always fits `mark`. */
+  (void)sp_refusal_mark_h1(mark, sizeof(mark),
+                           sp_refusal_stage_name(AI_GW_STAGE_ROUTE),
+                           SP_REFUSAL_LIVE_RID(pfe));
   n = snprintf(resp, sizeof(resp),
                "HTTP/1.1 %d %s\r\n"
+               "%s"
                "Content-Type: text/plain\r\n"
                "Connection: close\r\n"
                "\r\n"
                "%s\r\n",
-               code, l7_reason_phrase(code), safe_body);
+               code, l7_reason_phrase(code), mark, safe_body);
   if (n > 0 && n < (int)sizeof(resp)) {
     /* A refusal before any backend was chosen, recorded as every answer the
      * gateway writes itself: the response, and a deny record at ROUTE. */

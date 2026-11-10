@@ -30,8 +30,11 @@ proxy_fd_ent_t *h2fx_pfe;
 nghttp2_session *h2fx_cl;
 int h2fx_status[H2FX_MAX_STREAMS];
 #define H2FX_MAX_HDRS 16
-static struct { char name[48]; char value[48]; } h2fx_hdrs[H2FX_MAX_STREAMS][H2FX_MAX_HDRS];
+/* A value holds a whole request ID (255 bytes). */
+static struct { char name[48]; char value[256]; } h2fx_hdrs[H2FX_MAX_STREAMS][H2FX_MAX_HDRS];
 static int h2fx_nhdrs[H2FX_MAX_STREAMS];
+#define H2FX_CL_BODY_CAP 512
+static struct { char data[H2FX_CL_BODY_CAP]; size_t len; } h2fx_cl_body[H2FX_MAX_STREAMS];
 
 const char *
 h2fx_header(int32_t id, const char *name)
@@ -44,6 +47,16 @@ h2fx_header(int32_t id, const char *name)
     if (!strcmp(h2fx_hdrs[i][k].name, name))
       return h2fx_hdrs[i][k].value;
   return NULL;
+}
+
+const char *
+h2fx_body(int32_t id)
+{
+  int i = id / 2;
+
+  if (i < 0 || i >= H2FX_MAX_STREAMS)
+    return NULL;
+  return h2fx_cl_body[i].data;
 }
 
 proxy_epval_t *h2fx_lpm;
@@ -109,13 +122,29 @@ cl_on_header(nghttp2_session *s, const nghttp2_frame *f, const uint8_t *name,
              f->hd.stream_id / 2 < H2FX_MAX_STREAMS) {
     int i = f->hd.stream_id / 2, k = h2fx_nhdrs[i];
 
-    if (k < H2FX_MAX_HDRS && namelen < 48 && valuelen < 48) {
+    if (k < H2FX_MAX_HDRS && namelen < 48 && valuelen < 256) {
       memcpy(h2fx_hdrs[i][k].name, name, namelen);
       h2fx_hdrs[i][k].name[namelen] = 0;
       memcpy(h2fx_hdrs[i][k].value, value, valuelen);
       h2fx_hdrs[i][k].value[valuelen] = 0;
       h2fx_nhdrs[i] = k + 1;
     }
+  }
+  return 0;
+}
+
+static int
+cl_on_data(nghttp2_session *s, uint8_t flags, int32_t id, const uint8_t *data,
+           size_t len, void *u)
+{
+  int i = id / 2;
+
+  (void)s; (void)flags; (void)u;
+  if (i >= 0 && i < H2FX_MAX_STREAMS &&
+      h2fx_cl_body[i].len + len < H2FX_CL_BODY_CAP) {
+    memcpy(h2fx_cl_body[i].data + h2fx_cl_body[i].len, data, len);
+    h2fx_cl_body[i].len += len;
+    h2fx_cl_body[i].data[h2fx_cl_body[i].len] = 0;
   }
   return 0;
 }
@@ -524,6 +553,7 @@ h2fx_init(void)
   nghttp2_session_callbacks_new(&ccb);
   nghttp2_session_callbacks_set_send_callback(ccb, cl_send);
   nghttp2_session_callbacks_set_on_header_callback(ccb, cl_on_header);
+  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(ccb, cl_on_data);
   assert(nghttp2_session_client_new(&h2fx_cl, ccb, NULL) == 0);
   nghttp2_session_callbacks_del(ccb);
   assert(nghttp2_submit_settings(h2fx_cl, NGHTTP2_FLAG_NONE, NULL, 0) == 0);

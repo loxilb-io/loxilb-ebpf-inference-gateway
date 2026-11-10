@@ -20,7 +20,8 @@
 #   1. Every call of a local sender is inside a function that records, or is
 #      on the allowlist below with the reason it does not. A new answer fails
 #      until it records or is listed; an entry that matches nothing fails too.
-#   1b. A raw write (send, SSL_write) of a response built in the same
+#   1b. A raw write (send, SSL_write, or the two helpers that end in one,
+#      sp_raw_status_write and sp_raw_refusal_write) of a response built in the same
 #      function (a buffer initialised with an HTTP status line) is preceded,
 #      within 12 lines of that function, by its record: the paths that write
 #      on a worker that must not block (the P/D legs, the connect event, the
@@ -135,7 +136,7 @@ CALLS=$(awk '
   bleft > 0 { if ($0 ~ /"HTTP\/1\.[01] [1-5][0-9][0-9]/) built[bname] = 1; bleft-- }
   /proxy_record_local_completion\(|proxy_note_local_answer\(|proxy_note_local_refusal\(|proxy_record_local_deny\(/ &&
   !/^[[:space:]]*(\*|\/\*|\/\/)/ { lastrec = FNR }
-  pend == "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ && match($0, /(^|[^a-z_])(send|SSL_write|sp_raw_status_write)\(/) {
+  pend == "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ && match($0, /(^|[^a-z_])(send|SSL_write|sp_raw_status_write|sp_raw_refusal_write)\(/) {
     r = substr($0, RSTART + RLENGTH); split(r, args, ","); buf = args[2]
     gsub(/^[ \t]+|[ \t]+$/, "", buf)
     if (buf in built && !(lastrec > 0 && FNR - lastrec <= 12))
