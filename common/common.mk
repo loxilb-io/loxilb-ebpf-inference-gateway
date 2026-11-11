@@ -123,6 +123,9 @@ DEPFILES := $(BPF_OBJS:.o=.d) $(USER_OBJ:.o=.d)
 
 ABI_HEADER := llb_abi_fingerprint.generated.h
 ABI_INPUTS := $(shell python3 gen_abi_fingerprint.py --list-inputs)
+ifneq ($(strip $(MAKECMDGOALS)),clean)
+$(if $(strip $(ABI_INPUTS)),,$(error gen_abi_fingerprint.py --list-inputs returned no inputs; refusing to build with a possibly stale ABI fingerprint))
+endif
 $(ABI_HEADER): gen_abi_fingerprint.py $(ABI_INPUTS)
 	python3 gen_abi_fingerprint.py --output $@
 $(BPF_OBJS) $(USER_OBJ): $(SHARED_HDRS) $(ABI_HEADER)

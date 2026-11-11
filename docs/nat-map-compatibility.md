@@ -56,6 +56,16 @@ the deployment unit; it does not prove arbitrary Go mirrors or external code
 have compatible semantics. No map is automatically resized, migrated or deleted
 to repair a mismatch. Existing pin ownership must be respected.
 
+### Rollout
+
+Upgrade the loader before any no-loader consumer. A no-loader consumer
+refuses to start (exit 1) if the alias is missing or belongs to a different
+build, so mixed-version loader/consumer pairs are refused.
+
+During loader start, the alias is briefly absent between unlink and re-pin.
+A no-loader consumer starting in that window exits 1. Start consumers after
+the loader reports ready, or let them restart.
+
 ## Incremental builds
 
 All BPF rules and the native archive object emit `-MMD -MP` dependency files.
