@@ -16,11 +16,13 @@ on:
     branches: [ "main" ]
     paths:
       - 'common/**'
+      - 'kernel/**'
       - '.github/workflows/c-unit-gates.yml'
   pull_request:
     branches: [ "main" ]
     paths:
       - 'common/**'
+      - 'kernel/**'
       - '.github/workflows/c-unit-gates.yml'
   workflow_dispatch:
 
@@ -36,7 +38,7 @@ jobs:
       - name: Toolchain and unit dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -y install build-essential libnghttp2-dev libssl-dev
+          sudo apt-get -y install build-essential libnghttp2-dev libssl-dev libelf-dev zlib1g-dev python3
 
       - name: Host, listener identity, model and path routing
         run: |
@@ -48,6 +50,12 @@ jobs:
             common/sockproxy_fc.c common/log.c -Icommon -lpthread
           ASAN_OPTIONS=detect_leaks=1 /tmp/test_model_routing_sanitized
           make -C common test_route_hostless
+
+      - name: NAT userspace buffers match live map geometry (ASan + UBSan)
+        run: make -C kernel test_nat_map_abi
+
+      - name: NAT guard against real kernel maps (anonymous, no pins)
+        run: sudo make -C kernel test_nat_map_abi_kernel
 
       # The runner kernel's 32-bit mmap randomisation leaves no room for
       # ThreadSanitizer's shadow layout ("unexpected memory mapping").
