@@ -741,6 +741,22 @@ test_h2_resp_mark: test_h2_resp_mark.c $(H2FX_DEPS)
 test_h2rmark: test_h2_resp_mark
 	./test_h2_resp_mark
 
+# The HTTP/2 answers the gateway writes itself (the eight-field refusal, the
+# 401, each read and each reset with its body still queued) and the strip of a
+# backend's X-Loxilb-Refusal-* hold nothing per stream: 10000 cycles of the
+# five paths on one connection, LeakSanitizer at exit and the live heap read
+# at the end of every cycle. By default the two reset paths, which have to be
+# paced, run in every 6th cycle: about 33000 streams, past stream ID 65535,
+# in under two minutes on two CPUs. Every path in every cycle (50000 streams,
+# about 13 minutes): make test_h2dleak H2DLEAK_ARGS="10000 500 31 0 0 1"
+test_h2_deny_leak: test_h2_deny_leak.c $(H2FX_DEPS)
+	$(H2FX_LINK) -o $@ test_h2_deny_leak.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2dleak
+test_h2dleak: test_h2_deny_leak
+	ASAN_OPTIONS=detect_leaks=1 ./test_h2_deny_leak $(H2DLEAK_ARGS)
+
 # A half-closed HTTP/2 client is never held, and one of its legs ending leaves
 # no mark on it (sockproxy_hold.c). Linked with --gc-sections and the event
 # loop stubbed in the test.
@@ -1267,7 +1283,7 @@ test_sync: test_sockproxy_sync_emit
 
 clean:
 	rm -f test_pd_request_limit_bin test_pd_refusal_bin
-	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_refusal_mark test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_h2_resp_mark test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
+	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_refusal_mark test_obj_hint test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_h2_resp_mark test_h2_deny_leak test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

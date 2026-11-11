@@ -80,6 +80,13 @@ jobs:
       - name: A backend's X-Loxilb-Refusal-* is removed from every response head relayed to an HTTP/2 client (real relay, ASan + UBSan)
         run: make -C common test_h2rmark
 
+      # The default run: about 33000 streams on one connection, past stream ID
+      # 65535, the two paced reset paths in every 6th cycle. The full run (every
+      # path in every cycle, 50000 streams, about 13 minutes) is not a gate:
+      #   make -C common test_h2dleak H2DLEAK_ARGS="10000 500 31 0 0 1"
+      - name: Gateway-written HTTP/2 answers and the X-Loxilb-Refusal-* strip hold nothing per stream (33000 streams on one connection, ASan + UBSan + LeakSanitizer and the live heap)
+        run: make -C common test_h2dleak
+
       - name: A half-closed HTTP/2 client is never held (ASan + UBSan)
         run: make -C common test_h2hold
 
