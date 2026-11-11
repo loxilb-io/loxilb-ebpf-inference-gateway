@@ -16,6 +16,11 @@
  * forwarded to a fake backend, and the backend answering with an interim
  * 103 and a final 429 that both carry the family.
  *
+ * The same relay then carries the class headers of an admitted response:
+ * X-Loxilb-Admission-Objective-Requested is there when the request named an
+ * objective it may not use, with what it named, and absent when it did not;
+ * a backend's own header of that name is dropped either way.
+ *
  * Build: make test_h2rmark (ASan + UBSan, the gateway object included).
  */
 #define _GNU_SOURCE
@@ -27,12 +32,58 @@
 
 #define NV(n, v) { (uint8_t *)(n), (uint8_t *)(v), sizeof(n) - 1, sizeof(v) - 1, NGHTTP2_NV_FLAG_NONE }
 
+/* The admission gate's answer for the class cases: admitted, and the
+ * objective the request named was denied or not. */
+static int the_denied;
+static const char *the_requested;
+
+static void
+admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
+{
+  (void)req;
+  res->verdict = AI_GW_ADMIT_ALLOW;
+  snprintf(res->tenant_id, sizeof(res->tenant_id), "t1");
+  res->priority_class = AI_GW_CLASS_STANDARD;
+  res->objective_denied = the_denied ? 1 : 0;
+  /* Set even when not denied: the gateway must not read it then. */
+  snprintf(res->objective_requested, sizeof(res->objective_requested), "%s",
+           the_requested ? the_requested : "");
+}
+
+/* One admitted request relayed to the backend, which answers 200 with its
+ * own copies of the class headers. Returns the client's stream. */
+static int32_t
+class_exchange(int denied, const char *requested, int streams_before)
+{
+  nghttp2_nv ok[] = {
+    NV(":status", "200"),
+    NV("content-length", "0"),
+    NV("x-loxilb-admission-objective-requested", "forged"),
+    NV("x-loxilb-admission-class", "critical"),
+    NV("x-backend", "b1"),
+  };
+  int32_t id;
+
+  the_denied = denied;
+  the_requested = requested;
+  id = h2fx_submit("m1", NULL, 0);
+  CHECK(h2fx_gw_read() == 0 && h2fx_be[0].streams == streams_before + 1,
+        "the request is admitted and forwarded (backend streams %d)", h2fx_be[0].streams);
+  if (h2fx_be[0].streams != streams_before + 1)
+    return id;
+  assert(nghttp2_submit_response(h2fx_be[0].srv, h2fx_be[0].stream, ok,
+                                 sizeof(ok) / sizeof(ok[0]), NULL) == 0);
+  CHECK(h2fx_be_send(0) == 0 && h2fx_status[id / 2] == 200,
+        "the backend's 200 reaches the client (got %d)", h2fx_status[id / 2]);
+  return id;
+}
+
 int
 main(void)
 {
   proxy_epval_t *pool;
   const char *v;
-  int32_t s1;
+  int32_t s1, s2;
   nghttp2_nv interim[] = {
     NV(":status", "103"),
     NV("link", "</style.css>; rel=preload"),
@@ -87,6 +138,56 @@ main(void)
   CHECK(v && !strcmp(v, "be-7"), "its x-request-id included (got %s)", v ? v : "none");
   v = h2fx_header(s1, "retry-after");
   CHECK(v && !strcmp(v, "3"), "and its retry-after (got %s)", v ? v : "none");
+
+  /* The class headers on the same relay: classes on, a rule that exposes
+   * its admission headers, a request the gate admits. */
+  /* An admitted request completes, and its completion is recorded: the two
+   * stand-ins of that record abort for every test that did not say this. */
+  h2fx_allow_completion = 1;
+  h2fx_admit = admit;
+  h2fx_class_on = 1;
+  pool->ai_gw_mode = 1;
+  pool->fc.cfg.expose_headers = 1;
+
+  s2 = class_exchange(1, "premium", 1);
+  v = h2fx_header(s2, "x-loxilb-admission-class");
+  CHECK(v && !strcmp(v, "standard"), "denied: the class is the gateway's (got %s)", v ? v : "none");
+  v = h2fx_header(s2, "x-loxilb-admission-objective-requested");
+  CHECK(v && !strcmp(v, "premium"),
+        "denied: the head says what the request asked for, not the backend's value (got %s)",
+        v ? v : "none");
+  v = h2fx_header(s2, "x-loxilb-admission-objective");
+  CHECK(v == NULL, "and no applied objective, there being none (got %s)", v ? v : "none");
+  v = h2fx_header(s2, "x-backend");
+  CHECK(v && !strcmp(v, "b1"), "the rest of the head is the backend's");
+
+  s2 = class_exchange(0, "premium", 2);
+  v = h2fx_header(s2, "x-loxilb-admission-objective-requested");
+  CHECK(v == NULL, "not denied: the header is absent, the backend's copy included (got %s)",
+        v ? v : "none");
+  v = h2fx_header(s2, "x-loxilb-admission-class");
+  CHECK(v && !strcmp(v, "standard"), "the class is still there (got %s)", v ? v : "none");
+
+  s2 = class_exchange(1, "(oversize)", 3);
+  v = h2fx_header(s2, "x-loxilb-admission-objective-requested");
+  CHECK(v && !strcmp(v, "(oversize)"), "an oversize hint is reported as the capture kept it (got %s)",
+        v ? v : "none");
+
+  s2 = class_exchange(1, "pre mium", 4);
+  v = h2fx_header(s2, "x-loxilb-admission-objective-requested");
+  CHECK(v == NULL, "a hint that is not header text is not written (got %s)", v ? v : "none");
+
+  /* Classes off: the stage did not run, nothing is exposed or dropped. */
+  h2fx_class_on = 0;
+  s2 = class_exchange(1, "premium", 5);
+  v = h2fx_header(s2, "x-loxilb-admission-objective-requested");
+  CHECK(v && !strcmp(v, "forged"),
+        "with no class stage the backend's header passes as its other headers do (got %s)",
+        v ? v : "none");
+
+  CHECK(h2fx_completion_requests == 5 && h2fx_completion_usage_missing == 5,
+        "each of the five admitted requests left one completion record through the fixture (%d, usage missing %d)",
+        h2fx_completion_requests, h2fx_completion_usage_missing);
 
   h2fx_fini();
   return h2fx_result();

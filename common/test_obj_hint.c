@@ -184,13 +184,13 @@ test_capture(void)
 /* Run the splice on a heap buffer whose capacity is exactly `cap`. */
 static size_t
 expose(const char *resp, size_t len, size_t cap, const char *objective,
-       uint8_t cls, int *res, char **out)
+       uint8_t cls, const char *requested, int *res, char **out)
 {
   uint8_t *buf = malloc(cap);
   size_t n;
 
   memcpy(buf, resp, len);
-  n = sp_class_expose_h1(buf, len, cap, objective, cls, res);
+  n = sp_class_expose_h1(buf, len, cap, objective, cls, requested, res);
   *out = malloc(n + 1);
   memcpy(*out, buf, n);
   (*out)[n] = '\0';
@@ -212,7 +212,7 @@ test_expose(void)
          "{\"a\":\"\\r\\n\\r\\nX\"}\r\n\r\n";
   len = strlen(resp);
   body = strstr(resp, "\r\n\r\n") + 4;
-  n = expose(resp, len, len + 128, "batch", 2, &res, &out);
+  n = expose(resp, len, len + 128, "batch", 2, NULL, &res, &out);
   CHECK(res == SP_CLASS_H1_DONE, "a whole head takes the headers");
   CHECK(strstr(out, "\r\nX-Loxilb-Admission-Objective: batch\r\n") &&
         strstr(out, "\r\nX-Loxilb-Admission-Class: sheddable\r\n\r\n"),
@@ -222,15 +222,15 @@ test_expose(void)
   CHECK(!memcmp(out, resp, (size_t)(body - 2 - resp)), "the backend's own head lines are unchanged");
   free(out);
 
-  n = expose(resp, len, len + 128, "", 0, &res, &out);
+  n = expose(resp, len, len + 128, "", 0, NULL, &res, &out);
   CHECK(res == SP_CLASS_H1_DONE && strstr(out, "X-Loxilb-Admission-Class: standard\r\n") &&
         !strstr(out, "Admission-Objective"), "no hint applied: the class alone");
   free(out);
-  n = expose(resp, len, len + 128, "tier:priority", 1, &res, &out);
+  n = expose(resp, len, len + 128, "tier:priority", 1, NULL, &res, &out);
   CHECK(strstr(out, "X-Loxilb-Admission-Objective: tier:priority\r\n") &&
         strstr(out, "X-Loxilb-Admission-Class: critical\r\n"), "a tier hint is named as tier:<value>");
   free(out);
-  n = expose(resp, len, len + 128, "bad\r\nInjected: 1", 1, &res, &out);
+  n = expose(resp, len, len + 128, "bad\r\nInjected: 1", 1, NULL, &res, &out);
   CHECK(!strstr(out, "Injected") && strstr(out, "X-Loxilb-Admission-Class: critical\r\n"),
         "an objective name that is not header text is not written");
   free(out);
@@ -239,10 +239,10 @@ test_expose(void)
   {
     size_t need = strlen("X-Loxilb-Admission-Objective: batch\r\nX-Loxilb-Admission-Class: sheddable\r\n");
 
-    n = expose(resp, len, len + need, "batch", 2, &res, &out);
+    n = expose(resp, len, len + need, "batch", 2, NULL, &res, &out);
     CHECK(res == SP_CLASS_H1_DONE && n == len + need, "exactly enough room is enough");
     free(out);
-    n = expose(resp, len, len + need - 1, "batch", 2, &res, &out);
+    n = expose(resp, len, len + need - 1, "batch", 2, NULL, &res, &out);
     CHECK(res == SP_CLASS_H1_SKIPPED && n == len && !memcmp(out, resp, len),
           "one byte short: nothing is written and nothing changes");
     free(out);
@@ -253,7 +253,7 @@ test_expose(void)
          "X-Loxilb-Admission-Objective: stolen\r\nX-Loxilb-Admission-Inflight: 3\r\n"
          "X-Loxilb-Admission-Classic: keep\r\nContent-Length: 0\r\n\r\n";
   len = strlen(resp);
-  n = expose(resp, len, len + 128, "", 2, &res, &out);
+  n = expose(resp, len, len + 128, "", 2, NULL, &res, &out);
   CHECK(res == SP_CLASS_H1_DONE && !strstr(out, "critical") && !strstr(out, "stolen"),
         "the backend's own class and objective lines are removed");
   CHECK(strstr(out, "X-Loxilb-Admission-Inflight: 3\r\n") && strstr(out, "X-Loxilb-Admission-Classic: keep\r\n"),
@@ -262,21 +262,142 @@ test_expose(void)
 
   resp = "HTTP/1.1 100 Continue\r\n\r\n";
   len = strlen(resp);
-  n = expose(resp, len, len + 128, "batch", 2, &res, &out);
+  n = expose(resp, len, len + 128, "batch", 2, NULL, &res, &out);
   CHECK(res == SP_CLASS_H1_INTERIM && n == len, "an interim head is left for the final one");
   free(out);
 
   resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n";
   len = strlen(resp);
-  n = expose(resp, len, len + 128, "batch", 2, &res, &out);
+  n = expose(resp, len, len + 128, "batch", 2, NULL, &res, &out);
   CHECK(res == SP_CLASS_H1_SKIPPED && n == len, "a head that is not whole in the read is left");
   free(out);
 
   resp = "data: {\"x\":1}\r\n\r\nHTTP/1.1 200 OK\r\n\r\n";
   len = strlen(resp);
-  n = expose(resp, len, len + 128, "batch", 2, &res, &out);
+  n = expose(resp, len, len + 128, "batch", 2, NULL, &res, &out);
   CHECK(res == SP_CLASS_H1_SKIPPED && n == len && !memcmp(out, resp, len),
         "bytes that do not begin with a status line are left");
+  free(out);
+}
+
+/* ---- what a request asked for and did not get ---- */
+static void
+test_requested(void)
+{
+  static const char L_OBJ[] = "X-Loxilb-Admission-Objective: batch\r\n";
+  static const char L_CLASS[] = "X-Loxilb-Admission-Class: sheddable\r\n";
+  static const char L_REQ[] = "X-Loxilb-Admission-Objective-Requested: premium\r\n";
+  const char *resp;
+  char *out, big[512], name63[64];
+  creq_t c;
+  size_t n, len;
+  int res;
+
+  printf("== the objective a request asked for and may not use\n");
+
+  resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+  len = strlen(resp);
+
+  /* Denied, and the request fell to a default objective: all three, the
+   * new line last. */
+  n = expose(resp, len, len + 256, "batch", 2, "premium", &res, &out);
+  CHECK(res == SP_CLASS_H1_DONE && strstr(out, L_OBJ) && strstr(out, L_CLASS) &&
+        strstr(out, "\r\nX-Loxilb-Admission-Objective-Requested: premium\r\n\r\n{}"),
+        "denied: the hint the client sent is on the head, after the applied objective and the class");
+  CHECK(n == len + strlen(L_OBJ) + strlen(L_CLASS) + strlen(L_REQ), "and nothing else was added");
+  free(out);
+
+  /* Denied with no default: the applied objective is absent, the requested
+   * one is not. */
+  n = expose(resp, len, len + 256, "", 0, "premium", &res, &out);
+  CHECK(res == SP_CLASS_H1_DONE && !strstr(out, "X-Loxilb-Admission-Objective: ") &&
+        strstr(out, "X-Loxilb-Admission-Class: standard\r\n" "X-Loxilb-Admission-Objective-Requested: premium\r\n"),
+        "denied with no default objective: the class and what was asked for");
+  free(out);
+
+  /* Not denied: the caller passes no hint, or an empty one. */
+  n = expose(resp, len, len + 256, "batch", 2, NULL, &res, &out);
+  CHECK(res == SP_CLASS_H1_DONE && !strstr(out, "Objective-Requested") && strstr(out, L_OBJ),
+        "not denied: the header is absent");
+  free(out);
+  n = expose(resp, len, len + 256, "batch", 2, "", &res, &out);
+  CHECK(res == SP_CLASS_H1_DONE && !strstr(out, "Objective-Requested"),
+        "an empty hint writes no header");
+  free(out);
+
+  /* A tier that was asked for by the body and denied. */
+  n = expose(resp, len, len + 256, "", 0, "tier:priority", &res, &out);
+  CHECK(strstr(out, "X-Loxilb-Admission-Objective-Requested: tier:priority\r\n"),
+        "a denied body tier is named as tier:<value>");
+  free(out);
+
+  /* A value that is not header text is not written; the pair still is. */
+  n = expose(resp, len, len + 256, "batch", 2, "pre mium", &res, &out);
+  CHECK(res == SP_CLASS_H1_DONE && !strstr(out, "Objective-Requested") && strstr(out, L_CLASS),
+        "a hint with a space in it is not written, the class headers are");
+  free(out);
+  n = expose(resp, len, len + 256, "batch", 2, "x\r\nInjected: 1", &res, &out);
+  CHECK(!strstr(out, "Injected") && !strstr(out, "Objective-Requested"),
+        "nor one with a line break in it");
+  free(out);
+
+  /* An oversize hint, captured by the real request framer, is what the
+   * capture made of it. */
+  snprintf(big, sizeof(big), REQ_HEAD "x-llm-d-inference-objective: %.64s\r\n" REQ_TAIL,
+           "ooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo");
+  n = expose(resp, len, len + 256, "", 0, hint_of(&c, big, 0), &res, &out);
+  CHECK(strstr(out, "X-Loxilb-Admission-Objective-Requested: " SP_OBJ_OVERSIZE "\r\n"),
+        "an oversize hint is reported as " SP_OBJ_OVERSIZE);
+  free(out);
+
+  /* The longest values there can be: 63 bytes each. */
+  memset(name63, 'n', 63);
+  name63[63] = '\0';
+  n = expose(resp, len, len + 512, name63, 1, name63, &res, &out);
+  CHECK(res == SP_CLASS_H1_DONE && n == len + 30 + 63 + 2 + strlen("X-Loxilb-Admission-Class: critical\r\n") + 40 + 63 + 2,
+        "two names of 63 bytes are written whole (%zu bytes added)", n - len);
+  free(out);
+
+  /* All of it or none: exactly enough room, and one byte short. */
+  {
+    size_t need = strlen(L_OBJ) + strlen(L_CLASS) + strlen(L_REQ);
+
+    n = expose(resp, len, len + need, "batch", 2, "premium", &res, &out);
+    CHECK(res == SP_CLASS_H1_DONE && n == len + need, "exactly enough room for the three lines is enough");
+    free(out);
+    n = expose(resp, len, len + need - 1, "batch", 2, "premium", &res, &out);
+    CHECK(res == SP_CLASS_H1_SKIPPED && n == len && !memcmp(out, resp, len),
+          "one byte short: none of the three is written and nothing changes");
+    free(out);
+  }
+
+  /* A backend's own line of that name never reaches the client. */
+  resp = "HTTP/1.1 200 OK\r\nX-Loxilb-Admission-Objective-Requested: forged\r\n"
+         "x-loxilb-admission-objective-requested: forged2\r\n"
+         "X-Loxilb-Admission-Objective-Requested-By: keep\r\nContent-Length: 0\r\n\r\n";
+  len = strlen(resp);
+  n = expose(resp, len, len + 256, "", 0, NULL, &res, &out);
+  CHECK(res == SP_CLASS_H1_DONE && !strstr(out, "forged"),
+        "not denied: the backend's lines of that name are removed, in any case");
+  CHECK(strstr(out, "X-Loxilb-Admission-Objective-Requested-By: keep\r\n"),
+        "a longer name that begins the same stays");
+  free(out);
+  n = expose(resp, len, len + 256, "", 0, "premium", &res, &out);
+  CHECK(!strstr(out, "forged") &&
+        strstr(out, "X-Loxilb-Admission-Objective-Requested: premium\r\n\r\n"),
+        "denied: the backend's lines go and the gateway's is the only one");
+  free(out);
+
+  /* An interim head and a head that is not whole take nothing, as before. */
+  resp = "HTTP/1.1 103 Early Hints\r\n\r\n";
+  len = strlen(resp);
+  n = expose(resp, len, len + 256, "batch", 2, "premium", &res, &out);
+  CHECK(res == SP_CLASS_H1_INTERIM && n == len, "an interim head is left for the final one");
+  free(out);
+  resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n";
+  len = strlen(resp);
+  n = expose(resp, len, len + 256, "batch", 2, "premium", &res, &out);
+  CHECK(res == SP_CLASS_H1_SKIPPED && n == len, "a head that is not whole in the read is left");
   free(out);
 }
 
@@ -410,6 +531,7 @@ main(void)
 {
   test_capture();
   test_expose();
+  test_requested();
   test_response_strip();
   printf("\n%d checks, %d failed\n", checks, failures);
   return failures ? 1 : 0;

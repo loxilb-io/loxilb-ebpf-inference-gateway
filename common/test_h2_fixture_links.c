@@ -25,6 +25,21 @@ void abort(void);
 #define NOT_REACHED(name) \
   long name(void) { puts("test_h2_fixture_links: " #name " reached"); abort(); return 0; }
 
+/* A request's completion record. Only a test that relays an admitted
+ * request's answer gets here, and it says so first (h2fx_allow_completion);
+ * for every other test these two abort with their name as the NOT_REACHED
+ * ones do. The calls are counted for the test that opted in. */
+int h2fx_allow_completion, h2fx_completion_requests, h2fx_completion_usage_missing;
+#define REACHED_OPT_IN(name, counter) \
+  long name(void) \
+  { \
+    if (!h2fx_allow_completion) { \
+      puts("test_h2_fixture_links: " #name " reached"); abort(); \
+    } \
+    counter++; \
+    return 0; \
+  }
+
 /* Every stream initializes fixed scanner storage, including non-JSON
  * streams. These fixtures declare no JSON media type: reaching JSON body
  * inspection would change the lifetime test's setup and must fail loudly. */
@@ -116,9 +131,9 @@ NOT_REACHED(l7_cookie_persist_active)
 NOT_REACHED(l7_cookie_read_presented)
 NOT_REACHED(l7_hsts_synthesize)
 NOT_REACHED(l7_mcp_header_used)
-NOT_REACHED(llb_ai_record_request)
+REACHED_OPT_IN(llb_ai_record_request, h2fx_completion_requests)
 REACHED(llb_ai_record_unmetered)
-NOT_REACHED(llb_ai_record_usage_missing)
+REACHED_OPT_IN(llb_ai_record_usage_missing, h2fx_completion_usage_missing)
 REACHED(llb_ai_token_quota_consume)
 NOT_REACHED(llhttp_execute)
 NOT_REACHED(llhttp_get_error_pos)

@@ -1236,8 +1236,9 @@ h2_expose_admission(stream_mapping_t *mapping, const fc_permit_t *permit)
   }
 }
 
-/* The class headers of an admitted response: the class, and the hint that
- * was applied when there was one. A backend's own headers of those two
+/* The class headers of an admitted response: the class, the hint that was
+ * applied when there was one, and, when the request asked for an objective
+ * it may not use, what it asked for. A backend's own headers of those three
  * names are dropped first; this runs after h2_expose_admission, which
  * removes the whole admission family before it adds its values. */
 static void
@@ -1245,8 +1246,9 @@ h2_expose_class(stream_mapping_t *mapping, const proxy_h2_stream_t *cstream)
 {
   static const char n_obj[] = SP_CLASS_HDR_OBJ;
   static const char n_class[] = SP_CLASS_HDR_CLASS;
+  static const char n_req[] = SP_CLASS_HDR_OBJ_REQ;
   const char *cls = sp_class_name(cstream->adm_class);
-  nghttp2_nv add[2];
+  nghttp2_nv add[3];
   size_t i, j, n = 0;
 
   for (i = 0, j = 0; mapping->response_headers &&
@@ -1255,7 +1257,9 @@ h2_expose_class(stream_mapping_t *mapping, const proxy_h2_stream_t *cstream)
     if ((nv->namelen == sizeof(n_obj) - 1 &&
          !strncasecmp((const char *)nv->name, n_obj, nv->namelen)) ||
         (nv->namelen == sizeof(n_class) - 1 &&
-         !strncasecmp((const char *)nv->name, n_class, nv->namelen))) {
+         !strncasecmp((const char *)nv->name, n_class, nv->namelen)) ||
+        (nv->namelen == sizeof(n_req) - 1 &&
+         !strncasecmp((const char *)nv->name, n_req, nv->namelen))) {
       free(nv->name);
       free(nv->value);
       continue;
@@ -1279,6 +1283,14 @@ h2_expose_class(stream_mapping_t *mapping, const proxy_h2_stream_t *cstream)
   add[n].valuelen = strlen(cls);
   add[n].flags = NGHTTP2_NV_FLAG_NONE;
   n++;
+  if (cstream->adm_objective_denied && sp_class_hdr_value_ok(cstream->adm_objective_req)) {
+    add[n].name = (uint8_t *)n_req;
+    add[n].namelen = sizeof(n_req) - 1;
+    add[n].value = (uint8_t *)cstream->adm_objective_req;
+    add[n].valuelen = strlen(cstream->adm_objective_req);
+    add[n].flags = NGHTTP2_NV_FLAG_NONE;
+    n++;
+  }
   proxy_h2_inject_resp_headers(mapping, add, n);
 }
 
@@ -5042,6 +5054,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       stream->adm_objective_denied = adm.objective_denied;
       stream->adm_hint_not_applied = adm.hint_not_applied;
       snprintf(stream->adm_objective, sizeof(stream->adm_objective), "%s", adm.objective);
+      snprintf(stream->adm_objective_req, sizeof(stream->adm_objective_req), "%s",
+               adm.objective_denied ? adm.objective_requested : "");
       if (adm.tier_consumed && stream->data_buf)
         (void)json_null_top_key((char *)stream->data_buf, stream->data_len,
                                 "service_tier", 12);

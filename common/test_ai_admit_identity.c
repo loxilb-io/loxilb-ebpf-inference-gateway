@@ -2333,6 +2333,34 @@ test_class_denied_falls_through_unless_strict(void)
   assert(res.objective_denied == 1);
   assert(res.priority == -5 && strcmp(res.objective, "batch") == 0);
   assert(rl_stub.calls == 1 && rs_stub.calls == 1 && deny_stub.calls == 0);
+  /* and the answer keeps what was asked for, for the response head */
+  assert(strcmp(res.objective_requested, "not-mine") == 0);
+
+  /* a denied body tier, with no header: named as the resolver names it */
+  req.objective_hint = "";
+  reset_stubs();
+  cls_stub.out.objective_denied = 1;
+  tier_stub.tier = AI_TIER_PRIORITY;
+  tier_stub.off = 3;
+  tier_stub.vlen = 10;
+  assert(ai_gw_admit(&req, &res) == 0 && res.objective_denied == 1);
+  assert(strcmp(res.objective_requested, "tier:priority") == 0);
+
+  /* the header wins over the tier, as it does in the resolver */
+  req.objective_hint = "not-mine";
+  reset_stubs();
+  cls_stub.out.objective_denied = 1;
+  tier_stub.tier = AI_TIER_FAST;
+  tier_stub.off = 3;
+  tier_stub.vlen = 6;
+  assert(ai_gw_admit(&req, &res) == 0 && res.objective_denied == 1);
+  assert(strcmp(res.objective_requested, "not-mine") == 0);
+
+  /* not denied: nothing is kept, whatever was asked */
+  reset_stubs();
+  strcpy(cls_stub.out.objective, "not-mine");
+  assert(ai_gw_admit(&req, &res) == 0 && !res.objective_denied);
+  assert(res.objective_requested[0] == '\0');
 
   req.objective_strict = 1;
   reset_stubs();
