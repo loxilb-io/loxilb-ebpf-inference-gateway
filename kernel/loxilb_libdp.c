@@ -754,7 +754,6 @@ llb_setup_kern_sock(const char *cgroup_path)
     goto err;
   }
 
-
   pfd = bpf_program__fd(prog);
   if (pfd < 0) {
     log_error("sockaddr: failed to get program fd");
@@ -856,7 +855,6 @@ llb_setup_kern_mon(void)
       log_error("Failed to load and verify BPF skeleton");
       goto cleanup;
   }
-
 
   // Attach the various kProbes
   err = llb_kern_mon__attach(prog);
@@ -1007,7 +1005,6 @@ llb_setup_kern_sockmap_skmsg_helper(int map_fd, int verdict_map_fd, int peer_map
     goto err;
   }
 
-
   verdict_map_fd = bpf_map__fd(verdict_map2);
   if (verdict_map_fd < 0) {
     log_error("sockdir: map get failed");
@@ -1101,7 +1098,6 @@ llb_setup_kern_sockmap_strparser_helper(int sockmap_fd, int verdict_map_fd, int 
     log_error("sockstream: obj load failed");
     goto err;
   }
-
 
   map_fd = bpf_map__fd(map2);
   if (map_fd < 0) {
@@ -1514,7 +1510,6 @@ llb_setup_kern_sockmap(const char *cgroup_path)
     log_error("sockmap: load failed");
     goto err;
   }
-
 
   pfd = bpf_program__fd(prog);
   if (pfd < 0) {
@@ -4830,7 +4825,6 @@ llb_dp_link_attach(const char *ifname,
     llb_link_prop_del(ifname, mp_type);
     return -1;
   }
-
 
   if (bpf_obj && mp_type == LL_BPF_MOUNT_XDP) {
     llb_link_xdp_flags_set(ifname, cfg.bpf_flags);

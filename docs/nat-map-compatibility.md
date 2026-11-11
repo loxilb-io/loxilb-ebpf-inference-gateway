@@ -38,5 +38,6 @@ exist and match type/key/value geometry, or initialization exits 1. NAT is
 checked exactly once through the table and keeps the NAT-specific diagnostic.
 The generic guard header is llb_map_abi.h. Frozen Go scalar layouts remain
 explicit wire-size contracts; this is not a translation-unit layout handshake.
-See the accompanying D1-reader-inventory.json review aid. The slim profile's
+Direct userspace lookup sites were reviewed; the generic CT/FC walkers and fixed Go/CGO/auxiliary socket readers are covered by the table.
+The slim profile's
 missing ct_err_stats remains a follow-up; its table entry is not weakened here.
