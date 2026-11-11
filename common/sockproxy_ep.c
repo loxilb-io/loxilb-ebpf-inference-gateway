@@ -942,9 +942,13 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
          * connection, until a rule takes the address again). Say that,
          * not "no pool for this model": the request named a model the
          * operator may well serve elsewhere, and the "model_unavailable"
-         * answer sent operators to the pools instead of the rule table. */
+         * answer sent operators to the pools instead of the rule table.
+         * No backend is chosen here, so the answer names the stage every
+         * no_route answer names (sockproxy_refusal_mark.h); the line is
+         * part of the text, and the record stays the outage's. */
         static const char no_rule_resp[] =
             "HTTP/1.1 503 Service Unavailable\r\n"
+            "X-Loxilb-Refusal-Stage: route\r\n"
             "Content-Type: application/json\r\n"
             "Connection: close\r\n"
             "\r\n"

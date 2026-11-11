@@ -16,6 +16,7 @@ prefix = r'''
 #include <stdio.h>
 #include <string.h>
 #include "sockproxy_end_cause.h"
+#include "sockproxy_refusal_mark.h"
 typedef struct {
  int odir, ai_gw_mode, metric_ai_recorded, metric_response_status, fc, noted;
  uint64_t metric_req_start_ns;
@@ -25,6 +26,10 @@ typedef struct {
  char tenant_id[32], auth_user_id[32], auth_key_id[32], l7_peer_ip[32];
  char auth_net_identity[32], adm_objective[32], request_id[32], model[32];
  char effective_model[32], x_model_header[32];
+ /* request_id is the audit key (proxy_request_id: the live field, else the
+  * snapshot of an earlier forward); vllm_request_id is the live field alone,
+  * the only thing an answer may echo. */
+ char vllm_request_id[300];
  struct { char model[32]; } prefix_key;
 } proxy_fd_ent_t;
 static int emitted, released, sent, send_rc, observed_status;
@@ -67,9 +72,11 @@ static void capture(const char *t,int status,const char *r,const char *k,int str
 }
 #define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj) \
  ((void)(m),(void)(lat),(void)(ti),(void)(to),(void)(svc),(void)(worker),(void)(origin),(void)(hops),capture(t,st,r,k,stream,c))
+static char last_sent[2048];
 static int proxy_send_local_response(proxy_fd_ent_t *p,const void *buf,size_t n){
  (void)p;sent++;
  assert(n==strlen(buf));
+ assert(n<sizeof(last_sent));memcpy(last_sent,buf,n+1);
  if(strstr(buf,"backend_unreachable")){
   assert(strstr(buf,"HTTP/1.1 502 Bad Gateway\r\n"));assert(strstr(buf,"Content-Length:"));
  }
@@ -82,11 +89,15 @@ suffix = r'''
 static proxy_fd_ent_t request(void){
  proxy_fd_ent_t p={.ai_gw_mode=1,.metric_req_start_ns=1000000,.fc=1};
  strcpy(p.tenant_id,"tenant-a");strcpy(p.auth_key_id,"opaque-key-id");
- strcpy(p.request_id,"test-request-a");strcpy(p.model,"model-a");return p;
+ strcpy(p.request_id,"test-request-a");strcpy(p.vllm_request_id,"test-request-a");
+ strcpy(p.model,"model-a");return p;
 }
 int main(void){
  proxy_fd_ent_t p=request();
  assert(proxy_send_backend_unreachable(&p,"connect failed")==0);
+ /* an outage names no stage and carries the request's own ID */
+ assert(strstr(last_sent,"\r\nContent-Length: 59\r\nX-Request-Id: test-request-a\r\nConnection: close\r\n\r\n{"));
+ assert(!strstr(last_sent,"X-Loxilb-Refusal-"));
  assert(emitted==1 && observed_status==502 && p.metric_response_status==502);
  assert(!strcmp(observed_request,"test-request-a"));
  assert(!strcmp(observed_tenant,"tenant-a") && !strcmp(observed_key,"opaque-key-id"));
@@ -110,9 +121,24 @@ int main(void){
  /* An outage: no backend could take it. Completed with its status. */
  p=request();send_rc=0;
  assert(sp_send_local_outage(&p,503,outage503,strlen(outage503))==0);
+ /* an outage is not a refusal: no stage. It carries the request's own ID
+  * after its status line, and the rest is the text as built. */
+ assert(!strncmp(last_sent,"HTTP/1.1 503 Service Unavailable\r\nX-Request-Id: test-request-a\r\n",64));
+ assert(!strcmp(last_sent+64,strchr(outage503,'\n')+1) && !strstr(last_sent,"X-Loxilb-Refusal-"));
  assert(emitted==3 && observed_status==503 && p.metric_response_status==503);
  assert(released==3 && p.metric_ai_recorded && local_notes==8 && last_note_status==503);
  assert(denies==0);
+ /* answered when the request has no ID of its own left (forwarded, then no
+  * backend): as built. The audit key still has the snapshot, the wire not. */
+ {int e0=emitted,r0=released,n0=local_notes,s0=sent,st0=last_note_status;
+ p=request();p.vllm_request_id[0]=0;send_rc=0;
+ sp_send_local_outage(&p,503,outage503,strlen(outage503));
+ assert(!strcmp(last_sent,outage503) && !strcmp(observed_request,"test-request-a"));
+ proxy_send_backend_unreachable(&p,"no id left");
+ assert(!strstr(last_sent,"X-Request-Id"));
+ assert(denies==0 && emitted==e0+1 && local_notes==n0+2);
+ /* the two answers above, taken back out of the running counts */
+ emitted=e0;released=r0;local_notes=n0;sent=s0;last_note_status=st0;}
  p=request();p.ai_gw_mode=0;sp_send_local_outage(&p,503,outage503,strlen(outage503));
  assert(emitted==3 && local_notes==9);
 
@@ -120,6 +146,11 @@ int main(void){
   * never a completion; the model is the one this request named. */
  p=request();strcpy(p.effective_model,"model-unknown");
  assert(sp_send_local_refusal(&p,7,503,"model_unavailable",route503,strlen(route503))==0);
+ /* the answer names the stage of its deny record and the request, right
+  * after its status line; the rest is the text the caller built */
+ assert(!strcmp(last_sent,"HTTP/1.1 503 Service Unavailable\r\n"
+   "X-Loxilb-Refusal-Stage: route\r\nX-Request-Id: test-request-a\r\n"
+   "Connection: close\r\n\r\n{\"error\":\"model_unavailable\"}\r\n"));
  assert(denies==1 && deny_stage==7 && deny_status==503);
  assert(!strcmp(deny_code,"model_unavailable") && !strcmp(deny_model,"model-unknown"));
  assert(!strcmp(deny_tenant,"tenant-a") && !strcmp(deny_request,"test-request-a"));
@@ -136,6 +167,29 @@ int main(void){
  p=request();strcpy(p.prefix_key.model,"body-model");
  sp_send_local_refusal(&p,8,400,"invalid_cache_salt",route503,strlen(route503));
  assert(denies==3 && deny_stage==8 && deny_status==400 && !strcmp(deny_model,"body-model"));
+ assert(strstr(last_sent,"\r\nX-Loxilb-Refusal-Stage: framing\r\nX-Request-Id: test-request-a\r\n"));
+ /* a request with no ID of its own names its stage alone, even when the
+  * audit key falls back to an earlier request's ID on the connection: the
+  * record keeps that key (the pin's behaviour), the wire never shows it */
+ p=request();p.vllm_request_id[0]=0;strcpy(p.request_id,"previous-request");
+ sp_send_local_refusal(&p,5,429,"pd_overloaded",route503,strlen(route503));
+ assert(strstr(last_sent,"\r\nX-Loxilb-Refusal-Stage: capacity\r\nConnection: close\r\n"));
+ assert(!strstr(last_sent,"X-Request-Id") && !strstr(last_sent,"previous-request"));
+ assert(!strcmp(deny_request,"previous-request"));
+ /* an ID that cannot be one header value is left out, never cut */
+ p=request();strcpy(p.vllm_request_id,"a\rb");
+ sp_send_local_refusal(&p,7,503,"no_route",route503,strlen(route503));
+ assert(strstr(last_sent,"\r\nX-Loxilb-Refusal-Stage: route\r\nConnection: close\r\n"));
+ /* a stage with no wire name: no stage line, the ID all the same */
+ p=request();
+ sp_send_local_refusal(&p,0,503,"no_route",route503,strlen(route503));
+ assert(!strncmp(last_sent,"HTTP/1.1 503 Service Unavailable\r\nX-Request-Id: test-request-a\r\nConnection: close\r\n",83));
+ assert(!strstr(last_sent,"X-Loxilb-Refusal-"));
+ /* an answer that is not a response goes out as built */
+ p=request();
+ sp_send_local_refusal(&p,7,503,"no_route","not a response\r\n\r\n",18);
+ assert(!strcmp(last_sent,"not a response\r\n\r\n"));
+ denies-=4;local_notes-=4;
  /* outside the AI population and on the backend leg: no request record */
  p=request();p.ai_gw_mode=0;sp_send_local_refusal(&p,7,503,"no_route",route503,strlen(route503));
  p=request();p.odir=1;sp_send_local_refusal(&p,7,503,"no_route",route503,strlen(route503));

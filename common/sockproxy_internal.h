@@ -221,8 +221,11 @@ void proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status);
 void proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end);
 void sp_pd_record(proxy_fd_ent_t *pfe, const char *model, int64_t prefill_ms,
                   int64_t decode_ms, int kv, int error_phase);
-void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
-                           int retry_body, const char *code, const char *msg);
+/* `stage`: the AI_GW_STAGE_* of the refusal's deny record, named on the
+ * response by the refusal mark (sockproxy_refusal_mark.h). */
+void sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int stage, int status,
+                           int retry_after, int retry_body, const char *code,
+                           const char *msg);
 /* `keep`: the refusal leaves the connection open for its next request (the
  * body was fully buffered); otherwise it closes. Non-zero when the response
  * was not written whole. */

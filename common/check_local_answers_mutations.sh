@@ -60,13 +60,13 @@ expect "rule 1: an HTTP/2 route refusal sent raw" "proxy_h2_send_ai_deny:model_u
 
 fresh
 mut sockproxy_http.c '  proxy_record_local_deny(pfe, stage, status, code);
-  return proxy_send_local_response(pfe, buf, len);' '  return proxy_send_local_response(pfe, buf, len);'
+  ml = sp_refusal_mark_splice(' '  ml = sp_refusal_mark_splice('
 expect "rule 1: the refusal sender drops its deny record" "sp_send_local_refusal must record: proxy_record_local_deny(pfe, stage"
 
 fresh
 mut sockproxy_http.c '  proxy_record_local_completion(pfe, status);
-  return proxy_send_local_response(pfe, buf, len);' '  proxy_note_local_answer(pfe, status);
-  return proxy_send_local_response(pfe, buf, len);'
+  ml = sp_refusal_mark_splice(marked, sizeof(marked), buf, len, NULL,' '  proxy_note_local_answer(pfe, status);
+  ml = sp_refusal_mark_splice(marked, sizeof(marked), buf, len, NULL,'
 expect "rule 1: the outage sender drops its completion" "sp_send_local_outage must record: proxy_record_local_completion(pfe, status)"
 
 fresh
@@ -205,7 +205,7 @@ expect "rule 2: a wrapper writes the record itself" "a wrapper writes the record
 # Rule 3: every refusal names its stage.
 fresh
 mut sockproxy_http.c '  proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status, code);
-  sp_h1_send_admit_deny(pfe, status, 0, 0, code, msg);' '  sp_h1_send_admit_deny(pfe, status, 0, 0, code, msg);'
+  sp_h1_send_admit_deny(pfe, AI_GW_STAGE_FRAMING, status, 0, 0, code, msg);' '  sp_h1_send_admit_deny(pfe, AI_GW_STAGE_FRAMING, status, 0, 0, code, msg);'
 expect "rule 3: a framing 413 without its deny record" "sp_h1_send_framing_deny answers through sp_h1_send_admit_deny without the refusal's deny record"
 
 fresh

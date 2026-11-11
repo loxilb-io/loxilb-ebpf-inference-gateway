@@ -96,6 +96,7 @@
 #include "sockproxy_end_cause.h"      /* why an answer ended before the client had it */
 #include "sockproxy_stream_fallback.h"
 #include "sockproxy_admit_response.h"
+#include "sockproxy_refusal_mark.h"
 #include "sockproxy_mcp_capture.h"
 
 #ifdef HAVE_MTLS
@@ -601,34 +602,65 @@ proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status)
   }
 }
 
+/* The callers of sp_send_local_refusal and sp_send_local_outage build their
+ * answers in buffers of at most 512 bytes; this is the room one is given
+ * with its mark. */
+#define SP_LOCAL_REFUSAL_MAX 1024
+
 /* A refusal decided before any backend was chosen (route, framing, P/D
  * capacity), written on the client socket. `status` is the one the
- * response carries. Returns proxy_send_local_response's result. */
+ * response carries. The answer the caller built goes out with the refusal
+ * mark after its status line (sockproxy_refusal_mark.h): the wire name of
+ * `stage` when it has one, and the request's own ID when it has one. An
+ * answer with neither, one that is not a response, and one longer than
+ * SP_LOCAL_REFUSAL_MAX go out as built. Returns proxy_send_local_response's
+ * result. */
 int
 sp_send_local_refusal(proxy_fd_ent_t *pfe, int stage, uint16_t status,
                       const char *code, const void *buf, size_t len)
 {
+  char marked[SP_LOCAL_REFUSAL_MAX + SP_REFUSAL_MARK_MAX];
+  const char *stage_name = sp_refusal_stage_name(stage);
+  size_t ml;
+
   proxy_note_local_refusal(pfe, status);
   proxy_record_local_deny(pfe, stage, status, code);
+  ml = sp_refusal_mark_splice(marked, sizeof(marked), buf, len, stage_name,
+                              SP_REFUSAL_LIVE_RID(pfe));
+  if (ml > 0)
+    return proxy_send_local_response(pfe, marked, ml);
   return proxy_send_local_response(pfe, buf, len);
 }
 
-/* An outage answer: no backend could take the request. */
+/* An outage answer: no backend could take the request. It names no stage;
+ * like every answer the gateway writes it carries the request's own ID
+ * when the request has one (sockproxy_refusal_mark.h), after the status
+ * line of the answer the caller built. */
 int
 sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
                      size_t len)
 {
+  char marked[SP_LOCAL_REFUSAL_MAX + SP_REFUSAL_MARK_MAX];
+  size_t ml;
+
   proxy_record_local_completion(pfe, status);
+  ml = sp_refusal_mark_splice(marked, sizeof(marked), buf, len, NULL,
+                              SP_REFUSAL_LIVE_RID(pfe));
+  if (ml > 0)
+    return proxy_send_local_response(pfe, marked, ml);
   return proxy_send_local_response(pfe, buf, len);
 }
 
 /* The answer to a request no backend took. It carries its length, so the
- * client knows it is whole without waiting for the close that follows. */
+ * client knows it is whole without waiting for the close that follows, and
+ * the request's own ID when the request still has one (an outage: no
+ * stage; sockproxy_refusal_mark.h). */
 int
 proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
 {
   char body[192];
-  char resp[384];
+  char resp[384 + SP_REFUSAL_MARK_MAX];
+  char mark[SP_REFUSAL_MARK_MAX + 1];
   int blen, n;
 
   blen = snprintf(body, sizeof(body),
@@ -637,13 +669,16 @@ proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
   if (blen < 0 || blen >= (int)sizeof(body)) {
     return -1;
   }
+  (void)sp_refusal_mark_h1(mark, sizeof(mark), NULL,
+                           SP_REFUSAL_LIVE_RID(pfe));   /* always fits `mark` */
   n = snprintf(resp, sizeof(resp),
                "HTTP/1.1 502 Bad Gateway\r\n"
                "Content-Type: application/json\r\n"
                "Content-Length: %d\r\n"
+               "%s"
                "Connection: close\r\n"
                "\r\n"
-               "%s", blen, body);
+               "%s", blen, mark, body);
   if (n < 0 || n >= (int)sizeof(resp)) {
     return -1;
   }
@@ -1080,6 +1115,33 @@ sp_resp_strip_api_key(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen)
   if (!pool0 || !ai_security_should_strip_api_key(pool0->apikey_auth))
     return buflen;
   if (!l7h1_strip_header(buf, &cur, "X-Api-Key"))
+    return buflen;
+  return cur;
+}
+
+/*
+ * sp_resp_strip_refusal_mark — remove a backend's X-Loxilb-Refusal-* headers
+ * from the head of its response. Returns the (possibly shrunk) length.
+ *
+ * X-Loxilb-Refusal-Stage says the gateway refused the request before any
+ * backend saw it (sockproxy_refusal_mark.h). A relayed response is by
+ * definition not that, so the family never leaves a backend under the
+ * gateway's name: on every service, whatever its admission settings, with
+ * or without a permit, interim and final heads alike.
+ *
+ * Same read as sp_resp_strip_api_key, and called before it (that one clears
+ * the mark): only a read the response framer marked, one that began at a
+ * response's first byte and holds its whole header block. A head split
+ * across reads is left as it is, and so is every body byte.
+ */
+static size_t
+sp_resp_strip_refusal_mark(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen)
+{
+  size_t cur = buflen;
+
+  if (!client || !buf || !client->cresp_blk.hdr_block)
+    return buflen;
+  if (!l7h1_strip_header_prefix(buf, &cur, SP_REFUSAL_HDR_PREFIX))
     return buflen;
   return cur;
 }
@@ -2706,11 +2768,15 @@ skip_deferred_masking:
  * listeners — byte-for-byte unchanged. */
       len = l7_inject_hsts_h1(rfd_ent, (uint8_t *)msg, len, SP_SOCK_MSG_LEN);
     }
-    /* A backend's X-Api-Key does not leave a service that declares
-     * api_key_auth. Same legs as the response framer that marks the read. */
+    /* A backend's X-Loxilb-Refusal-* does not leave any service, and its
+     * X-Api-Key does not leave one that declares api_key_auth. Same legs as
+     * the response framer that marks the read; the key strip clears the
+     * mark, so it runs second. */
     if (ent->odir == 1 && rfd_ent && rfd_ent->odir == 0 && !ent->pd_sg_drain &&
-        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING)
+        rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
+      len = sp_resp_strip_refusal_mark(rfd_ent, (uint8_t *)msg, len);
       len = sp_resp_strip_api_key(rfd_ent, (uint8_t *)msg, len);
+    }
 
     /* The admission headers on the admitted response's head. Not on the
      * seam above: a chunked or event-stream response is marked chunked by
@@ -9499,6 +9565,35 @@ handle_on_message_begin(llhttp_t* parser)
   return 0;
 }
 
+/* The refusals that keep their raw write are whole texts of a few hundred
+ * bytes; this is the room one is given with its mark. */
+#define SP_RAW_REFUSAL_MAX 1024
+
+/* sp_raw_status_write for a refusal decided at `stage`, before any backend
+ * was chosen: the same text with the refusal mark after its status line
+ * (sockproxy_refusal_mark.h), the stage that refused and the request's own
+ * ID. A text that cannot take the mark goes out as it is. The record is the
+ * caller's, as for sp_raw_status_write (check_local_answers.sh rule 1b).
+ *
+ * Both callers refuse a request that was not forwarded, one of them a
+ * request that could not be parsed: on a keep-alive connection the audit
+ * key's snapshot is then still the PREVIOUS request's, which is why the
+ * echo is the live field. A request with no ID of its own yet is answered
+ * with the stage alone. */
+static ssize_t
+sp_raw_refusal_write(proxy_fd_ent_t *pfe, const void *buf, size_t len,
+                     int flags, int stage)
+{
+  char marked[SP_RAW_REFUSAL_MAX + SP_REFUSAL_MARK_MAX];
+  size_t ml = sp_refusal_mark_splice(marked, sizeof(marked), buf, len,
+                                     sp_refusal_stage_name(stage),
+                                     SP_REFUSAL_LIVE_RID(pfe));
+
+  if (ml > 0)
+    return sp_raw_status_write(pfe, marked, ml, flags);
+  return sp_raw_status_write(pfe, buf, len, flags);
+}
+
 /* Write an AI-gateway refusal to the client and shut the socket down. The
  * three wire shapes are the ones the inlined gate always produced: the
  * {"error","retry_after"} body for rate/reserve refusals, the
@@ -9506,18 +9601,25 @@ handle_on_message_begin(llhttp_t* parser)
  * Emission goes through the bounded local sender so a TLS-terminated
  * listener answers with a TLS record, never plaintext on the raw fd.
  * Records the response; the request record is the caller's: the gate's
- * verdict frame (ai_gw_admit), or sp_h1_send_framing_deny. */
+ * verdict frame (ai_gw_admit), or sp_h1_send_framing_deny. `stage` is the
+ * stage of that record, which the response names in the refusal mark
+ * (sockproxy_refusal_mark.h); AI_GW_STAGE_NONE, for an answer written after
+ * a backend saw request bytes, names none. Either way the response carries
+ * the request's own ID when the request has one. */
 void
-sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int status, int retry_after,
-                      int retry_body, const char *code, const char *msg)
+sp_h1_send_admit_deny(proxy_fd_ent_t *pfe, int stage, int status,
+                      int retry_after, int retry_body, const char *code,
+                      const char *msg)
 {
   /* This sender always ends the client request. Queued readable events
    * must not re-enter admission after its single deny record was emitted. */
   pfe->ai_gw_denied = 1;
-  char resp_buf[640];
+  char resp_buf[640 + SP_REFUSAL_MARK_MAX];
   int n;
   n = sp_h1_format_admit_deny(resp_buf, sizeof(resp_buf), status,
-                              retry_after, retry_body, code, msg);
+                              retry_after, retry_body, code, msg,
+                              sp_refusal_stage_name(stage),
+                              SP_REFUSAL_LIVE_RID(pfe));
   if (n > 0 && n < (int)sizeof(resp_buf)) {
     proxy_note_local_refusal(pfe, (uint16_t)status);
     if (proxy_send_local_response_and_shutdown(pfe, resp_buf, (size_t)n) != 0)
@@ -9536,7 +9638,7 @@ sp_h1_send_framing_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                         const char *msg)
 {
   proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status, code);
-  sp_h1_send_admit_deny(pfe, status, 0, 0, code, msg);
+  sp_h1_send_admit_deny(pfe, AI_GW_STAGE_FRAMING, status, 0, 0, code, msg);
 }
 
 /* A capacity refusal: the request passed policy and there is no room for it.
@@ -9544,6 +9646,8 @@ sp_h1_send_framing_deny(proxy_fd_ent_t *pfe, int status, const char *code,
  * (inflight, queued, limit); 503 says no healthy endpoint has capacity at
  * all, or that the process is draining. A request whose class was resolved
  * (`cls`) also carries its class and its band's wait window in force.
+ * It names its stage, capacity, and the request's own ID in the refusal
+ * mark (sockproxy_refusal_mark.h).
  * Emitted through the bounded TLS-aware sender like every refusal. With
  * `keep` the response is framed with its length and the connection stays
  * open for the next request: under overload a refusal that closes turns
@@ -9558,9 +9662,10 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
                          const char *dropped_reason)
 {
   char body[256];
-  char resp_buf[960];
+  char resp_buf[960 + SP_REFUSAL_MARK_MAX];
   char band_hdrs[128] = "";
   char reason_hdr[64] = "";
+  char mark[SP_REFUSAL_MARK_MAX + 1];
   const char *status_line = status == 503 ? "503 Service Unavailable"
                                           : "429 Too Many Requests";
   int blen, n, rc = -1;
@@ -9585,6 +9690,9 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
   if (dropped_reason)
     snprintf(reason_hdr, sizeof(reason_hdr), SP_LLMD_REASON_HDR ": %s\r\n",
              dropped_reason);
+  (void)sp_refusal_mark_h1(mark, sizeof(mark),
+                           sp_refusal_stage_name(AI_GW_STAGE_CAPACITY),
+                           SP_REFUSAL_LIVE_RID(pfe)); /* always fits `mark` */
   n = snprintf(resp_buf, sizeof(resp_buf),
     "HTTP/1.1 %s\r\n"
     "Content-Type: application/json\r\n"
@@ -9593,12 +9701,12 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
     "X-Loxilb-Admission-Inflight: %u\r\n"
     "X-Loxilb-Admission-Queued: %u\r\n"
     "X-Loxilb-Admission-Limit: %u\r\n"
-    "%s%s"
+    "%s%s%s"
     "Connection: %s\r\n"
     "\r\n"
     "%s",
     status_line, blen, retry_after, inflight, queued, limit, band_hdrs,
-    reason_hdr, keep ? "keep-alive" : "close", body);
+    reason_hdr, mark, keep ? "keep-alive" : "close", body);
   if (n > 0 && n < (int)sizeof(resp_buf)) {
     /* The request record is the caller's (ai_gw_record_capacity_deny). */
     proxy_note_local_refusal(pfe, (uint16_t)status);
@@ -10226,7 +10334,7 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   }
 
   if (adm.verdict == AI_GW_ADMIT_DENY) {
-    sp_h1_send_admit_deny(pfe, adm.http_status, adm.retry_after,
+    sp_h1_send_admit_deny(pfe, adm.stage, adm.http_status, adm.retry_after,
                           adm.retry_body, adm.error_code, adm.error_msg);
     switch (adm.stage) {
     case AI_GW_STAGE_CONFLICT:
@@ -10506,10 +10614,16 @@ sp_h1_stream_model_unresolvable(int fd, proxy_fd_ent_t *pfe)
 
   {
     static const char model_late[] = SP_MODEL_REQUIRED_EARLY_RESPONSE;
+    char marked[sizeof(model_late) + SP_REFUSAL_MARK_MAX];
+    size_t ml = sp_refusal_mark_splice(marked, sizeof(marked), model_late,
+                                       sizeof(model_late) - 1,
+                                       sp_refusal_stage_name(AI_GW_STAGE_FRAMING),
+                                       SP_REFUSAL_LIVE_RID(pfe));
     proxy_note_local_refusal(pfe, 400);
     proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, 400, "model_required_early");
     if (proxy_send_local_response_and_shutdown(
-            pfe, model_late, sizeof(model_late) - 1) != 0)
+            pfe, ml ? marked : model_late,
+            ml ? ml : sizeof(model_late) - 1) != 0)
       log_error("[JSON_STREAM_MODEL] fd=%d failed to send "
                 "complete bounded 400 response", fd);
     log_debug("[JSON_STREAM_MODEL] fd=%d no complete top-level "
@@ -10530,13 +10644,20 @@ static int sp_mcp_h1_refuse(proxy_fd_ent_t *pfe, int status)
   struct sp_mcp_capture *c=pfe->mcp_capture;
   size_t blen=0;
   char *body=sp_mcp_error_json(c?&c->req:NULL,status,c?c->body:NULL,c?c->len:0,&blen);
-  size_t cap=blen+256;
+  size_t cap=blen+256+SP_REFUSAL_MARK_MAX;
   char *response=malloc(cap);
   const char *reason = status == 405 ? "Method Not Allowed" : status == 413 ? "Content Too Large" :
                        status == 503 ? "Service Unavailable" : "Bad Request";
+  /* A 4xx refuses the request as framed and names its stage; the 503 is an
+   * outage and names none. Both carry the request's own ID when it has one
+   * (sockproxy_refusal_mark.h). Always fits `mark`. */
+  char mark[SP_REFUSAL_MARK_MAX + 1] = "";
+  (void)sp_refusal_mark_h1(mark, sizeof(mark),
+                           status < 500 ? sp_refusal_stage_name(AI_GW_STAGE_FRAMING) : NULL,
+                           SP_REFUSAL_LIVE_RID(pfe));
   int n=response ? snprintf(response,cap,
       "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
-      "%sConnection: close\r\n\r\n%s",status,reason,blen,status==405?"Allow: POST\r\n":"",body?body:""):-1;
+      "%s%sConnection: close\r\n\r\n%s",status,reason,blen,status==405?"Allow: POST\r\n":"",mark,body?body:""):-1;
   pfe->ai_gw_denied=1;
   pfe->lb_err_body_sent=1;
   /* Recorded by what the status means (F-20): a 4xx refuses the request as
@@ -10595,10 +10716,24 @@ sp_h1_json_refuse(proxy_fd_ent_t *pfe, const char *code)
   proxy_release_rfd_ctx(pfe);
   pfe->ai_gw_denied = 1;
   pfe->lb_err_body_sent = 1;
-  sp_h1_send_framing_deny(pfe, 400, code,
-      strcmp(code, "invalid_model_field") == 0 ?
+  {
+    const char *msg = strcmp(code, "invalid_model_field") == 0 ?
       "model must be a JSON string of at most 127 bytes" :
-      "ambiguous or invalid JSON request");
+      "ambiguous or invalid JSON request";
+
+    if (pfe->json_guard_streaming) {
+      /* The body was relayed to a backend as it arrived and only its tail
+       * was held: this refusal comes after request bytes reached that
+       * backend (its leg is reset above). The deny record is the same, at
+       * FRAMING; the answer names no stage, which is for a request no
+       * backend saw, and carries the request's ID, restored to the live
+       * field above (sockproxy_refusal_mark.h). */
+      proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, 400, code);
+      sp_h1_send_admit_deny(pfe, AI_GW_STAGE_NONE, 400, 0, 0, code, msg);
+    } else {
+      sp_h1_send_framing_deny(pfe, 400, code, msg);
+    }
+  }
   return -1;
 }
 
@@ -11045,8 +11180,8 @@ handle_on_message_complete(llhttp_t* parser)
            * answer the gateway writes itself, at its own stage. */
           proxy_note_local_refusal(pfe, 403);
           proxy_record_local_deny(pfe, AI_GW_STAGE_SECURITY, 403, "llamafirewall_block");
-          ssize_t sent = sp_raw_status_write(pfe, block_response, response_len,
-                                             MSG_NOSIGNAL);
+          ssize_t sent = sp_raw_refusal_write(pfe, block_response, response_len,
+                                              MSG_NOSIGNAL, AI_GW_STAGE_SECURITY);
 
           if (sent > 0) {
             log_info("[LlamaFirewall] Sent 403 response: fd=%d sent=%zd bytes", pfe->fd, sent);
@@ -14748,8 +14883,8 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
               proxy_note_local_refusal(pfe, 400);
               proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, 400,
                                       "bad_request");
-              sp_raw_status_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
-                                  MSG_NOSIGNAL);
+              sp_raw_refusal_write(pfe, smuggle_400, sizeof(smuggle_400) - 1,
+                                   MSG_NOSIGNAL, AI_GW_STAGE_FRAMING);
               shutdown(pfe->fd, SHUT_RDWR);
               log_debug("[AIGateway] fd=%d parse error on an enforcing "
                        "service — refused before admission (no raw relay)",

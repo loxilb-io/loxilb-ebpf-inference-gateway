@@ -390,6 +390,88 @@ main(void)
           (unsigned long long)atomic_load(&global_stats.reap_fallback));
   }
 
+  /* What that fallback writes for a refusal: the plain text, which names its
+   * stage, and nothing of the request, whatever the request holds: no
+   * request ID, no admission header, no wait. An ending that is not a
+   * refusal is written as it is, with no stage. */
+  {
+    static const char want_q[] =
+      "HTTP/1.1 504 Gateway Timeout\r\n"
+      "X-Loxilb-Refusal-Stage: queue\r\n"
+      "Content-Type: application/json\r\n"
+      "Content-Length: 35\r\n"
+      "Retry-After: 1\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+      "{\"error\":\"admission_queue_timeout\"}";
+    static const uint8_t fc_kinds[] = { SP_REAP_FC_QUEUE_TIMEOUT, SP_REAP_FC_DRAINED,
+                                        SP_REAP_FC_SHED, SP_REAP_FC_TTL };
+    static const char *const fc_codes[] = { "admission_queue_timeout", "admission_drained",
+                                            "admission_shed", "admission_ttl_expired" };
+    proxy_map_ent_t ent6;
+    proxy_fd_ent_t q, pk, idle, fcq[4];
+    char got[1024];
+    ssize_t n;
+    size_t i;
+
+    memset(&ent6, 0, sizeof(ent6));
+    mk(&ent6, &q, 0, EP);
+    mk(&ent6, &pk, 0, EP);
+    mk(&ent6, &idle, 0, EP);
+    /* Every request here has an ID of its own, and the queue ending says it
+     * was classed and has waited: none of it may reach the wire. */
+    snprintf(q.vllm_request_id, sizeof(q.vllm_request_id), "rid-reap-1");
+    snprintf(q.resp_request_id, sizeof(q.resp_request_id), "rid-reap-previous");
+    q.adm_class_set = 1;
+    q.fc.q_enqueue_ns = 1;
+    snprintf(pk.vllm_request_id, sizeof(pk.vllm_request_id), "rid-reap-2");
+    snprintf(idle.vllm_request_id, sizeof(idle.vllm_request_id), "rid-reap-3");
+    pstruct.ns = &pstruct;
+    owner_rc = -1;
+
+    pd_reap_respond(&q, SP_REAP_FC_QUEUE_TIMEOUT);
+    n = recv(peer[q.fd], got, sizeof(got) - 1, MSG_DONTWAIT);
+    got[n > 0 ? n : 0] = '\0';
+    CHECK(n == (ssize_t)sizeof(want_q) - 1 && !strcmp(got, want_q),
+          "a queue timeout ended from the health thread: its plain text, byte for byte (%zd bytes)", n);
+    CHECK(!strstr(got, "X-Request-Id") && !strstr(got, "rid-reap") &&
+          !strstr(got, "X-Loxilb-Admission-") && !strstr(got, "queued_ms"),
+          "with the stage and nothing of the request: no ID, no admission header, no wait");
+
+    for (i = 0; i < sizeof(fc_kinds); i++) {
+      char want_body[64];
+
+      mk(&ent6, &fcq[i], 0, EP);
+      snprintf(fcq[i].vllm_request_id, sizeof(fcq[i].vllm_request_id), "rid-reap-fc-%zu", i);
+      snprintf(want_body, sizeof(want_body), "\r\n\r\n{\"error\":\"%s\"}", fc_codes[i]);
+      pd_reap_respond(&fcq[i], fc_kinds[i]);
+      n = recv(peer[fcq[i].fd], got, sizeof(got) - 1, MSG_DONTWAIT);
+      got[n > 0 ? n : 0] = '\0';
+      CHECK(n > 0 && strstr(got, "\r\nX-Loxilb-Refusal-Stage: queue\r\n") &&
+            strstr(got, want_body) && !strstr(got, "X-Request-Id") &&
+            !strstr(got, "X-Loxilb-Admission-"),
+            "%s from the health thread: stage queue only", fc_codes[i]);
+    }
+
+    pd_reap_respond(&pk, SP_REAP_PD_PARK_TIMEOUT);
+    n = recv(peer[pk.fd], got, sizeof(got) - 1, MSG_DONTWAIT);
+    got[n > 0 ? n : 0] = '\0';
+    CHECK(n > 0 && strstr(got, "\r\nX-Loxilb-Refusal-Stage: queue\r\n") &&
+          !strstr(got, "X-Request-Id") &&
+          strstr(got, "\r\n\r\n{\"error\":\"pd_admission_park_timeout\"}"),
+          "a P/D park timeout from the health thread: stage queue, no request ID");
+
+    pd_reap_respond(&idle, SP_REAP_PD_IDLE_TIMEOUT);
+    n = recv(peer[idle.fd], got, sizeof(got) - 1, MSG_DONTWAIT);
+    got[n > 0 ? n : 0] = '\0';
+    CHECK(n > 0 && strstr(got, "{\"error\":\"pd_idle_timeout\"}") &&
+          !strstr(got, "X-Loxilb-Refusal-") && !strstr(got, "X-Request-Id"),
+          "a P/D idle timeout is not a refusal: no stage, no request ID");
+
+    owner_rc = 3;
+    pstruct.ns = NULL;
+  }
+
   printf("%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
 }

@@ -59,8 +59,12 @@ extern nghttp2_session *h2fx_cl;
 #define H2FX_MAX_STREAMS 64
 extern int h2fx_status[H2FX_MAX_STREAMS];
 /* The value of response header <name> on stream id, NULL when it did not
- * arrive. Regular headers only, the last 16 of a stream. */
+ * arrive. Regular headers only, the first 16 of a stream, values under 256
+ * bytes. */
 const char *h2fx_header(int32_t id, const char *name);
+/* The response body the client got on stream id, as a string ("" when none;
+ * a body of 512 bytes or more is not kept past what fitted). */
+const char *h2fx_body(int32_t id);
 /* What ai_gw_class_on() answers (0: classes off, as with nothing configured). */
 extern int h2fx_class_on;
 

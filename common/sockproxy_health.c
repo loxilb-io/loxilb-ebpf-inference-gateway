@@ -52,6 +52,7 @@
 #include "sockproxy_internal.h"
 #include "sockproxy_epp.h"
 #include "sockproxy_ai_admit.h"   /* the refusal record of a request ended while it waited */
+#include "sockproxy_refusal_mark.h" /* the stage and request ID a refusal names */
 #include "sockproxy_conn.h"
 #include "circuit_breaker_heal.h"  /* (D1): shared proactive-heal predicate (also unit-tested) */
 static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
@@ -254,6 +255,13 @@ typedef struct sp_reap_text {
 
 #define SP_REAP_TEXT(s, td, body) { (s), sizeof(s) - 1, (td), (body) }
 
+/* The bodies of the capacity-queue fallbacks, named so their Content-Length
+ * is checked where the table ends. */
+#define SP_REAP_FC_QUEUE_TIMEOUT_BODY "{\"error\":\"admission_queue_timeout\"}"
+#define SP_REAP_FC_DRAINED_BODY       "{\"error\":\"admission_drained\"}"
+#define SP_REAP_FC_SHED_BODY          "{\"error\":\"admission_shed\"}"
+#define SP_REAP_FC_TTL_BODY           "{\"error\":\"admission_ttl_expired\"}"
+
 static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
   [SP_REAP_NONE] = { NULL, 0, 0 },
   [SP_REAP_SSE_CAP] =
@@ -271,7 +279,11 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "\r\n"
                    "{\"error\":\"pd_decode_timeout\"}", 1, 0),
   [SP_REAP_PD_PARK_TIMEOUT] =
+      /* A refusal: the request was parked for capacity and never
+       * dispatched. Its stage is on the text; the owner worker adds the
+       * request's ID (sp_reap_refusal_wire), the health thread nothing. */
       SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
+                   "X-Loxilb-Refusal-Stage: queue\r\n"
                    "Content-Type: application/json\r\n"
                    "Connection: close\r\n"
                    "\r\n"
@@ -291,21 +303,28 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
                    "{\"error\":\"pd_idle_timeout\"}", 1, 0),
   /* The capacity-queue endings are formatted on the owner worker with the
    * wait and the admission headers (sp_reap_finish); these are the plain
-   * fallbacks for a socket the reaper has to end itself. */
+   * fallbacks for a socket the reaper has to end itself. Each is a whole
+   * response on its own: its length, and the stage every ending in the
+   * queue names. From the health thread that is all a client gets: no
+   * request ID, no counts, no wait. */
   [SP_REAP_FC_QUEUE_TIMEOUT] =
       SP_REAP_TEXT("HTTP/1.1 504 Gateway Timeout\r\n"
+                   "X-Loxilb-Refusal-Stage: queue\r\n"
                    "Content-Type: application/json\r\n"
+                   "Content-Length: 35\r\n"
                    "Retry-After: 1\r\n"
                    "Connection: close\r\n"
                    "\r\n"
-                   "{\"error\":\"admission_queue_timeout\"}", 1, 0),
+                   SP_REAP_FC_QUEUE_TIMEOUT_BODY, 1, 0),
   [SP_REAP_FC_DRAINED] =
       SP_REAP_TEXT("HTTP/1.1 503 Service Unavailable\r\n"
+                   "X-Loxilb-Refusal-Stage: queue\r\n"
                    "Content-Type: application/json\r\n"
+                   "Content-Length: 29\r\n"
                    "Retry-After: 5\r\n"
                    "Connection: close\r\n"
                    "\r\n"
-                   "{\"error\":\"admission_drained\"}", 1, 0),
+                   SP_REAP_FC_DRAINED_BODY, 1, 0),
   [SP_REAP_EPP_TIMEOUT] =
       SP_REAP_TEXT("HTTP/1.1 503 Service Unavailable\r\n"
                    "Content-Type: application/json\r\n"
@@ -323,19 +342,29 @@ static const sp_reap_text_t sp_reap_texts[SP_REAP_KINDS] = {
       SP_REAP_TEXT("data: {\"error\":\"client_stalled\"}\n\n", 0, 1),
   [SP_REAP_FC_SHED] =
       SP_REAP_TEXT("HTTP/1.1 429 Too Many Requests\r\n"
+                   "X-Loxilb-Refusal-Stage: queue\r\n"
                    "Content-Type: application/json\r\n"
+                   "Content-Length: 26\r\n"
                    "Retry-After: 1\r\n"
                    "Connection: close\r\n"
                    "\r\n"
-                   "{\"error\":\"admission_shed\"}", 1, 0),
+                   SP_REAP_FC_SHED_BODY, 1, 0),
   [SP_REAP_FC_TTL] =
       SP_REAP_TEXT("HTTP/1.1 429 Too Many Requests\r\n"
+                   "X-Loxilb-Refusal-Stage: queue\r\n"
                    "Content-Type: application/json\r\n"
+                   "Content-Length: 33\r\n"
                    "Retry-After: 1\r\n"
                    "Connection: close\r\n"
                    "\r\n"
-                   "{\"error\":\"admission_ttl_expired\"}", 1, 0),
+                   SP_REAP_FC_TTL_BODY, 1, 0),
 };
+
+_Static_assert(sizeof(SP_REAP_FC_QUEUE_TIMEOUT_BODY) - 1 == 35 &&
+               sizeof(SP_REAP_FC_DRAINED_BODY) - 1 == 29 &&
+               sizeof(SP_REAP_FC_SHED_BODY) - 1 == 26 &&
+               sizeof(SP_REAP_FC_TTL_BODY) - 1 == 33,
+               "update the Content-Length of the capacity-queue fallback texts");
 
 /* Whether the answer this client is being sent is chunked, read from the
  * client's own response framer: its parser's flags while it is inside that
@@ -412,6 +441,32 @@ pd_reap_lifecycle(proxy_fd_ent_t *pfe, int error_phase)
   pfe->pd_phase = PD_PHASE_ERROR;
 }
 
+/* A refusal the owner worker still sends as its plain text (a P/D park
+ * timeout, or a capacity-queue ending whose formatted answer did not fit):
+ * the text, which already names its stage, with the request's own ID after
+ * the status line (sockproxy_refusal_mark.h). Owner worker only: the health
+ * thread's fallback (pd_reap_respond) sends the text as it is and reads
+ * nothing of the request. Any other kind, an outage or an event inside an
+ * answer, is not a refusal: 0. Returns the length written into `out`, 0 to
+ * send the text as it is. */
+static size_t
+sp_reap_refusal_wire(proxy_fd_ent_t *pfe, uint8_t kind, char *out, size_t cap)
+{
+  const sp_reap_text_t *t = &sp_reap_texts[kind];
+
+  switch (kind) {
+  case SP_REAP_FC_QUEUE_TIMEOUT:
+  case SP_REAP_FC_DRAINED:
+  case SP_REAP_FC_SHED:
+  case SP_REAP_FC_TTL:
+  case SP_REAP_PD_PARK_TIMEOUT:
+    return sp_refusal_mark_splice(out, cap, t->text, t->len, NULL,
+                                  SP_REFUSAL_LIVE_RID(pfe));
+  default:
+    return 0;
+  }
+}
+
 static void
 pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
 {
@@ -457,6 +512,8 @@ pd_reap_respond(proxy_fd_ent_t *pfe, uint8_t kind)
       char framed[512];
       size_t fl = sp_reap_body_frame(pfe, t, framed, sizeof(framed));
 
+      /* A refusal goes out as its text, which names its stage and nothing
+       * of the request: no field of it is read on this thread. */
       send(pfe->fd, fl ? framed : t->text, fl ? fl : t->len,
            MSG_DONTWAIT | MSG_NOSIGNAL);
     }
@@ -490,8 +547,10 @@ sp_reap_request(proxy_fd_ent_t *pfe, uint8_t kind)
  * like any shed, 429 admission_shed with its body shape and the wait. The
  * response is framed with its length; `keep` says whether the connection
  * stays open for its next request (only an eviction answered by the
- * request's own worker keeps it, sp_fc_shed_answer_kept). Returns the
- * length written into `out`, 0 to use the plain text. */
+ * request's own worker keeps it, sp_fc_shed_answer_kept). It carries the
+ * refusal mark (sockproxy_refusal_mark.h): stage "queue", and the request's
+ * own ID. Owner worker only. Returns the length written into `out`, 0 to
+ * use the plain text. */
 static size_t
 sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
                   size_t cap)
@@ -516,6 +575,7 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
                           : status == 429 ? "429 Too Many Requests"
                           : "504 Gateway Timeout";
   char band_hdrs[128] = "";
+  char mark[SP_REFUSAL_MARK_MAX + 1];
   int blen, n;
 
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -530,6 +590,8 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
              sp_class_name(pfe->adm_class), fc_band_wait_ms(fc, pfe->fc.band));
   if (reason)
     snprintf(reason_hdr, sizeof(reason_hdr), SP_LLMD_REASON_HDR ": %s\r\n", reason);
+  (void)sp_refusal_mark_h1(mark, sizeof(mark), SP_REFUSAL_STAGE_QUEUE,
+                           SP_REFUSAL_LIVE_RID(pfe));   /* always fits `mark` */
   if (status == 429)
     blen = snprintf(body, sizeof(body),
                     "{\"error\":\"%s\",\"retry_after\":%u,\"jitter_hint_ms\":250,"
@@ -550,12 +612,12 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
                  "X-Loxilb-Admission-Inflight: %u\r\n"
                  "X-Loxilb-Admission-Queued: %u\r\n"
                  "X-Loxilb-Admission-Limit: %u\r\n"
-                 "%s%s"
+                 "%s%s%s"
                  "Connection: %s\r\n"
                  "\r\n"
                  "%s",
                  status_line, blen, retry_after, inflight, queued, limit,
-                 band_hdrs, reason_hdr, keep ? "keep-alive" : "close", body);
+                 band_hdrs, reason_hdr, mark, keep ? "keep-alive" : "close", body);
   proxy_pfe_svc_ident(pfe, svc_ident, sizeof(svc_ident));
   ai_gw_record_capacity_deny(proxy_request_id(pfe), notify_worker_id(),
                              svc_ident, proxy_effective_model(pfe),
@@ -651,7 +713,7 @@ int
 sp_fc_shed_answer_kept(proxy_fd_ent_t *pfe)
 {
   const sp_reap_text_t *t = &sp_reap_texts[SP_REAP_FC_SHED];
-  char framed[512];
+  char framed[1024];
   size_t len = sp_reap_fc_format(pfe, SP_REAP_FC_SHED, 1, framed, sizeof(framed));
 
   /* Both answers below are the 429; the deny record is the formatter's. */
@@ -679,7 +741,7 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
 {
   uint8_t kind = pfe->reap_resp;
   const sp_reap_text_t *t;
-  char framed[512];
+  char framed[1024];
   const char *buf;
   size_t len;
 
@@ -696,6 +758,16 @@ sp_reap_finish(proxy_fd_ent_t *pfe)
     if (fl > 0) {
       buf = framed;
       len = fl;
+    }
+  }
+  /* A refusal still going out as its plain text (a P/D park timeout, or a
+   * queue ending whose formatted answer did not fit) names the request,
+   * when the request has an ID of its own. */
+  if (buf && buf == t->text) {
+    size_t rl = sp_reap_refusal_wire(pfe, kind, framed, sizeof(framed));
+    if (rl > 0) {
+      buf = framed;
+      len = rl;
     }
   }
   /* An event written into a response in progress is body bytes: on a chunked

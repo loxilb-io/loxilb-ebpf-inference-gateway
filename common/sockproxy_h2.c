@@ -31,6 +31,7 @@
 #include "sockproxy_ai_security.h"
 #include "sockproxy_in_ifindex.h"
 #include "sockproxy_ai_admit.h"   /* the shared H1/H2 admission gate */
+#include "sockproxy_refusal_mark.h" /* after the gate: the stage and request ID a refusal names */
 #include "sockproxy_ai_gw.h"      /* settle-path ladder calls */
 #include "sockproxy_pd.h"         /* dialect ops for usage extraction */
 #include "sockproxy_json.h"
@@ -62,7 +63,7 @@ extern int is_tracing_enabled(void);
 
 static int proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     int status_code, int retry_after, int retry_body,
-    const char *error_code, const char *error_msg);
+    const char *error_code, const char *error_msg, int stage);
 /* The recording senders (check_local_answers.sh rule 1): a refusal takes its
  * deny record at its stage, an outage sets the stream's status for its
  * settle. Defined with proxy_h2_send_ai_deny below. */
@@ -1750,6 +1751,7 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
       /* Non-final (1xx, e.g. 100 Continue, 103 Early Hints): relay as is.
        * The final response follows, so the stream stays open and the
        * response header injection below waits for it. */
+      proxy_h2_drop_resp_refusal_mark(mapping);
       if (cstream->resp_strip_api_key)
         proxy_h2_drop_resp_header(mapping, "x-api-key", 9);
       rv = nghttp2_submit_headers(client_session->session, NGHTTP2_FLAG_NONE,
@@ -1772,9 +1774,13 @@ proxy_h2_backend_on_frame_recv_callback(nghttp2_session *session,
         cstream->response_is_sse = sp_sse_content_type((char *)nv->value, nv->valuelen);
     }
 
-    /* A backend's X-Api-Key does not leave a service that declares
-     * api_key_auth: the HTTP/1.1 rule (sp_resp_strip_api_key), on a
+    /* A backend's X-Loxilb-Refusal-* does not leave any service: the
+     * family says the gateway refused the request before a backend saw it,
+     * which a relayed response is not (the HTTP/1.1 rule,
+     * sp_resp_strip_refusal_mark). And its X-Api-Key does not leave a
+     * service that declares api_key_auth (sp_resp_strip_api_key). Both on a
      * response head, interim or final. Trailers are not a head and pass. */
+    proxy_h2_drop_resp_refusal_mark(mapping);
     if (cstream->resp_strip_api_key)
       proxy_h2_drop_resp_header(mapping, "x-api-key", 9);
 
@@ -3094,6 +3100,27 @@ proxy_h2_drop_resp_header(stream_mapping_t *mapping, const char *name,
   return dropped;
 }
 
+size_t
+proxy_h2_drop_resp_refusal_mark(stream_mapping_t *mapping)
+{
+  size_t i, j, dropped = 0;
+
+  if (!mapping || !mapping->response_headers)
+    return 0;
+  for (i = 0, j = 0; i < mapping->response_headers_count; i++) {
+    nghttp2_nv *nv = &mapping->response_headers[i];
+    if (sp_refusal_hdr_is_mark(nv->name, nv->namelen)) {
+      free(nv->name);
+      free(nv->value);
+      dropped++;
+      continue;
+    }
+    mapping->response_headers[j++] = *nv;
+  }
+  mapping->response_headers_count = j;
+  return dropped;
+}
+
 int
 proxy_h2_inject_resp_headers(stream_mapping_t *mapping,
                              const nghttp2_nv *extra, size_t nextra)
@@ -3235,9 +3262,11 @@ proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
   char status_str[8];
   snprintf(status_str, sizeof(status_str), "%d", status_code);
 
-  /* HEADERS-only: :status (always), location (REDIRECT only), content-length: 0.
+  /* HEADERS-only: :status (always), location (REDIRECT only), content-length: 0,
+   * and on a REJECT the refusal mark (below).
    * Positional nghttp2_nv init mirrors the 503 responder below (line ~2337). */
-  nghttp2_nv hdrs[3];
+  nghttp2_nv hdrs[5];
+  char rid[SP_REFUSAL_RID_MAX + 1];
   size_t nvlen = 0;
   hdrs[nvlen].name = (uint8_t *)":status";
   hdrs[nvlen].value = (uint8_t *)status_str;
@@ -3272,6 +3301,30 @@ proxy_h2_send_l7_synthetic(proxy_fd_ent_t *pfe, int status_code,
     else
       h2_record_local_deny(pfe, l7_stream, AI_GW_STAGE_ROUTE, status_code,
                            l7_stream->effective_model, "l7_policy_reject");
+  }
+
+  /* A REJECT is a refusal at ROUTE and says so, with the request's ID where
+   * the stream has one that can be a field value (sockproxy_refusal_mark.h);
+   * a REDIRECT completes the request and carries no mark. The ID is copied:
+   * the answer can free the stream. */
+  if (!(location && location[0])) {
+    const char *stage_name = sp_refusal_stage_name(AI_GW_STAGE_ROUTE);
+
+    hdrs[nvlen].name = (uint8_t *)SP_REFUSAL_STAGE_HDR_H2;
+    hdrs[nvlen].value = (uint8_t *)stage_name;
+    hdrs[nvlen].namelen = sizeof(SP_REFUSAL_STAGE_HDR_H2) - 1;
+    hdrs[nvlen].valuelen = strlen(stage_name);
+    hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+    nvlen++;
+    if (l7_stream && sp_refusal_rid_ok(l7_stream->request_id)) {
+      snprintf(rid, sizeof(rid), "%s", l7_stream->request_id);
+      hdrs[nvlen].name = (uint8_t *)SP_REFUSAL_RID_HDR_H2;
+      hdrs[nvlen].value = (uint8_t *)rid;
+      hdrs[nvlen].namelen = sizeof(SP_REFUSAL_RID_HDR_H2) - 1;
+      hdrs[nvlen].valuelen = strlen(rid);
+      hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+      nvlen++;
+    }
   }
 
   /* NULL data provider => END_STREAM is set on the HEADERS frame (no body). */
@@ -3345,22 +3398,33 @@ proxy_h2_deny_body_read_callback(nghttp2_session *session, int32_t stream_id,
   return (ssize_t)to_copy;
 }
 
-/* The caller's headers a refusal frame holds. A list built in a fixed array
- * is checked against it at compile time (H2_DENY_EXTRA_FITS); a longer list
- * at run time is a defect, never sent short. */
-#define H2_DENY_EXTRA_MAX 6
+/* The headers a refusal frame holds after its fixed four: the caller's, and
+ * the two of the refusal mark (H2_DENY_MARK_HDRS), which the frame adds
+ * itself. A caller's list built in a fixed array is checked against its
+ * share at compile time (H2_DENY_EXTRA_FITS); a longer list at run time is a
+ * defect, never sent short. */
+#define H2_DENY_EXTRA_MAX 8
+#define H2_DENY_MARK_HDRS 2
 #define H2_DENY_EXTRA_FITS(arr)                                           \
-  _Static_assert(sizeof(arr) / sizeof((arr)[0]) <= H2_DENY_EXTRA_MAX,      \
+  _Static_assert(sizeof(arr) / sizeof((arr)[0]) <=                         \
+                 H2_DENY_EXTRA_MAX - H2_DENY_MARK_HDRS,                    \
                  "an HTTP/2 refusal's header list is longer than its frame")
 
 /* Frame a terminal refusal on ONE stream: :status, content-type, an
- * optional retry-after, the caller's extra headers, and the body. The
- * multiplexed connection stays alive. */
+ * optional retry-after, the caller's extra headers, the refusal mark, and
+ * the body. The multiplexed connection stays alive.
+ *
+ * `stage` is the AI_GW_STAGE_* of a refusal made before any backend was
+ * chosen: the frame then names it (x-loxilb-refusal-stage). AI_GW_STAGE_NONE
+ * is an outage and names none. Either way the frame echoes the stream's own
+ * request ID (x-request-id) when the stream has one that can be a field
+ * value; a stream answered before its ID exists carries none
+ * (sockproxy_refusal_mark.h). */
 static int
 h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                    int status_code, int retry_after,
                    const char *body, int blen,
-                   const nghttp2_nv *extra, size_t n_extra)
+                   const nghttp2_nv *extra, size_t n_extra, int stage)
 {
   if (!pfe || !stream || !pfe->h2_session || !pfe->h2_session->session)
     return -1;
@@ -3374,6 +3438,12 @@ h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   char status_str[8];
   char retry_str[16];
   char clen_str[16];
+  /* The mark. The ID is read here: nghttp2 copies a field's value when the
+   * response is submitted, and the stream is not read after that. */
+  const char *stage_name = sp_refusal_stage_name(stage);
+  const char *rid = sp_refusal_rid_ok(stream->request_id) ?
+                    stream->request_id : NULL;
+  size_t n_mark = (stage_name ? 1 : 0) + (rid ? 1 : 0);
 
   snprintf(status_str, sizeof(status_str), "%d", status_code);
   if (blen < 0 || !body)
@@ -3405,20 +3475,21 @@ h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   snprintf(clen_str, sizeof(clen_str), "%d", ctx ? blen : 0);
 
   /* :status, content-type, retry-after, content-length, then at most
-   * H2_DENY_EXTRA_MAX of the caller's (the capacity refusal sends six). */
+   * H2_DENY_EXTRA_MAX of the caller's and the mark's together (the
+   * capacity refusal sends six of its own, and the mark's two). */
   nghttp2_nv hdrs[4 + H2_DENY_EXTRA_MAX];
   size_t nvlen = 0;
-  if (n_extra > H2_DENY_EXTRA_MAX) {
+  if (n_extra + n_mark > H2_DENY_EXTRA_MAX) {
     /* Never a refusal with headers missing. A debug build stops here; a
      * product build resets the stream, so its client is not left waiting,
      * and the anomaly counter says a defect ran. */
 #ifdef SP_DEBUG_ASSERTS
-    assert(n_extra <= H2_DENY_EXTRA_MAX);
+    assert(n_extra + n_mark <= H2_DENY_EXTRA_MAX);
 #endif
     atomic_fetch_add_explicit(&fc_anomaly_total[FC_A_H2_DENY_HEADERS], 1,
                               memory_order_relaxed);
     log_error("[HTTP/2] stream %d: refusal %d has %zu headers, the frame holds %d: reset",
-              stream_id, status_code, n_extra, H2_DENY_EXTRA_MAX);
+              stream_id, status_code, n_extra + n_mark, H2_DENY_EXTRA_MAX);
     stream->deny_body_ctx = NULL;
     if (ctx) {
       free(ctx->data);
@@ -3459,6 +3530,23 @@ h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   nvlen++;
   for (size_t i = 0; i < n_extra; i++)
     hdrs[nvlen++] = extra[i];
+  /* Last, so every header a refusal carried before keeps its place. */
+  if (stage_name) {
+    hdrs[nvlen].name = (uint8_t *)SP_REFUSAL_STAGE_HDR_H2;
+    hdrs[nvlen].value = (uint8_t *)stage_name;
+    hdrs[nvlen].namelen = sizeof(SP_REFUSAL_STAGE_HDR_H2) - 1;
+    hdrs[nvlen].valuelen = strlen(stage_name);
+    hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+    nvlen++;
+  }
+  if (rid) {
+    hdrs[nvlen].name = (uint8_t *)SP_REFUSAL_RID_HDR_H2;
+    hdrs[nvlen].value = (uint8_t *)rid;
+    hdrs[nvlen].namelen = sizeof(SP_REFUSAL_RID_HDR_H2) - 1;
+    hdrs[nvlen].valuelen = strlen(rid);
+    hdrs[nvlen].flags = NGHTTP2_NV_FLAG_NONE;
+    nvlen++;
+  }
 
   nghttp2_data_provider data_prd;
   nghttp2_data_provider *prd = NULL;
@@ -3487,7 +3575,7 @@ h2_send_deny_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 static int
 proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                       int status_code, int retry_after, int retry_body,
-                      const char *error_code, const char *error_msg)
+                      const char *error_code, const char *error_msg, int stage)
 {
   char body[512];
   int blen;
@@ -3497,7 +3585,7 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
       !strncmp(error_code,"mcp_",4)) {
     size_t len=0;
     char *denial=sp_mcp_error_json(NULL,status_code,(const char *)stream->data_buf,stream->data_len,&len);
-    int ret=h2_send_deny_frame(pfe,stream,status_code,retry_after,denial,(int)len,NULL,0);
+    int ret=h2_send_deny_frame(pfe,stream,status_code,retry_after,denial,(int)len,NULL,0,stage);
     free(denial);return ret;
   }
   if (!error_code || !error_code[0])
@@ -3514,7 +3602,7 @@ proxy_h2_send_ai_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   if (blen < 0 || blen >= (int)sizeof(body))
     blen = 0;
   return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
-                            NULL, 0);
+                            NULL, 0, stage);
 }
 
 /* A refusal the stream's dispatch made outside the gate's verdict frame,
@@ -3528,7 +3616,7 @@ h2_send_local_refusal(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 {
   h2_record_local_deny(pfe, stream, stage, status_code, model, error_code);
   return proxy_h2_send_ai_deny(pfe, stream, status_code, 0, 0, error_code,
-                               error_msg);
+                               error_msg, stage);
 }
 
 /* An outage answer on one stream: no backend could take it. The status is
@@ -3541,7 +3629,7 @@ h2_send_local_outage(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
 {
   stream->metric_response_status = status_code;
   return proxy_h2_send_ai_deny(pfe, stream, status_code, 0, 0, error_code,
-                               error_msg);
+                               error_msg, AI_GW_STAGE_NONE);
 }
 
 /* An MCP answer the gateway frames on one stream, with the JSON-RPC body and
@@ -3561,7 +3649,9 @@ h2_send_mcp_frame(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
     h2_record_local_deny(pfe, stream, AI_GW_STAGE_FRAMING, status_code,
                          stream->effective_model, sp_mcp_refusal_code(status_code));
   return h2_send_deny_frame(pfe, stream, status_code, 0, body, blen,
-                            extra, n_extra);
+                            extra, n_extra,
+                            status_code >= 500 ? AI_GW_STAGE_NONE :
+                                                 AI_GW_STAGE_FRAMING);
 }
 
 /* A capacity refusal on one stream: the H2 twin of sp_h1_send_capacity_deny,
@@ -3582,9 +3672,11 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   int blen;
 
   if (status_code == 503) {
+    /* The same body the HTTP/1.1 answer has (sp_h1_send_capacity_deny):
+     * retry_after equals the retry-after header. */
     blen = snprintf(body, sizeof(body),
-                    "{\"error\":\"%s\",\"message\":\"%s\"}\r\n",
-                    error_code, error_msg ? error_msg : "");
+                    "{\"error\":\"%s\",\"message\":\"%s\",\"retry_after\":%d}\r\n",
+                    error_code, error_msg ? error_msg : "", retry_after);
   } else {
     blen = snprintf(body, sizeof(body),
                     "{\"error\":\"%s\",\"retry_after\":1,\"jitter_hint_ms\":250}\r\n",
@@ -3619,7 +3711,8 @@ proxy_h2_send_capacity_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
   if (dropped_reason && !cls)
     extra[3] = extra[5];
   return h2_send_deny_frame(pfe, stream, status_code, retry_after, body, blen,
-                            extra, (cls ? 5 : 3) + (dropped_reason ? 1 : 0));
+                            extra, (cls ? 5 : 3) + (dropped_reason ? 1 : 0),
+                            AI_GW_STAGE_CAPACITY);
 }
 
 /* ---- capacity admission at the HTTP/2 stream site ---------------------------
@@ -4896,7 +4989,8 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
        * response_sent and never redispatches. */
       proxy_h2_send_ai_deny(pfe, stream,
                             adm.http_status, adm.retry_after,
-                            adm.retry_body, adm.error_code, adm.error_msg);
+                            adm.retry_body, adm.error_code, adm.error_msg,
+                            adm.stage);
       if (adm.net_identity[0])
         log_debug("[AIGateway][HTTP/2] stream=%d rejected before routing: "
                  "status=%d stage=%d error=%s key=%s tenant=%s net_identity=%s",
