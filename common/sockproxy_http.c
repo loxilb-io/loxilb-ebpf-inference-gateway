@@ -2803,7 +2803,9 @@ skip_deferred_masking:
       int xr = SP_CLASS_H1_SKIPPED;
 
       len = sp_class_expose_h1((uint8_t *)msg, len, SP_SOCK_MSG_LEN,
-                               rfd_ent->adm_objective, rfd_ent->adm_class, &xr);
+                               rfd_ent->adm_objective, rfd_ent->adm_class,
+                               rfd_ent->adm_objective_denied ? rfd_ent->adm_objective_req : NULL,
+                               &xr);
       if (xr != SP_CLASS_H1_INTERIM)
         rfd_ent->class_expose_pending = 0;
     }
@@ -9534,6 +9536,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->adm_objective_denied = 0;
     pfe->adm_hint_not_applied = 0;
     pfe->adm_objective[0] = '\0';
+    pfe->adm_objective_req[0] = '\0';
     pfe->class_expose_pending = 0;
     pfe->x_model_header[0] = '\0';
     pfe->effective_model[0] = '\0';
@@ -10401,6 +10404,8 @@ sp_h1_admit_apply(proxy_fd_ent_t *pfe, proxy_map_ent_t *hent,
   pfe->adm_objective_denied = adm.objective_denied;
   pfe->adm_hint_not_applied = adm.hint_not_applied;
   snprintf(pfe->adm_objective, sizeof(pfe->adm_objective), "%s", adm.objective);
+  snprintf(pfe->adm_objective_req, sizeof(pfe->adm_objective_req), "%s",
+           adm.objective_denied ? adm.objective_requested : "");
   if (req->body &&
       (const uint8_t *)req->body >= pfe->rcvbuf &&
       (const uint8_t *)req->body + req->body_len <= pfe->rcvbuf + pfe->rcv_off) {

@@ -537,6 +537,17 @@ admit_class(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res,
                         ? cls.priority_class : AI_GW_CLASS_STANDARD;
   res->objective_denied = cls.objective_denied ? 1 : 0;
   snprintf(res->objective, sizeof(res->objective), "%s", cls.objective);
+  /* What was asked for and not given, for the response head. The header's
+   * name wins as it does in the resolver; a tier is named as the resolver
+   * names it. */
+  res->objective_requested[0] = '\0';
+  if (res->objective_denied) {
+    if (hint[0])
+      snprintf(res->objective_requested, sizeof(res->objective_requested), "%s", hint);
+    else if (tier != AI_TIER_NONE)
+      snprintf(res->objective_requested, sizeof(res->objective_requested), "tier:%s",
+               tier == AI_TIER_FLEX ? "flex" : tier == AI_TIER_PRIORITY ? "priority" : "fast");
+  }
 
   if (res->objective_denied &&
       (req->objective_strict_of

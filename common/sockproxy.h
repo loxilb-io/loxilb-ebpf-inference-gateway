@@ -1675,6 +1675,9 @@ struct proxy_fd_ent {
   uint8_t  adm_hint_not_applied;      // a body hint could not be read (streamed body)
   uint8_t  class_expose_pending;      // 1 = the response head still owes the class headers
   char     adm_objective[64];         // the hint applied: an objective name, "tier:<value>", or ""
+  char     adm_objective_req[64];     // with adm_objective_denied: what was asked for and not given
+                                      // (obj_hint is reset when the request is forwarded; this copy
+                                      // lasts until the response head)
   uint8_t  ai_gw_denied;              // 1 = the AI gate refused this request (response already sent,
                                       // socket shut down). Read after llhttp_execute to keep a policy
                                       // denial out of the parse-error fallback, which relays the buffer

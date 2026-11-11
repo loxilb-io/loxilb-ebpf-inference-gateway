@@ -160,6 +160,7 @@ typedef struct proxy_h2_stream {
   uint8_t  class_expose;             // the response head carries the class headers
   uint8_t  resp_strip_api_key;       // the service declares api_key_auth: a backend's x-api-key stays out of a response head
   char     adm_objective[64];
+  char     adm_objective_req[64];    // with adm_objective_denied: what was asked for and not given
   uint32_t usage_reserved_toks;      // admission-time token reservation (0 = none)
   int64_t  usage_res_epoch;          // reservation window tag
   uint8_t  usage_consumed;           // 1 = settle ran (no double charge/release)

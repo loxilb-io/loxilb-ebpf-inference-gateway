@@ -67,6 +67,9 @@ const char *h2fx_header(int32_t id, const char *name);
 const char *h2fx_body(int32_t id);
 /* What ai_gw_class_on() answers (0: classes off, as with nothing configured). */
 extern int h2fx_class_on;
+/* The two completion-record stand-ins (test_h2_fixture_links.c) abort
+ * unless a test set h2fx_allow_completion; then they count their calls. */
+extern int h2fx_allow_completion, h2fx_completion_requests, h2fx_completion_usage_missing;
 
 void h2fx_init(void);
 void h2fx_fini(void);

@@ -105,6 +105,10 @@ sp_class_name(uint8_t priority_class)
 
 #define SP_CLASS_HDR_OBJ   "x-loxilb-admission-objective"
 #define SP_CLASS_HDR_CLASS "x-loxilb-admission-class"
+/* What the request asked for, on a response whose request named an
+ * objective it may not use and was admitted at its default all the same.
+ * Absent on every other response: its absence says "not denied". */
+#define SP_CLASS_HDR_OBJ_REQ "x-loxilb-admission-objective-requested"
 
 /* A header value is written only when every byte of it is a visible
  * character: an objective name is whatever the operator stored. */
@@ -124,17 +128,21 @@ sp_class_hdr_value_ok(const char *v)
 #define SP_CLASS_H1_SKIPPED  2   /* head not whole in this read, or no room */
 
 /*
- * Put X-Loxilb-Admission-Class, and X-Loxilb-Admission-Objective when a
- * hint was applied, on a response head. Lines of those two names the
- * backend sent are removed first: the pair says what the gateway decided.
- * Only the head is touched; the bytes after it move as they are. Returns
- * the new length (len itself when nothing was done).
+ * Put X-Loxilb-Admission-Class, X-Loxilb-Admission-Objective when a hint
+ * was applied, and X-Loxilb-Admission-Objective-Requested when `requested`
+ * is given (the caller passes it only for a request whose objective was
+ * denied) on a response head. Lines of those three names the backend sent
+ * are removed first: they say what the gateway decided. All of it or none:
+ * a head with no room for every line takes none. Only the head is touched;
+ * the bytes after it move as they are. Returns the new length (len itself
+ * when nothing was done).
  */
 static inline size_t
 sp_class_expose_h1(uint8_t *buf, size_t len, size_t cap, const char *objective,
-                   uint8_t priority_class, int *res)
+                   uint8_t priority_class, const char *requested, int *res)
 {
-  char add[192];
+  char add[320];
+  int rlen = 0;
   size_t end = 0, i, n;
   int alen, status;
 
@@ -167,7 +175,9 @@ sp_class_expose_h1(uint8_t *buf, size_t len, size_t cap, const char *objective,
     if ((nlen == sizeof(SP_CLASS_HDR_OBJ) - 1 &&
          !strncasecmp((const char *)buf + i, SP_CLASS_HDR_OBJ, nlen)) ||
         (nlen == sizeof(SP_CLASS_HDR_CLASS) - 1 &&
-         !strncasecmp((const char *)buf + i, SP_CLASS_HDR_CLASS, nlen))) {
+         !strncasecmp((const char *)buf + i, SP_CLASS_HDR_CLASS, nlen)) ||
+        (nlen == sizeof(SP_CLASS_HDR_OBJ_REQ) - 1 &&
+         !strncasecmp((const char *)buf + i, SP_CLASS_HDR_OBJ_REQ, nlen))) {
       memmove(buf + i, buf + eol, len - eol);
       len -= eol - i; end -= eol - i;
       continue;
@@ -184,7 +194,13 @@ sp_class_expose_h1(uint8_t *buf, size_t len, size_t cap, const char *objective,
                     sp_class_name(priority_class));
   if (alen <= 0 || (size_t)alen >= sizeof(add))
     return len;
-  n = (size_t)alen;
+  if (sp_class_hdr_value_ok(requested)) {
+    rlen = snprintf(add + alen, sizeof(add) - (size_t)alen,
+                    "X-Loxilb-Admission-Objective-Requested: %s\r\n", requested);
+    if (rlen <= 0 || (size_t)rlen >= sizeof(add) - (size_t)alen)
+      return len;
+  }
+  n = (size_t)alen + (size_t)rlen;
   if (len + n > cap)
     return len;
   memmove(buf + end + n, buf + end, len - end);

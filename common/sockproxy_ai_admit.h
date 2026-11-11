@@ -270,6 +270,10 @@ typedef struct ai_gw_admit_result {
   uint32_t tier_off;
   uint32_t tier_len;
   char     objective[64];
+  /* objective_requested: set only with objective_denied. What the request
+   * asked for and did not get: the header's objective name as it was
+   * given, or "tier:<value>" when the body's service_tier was the hint. */
+  char     objective_requested[64];
 } ai_gw_admit_result_t;
 
 int ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res);
