@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause) */
-#ifndef LLB_NAT_MAP_ABI_H
-#define LLB_NAT_MAP_ABI_H
+#ifndef LLB_MAP_ABI_H
+#define LLB_MAP_ABI_H
 
 #include <errno.h>
 #include <stddef.h>

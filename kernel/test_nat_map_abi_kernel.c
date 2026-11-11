@@ -2,7 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
-#include "llb_nat_map_abi.h"
+#include "llb_map_abi.h"
 
 /* Run only in an isolated environment with permission to create BPF maps.
  * These maps are anonymous, never attached or pinned, and closed after use. */

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause) */
 #include <assert.h>
 #include <stdio.h>
-#include "llb_nat_map_abi.h"
+#include "llb_map_abi.h"
 
 static struct bpf_map_info live;
 static __u32 reply_len;
