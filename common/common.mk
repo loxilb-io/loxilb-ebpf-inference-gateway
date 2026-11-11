@@ -121,7 +121,17 @@ BPF_OBJS := $(XDP_OBJ) $(TC_OBJ) $(TC_EOBJ) $(MON_OBJ) $(SOCK_OBJ) \
 DEPFILES := $(BPF_OBJS:.o=.d) $(USER_OBJ:.o=.d)
 -include $(DEPFILES)
 
-$(BPF_OBJS) $(USER_OBJ): $(SHARED_HDRS)
+ABI_HEADER := llb_abi_fingerprint.generated.h
+ABI_INPUTS := $(shell python3 gen_abi_fingerprint.py --list-inputs)
+$(ABI_HEADER): gen_abi_fingerprint.py $(ABI_INPUTS)
+	python3 gen_abi_fingerprint.py --output $@
+$(BPF_OBJS) $(USER_OBJ): $(SHARED_HDRS) $(ABI_HEADER)
+
+.PHONY: check_abi_identity
+check_abi_identity: $(BPF_OBJS) $(USER_OBJ) $(USER_TARGETS_LIB)
+	python3 check_abi_identity.py --native $(USER_OBJ) --archive $(USER_TARGETS_LIB) --bpf $(sort $(BPF_OBJS))
+
+$(BPF_OBJS) $(USER_OBJ): | $(OBJECT_LIBBPF)
 
 # DPU Slim Build Profile (BF2 kernel 5.15 compatibility)
 # Strips: IP_FILTER, SECURITY_RATE_LIMIT, SECURITY_RATE_RUNTIME_CONFIG,
@@ -223,7 +233,7 @@ BPF_CFLAGS ?= -I$(LIBBPF_DIR)/build/usr/include/ -I../headers/ -I/usr/include/$(
 # Libraries: json-c added for Phase 2.2 custom pattern recognition (PII detection)
 LIBS = $(OBJECT_LIBBPF) -lelf $(USER_LIBS) -lz -lpthread -lssl -lcrypto -lnghttp2 -ljson-c
 
-all: llvm-check $(USER_TARGETS) $(XDP_OBJ) $(TC_OBJ) $(TC_EOBJ) $(MON_OBJ) $(SOCK_OBJ) $(SM_OBJ) $(STREAM_OBJ) $(SOCKDIR_OBJ) $(USER_TARGETS_LIB)
+all: llvm-check $(USER_TARGETS) $(XDP_OBJ) $(TC_OBJ) $(TC_EOBJ) $(MON_OBJ) $(SOCK_OBJ) $(SM_OBJ) $(STREAM_OBJ) $(SOCKDIR_OBJ) $(USER_TARGETS_LIB) check_abi_identity
 
 .PHONY: clean $(CLANG) $(LLC)
 
@@ -237,7 +247,7 @@ clean:
 	rm -f *skel*.h
 	rm -f $@
 	rm -f *.ll
-	rm -f $(DEPFILES) *.d test_nat_map_abi test_nat_map_abi_sanitized test_nat_map_abi_kernel
+	rm -f $(DEPFILES) *.d $(ABI_HEADER) test_nat_map_abi test_nat_map_abi_sanitized test_nat_map_abi_kernel
 	rm -f *~
 
 # For build dependency on this file, if it gets updated
@@ -328,7 +338,7 @@ $(USER_TARGETS_LIB): %: $(USER_OBJ) $(COMMON_OBJS)
 
 $(XDP_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		$(BPF_CFLAGS) \
 		-Wall \
@@ -346,7 +356,7 @@ $(XDP_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_D
 
 $(TC_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		-DLL_TC_EBPF=1 \
 		$(BPF_CFLAGS) \
@@ -363,7 +373,7 @@ $(TC_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DE
 
 $(TC_EOBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		-DLL_TC_EBPF=1 \
 		-DLL_TC_EBPF_EHOOK=1 \
@@ -388,7 +398,7 @@ vmlinux: vmlinux.h
 
 $(MON_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS) vmlinux
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		-DLL_TC_EBPF=1 \
@@ -401,7 +411,7 @@ $(MON_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_D
 
 $(SOCK_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) 
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		-DLL_TC_EBPF=1 \
@@ -414,7 +424,7 @@ $(SOCK_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 
 $(SM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) vmlinux
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		$(BPF_CFLAGS) \
@@ -424,7 +434,7 @@ $(SM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) vmlinux
 
 $(STREAM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		$(BPF_CFLAGS) \
@@ -434,7 +444,7 @@ $(STREAM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 
 $(SOCKDIR_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 	$(CLANG) \
-		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ -include llb_abi_marker.h \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		$(BPF_CFLAGS) \

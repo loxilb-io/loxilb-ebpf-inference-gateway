@@ -66,12 +66,11 @@ make -C common test_mcp
 
 The dependent Gateway repository contains independent backend fixtures and real HTTP/TLS/HTTP2 runtime checks under `cicd/mcp-stateless`. Run those against an image built from this exact dataplane and the matching Gateway source; portable tests alone do not qualify installed behavior.
 
-## NAT map compatibility
+# Native map compatibility
 
-Startup refuses a missing or incompatible NAT map before userspace workers
-or configuration replay. Shared-header dependency files keep incremental BPF
-and native artifacts aligned. See [the compatibility contract](docs/nat-map-compatibility.md)
-for tests and matched-build requirements.
-
-The startup geometry table additionally protects other fixed-buffer native
-and Go/CGO map readers, including CT/FW and auxiliary socket maps.
+The loader checks the live NAT and other userspace-read map geometry once at
+startup, before workers or configuration replay. Map geometry is immutable
+for that fd, so the check covers all later accesses, including static native
+buffers. A read-only shared-header/feature fingerprint also rejects equal-size
+layout drift. See [map compatibility](docs/nat-map-compatibility.md) for the
+matched-build contract, header dependency tests and isolated regression checks.
