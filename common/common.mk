@@ -111,6 +111,18 @@ EXTRA_DEPS +=
 # BPF-prog kern and userspace shares struct via header file:
 KERN_USER_H ?= $(wildcard common_kern_user.h)
 
+# Rebuild the artifact set together when a shared ABI header changes, also
+# when upgrading a built tree that has no compiler-generated dependency files.
+SHARED_HDRS := $(COMMON_DIR)/llb_dpapi.h $(COMMON_DIR)/llb_dp_mdi.h \
+               $(COMMON_DIR)/common_pdi.h $(COMMON_DIR)/parsing_helpers.h \
+               llb_kern_cdefs.h loxilb_libdp.h
+BPF_OBJS := $(XDP_OBJ) $(TC_OBJ) $(TC_EOBJ) $(MON_OBJ) $(SOCK_OBJ) \
+            $(SM_OBJ) $(STREAM_OBJ) $(SOCKDIR_OBJ)
+DEPFILES := $(BPF_OBJS:.o=.d) $(USER_OBJ:.o=.d)
+-include $(DEPFILES)
+
+$(BPF_OBJS) $(USER_OBJ): $(SHARED_HDRS)
+
 # DPU Slim Build Profile (BF2 kernel 5.15 compatibility)
 # Strips: IP_FILTER, SECURITY_RATE_LIMIT, SECURITY_RATE_RUNTIME_CONFIG,
 #          GPU_ROUTING, RSS, SCTP_SUM, PROXY_EXTRA_DEBUG
@@ -225,6 +237,7 @@ clean:
 	rm -f *skel*.h
 	rm -f $@
 	rm -f *.ll
+	rm -f $(DEPFILES) *.d test_nat_map_abi test_nat_map_abi_sanitized test_nat_map_abi_kernel
 	rm -f *~
 
 # For build dependency on this file, if it gets updated
@@ -306,7 +319,8 @@ endif
 
 # The archive compiles USER_OBJ independently of the debug executable.
 # Its generated skeleton must exist before that compile in a parallel build.
-$(USER_OBJ): %.o: %.skel.h
+$(USER_OBJ): %.o: %.c %.skel.h Makefile $(COMMON_MK)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -MF $(@:.o=.d) -MT $@ -c -o $@ $<
 
 $(USER_TARGETS_LIB): %: $(USER_OBJ) $(COMMON_OBJS)
 	$(AR) rcu $@ $^
@@ -314,7 +328,7 @@ $(USER_TARGETS_LIB): %: $(USER_OBJ) $(COMMON_OBJS)
 
 $(XDP_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		$(BPF_CFLAGS) \
 		-Wall \
@@ -332,7 +346,7 @@ $(XDP_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_D
 
 $(TC_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		-DLL_TC_EBPF=1 \
 		$(BPF_CFLAGS) \
@@ -349,7 +363,7 @@ $(TC_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DE
 
 $(TC_EOBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS)
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		-DLL_TC_EBPF=1 \
 		-DLL_TC_EBPF_EHOOK=1 \
@@ -374,7 +388,7 @@ vmlinux: vmlinux.h
 
 $(MON_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_DEPS) vmlinux
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		-DLL_TC_EBPF=1 \
@@ -387,7 +401,7 @@ $(MON_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) $(XDP_D
 
 $(SOCK_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) 
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		-DLL_TC_EBPF=1 \
@@ -400,7 +414,7 @@ $(SOCK_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 
 $(SM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) vmlinux
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		$(BPF_CFLAGS) \
@@ -410,7 +424,7 @@ $(SM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS) vmlinux
 
 $(STREAM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		$(BPF_CFLAGS) \
@@ -420,7 +434,7 @@ $(STREAM_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 
 $(SOCKDIR_OBJ): %.o: %.c  Makefile $(COMMON_MK) $(KERN_USER_H) $(EXTRA_DEPS)
 	$(CLANG) \
-		-target bpf \
+		-target bpf -MMD -MP -MF $(@:.o=.d) -MT $@ \
 		-D __BPF_TRACING__ \
 		-D__TARGET_ARCH_$(ARCH) \
 		$(BPF_CFLAGS) \

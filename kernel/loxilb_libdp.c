@@ -35,6 +35,7 @@
 #include <netinet/in.h>
 
 #include "loxilb_libdp.h"
+#include "llb_nat_map_abi.h"
 #include "llb_kern_mon.h"
 #include "loxilb_libdp.skel.h"
 #include "../common/pdi.h"
@@ -1660,6 +1661,27 @@ llb_setup_lcpu_map(int mapfd)
 }
 
 static int
+llb_check_nat_map_fd(int fd)
+{
+  struct bpf_map_info info;
+  int ret = llb_nat_map_check_fd(fd, sizeof(struct dp_nat_key),
+                               sizeof(struct dp_proxy_tacts), &info);
+
+  if (ret != 0) {
+    log_error("nat_map: refusing unsafe userspace access: fd=%d id=%u "
+              "expected type=%u key=%zu value=%zu, live type=%u key=%u "
+              "value=%u, error=%d; use matching userspace and BPF artifacts",
+              fd, info.id, (__u32)BPF_MAP_TYPE_HASH, sizeof(struct dp_nat_key),
+              sizeof(struct dp_proxy_tacts), info.type, info.key_size,
+              info.value_size, ret);
+  } else {
+    log_debug("nat_map: validated fd=%d id=%u key=%u value=%u",
+              fd, info.id, info.key_size, info.value_size);
+  }
+  return ret;
+}
+
+static int
 llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
 {
   int i = 0;
@@ -1675,7 +1697,18 @@ llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
     fd = llb_objmap2fd(bpf_obj, xh->maps[i].map_name);  
     if (fd < 0) {
       log_error("BPF: map2fd failed %s", xh->maps[i].map_name);
+      if (i == LL_DP_NAT_MAP) {
+        log_error("ebpf: required nat_map unavailable; initialization refused");
+        exit(EXIT_FAILURE);
+      }
       continue;
+    }
+    /* Geometry is immutable for this fd. One startup check covers every
+     * later access, including add's static .bss oldv buffer, which a stack
+     * protector cannot protect, before workers or config replay. */
+    if (i == LL_DP_NAT_MAP && llb_check_nat_map_fd(fd) != 0) {
+      log_error("ebpf: incompatible nat_map; initialization refused");
+      exit(EXIT_FAILURE);
     }
     xh->maps[i].map_fd = fd;
 
@@ -3190,6 +3223,16 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   return 0;
 }
 
+/* Add and delete must stay symmetric: only IPv4 TCP/SCTP FULLPROXY
+ * rules use the userspace proxy without a kernel NAT row. */
+static inline bool
+llb_nat_uses_proxy_only(const struct dp_nat_key *key,
+                        const struct dp_proxy_tacts *value)
+{
+  return value->ca.act_type == DP_SET_FULLPROXY &&
+         (key->l4proto == IPPROTO_TCP || key->l4proto == IPPROTO_SCTP) && key->v6 == 0;
+}
+
 int
 llb_add_map_elem(int tbl, void *k, void *v)
 {
@@ -3255,8 +3298,7 @@ llb_add_map_elem(int tbl, void *k, void *v)
     struct proxy_ent pk = { 0 };
     struct proxy_arg *pv = NULL;  // Use pointer for heap allocation
 
-    if (nv->ca.act_type == DP_SET_FULLPROXY &&
-        (nk->l4proto == IPPROTO_TCP || nk->l4proto == IPPROTO_SCTP) && nk->v6 == 0) {
+    if (llb_nat_uses_proxy_only(nk, nv)) {
       // CRITICAL: Allocate proxy_arg on HEAP to persist beyond function lifetime
       // For mTLS: OpenSSL stores pointer in SSL_CTX ex_data and auto-frees via callback
       // For non-mTLS: No pointer stored, but heap is safer for consistency
@@ -3486,13 +3528,14 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
 
     assert(nv);
 
-    if (nv->ca.act_type == DP_SET_FULLPROXY &&
-        (nk->l4proto == IPPROTO_TCP || nk->l4proto == IPPROTO_SCTP) && nk->v6 == 0) {
+    if (llb_nat_uses_proxy_only(nk, nv)) {
       if (llb_sockmap_rule_ports_op(nk, nv, 0) != 0) {
         log_error("sockmap: failed to remove rule ports for vip %u", ntohs(nk->dport));
       }
       llb_conv_nat2proxy(nk, nv, &pk, &pa);
       proxy_delete_entry(&pk, &pa);
+      XH_UNLOCK();
+      return 0;
     }
 
     if (xh->have_noebpf) {

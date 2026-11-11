@@ -65,3 +65,10 @@ make -C common test_mcp
 ```
 
 The dependent Gateway repository contains independent backend fixtures and real HTTP/TLS/HTTP2 runtime checks under `cicd/mcp-stateless`. Run those against an image built from this exact dataplane and the matching Gateway source; portable tests alone do not qualify installed behavior.
+
+## NAT map compatibility
+
+Startup refuses a missing or incompatible NAT map before userspace workers
+or configuration replay. Shared-header dependency files keep incremental BPF
+and native artifacts aligned. See [the compatibility contract](docs/nat-map-compatibility.md)
+for tests and matched-build requirements.

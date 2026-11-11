@@ -46,6 +46,24 @@ LDFLAGS +=  -lz
 
 include $(COMMON_DIR)/common.mk
 
+loxilb_libdp.o: llb_nat_map_abi.h
+
+.PHONY: test_nat_map_abi test_nat_map_abi_kernel
+test_nat_map_abi: test_nat_map_abi.c llb_nat_map_abi.h
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I$(LIBBPF_DIR) -O2 -o test_nat_map_abi test_nat_map_abi.c
+	./test_nat_map_abi
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I$(LIBBPF_DIR) -g -fsanitize=address,undefined -fno-omit-frame-pointer -o test_nat_map_abi_sanitized test_nat_map_abi.c
+	ASAN_OPTIONS=detect_leaks=1 ./test_nat_map_abi_sanitized
+
+# Privileged integration check; run in a disposable container, not on host pins.
+test_nat_map_abi_kernel: test_nat_map_abi_kernel.c llb_nat_map_abi.h $(OBJECT_LIBBPF)
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I$(LIBBPF_DIR) -g -o test_nat_map_abi_kernel test_nat_map_abi_kernel.c $(OBJECT_LIBBPF) -lelf -lz
+	./test_nat_map_abi_kernel
+
 .PHONY: test_l4_trace_helper_compat
 test_l4_trace_helper_compat: $(TC_OBJ) test_l4_trace_helper_compat.sh
 	sh ./test_l4_trace_helper_compat.sh llb_ebpf_main.o
+
+.PHONY: test_build_deps
+test_build_deps:
+	python3 test_build_deps.py
