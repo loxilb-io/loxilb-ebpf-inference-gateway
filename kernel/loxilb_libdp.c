@@ -35,7 +35,8 @@
 #include <netinet/in.h>
 
 #include "loxilb_libdp.h"
-#include "llb_nat_map_abi.h"
+#include "llb_map_abi.h"
+#include "llb_map_abi_table.h"
 #include "llb_kern_mon.h"
 #include "loxilb_libdp.skel.h"
 #include "../common/pdi.h"
@@ -45,6 +46,37 @@
 #ifndef PATH_MAX
 #define PATH_MAX  4096
 #endif
+
+/* Only initialization publishes map descriptors. Geometry is immutable for
+ * the lifetime of a descriptor; no per-operation compatibility branch may
+ * silently abandon native cleanup. */
+static void
+llb_require_geometry(const char *name, int fd, __u32 type,
+                     __u32 key_size, __u32 value_size)
+{
+  struct bpf_map_info info;
+  int ret = llb_map_check_fd(fd, type, key_size, value_size, &info);
+  if (ret) {
+    if (strcmp(name, "nat_map") == 0) {
+      log_error("nat_map: refusing unsafe userspace access: fd=%d id=%u "
+                "expected type=%u key=%u value=%u, live type=%u key=%u "
+                "value=%u, error=%d; use matching userspace and BPF artifacts",
+                fd, info.id, type, key_size, value_size, info.type,
+                info.key_size, info.value_size, ret);
+      log_error("ebpf: incompatible nat_map; initialization refused");
+    } else {
+      log_error("%s: incompatible map: fd=%d id=%u expected type=%u key=%u "
+                "value=%u, live type=%u key=%u value=%u error=%d; "
+                "initialization refused", name, fd, info.id, type, key_size,
+                value_size, info.type, info.key_size, info.value_size, ret);
+    }
+    exit(EXIT_FAILURE);
+  }
+  if (strcmp(name, "nat_map") == 0) {
+    log_debug("nat_map: validated fd=%d id=%u key=%u value=%u",
+              fd, info.id, info.key_size, info.value_size);
+  }
+}
 
 typedef struct llb_dp_sect {
 #define SECNAMSIZ 64
@@ -722,6 +754,7 @@ llb_setup_kern_sock(const char *cgroup_path)
     goto err;
   }
 
+
   pfd = bpf_program__fd(prog);
   if (pfd < 0) {
     log_error("sockaddr: failed to get program fd");
@@ -746,6 +779,8 @@ llb_setup_kern_sock(const char *cgroup_path)
     goto err1;
   }
 
+  llb_require_geometry("sock_rwr_map", map_fd, BPF_MAP_TYPE_HASH,
+                       sizeof(struct sock_rwr_key), sizeof(struct sock_rwr_action));
   xh->maps[LL_DP_SOCK_RWR_MAP].map_fd = map_fd;
   if (xh->cgfd <= 0) {
     xh->cgfd = cgfd;
@@ -821,6 +856,7 @@ llb_setup_kern_mon(void)
       log_error("Failed to load and verify BPF skeleton");
       goto cleanup;
   }
+
 
   // Attach the various kProbes
   err = llb_kern_mon__attach(prog);
@@ -971,6 +1007,7 @@ llb_setup_kern_sockmap_skmsg_helper(int map_fd, int verdict_map_fd, int peer_map
     goto err;
   }
 
+
   verdict_map_fd = bpf_map__fd(verdict_map2);
   if (verdict_map_fd < 0) {
     log_error("sockdir: map get failed");
@@ -1064,6 +1101,7 @@ llb_setup_kern_sockmap_strparser_helper(int sockmap_fd, int verdict_map_fd, int 
     log_error("sockstream: obj load failed");
     goto err;
   }
+
 
   map_fd = bpf_map__fd(map2);
   if (map_fd < 0) {
@@ -1477,6 +1515,7 @@ llb_setup_kern_sockmap(const char *cgroup_path)
     goto err;
   }
 
+
   pfd = bpf_program__fd(prog);
   if (pfd < 0) {
     log_error("sockmap: failed to get program fd");
@@ -1536,6 +1575,18 @@ llb_setup_kern_sockmap(const char *cgroup_path)
   }
 #endif
 
+  llb_require_geometry("sock_proxy_map", map_fd, BPF_MAP_TYPE_SOCKHASH,
+                       sizeof(struct llb_sockmap_key), sizeof(__u64));
+  llb_require_geometry("sock_verdict_map", map_fd2, BPF_MAP_TYPE_SOCKHASH,
+                       sizeof(struct llb_sockmap_key), sizeof(__u64));
+  llb_require_geometry("peer_map", peer_map_fd, BPF_MAP_TYPE_HASH,
+                       sizeof(struct llb_sockmap_key), sizeof(struct llb_sockmap_peer));
+  llb_require_geometry("sockmap_stats", stats_map_fd, BPF_MAP_TYPE_PERCPU_ARRAY,
+                       sizeof(__u32), sizeof(__u64));
+  llb_require_geometry("sockmap_vip_portset", vip_map_fd, BPF_MAP_TYPE_HASH,
+                       sizeof(struct llb_sockmap_portset_key), sizeof(struct llb_sockmap_portset_val));
+  llb_require_geometry("sockmap_ep_portset", ep_map_fd, BPF_MAP_TYPE_HASH,
+                       sizeof(struct llb_sockmap_portset_key), sizeof(struct llb_sockmap_portset_val));
   memset(xh->sm_rule_rec, 0, sizeof(xh->sm_rule_rec));
 
   /* map_fd2 is the map the stream programs attached to (sock_verdict_map);
@@ -1661,27 +1712,6 @@ llb_setup_lcpu_map(int mapfd)
 }
 
 static int
-llb_check_nat_map_fd(int fd)
-{
-  struct bpf_map_info info;
-  int ret = llb_nat_map_check_fd(fd, sizeof(struct dp_nat_key),
-                               sizeof(struct dp_proxy_tacts), &info);
-
-  if (ret != 0) {
-    log_error("nat_map: refusing unsafe userspace access: fd=%d id=%u "
-              "expected type=%u key=%zu value=%zu, live type=%u key=%u "
-              "value=%u, error=%d; use matching userspace and BPF artifacts",
-              fd, info.id, (__u32)BPF_MAP_TYPE_HASH, sizeof(struct dp_nat_key),
-              sizeof(struct dp_proxy_tacts), info.type, info.key_size,
-              info.value_size, ret);
-  } else {
-    log_debug("nat_map: validated fd=%d id=%u key=%u value=%u",
-              fd, info.id, info.key_size, info.value_size);
-  }
-  return ret;
-}
-
-static int
 llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
 {
   int i = 0;
@@ -1693,6 +1723,7 @@ llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
   const char *section;
 
   for (; i < LL_DP_MAX_MAP; i++) {
+    if (!xh->maps[i].map_name) continue;
     if (i == LL_DP_SOCK_RWR_MAP || i == LL_DP_SOCK_PROXY_MAP) continue;
     fd = llb_objmap2fd(bpf_obj, xh->maps[i].map_name);  
     if (fd < 0) {
@@ -1701,14 +1732,20 @@ llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
         log_error("ebpf: required nat_map unavailable; initialization refused");
         exit(EXIT_FAILURE);
       }
+      if (llb_map_geometry[i].type) {
+        log_error("ebpf: required userspace map %s unavailable; initialization refused",
+                  xh->maps[i].map_name);
+        exit(EXIT_FAILURE);
+      }
       continue;
     }
-    /* Geometry is immutable for this fd. One startup check covers every
-     * later access, including add's static .bss oldv buffer, which a stack
-     * protector cannot protect, before workers or config replay. */
-    if (i == LL_DP_NAT_MAP && llb_check_nat_map_fd(fd) != 0) {
-      log_error("ebpf: incompatible nat_map; initialization refused");
-      exit(EXIT_FAILURE);
+    /* Geometry is immutable for this fd. This startup check covers all
+     * later accesses, including NAT add's static .bss oldv buffer, which a
+     * stack protector cannot protect, before workers or config replay. */
+    const struct llb_map_geometry *geometry = &llb_map_geometry[i];
+    if (geometry->type) {
+      llb_require_geometry(xh->maps[i].map_name, fd, geometry->type,
+                           geometry->key_size, geometry->value_size);
     }
     xh->maps[i].map_fd = fd;
 
@@ -4793,6 +4830,7 @@ llb_dp_link_attach(const char *ifname,
     llb_link_prop_del(ifname, mp_type);
     return -1;
   }
+
 
   if (bpf_obj && mp_type == LL_BPF_MOUNT_XDP) {
     llb_link_xdp_flags_set(ifname, cfg.bpf_flags);

@@ -27,3 +27,16 @@ llb_dpapi.h and llb_kern_cdefs.h. --expect-gap records the base defect. That
 built-tree check requires the full dataplane/skeleton/common build and is not
 part of the small C-unit job. Python3 is a test-only dependency at this layer;
 ordinary native builds do not invoke it.
+
+## Userspace-read map geometry
+
+The per-map expected table covers fixed-buffer native and Go/CGO readers:
+CT, IPv4/IPv6 firewall, interface, policer, FC, per-CPU statistics, IP filters,
+security configuration/counters, GPU and trace configuration. Auxiliary socket
+map descriptors are checked before publication. Every named table map must
+exist and match type/key/value geometry, or initialization exits 1. NAT is
+checked exactly once through the table and keeps the NAT-specific diagnostic.
+The generic guard header is llb_map_abi.h. Frozen Go scalar layouts remain
+explicit wire-size contracts; this is not a translation-unit layout handshake.
+See the accompanying D1-reader-inventory.json review aid. The slim profile's
+missing ct_err_stats remains a follow-up; its table entry is not weakened here.

@@ -1,0 +1,77 @@
+{
+  "source": "PR1+PR2 kernel/loxilb_libdp.c",
+  "source_sha256": "121101c16d87d252f2a0fb53d734b5b2c65ac7faf6b17a0336b73ae21dd22920",
+  "note": "Direct lookup/lookup_flags sites including conditional branches; generic walkers cover CT/FC. The table additionally protects fixed Go/CGO and auxiliary socket readers.",
+  "calls": [
+    {
+      "line": 505,
+      "function": "llb_packet_trace_en",
+      "call": "bpf_map_lookup_elem(ifm_fd, &next_key, &l2a) != 0) {       goto next;"
+    },
+    {
+      "line": 1193,
+      "function": "llb_peer_map_op",
+      "call": "bpf_map_lookup_elem(xh->smfd, peer, &cookie) != 0) {       return -ENOENT;"
+    },
+    {
+      "line": 1206,
+      "function": "llb_peer_map_op",
+      "call": "bpf_map_lookup_elem(xh->smpeerfd, self, last);"
+    },
+    {
+      "line": 1257,
+      "function": "llb_sockmap_portset_op",
+      "call": "bpf_map_lookup_elem(map_fd, key, &val) == 0;"
+    },
+    {
+      "line": 2310,
+      "function": "ll_get_stats_pcpu_arr",
+      "call": "bpf_map_lookup_elem(mfd, &idx, values)) != 0) {     log_error(\"bpf_map_lookup_elem failed idx:0x%X\", idx);"
+    },
+    {
+      "line": 2481,
+      "function": "llb_fetch_pol_map_stats",
+      "call": "bpf_map_lookup_elem(t->map_fd, &e, &pa)) != 0) {       log_error(\"bpf_map_lookup_elem failed idx:0x%X\\n\", e);"
+    },
+    {
+      "line": 2527,
+      "function": "llb_map_loop_and_delete",
+      "call": "bpf_map_lookup_elem(t->map_fd, it->next_key, it->val) != 0) {       goto next;"
+    },
+    {
+      "line": 2672,
+      "function": "llb_nat_dec_act_sessions",
+      "call": "bpf_map_lookup_elem_flags(t->map_fd, &rid, &epa, BPF_F_LOCK)) != 0) {       if (epa.active_sess[aid] > 0) {         epa.active_sess[aid]--;"
+    },
+    {
+      "line": 2679,
+      "function": "llb_nat_dec_act_sessions",
+      "call": "bpf_map_lookup_elem(t->map_fd, &rid, &epa)) == 0) {       if (epa.active_sess[aid] > 0) {         epa.active_sess[aid]--;"
+    },
+    {
+      "line": 2714,
+      "function": "llb_nat_rst_act_sessions",
+      "call": "bpf_map_lookup_elem_flags(t->map_fd, &rid, &epa, BPF_F_LOCK)) != 0) {       epa.ca.act_type = 0;"
+    },
+    {
+      "line": 2730,
+      "function": "llb_nat_rst_act_sessions",
+      "call": "bpf_map_lookup_elem(t->map_fd, &rid, &epa)) == 0) {       epa.ca.act_type = 0;"
+    },
+    {
+      "line": 3315,
+      "function": "llb_add_map_elem",
+      "call": "bpf_map_lookup_elem(llb_map2fd(tbl), k, &oldv) == 0) {         have_old = 1;"
+    },
+    {
+      "line": 3583,
+      "function": "llb_del_map_elem_wval",
+      "call": "bpf_map_lookup_elem(llb_map2fd(tbl), k, &t);"
+    },
+    {
+      "line": 3953,
+      "function": "ll_ct_map_ent_has_aged",
+      "call": "bpf_map_lookup_elem(t->map_fd, &xkey, &axdat) != 0) {     if (key->v6 == 0) {       inet_ntop(AF_INET, xkey.saddr, sstr, INET_ADDRSTRLEN);"
+    }
+  ]
+}

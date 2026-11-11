@@ -72,3 +72,6 @@ Startup refuses a missing or incompatible NAT map before userspace workers
 or configuration replay. Shared-header dependency files keep incremental BPF
 and native artifacts aligned. See [the compatibility contract](docs/nat-map-compatibility.md)
 for tests and matched-build requirements.
+
+The startup geometry table additionally protects other fixed-buffer native
+and Go/CGO map readers, including CT/FW and auxiliary socket maps.
