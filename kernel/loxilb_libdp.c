@@ -37,6 +37,7 @@
 #include "loxilb_libdp.h"
 #include "llb_map_abi.h"
 #include "llb_map_abi_table.h"
+#include "llb_abi_fingerprint.generated.h"
 #include "llb_kern_mon.h"
 #include "loxilb_libdp.skel.h"
 #include "../common/pdi.h"
@@ -76,6 +77,37 @@ llb_require_geometry(const char *name, int fd, __u32 type,
     log_debug("nat_map: validated fd=%d id=%u key=%u value=%u",
               fd, info.id, info.key_size, info.value_size);
   }
+}
+
+static const char llb_expected_abi[] = LLB_ABI_FINGERPRINT;
+
+static void
+llb_require_abi_fd(int fd)
+{
+  char actual[sizeof(llb_expected_abi)] = {0};
+  __u32 key = 0;
+  llb_require_geometry("ABI fingerprint", fd, BPF_MAP_TYPE_ARRAY,
+                       sizeof(key), sizeof(actual));
+  int ret = bpf_map_lookup_elem(fd, &key, actual);
+  if (ret || memcmp(actual, llb_expected_abi, sizeof(actual))) {
+    log_error("ebpf: ABI fingerprint mismatch: expected=%s actual=%.*s "
+              "error=%d; initialization refused; deploy a matching build",
+              llb_expected_abi, (int)sizeof(actual), actual, ret);
+    exit(EXIT_FAILURE);
+  }
+}
+
+static struct bpf_map *
+llb_require_abi_object(struct bpf_object *obj)
+{
+  struct bpf_map *map = obj ? bpf_object__find_map_by_name(obj, ".rodata.llbabi") : NULL;
+  if (!map || bpf_map__fd(map) < 0) {
+    log_error("ebpf: missing ABI fingerprint; initialization refused; "
+              "rebuild userspace and all BPF objects together");
+    exit(EXIT_FAILURE);
+  }
+  llb_require_abi_fd(bpf_map__fd(map));
+  return map;
 }
 
 typedef struct llb_dp_sect {
@@ -754,6 +786,8 @@ llb_setup_kern_sock(const char *cgroup_path)
     goto err;
   }
 
+  llb_require_abi_object(bpf_obj);
+
   pfd = bpf_program__fd(prog);
   if (pfd < 0) {
     log_error("sockaddr: failed to get program fd");
@@ -855,6 +889,8 @@ llb_setup_kern_mon(void)
       log_error("Failed to load and verify BPF skeleton");
       goto cleanup;
   }
+
+  llb_require_abi_object(prog->obj);
 
   // Attach the various kProbes
   err = llb_kern_mon__attach(prog);
@@ -1005,6 +1041,8 @@ llb_setup_kern_sockmap_skmsg_helper(int map_fd, int verdict_map_fd, int peer_map
     goto err;
   }
 
+  llb_require_abi_object(bpf_obj2);
+
   verdict_map_fd = bpf_map__fd(verdict_map2);
   if (verdict_map_fd < 0) {
     log_error("sockdir: map get failed");
@@ -1098,6 +1136,8 @@ llb_setup_kern_sockmap_strparser_helper(int sockmap_fd, int verdict_map_fd, int 
     log_error("sockstream: obj load failed");
     goto err;
   }
+
+  llb_require_abi_object(bpf_obj2);
 
   map_fd = bpf_map__fd(map2);
   if (map_fd < 0) {
@@ -1511,6 +1551,8 @@ llb_setup_kern_sockmap(const char *cgroup_path)
     goto err;
   }
 
+  llb_require_abi_object(bpf_obj);
+
   pfd = bpf_program__fd(prog);
   if (pfd < 0) {
     log_error("sockmap: failed to get program fd");
@@ -1717,6 +1759,17 @@ llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
   struct bpf_program *prog;
   const char *section;
 
+  static bool abi_alias_pinned;
+  char abi_path[PINPATH_MAX_LEN];
+  snprintf(abi_path, sizeof(abi_path), "%s/llb_abi", xh->ll_dp_pdir);
+  if (xh->have_loader) {
+    llb_require_abi_object(bpf_obj);
+  } else {
+    int abi_fd = bpf_obj_get(abi_path);
+    llb_require_abi_fd(abi_fd);
+    close(abi_fd);
+  }
+
   for (; i < LL_DP_MAX_MAP; i++) {
     if (!xh->maps[i].map_name) continue;
     if (i == LL_DP_SOCK_RWR_MAP || i == LL_DP_SOCK_PROXY_MAP) continue;
@@ -1799,16 +1852,34 @@ llb_dflt_sec_map2fd_all(struct bpf_object *bpf_obj)
     return 0;
   }
 
+  /* The loader owns this alias across upgrades. Replace it once per
+   * process; the TC/XDP peer call must not create another absence window. */
+  if (!abi_alias_pinned && unlink(abi_path) != 0 && errno != ENOENT) {
+    log_error("ebpf: cannot unlink ABI fingerprint alias %s: %s; "
+              "initialization refused", abi_path, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
   /* Clean previous pins */
   if (bpf_object__unpin_maps(bpf_obj, xh->ll_dp_pdir) != 0) {
     log_warn("%s: Unpin maps failed", xh->ll_dp_pdir);
   }
 
-  /* This will pin all maps in our bpf_object */
+  /* Pin the ordinary set first. A raw alias must not change libbpf's
+   * per-map pin_path: doing that would make pin_maps reject a second path
+   * and roll back the shared pins needed by the TC/XDP peer object. */
   err = bpf_object__pin_maps(bpf_obj, xh->ll_dp_pdir);
   if (err) {
-    log_error("bpf: object pin failed");
-    //assert(0);
+    log_error("ebpf: object pin failed (%d); initialization refused", err);
+    exit(EXIT_FAILURE);
+  }
+
+  if (!abi_alias_pinned) {
+    if (bpf_obj_pin(bpf_map__fd(llb_require_abi_object(bpf_obj)), abi_path)) {
+      log_error("ebpf: cannot pin checked ABI fingerprint; initialization refused");
+      exit(EXIT_FAILURE);
+    }
+    abi_alias_pinned = true;
   }
 
   return 0;
@@ -4825,6 +4896,8 @@ llb_dp_link_attach(const char *ifname,
     llb_link_prop_del(ifname, mp_type);
     return -1;
   }
+
+  if (bpf_obj) llb_require_abi_object(bpf_obj);
 
   if (bpf_obj && mp_type == LL_BPF_MOUNT_XDP) {
     llb_link_xdp_flags_set(ifname, cfg.bpf_flags);

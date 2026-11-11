@@ -70,3 +70,4 @@ common/test_pd_request_limit_bin
 
 # Compiler dependency and generated ABI identity files
 *.d
+kernel/llb_abi_fingerprint.generated.h
