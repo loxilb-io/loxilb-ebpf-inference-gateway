@@ -70,6 +70,7 @@ static const char *const fc_anomaly_names[FC_A_COUNT] = {
   [FC_A_UNKNOWN_PERMIT] = "unknown_permit",
   [FC_A_TENANT_TABLE_FULL] = "tenant_table_full",
   [FC_A_H2_DENY_HEADERS] = "h2_deny_headers",
+  [FC_A_EXPOSE_HEAD_OVERFLOW] = "expose_head_overflow",
 };
 
 static const char *const fc_adapt_state_names[FC_AS_COUNT] = {

@@ -180,6 +180,7 @@ void pfe_trace_op(const char *op, void *rule, struct proxy_fd_ent *pfe);
 // can pin them without the proxy object graph.
 #include "sockproxy_hdr_deadline.h"
 #include "sockproxy_fc.h"  /* capacity admission: per-pool state and per-request permit */
+#include "sockproxy_resp_head.h"  /* a split HTTP/1.1 response head, kept until whole (proxy_fd_ent member) */
 #include "sockproxy_pool.h"  /* pool lifetime: reference count and the workers' index */
 
 // ============================================================================
@@ -1674,6 +1675,8 @@ struct proxy_fd_ent {
   uint8_t  adm_objective_denied;      // the header named an objective the request may not use
   uint8_t  adm_hint_not_applied;      // a body hint could not be read (streamed body)
   uint8_t  class_expose_pending;      // 1 = the response head still owes the class headers
+  sp_resp_head_t resp_head;           // the start of a response head that came split, kept until
+                                      // it is whole (client entry, under its lock; sockproxy_resp_head.h)
   char     adm_objective[64];         // the hint applied: an objective name, "tier:<value>", or ""
   char     adm_objective_req[64];     // with adm_objective_denied: what was asked for and not given
                                       // (obj_hint is reset when the request is forwarded; this copy
