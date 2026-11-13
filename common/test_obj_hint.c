@@ -266,6 +266,9 @@ test_expose(void)
   CHECK(res == SP_CLASS_H1_INTERIM && n == len, "an interim head is left for the final one");
   free(out);
 
+  /* The helper alone leaves a part of a head. On the socket path a split
+   * head is assembled first (sp_resp_head_relay, up to 16 KiB) and gets the
+   * class headers like a whole one: test_resp_head_assemble.c. */
   resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n";
   len = strlen(resp);
   n = expose(resp, len, len + 128, "batch", 2, NULL, &res, &out);
@@ -513,7 +516,9 @@ test_response_strip(void)
   CHECK(!marked && !strcmp(out, rest), "its events are untouched, blank lines and all");
   free(out);
 
-  /* A head split across two reads is left as it is. */
+  /* A head split across two reads is not marked for the X-Api-Key strip:
+   * that strip is per read and is not part of the head assembly, which
+   * serves the admission, class and refusal-mark headers only. */
   cresp_init(&c);
   out = cresp_read(&c, "HTTP/1.1 200 OK\r\nX-Api-Key: split\r\n", 1, &marked);
   CHECK(!marked && strstr(out, "split"), "the first part of a split head is not marked");
