@@ -200,6 +200,7 @@ typedef struct llb_dp_struct
   FILE *logfp;
   struct throttler cpt;
   uint64_t lctts;
+  uint64_t nat_conc_fixups;
   uint64_t lfcts;
 } llb_dp_struct_t;
 
@@ -2732,10 +2733,14 @@ llb_nat_dec_act_sessions(uint32_t rid, uint32_t aid)
 
   t = &xh->maps[LL_DP_NAT_EP_MAP];
 
+  if (aid >= LLB_MAX_NXFRMS) {
+    return;
+  }
+
   if (t != NULL) {
     memset(&epa, 0, sizeof(epa));
 #ifndef HAVE_DP_DPU_SLIM
-    if ((bpf_map_lookup_elem_flags(t->map_fd, &rid, &epa, BPF_F_LOCK)) != 0) {
+    if ((bpf_map_lookup_elem_flags(t->map_fd, &rid, &epa, BPF_F_LOCK)) == 0) {
       if (epa.active_sess[aid] > 0) {
         epa.active_sess[aid]--;
         bpf_map_update_elem(t->map_fd, &rid, &epa, BPF_F_LOCK);
@@ -2777,7 +2782,7 @@ llb_nat_rst_act_sessions(uint32_t rid)
   if (t != NULL) {
     memset(&epa, 0, sizeof(epa));
 #ifndef HAVE_DP_DPU_SLIM
-    if ((bpf_map_lookup_elem_flags(t->map_fd, &rid, &epa, BPF_F_LOCK)) != 0) {
+    if ((bpf_map_lookup_elem_flags(t->map_fd, &rid, &epa, BPF_F_LOCK)) == 0) {
       epa.ca.act_type = 0;
       for (i = 0; i < LLB_MAX_NXFRMS; i++) {
         epa.active_sess[i] = 0;
@@ -2809,6 +2814,82 @@ llb_nat_rst_act_sessions(uint32_t rid)
       bpf_map_update_elem(t->map_fd, &rid, &epa, BPF_ANY);
     }
 #endif
+  }
+}
+
+/* conc_conns is the number of NAT connections that have a forward conntrack
+ * entry. The datapath counts a connection in when it creates the entries and
+ * out when it tears them down itself. Every entry that is added or removed
+ * from user space has to be counted here, or the rule's connectionLimit
+ * drifts away from the connections that exist. */
+static int
+llb_nat_epa_get(uint32_t rid, struct dp_nat_epacts *epa)
+{
+  llb_dp_map_t *t = &xh->maps[LL_DP_NAT_EP_MAP];
+
+  if (xh->have_noebpf || rid >= LLB_NAT_EP_MAP_ENTRIES) {
+    return -1;
+  }
+#ifndef HAVE_DP_DPU_SLIM
+  return bpf_map_lookup_elem_flags(t->map_fd, &rid, epa, BPF_F_LOCK);
+#else
+  return bpf_map_lookup_elem(t->map_fd, &rid, epa);
+#endif
+}
+
+static int
+llb_nat_epa_put(uint32_t rid, struct dp_nat_epacts *epa)
+{
+  llb_dp_map_t *t = &xh->maps[LL_DP_NAT_EP_MAP];
+
+#ifndef HAVE_DP_DPU_SLIM
+  return bpf_map_update_elem(t->map_fd, &rid, epa, BPF_F_LOCK);
+#else
+  return bpf_map_update_elem(t->map_fd, &rid, epa, BPF_ANY);
+#endif
+}
+
+/* The datapath also keeps copies of a connection's forward entry under other
+ * keys: one per fragment identifier, and one per extra address of an SCTP
+ * association. They are entries of a connection that is already counted. */
+static int
+ll_ct_ent_is_copy(struct dp_ct_tact *adat)
+{
+  return adat->ctd.pi.frag || adat->ctd.xi.mhs;
+}
+
+static int
+ll_ct_ent_is_counted(struct dp_ct_tact *adat)
+{
+  return adat->ctd.xi.nat_flags && adat->ctd.dir == CT_DIR_IN &&
+         !ll_ct_ent_is_copy(adat);
+}
+
+static void
+ll_ct_ent_count(struct dp_ct_tact *adat)
+{
+  struct dp_nat_epacts epa;
+
+  if (!ll_ct_ent_is_counted(adat)) {
+    return;
+  }
+  if (llb_nat_epa_get(adat->ctd.rid, &epa) == 0) {
+    epa.conc_conns++;
+    llb_nat_epa_put(adat->ctd.rid, &epa);
+  }
+}
+
+static void
+ll_ct_ent_uncount(struct dp_ct_tact *adat)
+{
+  struct dp_nat_epacts epa;
+
+  if (!ll_ct_ent_is_counted(adat)) {
+    return;
+  }
+  if (llb_nat_epa_get(adat->ctd.rid, &epa) == 0 && epa.conc_conns > 0) {
+    epa.conc_conns--;
+    llb_nat_epa_put(adat->ctd.rid, &epa);
   }
 }
 
@@ -3389,7 +3470,11 @@ llb_add_map_elem(int tbl, void *k, void *v)
         }
         llb_clear_map_stats(tbl, LLB_NAT_STAT_CID(cidx, aid));
       }
-      llb_nat_rst_act_sessions(cidx);
+      /* A rule updated in place keeps its connections, so it keeps its
+       * counts; only a new rule starts from zero. */
+      if (!have_old) {
+        llb_nat_rst_act_sessions(cidx);
+      }
     } else {
       llb_clear_map_stats(tbl, cidx);
     }
@@ -3449,6 +3534,14 @@ llb_add_map_elem(int tbl, void *k, void *v)
 
   if (tbl == LL_DP_FW4_MAP || tbl == LL_DP_FW6_MAP) {
     ret = llb_add_mf_map_elem__(tbl, k, v);
+  } else if (tbl == LL_DP_CT_MAP) {
+    struct dp_ct_tact oct;
+    int is_new = bpf_map_lookup_elem(llb_map2fd(tbl), k, &oct) != 0;
+
+    ret = bpf_map_update_elem(llb_map2fd(tbl), k, v, 0);
+    if (ret == 0 && is_new) {
+      ll_ct_ent_count(v);
+    }
   } else {
     ret = bpf_map_update_elem(llb_map2fd(tbl), k, v, 0);
   }
@@ -3660,6 +3753,14 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
 
   if (tbl == LL_DP_FW4_MAP || tbl == LL_DP_FW6_MAP) {
     ret = llb_del_mf_map_elem__(tbl, k);
+  } else if (tbl == LL_DP_CT_MAP) {
+    struct dp_ct_tact oct;
+    int had = bpf_map_lookup_elem(llb_map2fd(tbl), k, &oct) == 0;
+
+    ret = bpf_map_delete_elem(llb_map2fd(tbl), k);
+    if (ret == 0 && had) {
+      ll_ct_ent_uncount(&oct);
+    }
   } else {
     ret = bpf_map_delete_elem(llb_map2fd(tbl), k);
   }
@@ -3679,6 +3780,9 @@ llb_del_map_elem_wval(int tbl, void *k, void *v)
       }
     }
     llb_del_map_elem_nat_post_proc(k, &t);
+    if (ret == 0) {
+      llb_nat_rst_act_sessions(t.ca.cidx);
+    }
   }
 
   XH_UNLOCK();
@@ -4017,6 +4121,7 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
   if (adat->ctd.pi.frag) {
     memset(&axdat, 0, sizeof(axdat));
   } else if (bpf_map_lookup_elem(t->map_fd, &xkey, &axdat) != 0) {
+    memset(&axdat, 0, sizeof(axdat));
     if (key->v6 == 0) {
       inet_ntop(AF_INET, xkey.saddr, sstr, INET_ADDRSTRLEN);
       inet_ntop(AF_INET, xkey.daddr, dstr, INET_ADDRSTRLEN);
@@ -4025,9 +4130,15 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
       inet_ntop(AF_INET6, xkey.daddr, dstr, INET6_ADDRSTRLEN);
     }
 
-    ll_ct_get_state(&xkey, &axdat, &est, &to, &bidir);
-
-    if (est && curr_ns - adat->lts < CT_MISMATCH_FN_CPTO) {
+    /* An entry can be without its other half for a while: a peer sends the
+     * two in separate messages, and the datapath removes them one after the
+     * other. Leave an established entry for the mismatch timeout and any
+     * other for its own closing timeout before taking it for an orphan. */
+    ll_ct_get_state(key, adat, &est, &to, &bidir);
+    if (est || to > CT_MISMATCH_FN_CPTO) {
+      to = CT_MISMATCH_FN_CPTO;
+    }
+    if (curr_ns < adat->lts || curr_ns - adat->lts < to) {
       return 0;
     }
 
@@ -4038,6 +4149,7 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
          dstr, ntohs(xkey.dport),
          xkey.l4proto);
     llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
+    ll_ct_ent_uncount(adat);
     return 1;
   }
 
@@ -4078,11 +4190,13 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
 
     ll_send_ctep_reset(key, adat);
     llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
-    if (adat->ctd.xi.nat_flags) {
+    if (adat->ctd.xi.nat_flags && !ll_ct_ent_is_copy(adat)) {
       llb_nat_dec_act_sessions(adat->ctd.rid, adat->ctd.aid);
     }
+    ll_ct_ent_uncount(adat);
 
     if (!adat->ctd.pi.frag) {
+      ll_ct_ent_uncount(&axdat);
       ll_send_ctep_reset(&xkey, &axdat);
       llb_maptrace_uhook(LL_DP_CT_MAP, 0, &xkey, sizeof(xkey), NULL, 0);
       bpf_map_delete_elem(t->map_fd, &xkey);
@@ -4106,6 +4220,165 @@ ll_ct_map_ent_has_aged(int tid, void *k, void *ita)
 #endif
 
   return 0;
+}
+
+#define LL_CT_RECONCILE_BATCH 512
+
+/* Read the counters of every rule index in one call. */
+static int
+ll_nat_conc_snapshot(struct dp_nat_epacts *epas)
+{
+  static uint32_t keys[LLB_NAT_EP_MAP_ENTRIES];
+  uint32_t count = LLB_NAT_EP_MAP_ENTRIES;
+  uint32_t out = 0;
+  int err;
+
+  err = bpf_map_lookup_batch(xh->maps[LL_DP_NAT_EP_MAP].map_fd, NULL, &out,
+                             keys, epas, &count, NULL);
+  if (err != 0 && errno != ENOENT) {
+    return -1;
+  }
+  return count == LLB_NAT_EP_MAP_ENTRIES ? 0 : -1;
+}
+
+/* Safety net for conc_conns and, on rules that select by least connections,
+ * for the per-endpoint session counts. They are kept by increments and
+ * decrements on both sides of the datapath, and a removal path that forgets
+ * its decrement, or a user-space update that overwrites a concurrent datapath
+ * one, would leave them wrong for good. After every ageing run, count the
+ * forward NAT entries per rule and per endpoint and correct each rule whose
+ * counters did not move while the entries were being counted: for such a
+ * rule the count is exact. A rule with traffic during the pass is left for a
+ * later run. Every correction is logged and counted, because it means a
+ * path was missed or an update was lost.
+ *
+ * The datapath takes a session at selection, before the connection's entries
+ * exist, and counts the connection in total_conns once they do. A session
+ * with no entry behind it is therefore either a connection that was never
+ * created, which is a leak to correct, or one whose total_conns update falls
+ * inside the pass, which makes the rule not quiet. */
+static void
+ll_nat_conc_reconcile(void)
+{
+  static uint32_t cnt[LLB_NAT_EP_MAP_ENTRIES];
+  static uint16_t scnt[LLB_NAT_EP_MAP_ENTRIES][LLB_MAX_NXFRMS];
+  struct dp_nat_epacts *s0 = NULL;
+  struct dp_nat_epacts *s1 = NULL;
+  struct dp_ct_key *keys = NULL;
+  struct dp_ct_tact *vals = NULL;
+  struct dp_nat_epacts epa;
+  uint32_t in = 0;
+  uint32_t out = 0;
+  uint32_t count;
+  uint32_t i;
+  uint32_t a;
+  int fd = xh->maps[LL_DP_CT_MAP].map_fd;
+  int first = 1;
+  int fix_conc;
+  int fix_sess;
+  int err;
+
+  s0 = calloc(LLB_NAT_EP_MAP_ENTRIES, sizeof(*s0));
+  s1 = calloc(LLB_NAT_EP_MAP_ENTRIES, sizeof(*s1));
+  keys = calloc(LL_CT_RECONCILE_BATCH, sizeof(*keys));
+  vals = calloc(LL_CT_RECONCILE_BATCH, sizeof(*vals));
+  if (!s0 || !s1 || !keys || !vals) {
+    goto out;
+  }
+
+  if (ll_nat_conc_snapshot(s0) != 0) {
+    goto out;
+  }
+
+  memset(cnt, 0, sizeof(cnt));
+  memset(scnt, 0, sizeof(scnt));
+  while (1) {
+    count = LL_CT_RECONCILE_BATCH;
+    err = bpf_map_lookup_batch(fd, first ? NULL : &in, &out, keys, vals, &count, NULL);
+    if (err != 0 && errno != ENOENT) {
+      /* No batch support, or a walk that cannot be trusted: correct nothing. */
+      static int warned;
+
+      if (!warned) {
+        warned = 1;
+        log_warn("nat: live connection counts are not verified: conntrack walk failed (%s)",
+                 strerror(errno));
+      }
+      goto out;
+    }
+    for (i = 0; i < count; i++) {
+      if (ll_ct_ent_is_counted(&vals[i]) && vals[i].ctd.rid < LLB_NAT_EP_MAP_ENTRIES) {
+        cnt[vals[i].ctd.rid]++;
+        a = vals[i].ctd.aid;
+        if (a < LLB_MAX_NXFRMS && scnt[vals[i].ctd.rid][a] < UINT16_MAX) {
+          scnt[vals[i].ctd.rid][a]++;
+        }
+      }
+    }
+    if (err != 0) {
+      break;
+    }
+    in = out;
+    first = 0;
+  }
+
+  if (ll_nat_conc_snapshot(s1) != 0) {
+    goto out;
+  }
+
+  for (i = 0; i < LLB_NAT_EP_MAP_ENTRIES; i++) {
+    if (s0[i].conc_conns != s1[i].conc_conns ||
+        s0[i].total_conns != s1[i].total_conns ||
+        memcmp(s0[i].active_sess, s1[i].active_sess, sizeof(s1[i].active_sess)) != 0) {
+      continue;
+    }
+    fix_conc = s1[i].conc_conns != cnt[i];
+    /* Session counts exist only on a rule the datapath has selected on by
+     * least connections; it marks the rule when it first does. */
+    fix_sess = s1[i].ca.act_type == DP_SET_NACT_SESS &&
+               memcmp(s1[i].active_sess, scnt[i], sizeof(scnt[i])) != 0;
+    if (!fix_conc && !fix_sess) {
+      continue;
+    }
+    if (llb_nat_epa_get(i, &epa) != 0 ||
+        epa.conc_conns != s1[i].conc_conns ||
+        epa.total_conns != s1[i].total_conns ||
+        memcmp(epa.active_sess, s1[i].active_sess, sizeof(epa.active_sess)) != 0) {
+      continue;
+    }
+    epa.conc_conns = cnt[i];
+    if (fix_sess) {
+      memcpy(epa.active_sess, scnt[i], sizeof(epa.active_sess));
+    }
+    if (llb_nat_epa_put(i, &epa) != 0) {
+      continue;
+    }
+    xh->nat_conc_fixups++;
+    if (fix_conc) {
+      log_warn("nat rule %u: live connection count corrected %u -> %u (correction %llu)",
+               i, s1[i].conc_conns, cnt[i],
+               (unsigned long long)xh->nat_conc_fixups);
+    }
+    for (a = 0; fix_sess && a < LLB_MAX_NXFRMS; a++) {
+      if (s1[i].active_sess[a] != scnt[i][a]) {
+        log_warn("nat rule %u endpoint %u: session count corrected %u -> %u (correction %llu)",
+                 i, a, s1[i].active_sess[a], scnt[i][a],
+                 (unsigned long long)xh->nat_conc_fixups);
+      }
+    }
+  }
+
+out:
+  free(s0);
+  free(s1);
+  free(keys);
+  free(vals);
+}
+
+unsigned long long
+llb_nat_conc_fixups(void)
+{
+  return xh ? xh->nat_conc_fixups : 0;
 }
 
 static void
@@ -4151,6 +4424,7 @@ ll_age_ctmap(void)
     llb_map_loop_and_delete(LL_DP_CT_MAP, ll_ct_map_ent_has_aged, &it);
     xh->lctts = ns;
   }
+  ll_nat_conc_reconcile();
   XH_UNLOCK();
   if (adat) free(adat);
   if (as) free(as);
@@ -4243,6 +4517,7 @@ ll_ct_map_ent_rm_related(int tid, void *k, void *ita)
         llb_del_map_elem_with_cidx(LL_DP_FCV4_MAP, adat->ca.cidx);
       }
       llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
+      ll_ct_ent_uncount(adat);
 
       return 1;
     }
@@ -4308,6 +4583,7 @@ ll_ct_map_ent_rm_vtuple(int tid, void *k, void *ita)
     llb_del_map_elem_with_cidx(LL_DP_FCV4_MAP, adat->ca.cidx);
   }
   llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
+  ll_ct_ent_uncount(adat);
   as->n_aged++;
 
   return 1;
@@ -4328,6 +4604,7 @@ ll_ct_map_ent_rm_any(int tid, void *k, void *ita)
     llb_del_map_elem_with_cidx(LL_DP_FCV4_MAP, adat->ca.cidx);
   }
   llb_clear_map_stats(LL_DP_CT_STATS_MAP, adat->ca.cidx);
+  ll_ct_ent_uncount(adat);
   return 1;
 }
 
