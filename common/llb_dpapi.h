@@ -1484,6 +1484,7 @@ typedef int (*dp_map_walker_t)(int tid, void *key, void *arg);
 int llb_map2fd(int t);
 int llb_fetch_map_stats_cached(int tbl, uint32_t index, int raw, void *bc, void *pc);
 void llb_age_map_entries(int tbl);
+unsigned long long llb_nat_conc_fixups(void);
 void llb_trigger_get_proxy_entries(void);
 void llb_collect_map_stats(int tbl);
 int llb_fetch_pol_map_stats(int tid, uint32_t e, void *ppass, void *pdrop);
