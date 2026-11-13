@@ -1483,6 +1483,8 @@ proxy_free_fd_ctx(proxy_fd_ent_t *pfe)
      * instead of free()ing it to the heap. */
     sp_mcp_capture_free(pfe->mcp_capture);
     pfe->mcp_capture = NULL;
+    sp_resp_head_free(&pfe->resp_head);
+    pfe->resp_head.over_logged = 0;
     pfe_recycle(pfe);
   }
 }

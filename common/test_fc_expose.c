@@ -21,8 +21,12 @@
  * reads, and the HTTP/1 head splice: a final head whole in the buffer gets
  * the three lines before its blank line and everything after it moves
  * unread (a body, chunks, an event stream), a backend's lines of the same
- * names give way, and an interim head, a split head, a buffer that is not a
- * head and a head with no room are left as they are.
+ * names give way, and an interim head, a buffer that is not a head and a
+ * head with no room are left as they are. So is a head that is not whole in
+ * the buffer, when the helper is handed one: on the socket path it no longer
+ * is. A head that arrives split is put together first (sp_resp_head_relay,
+ * sockproxy_resp_head.h, up to 16 KiB) and reaches this helper whole, so a
+ * split head does get the three lines; test_resp_head_assemble.c holds that.
  *
  * Build: make test_fc_expose (also run by `make test_fc`).
  */
@@ -242,6 +246,8 @@ test_left_as_is(void)
   assert(res == FC_EXPOSE_H1_INTERIM && n == strlen(interim));
   assert(!memcmp(buf, interim, n));
 
+  /* The helper alone: a part of a head is not edited. The relay assembles a
+   * split head before it calls the helper (test_resp_head_assemble.c). */
   n = splice(buf, split, CAP, &V, &res);
   assert(res == FC_EXPOSE_H1_SKIPPED && n == strlen(split));
   assert(!memcmp(buf, split, n));

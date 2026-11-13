@@ -375,6 +375,8 @@ enum fc_anomaly {
   FC_A_UNKNOWN_PERMIT,           /* an executing permit with no service */
   FC_A_TENANT_TABLE_FULL,        /* a tenant past the table was put in the shared slot */
   FC_A_H2_DENY_HEADERS,          /* an HTTP/2 refusal had more headers than its frame holds: not sent */
+  FC_A_EXPOSE_HEAD_OVERFLOW,     /* an HTTP/1.1 response head came split and longer than the
+                                  * assembly bound: sent as it came, without the admission headers */
   FC_A_COUNT,
 };
 

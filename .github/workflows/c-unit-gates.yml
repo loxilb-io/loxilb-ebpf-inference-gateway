@@ -131,6 +131,9 @@ jobs:
       - name: The objective header's capture, the class headers of an admitted response, and a backend's X-Api-Key in its response head (real framers, ASan + UBSan)
         run: make -C common test_objhint
 
+      - name: An admitted HTTP/1.1 response head sent in more than one read is put together and carries the admission and class headers (every cut reads like one read; 1xx, keep-alive, the 16 KiB bound; ASan + UBSan)
+        run: make -C common test_resphead
+
       - name: The llm-d request headers (TTL parse and capture, dropped-reason mapping, the forwarded objective and fairness rewrite) and the X-Vllm-Priority strip of the request head (ASan + UBSan)
         run: make -C common test_llmd
 

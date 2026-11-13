@@ -445,7 +445,7 @@ int proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max);
 /*
  * proxy_get_fc_anomaly - the process-wide anomaly counter for `kind`
  * (enum fc_anomaly: 0 underflow, 1 unknown_permit, 2 tenant_table_full,
- * 3 h2_deny_headers); 0 for any other kind.
+ * 3 h2_deny_headers, 4 expose_head_overflow); 0 for any other kind.
  */
 uint64_t proxy_get_fc_anomaly(int kind);
 

@@ -366,6 +366,7 @@ static void cresp_note_local_answer(proxy_fd_ent_t *client);
 static int proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
                                         const char *op, int sys_errno);
 static void proxy_backend_leg_ended_unanswered(proxy_fd_ent_t *pfe);
+static void proxy_resp_head_backend_end(proxy_fd_ent_t *pfe);
 
 static ssize_t
 proxy_send_local_once(void *arg, const uint8_t *buf, size_t len,
@@ -1758,6 +1759,58 @@ proxy_note_local_answer(proxy_fd_ent_t *pfe, uint16_t status)
   return proxy_note_response_(pfe, status, 0);
 }
 
+/* A response head that was kept until it was whole leaves through the
+ * client's transmit cache: whatever is already queued goes first, and the
+ * rest of the read that completed it follows by the relay's FIFO rule.
+ * Call with the client entry's lock held. */
+static int
+proxy_resp_head_emit(void *ctx, const uint8_t *buf, size_t len)
+{
+  proxy_fd_ent_t *client = ctx;
+
+  if (len == 0)
+    return 0;
+  return proxy_add_xmitcache(client, (uint8_t *)buf, len);
+}
+
+/* The relay's strip of a backend's X-Loxilb-Refusal-* (sp_resp_strip_refusal_mark)
+ * on a head that came in pieces and is now whole: the same lines, on a
+ * buffer that holds exactly that head. */
+static size_t
+proxy_resp_head_strip(uint8_t *buf, size_t len)
+{
+  size_t cur = len;
+
+  if (!l7h1_strip_header_prefix(buf, &cur, SP_REFUSAL_HDR_PREFIX))
+    return len;
+  return cur;
+}
+
+/* The backend leg ended while the start of a response head was still kept
+ * for its client: the client gets those bytes, as it did before heads were
+ * put together, and the close that follows waits for them like any cached
+ * bytes. Called on the backend's worker, the one the relay runs on, with
+ * nothing held. */
+static void
+proxy_resp_head_backend_end(proxy_fd_ent_t *pfe)
+{
+  proxy_fd_ent_t *client;
+
+  if (pfe->odir != 1 || pfe->pd_sg_drain || pfe->n_rfd <= 0)
+    return;
+  client = pfe->rfd_ent[0];
+  if (!client || client->odir != 0 || client->fd <= 0)
+    return;
+  PROXY_ENT_LOCK(client);
+  if (client->resp_head.len > 0) {
+    (void)proxy_add_xmitcache(client, client->resp_head.buf, client->resp_head.len);
+    sp_resp_head_free(&client->resp_head);
+    client->fc_expose_pending = 0;
+    client->class_expose_pending = 0;
+  }
+  PROXY_ENT_UNLOCK(client);
+}
+
 int
 proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
 {
@@ -2778,36 +2831,74 @@ skip_deferred_masking:
       len = sp_resp_strip_api_key(rfd_ent, (uint8_t *)msg, len);
     }
 
-    /* The admission headers on the admitted response's head. Not on the
-     * seam above: a chunked or event-stream response is marked chunked by
-     * this very read, and its head is still whole text here; only the head
-     * is touched and the chunks after it are moved as they are. A prefill
-     * leg's answer and a drain leg never reach the client. A head split
-     * across reads is left as it is: the values would be a read late. */
-    if (ent->odir == 1 && rfd_ent->odir == 0 && rfd_ent->fc_expose_pending &&
+    /* The admission headers and the class headers on the admitted
+     * response's head. Not on the seam above: a chunked or event-stream
+     * response is marked chunked by this very read, and its head is still
+     * whole text here; only the head is touched and the chunks after it are
+     * moved as they are. A prefill leg's answer and a drain leg never reach
+     * the client.
+     *
+     * A head the backend sent in more than one read is kept until it is
+     * whole (sockproxy_resp_head.h), at most SP_RESP_HEAD_ASSEMBLE_MAX
+     * bytes of it: the two helpers see one head, and the values are those
+     * of the read that completed it. The kept head leaves through the
+     * transmit cache, and whatever followed it in this read goes behind it
+     * by the FIFO rule below: nothing is sent directly past a cache that
+     * holds bytes. Everything above this point has seen each read once, as
+     * it came; only what is sent to the client waits. */
+    if (ent->odir == 1 && rfd_ent->odir == 0 &&
+        (rfd_ent->fc_expose_pending || rfd_ent->class_expose_pending ||
+         rfd_ent->resp_head.len > 0) &&
         !ent->pd_sg_drain && rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
-      int xr = FC_EXPOSE_H1_SKIPPED;
+      sp_resp_expose_t xp = {
+        .fc_pending = &rfd_ent->fc_expose_pending,
+        .class_pending = &rfd_ent->class_expose_pending,
+        .fc_x = fc_x,
+        .fc_v = &fc_xv,
+        .objective = rfd_ent->adm_objective,
+        .priority_class = rfd_ent->adm_class,
+        .requested = rfd_ent->adm_objective_denied ? rfd_ent->adm_objective_req : NULL,
+        .strip = proxy_resp_head_strip,
+      };
+      int skipped = 0;
 
-      if (fc_x)
-        len = fc_expose_h1((uint8_t *)msg, len, SP_SOCK_MSG_LEN, &fc_xv, &xr);
-      if (xr != FC_EXPOSE_H1_INTERIM)
-        rfd_ent->fc_expose_pending = 0;
-      if (fc_x && xr == FC_EXPOSE_H1_SKIPPED)
+      if (rfd_ent->resp_head.len == 0 && !rfd_ent->class_expose_pending && !fc_x) {
+        /* Nothing would be written (no executing permit on a pool that
+         * exposes): the flag goes, the read is not looked at. */
+        len = sp_resp_expose_apply(&xp, (uint8_t *)msg, len, SP_SOCK_MSG_LEN, &skipped);
+      } else {
+        size_t rh_off = 0;
+        enum sp_resp_head_res rh =
+            sp_resp_head_relay(&rfd_ent->resp_head, &xp, (uint8_t *)msg, &len,
+                               SP_SOCK_MSG_LEN, &rh_off, proxy_resp_head_emit,
+                               rfd_ent, &skipped);
+
+        if (rh == SP_RESP_HEAD_ERR) {
+          log_error("[CACHE_FULL] fd=%d: Cannot add the assembled response head, "
+                    "closing connection", rfd_ent->fd);
+          PROXY_ENT_UNLOCK(rfd_ent);
+          return -1;
+        }
+        if (rh == SP_RESP_HEAD_OVER) {
+          if (sp_resp_head_over(&rfd_ent->resp_head)) {
+            log_info("[AIGateway] fd=%d admission headers not added: the response "
+                     "head came in more than one read and is longer than %d bytes; "
+                     "sent as the backend sent it (logged once per connection)",
+                     rfd_ent->fd, SP_RESP_HEAD_ASSEMBLE_MAX);
+          }
+        }
+        msg = (uint8_t *)msg + rh_off;
+        if (len == 0) {
+          /* All of this read is kept, or left with the kept head. */
+          if (rfd_ent->cache_head != NULL)
+            proxy_xmit_cache(rfd_ent);
+          PROXY_ENT_UNLOCK(rfd_ent);
+          return 0;
+        }
+      }
+      if (skipped)
         log_debug("[AIGateway] fd=%d admission headers not added: the response "
-                  "head is not whole in this read, or has no room", rfd_ent->fd);
-    }
-    /* The class headers, after the block above: it removes every line of
-     * the admission family the backend sent before it adds its own. */
-    if (ent->odir == 1 && rfd_ent->odir == 0 && rfd_ent->class_expose_pending &&
-        !ent->pd_sg_drain && rfd_ent->pd_phase != PD_PHASE_PREFILL_WAITING) {
-      int xr = SP_CLASS_H1_SKIPPED;
-
-      len = sp_class_expose_h1((uint8_t *)msg, len, SP_SOCK_MSG_LEN,
-                               rfd_ent->adm_objective, rfd_ent->adm_class,
-                               rfd_ent->adm_objective_denied ? rfd_ent->adm_objective_req : NULL,
-                               &xr);
-      if (xr != SP_CLASS_H1_INTERIM)
-        rfd_ent->class_expose_pending = 0;
+                  "head has no room", rfd_ent->fd);
     }
 
     rfd_ent->chunk_seq++;  // Increment sequence for each transmission attempt
@@ -6668,6 +6759,13 @@ proxy_pdestroy(void *priv)
              pfe->fd, pfe->session_key, pfe->sticky_server_id, pfe->session_created);
   }
 
+  /* An HTTP/1.1 leg ending with the start of a response head still kept
+   * for its client (an end that did not come by the read path): the bytes
+   * go to the client as they came, and nothing of this leg's answer is
+   * left to meet the next leg's. Before PROXY_LOCK, with nothing held,
+   * like the three calls that follow. */
+  proxy_resp_head_backend_end(pfe);
+
   /* A fatal HUP can bypass the read/EOF path. Refuse only this unfinished
    * bridge stream before entering PROXY_LOCK: framing and stream settling
    * may re-enter control-plane locks through the client callbacks. An
@@ -8334,6 +8432,10 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
           sp_hold_leg_ended(pfe->rfd_ent[0], pfe);
         }
 
+        /* The start of a response head still kept for the client goes into
+         * its cache first, so the check below sees it. */
+        proxy_resp_head_backend_end(pfe);
+
         // Check if peer connection still has data to send
         if (pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
           proxy_fd_ent_t *peer_pfe = pfe->rfd_ent[0];
@@ -8588,6 +8690,9 @@ proxy_sock_read_err(proxy_fd_ent_t *pfe, int rval)
           }
         }
 #endif
+
+        /* As on the plaintext path: a kept start of a response head first. */
+        proxy_resp_head_backend_end(pfe);
 
         // CRITICAL FIX: Implement graceful shutdown for SSL path too
         if (pfe->n_rfd > 0 && pfe->rfd_ent[0]) {
