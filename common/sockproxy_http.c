@@ -97,6 +97,7 @@
 #include "sockproxy_stream_fallback.h"
 #include "sockproxy_admit_response.h"
 #include "sockproxy_refusal_mark.h"
+#include "sockproxy_conv_hdr.h"
 #include "sockproxy_mcp_capture.h"
 
 #ifdef HAVE_MTLS
@@ -214,9 +215,15 @@ proxy_owes_completion(const proxy_fd_ent_t *pfe)
  * had its counts read after the record naming them was already written, and
  * the trail then held a completion claiming nothing was spent beside a settle
  * charging the real amount. HTTP/2 settles in one place for the same reason
- * (proxy_h2_settle_stream). */
+ * (proxy_h2_settle_stream).
+ *
+ * `rid` is the record's key when the caller knows it better than the
+ * connection's fields do (an answer to a request already forwarded, whose
+ * live field may by now hold the next request's ID); NULL for the key every
+ * other record of the request uses, proxy_request_id(). */
 static void
-proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end)
+proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end,
+                            const char *rid)
 {
   char svc_ident[64];
   int64_t lat_ms = 0;
@@ -233,7 +240,8 @@ proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end)
                         (char *)proxy_effective_model(pfe),
                         (int)pfe->metric_response_status, lat_ms,
                         pfe->usage_prompt_toks, pfe->usage_complet_toks,
-                        0, 0, (char *)sp_end_code(end), (char *)proxy_request_id(pfe),
+                        0, 0, (char *)sp_end_code(end),
+                        (char *)(rid ? rid : proxy_request_id(pfe)),
                         (char *)pfe->auth_user_id, (char *)pfe->auth_key_id,
                         svc_ident, is_stream, notify_worker_id(),
                         (char *)pfe->l7_peer_ip,
@@ -255,7 +263,7 @@ proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end)
 static void
 proxy_ai_record_completion(proxy_fd_ent_t *pfe)
 {
-  proxy_ai_record_completion_(pfe, 0, SP_END_NONE);
+  proxy_ai_record_completion_(pfe, 0, SP_END_NONE, NULL);
 }
 
 /* An answer the client was receiving, ended by a reaper that frees the
@@ -267,7 +275,7 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
 void
 proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end)
 {
-  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0, end);
+  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0, end, NULL);
 }
 
 /* One P/D lifecycle record, for one request and one completion event: the
@@ -603,6 +611,23 @@ proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status)
   }
 }
 
+/* proxy_record_local_completion for an answer to a request that was already
+ * forwarded: the same records, the completion keyed by `rid`, the ID that
+ * request was forwarded under (NULL: the connection's key). */
+static void
+proxy_record_forwarded_completion(proxy_fd_ent_t *pfe, uint16_t status,
+                                  const char *rid)
+{
+  int owed = pfe->odir == 0 && pfe->ai_gw_mode &&
+             !pfe->metric_ai_recorded && pfe->metric_response_status == 0;
+
+  proxy_note_local_answer(pfe, status);
+  if (owed) {
+    pfe->metric_response_status = status;
+    proxy_ai_record_completion_(pfe, 0, SP_END_NONE, rid);
+  }
+}
+
 /* The callers of sp_send_local_refusal and sp_send_local_outage build their
  * answers in buffers of at most 512 bytes; this is the room one is given
  * with its mark. */
@@ -652,15 +677,16 @@ sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
   return proxy_send_local_response(pfe, buf, len);
 }
 
-/* The answer to a request no backend took. It carries its length, so the
- * client knows it is whole without waiting for the close that follows, and
- * the request's own ID when the request still has one (an outage: no
- * stage; sockproxy_refusal_mark.h). */
-int
-proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
+/* The text of the answer to a request no backend took: a 502 that carries
+ * its length, so the client knows it is whole without waiting for the close
+ * that follows, and `rid` as X-Request-Id when it can be echoed (an outage:
+ * no stage; sockproxy_refusal_mark.h). Returns its length, -1 when it does
+ * not fit. */
+static int
+proxy_backend_unreachable_text(char *resp, size_t cap, const char *detail,
+                               const char *rid)
 {
   char body[192];
-  char resp[384 + SP_REFUSAL_MARK_MAX];
   char mark[SP_REFUSAL_MARK_MAX + 1];
   int blen, n;
 
@@ -670,9 +696,8 @@ proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
   if (blen < 0 || blen >= (int)sizeof(body)) {
     return -1;
   }
-  (void)sp_refusal_mark_h1(mark, sizeof(mark), NULL,
-                           SP_REFUSAL_LIVE_RID(pfe));   /* always fits `mark` */
-  n = snprintf(resp, sizeof(resp),
+  (void)sp_refusal_mark_h1(mark, sizeof(mark), NULL, rid);   /* always fits `mark` */
+  n = snprintf(resp, cap,
                "HTTP/1.1 502 Bad Gateway\r\n"
                "Content-Type: application/json\r\n"
                "Content-Length: %d\r\n"
@@ -680,13 +705,148 @@ proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
                "Connection: close\r\n"
                "\r\n"
                "%s", blen, mark, body);
-  if (n < 0 || n >= (int)sizeof(resp)) {
+  if (n < 0 || (size_t)n >= cap) {
+    return -1;
+  }
+  return n;
+}
+
+/* The answer to a request no backend took, written while the request is
+ * still being placed: it names the request by the connection's live ID. */
+int
+proxy_send_backend_unreachable(proxy_fd_ent_t *pfe, const char *detail)
+{
+  char resp[384 + SP_REFUSAL_MARK_MAX];
+  int n = proxy_backend_unreachable_text(resp, sizeof(resp), detail,
+                                         SP_REFUSAL_LIVE_RID(pfe));
+
+  if (n < 0) {
     return -1;
   }
   /* This response bypasses the backend parser, which normally captures the
    * status that completion/teardown audit relies on. Record the terminal
    * failure even if the client cannot receive the whole local response. */
   proxy_record_local_completion(pfe, 502);
+  return proxy_send_local_response(pfe, resp, (size_t)n);
+}
+
+/* ---- whose ID the answer to a backend leg that went away carries ----
+ *
+ * rid_fwd says what the snapshot (resp_request_id) is worth to that answer.
+ * The rule: the answer carries the ID of the request it answers, and when
+ * the gateway cannot be sure which request that is, no ID at all. Never
+ * another request's. Every doubt below is resolved towards no ID: "an
+ * answer is owed" is read from the response counters, which also stay
+ * behind for good after a response the framer did not count, and such a
+ * connection cannot be told from a pipelining one. */
+#define RID_FWD_TAKEN     0x01  /* the request that began last has been handed
+                                 * to a backend: the snapshot is its ID */
+#define RID_FWD_UNSURE    0x02  /* a request was handed over while an earlier
+                                 * answer was owed (a pipelining client), or
+                                 * began under an owed answer after a request
+                                 * that was never handed over: an answer
+                                 * written now may be more than one request's.
+                                 * Set again by every hand-over under an owed
+                                 * answer; gone when a request begins with
+                                 * nothing owed */
+#define RID_FWD_PREV_SEEN 0x04  /* an earlier answer was owed by the counters
+                                 * when the request that began last began, yet
+                                 * a response status had been seen since the
+                                 * request before it was complete: the
+                                 * counters do not say whose answer is owed */
+
+/* The request's ID is taken across as the request is handed to a backend:
+ * before its first byte is written to a leg (a leg that fails during that
+ * write, or right after it, is answered for this request), and again at the
+ * keep-alive reset, which clears the live field. With an earlier answer
+ * still owed the client is pipelining: the next answer written may belong to
+ * either request, and the snapshot is marked as not to be echoed until a
+ * request begins with nothing owed. */
+static void
+proxy_request_id_forward_snapshot(proxy_fd_ent_t *pfe)
+{
+  proxy_request_id_snapshot(pfe);
+  pfe->rid_fwd = (uint8_t)(RID_FWD_TAKEN |
+                           (pfe->rid_prev_owed ? RID_FWD_UNSURE : 0));
+}
+
+/* A request begins (handle_on_message_begin, after the completion and the
+ * release of the request before it, the snapshot's last readers, and before
+ * its response status is cleared). With no answer to an earlier request owed
+ * when it began (creq_on_message_begin) the snapshot is forgotten: a request
+ * refused before it has an ID of its own must not be recorded under the
+ * earlier one's. A pipelining client's next request begins under an answer
+ * still owed; that request keeps its key. */
+static void
+proxy_request_id_request_begin(proxy_fd_ent_t *pfe)
+{
+  uint8_t handed;
+
+  if (!pfe->rid_prev_owed) {
+    proxy_request_id_response_done(pfe);
+    pfe->rid_fwd = 0;
+    return;
+  }
+  /* Under an owed answer. The request before this one was not handed to a
+   * backend (answered here on the kept connection, or its begin ran in this
+   * same read): the snapshot is an older request's and the owed answer may
+   * be that one's or not. A status seen since the request before was
+   * complete: an answer began, so the counters are behind or the client
+   * sent early. Either way the snapshot is not echoed. */
+  handed = pfe->rid_fwd & RID_FWD_TAKEN;
+  pfe->rid_fwd &= (uint8_t)~(RID_FWD_TAKEN | RID_FWD_PREV_SEEN);
+  if (!handed)
+    pfe->rid_fwd |= RID_FWD_UNSURE;
+  if (pfe->metric_response_status != 0)
+    pfe->rid_fwd |= RID_FWD_PREV_SEEN;
+}
+
+/* The ID the answer to a backend leg that went away carries; "" for none.
+ *
+ * - The request that began last was handed to a backend: its snapshot,
+ *   unless it was taken under an earlier answer still owed.
+ * - It was not handed over yet, and nothing earlier was owed when it began
+ *   (a kept leg that closes while the request is still being read): the
+ *   answer is this request's, and its ID is the live field.
+ * - It was not handed over yet, and an earlier answer was owed when it began
+ *   (the client sent the start of its next request under a request the
+ *   backend then dropped): the answer is the earlier request's, by its
+ *   snapshot, never by the live field, which is the next request's. Not when
+ *   the snapshot is marked, not when a response status was seen in between,
+ *   and not on a connection whose answers go by the kernel, where no status
+ *   is ever seen: then the answer may be this request's. */
+static const char *
+proxy_answer_forwarded_request_id(const proxy_fd_ent_t *pfe)
+{
+  if (pfe->rid_fwd & RID_FWD_TAKEN)
+    return (pfe->rid_fwd & RID_FWD_UNSURE) ? "" : proxy_forwarded_request_id(pfe);
+  if (!pfe->rid_prev_owed)
+    return pfe->vllm_request_id;
+  if ((pfe->rid_fwd & (RID_FWD_UNSURE | RID_FWD_PREV_SEEN)) || pfe->resp_kernel)
+    return "";
+  return proxy_forwarded_request_id(pfe);
+}
+
+/* The same answer for a request that was handed to a backend leg which
+ * went away before it answered, or whose kept leg went away while it was
+ * being read. The live field does not name a forwarded request: it is
+ * cleared once the request is forwarded, and a client that has already sent
+ * the head of its next request has put that request's ID there. The answer
+ * and its completion name the request they belong to
+ * (proxy_answer_forwarded_request_id); when that cannot be told, or the
+ * request has no ID, the answer carries none and the completion keeps the
+ * connection's key. */
+static int
+proxy_send_backend_unreachable_forwarded(proxy_fd_ent_t *pfe, const char *detail)
+{
+  char resp[384 + SP_REFUSAL_MARK_MAX];
+  const char *rid = proxy_answer_forwarded_request_id(pfe);
+  int n = proxy_backend_unreachable_text(resp, sizeof(resp), detail, rid);
+
+  if (n < 0) {
+    return -1;
+  }
+  proxy_record_forwarded_completion(pfe, 502, rid[0] != '\0' ? rid : NULL);
   return proxy_send_local_response(pfe, resp, (size_t)n);
 }
 
@@ -8231,7 +8391,7 @@ proxy_backend_leg_unanswered(proxy_fd_ent_t *pfe, int ssl_error,
   }
   PROXY_ENT_LOCK(client);
   if (!sp_answer_started(client)) {
-    if (proxy_send_backend_unreachable(client,
+    if (proxy_send_backend_unreachable_forwarded(client,
             "the backend endpoint closed the connection before it answered") == 0) {
       cresp_note_local_answer(client);
       answered = PROXY_LEG_ANSWERED_H1;
@@ -8283,7 +8443,7 @@ proxy_backend_leg_ended_unanswered(proxy_fd_ent_t *pfe)
     proxy_backend_leg_name(pfe, client, ep, sizeof(ep));
     log_error("backend %s closed the connection before any response: 502 to client fd=%d",
               ep, client->fd);
-    if (proxy_send_backend_unreachable(client,
+    if (proxy_send_backend_unreachable_forwarded(client,
             "the backend endpoint closed the connection before it answered") == 0) {
       cresp_note_local_answer(client);
     }
@@ -9616,6 +9776,11 @@ handle_on_message_begin(llhttp_t* parser)
                                   LLB_AI_UMISS_RESPONSE_COMPLETE);
       pfe->metric_ai_recorded = 0;   /* reported once */
     }
+    /* The release and the completion above were the last readers of request
+     * N's key: forgotten here unless an answer to an earlier request was
+     * owed when this request began. Before the status below is cleared: it
+     * is read. */
+    proxy_request_id_request_begin(pfe);
     pfe->metric_response_status = 0;
     pfe->metric_ai_recorded = 0;
     pfe->metric_req_start_ns = get_timestamp_ns();
@@ -9683,11 +9848,11 @@ handle_on_message_begin(llhttp_t* parser)
  * ID. A text that cannot take the mark goes out as it is. The record is the
  * caller's, as for sp_raw_status_write (check_local_answers.sh rule 1b).
  *
- * Both callers refuse a request that was not forwarded, one of them a
- * request that could not be parsed: on a keep-alive connection the audit
- * key's snapshot is then still the PREVIOUS request's, which is why the
- * echo is the live field. A request with no ID of its own yet is answered
- * with the stage alone. */
+ * Every caller answers a request that was not forwarded, one of them a
+ * request that could not be parsed: the echo is the live field, the ID of
+ * the request in hand. A request with no ID of its own yet is answered with
+ * the stage alone. The connect event's 502 passes AI_GW_STAGE_NONE: an
+ * outage names no stage and gets the ID alone. */
 static ssize_t
 sp_raw_refusal_write(proxy_fd_ent_t *pfe, const void *buf, size_t len,
                      int flags, int stage)
@@ -11699,7 +11864,17 @@ static int
 creq_on_message_begin(llhttp_t *parser)
 {
   if (parser->data) {
-    creq_block_msg_begin(&((proxy_fd_ent_t *)parser->data)->creq_blk);
+    proxy_fd_ent_t *pfe = parser->data;
+
+    /* Whether an earlier request is still unanswered, read here because this
+     * is the last point at which the counters do not include the request
+     * that begins: its message complete, later in this same read when it
+     * arrives whole, counts it. handle_on_message_begin keeps the earlier
+     * request's ID for its answer when this says one is owed. */
+    pfe->rid_prev_owed =
+        atomic_load_explicit(&pfe->cresp_forwarded, memory_order_relaxed) !=
+        atomic_load_explicit(&pfe->cresp_completed, memory_order_relaxed);
+    creq_block_msg_begin(&pfe->creq_blk);
     hc_req_begin(parser->data);
   }
   return 0;
@@ -12293,13 +12468,11 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
 
   // P0.3: Check for conversation/session ID headers (multiple formats supported)
   // X-Conversation-ID: Standard conversation tracking
-  // X-Request-Id: Common in OpenAI API and many LLM frameworks
   // X-Session-ID: Alternative session tracking
   // X-Trace-ID: Distributed tracing ID (can be used for affinity)
-  if (!strncasecmp("X-Conversation-ID", pfe->last_header_name, 17) ||
-      !strncasecmp("X-Request-Id", pfe->last_header_name, 12) ||
-      !strncasecmp("X-Session-ID", pfe->last_header_name, 12) ||
-      !strncasecmp("X-Trace-ID", pfe->last_header_name, 10)) {
+  // X-Request-Id is NOT one: it names a single request and is the
+  // correlation key below, never an affinity key (sockproxy_conv_hdr.h).
+  if (sp_h1_conv_id_header(pfe->last_header_name)) {
     if (length < sizeof(pfe->conversation_id)) {
       strncpy(pfe->conversation_id, at, length);
       pfe->conversation_id[length] = '\0';
@@ -12311,7 +12484,9 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
     }
   }
 
-  /* Also store X-Request-Id in vllm_request_id for P/D propagation */
+  /* X-Request-Id is the request's correlation key: stored in vllm_request_id
+   * for the audit trail, the echo on a gateway-written answer and P/D
+   * propagation. */
   if (!strncasecmp("X-Request-Id", pfe->last_header_name, 12)) {
     size_t copy_len = length < sizeof(pfe->vllm_request_id) - 1
                     ? length : sizeof(pfe->vllm_request_id) - 1;
@@ -13404,12 +13579,23 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
     } else if (pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_ops &&
         (pfe->pd_phase == PD_PHASE_PREFILL_SENDING ||
          (pfe->pd_sg_active && pfe->pd_phase == PD_PHASE_NONE))) {
+      /* As in the plain branch below: the ID is taken across before a byte
+       * is written. The SGLang dispatch writes to its prefill leg while the
+       * phase is still NONE, so a leg failing in that write is answered by
+       * proxy_backend_leg_unanswered like a plain one. */
+      proxy_request_id_forward_snapshot(pfe);
       ((proxy_epval_t *)pfe->epv)->pd_ops->dispatch(pfe);
     } else {
       /* R2 [FRAME_MISMATCH] instrument (log-only): generic multiplexor forward
        * site — declared (parser-owned) CL vs actual relayed body. */
       pd_frame_mismatch_log(pfe, pfe->rcvbuf, pfe->rcv_off,
                             pfe->http_content_length, "multiplexor");
+      /* The request's ID is taken across BEFORE its first byte is written
+       * to a backend: a leg that fails during that write, or right after it,
+       * is answered for this request by the ID it is forwarded under
+       * (proxy_send_backend_unreachable_forwarded), and the reset below has
+       * not run yet. The reset takes the same snapshot again. */
+      proxy_request_id_forward_snapshot(pfe);
       if (proxy_multiplexor(pfe, pfe->rcvbuf, pfe->rcv_off)) {
         return SP_FWD_RESTART; // Restart
       }
@@ -13490,7 +13676,7 @@ pd_setup_and_forward(int fd, proxy_fd_ent_t *pfe,
      * forwarded, and its response-phase consumers — the completion record, the
      * token settle, the teardown release — all run after this point and
      * resolve the key via proxy_request_id() → resp_request_id. */
-    proxy_request_id_snapshot(pfe);
+    proxy_request_id_forward_snapshot(pfe);
     /* The derived origin needs carrying across for the same reason and at the
      * same moment: this request has only been forwarded, and the record that
      * reports where it came from is written in its response phase. */
@@ -13847,18 +14033,27 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
       return 0;
     }
     if (client && client->fd > 0) {
+#define SP_LB_502_BODY                                                         \
+          "{\"error\":\"backend_unreachable\","                                 \
+          "\"detail\":\"the selected backend endpoint did not accept the connection\"}\r\n"
       static const char lb_502[] =
           "HTTP/1.1 502 Bad Gateway\r\n"
           "Content-Type: application/json\r\n"
+          "Content-Length: 104\r\n"
           "Connection: close\r\n"
           "\r\n"
-          "{\"error\":\"backend_unreachable\","
-          "\"detail\":\"the selected backend endpoint did not accept the connection\"}\r\n";
+          SP_LB_502_BODY;
+      _Static_assert(sizeof(SP_LB_502_BODY) - 1 == 104,
+                     "lb_502's Content-Length is its body's length");
+#undef SP_LB_502_BODY
       /* No backend took the request: completed with the status written,
-       * as proxy_send_backend_unreachable records it. */
+       * as proxy_send_backend_unreachable records it. An outage, so no
+       * stage; like every answer the gateway writes it names the request
+       * (sockproxy_refusal_mark.h). The request has not been forwarded, so
+       * the live field still holds its ID. */
       proxy_record_local_completion(client, 502);
-      sp_raw_status_write(client, lb_502, sizeof(lb_502) - 1,
-                          MSG_DONTWAIT | MSG_NOSIGNAL);
+      sp_raw_refusal_write(client, lb_502, sizeof(lb_502) - 1,
+                           MSG_DONTWAIT | MSG_NOSIGNAL, AI_GW_STAGE_NONE);
       client->connect_wait = 0;
     }
     if (!(type & (NOTI_TYPE_HUP | NOTI_TYPE_ERROR))) {

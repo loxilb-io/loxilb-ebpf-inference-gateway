@@ -41,7 +41,9 @@
 #      would otherwise leave a completion owed, and the refusal would be
 #      counted again, as completed, at the next request or the teardown.
 #      proxy_note_local_answer is called only by that wrapper and by
-#      proxy_record_local_completion, whose answers complete the request.
+#      proxy_record_local_completion and its twin for a request already
+#      forwarded (proxy_record_forwarded_completion), whose answers complete
+#      the request.
 #
 #   6. An answer the client has begun to receive takes no new status line
 #      (sockproxy_answer.h). The two senders and sp_raw_status_write check
@@ -81,11 +83,16 @@ sockproxy_health.c:pd_reap_respond:send:-|1|reaper fallback when the owner worke
 # sp_reap_record: a queued or parked request is refused (capacity); a P/D
 # request that timed out on its legs completes with the status written; the
 # SSE events are body bytes inside a response in progress, not a response.
+# epp_send_immediate: the Endpoint Picker's immediate answer, an outage
+# written with the request's ID already in its head (one X-Request-Id), so
+# not through sp_send_local_outage's splice; it completes with the EPP's status.
 RECORDS='
 sockproxy_refusal.c:sp_pd_send_refusal:proxy_note_local_refusal(pfe, status);proxy_record_local_deny(pfe, stage
 sockproxy_http.c:sp_send_local_refusal:proxy_note_local_refusal(pfe, status);proxy_record_local_deny(pfe, stage
 sockproxy_http.c:sp_send_local_outage:proxy_record_local_completion(pfe, status)
 sockproxy_http.c:proxy_send_backend_unreachable:proxy_record_local_completion(pfe, 502)
+sockproxy_http.c:proxy_send_backend_unreachable_forwarded:proxy_record_forwarded_completion(pfe, 502
+sockproxy_epp.c:epp_send_immediate:proxy_record_local_completion(pfe, (uint16_t)r->imm_code)
 sockproxy_http.c:sp_mcp_h1_refuse:proxy_record_local_completion(pfe, (uint16_t)status);proxy_note_local_refusal(pfe, (uint16_t)status);proxy_record_local_deny(pfe, AI_GW_STAGE_FRAMING, status
 sockproxy_h2.c:h2_send_mcp_frame:stream->metric_response_status = status_code;h2_record_local_deny(pfe, stream, AI_GW_STAGE_FRAMING
 sockproxy_http.c:sp_h1_send_admit_deny:proxy_note_local_refusal(pfe
@@ -293,7 +300,7 @@ stray=$(awk '
   /^[A-Za-z_]/ && /\(/ && !/;[[:space:]]*$/ && !/^#/ {t = $0; sub(/\(.*/, "", t); n = split(t, a, /[ *]+/); fn = a[n]; next}
   /^[[:space:]]*(\*|\/\*|\/\/)/ {next}
   /(^|[^a-z_])proxy_note_local_answer\(/ && fn != "proxy_note_local_refusal" &&
-    fn != "proxy_record_local_completion" && fn != "" {print FILENAME ":" FNR ": " fn}' $SRCS)
+    fn != "proxy_record_local_completion" && fn != "proxy_record_forwarded_completion" && fn != "" {print FILENAME ":" FNR ": " fn}' $SRCS)
 if [ -n "$stray" ]; then
   printf '%s\n' "$stray"
   echo "  ^ proxy_note_local_answer outside a completion: a refusal records through proxy_note_local_refusal, or it is counted again as completed"

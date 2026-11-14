@@ -172,8 +172,14 @@ jobs:
       - name: The decode leg's EOF under an open stream, finished or cut (ASan + UBSan, mutation-tested)
         run: make -C common test_pd_eof_finish
 
-      - name: The correlation key that joins a request's records across its keep-alive reset
+      - name: The correlation key that joins a request's records across its keep-alive reset, and ends with its response
         run: make -C common test_ridjoin
+
+      - name: Which HTTP/1.1 request headers are a conversation ID (X-Request-Id is not one; the capture asks the helper)
+        run: make -C common test_convhdr
+
+      - name: An Endpoint Picker's immediate answer carries exactly one X-Request-Id, the request's own (production sender)
+        run: make -C common test_eppimm
 
       - name: Which forwarded hop a request is attributed to
         run: make -C common test_l7tr

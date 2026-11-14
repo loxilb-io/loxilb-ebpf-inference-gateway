@@ -1897,6 +1897,15 @@ struct proxy_fd_ent {
                                       // and snapshotted into resp_model at the keep-alive
                                       // reset boundary like the fields it supersedes.
 
+  uint8_t  rid_prev_owed;             // An answer to an EARLIER request was still owed when the
+                                      // request framer saw the current request begin (read before
+                                      // the current one is counted). The next request's message
+                                      // begin forgets resp_request_id only when this is 0.
+  uint8_t  rid_fwd;                   // What resp_request_id is worth to the answer written for a
+                                      // backend leg that went away (RID_FWD_* and
+                                      // proxy_answer_forwarded_request_id, sockproxy_http.c):
+                                      // taken for the request that began last or not, and
+                                      // whether it was taken under an earlier answer still owed.
   char     resp_request_id[256];      // Request-ID snapshot taken at the keep-alive request-reset
                                       // boundary, the twin of resp_model above. vllm_request_id is
                                       // cleared for the next request as soon as this one is
@@ -2004,6 +2013,43 @@ proxy_request_id_snapshot(proxy_fd_ent_t *pfe)
   strncpy(pfe->resp_request_id, pfe->vllm_request_id,
           sizeof(pfe->resp_request_id) - 1);
   pfe->resp_request_id[sizeof(pfe->resp_request_id) - 1] = '\0';
+}
+
+/* The response the snapshot was taken for is over and its last reader has
+ * run: forget the key, so that a later request on this connection that is
+ * refused before it has an ID of its own is not recorded under this one.
+ *
+ * The last reader is not the response framer. A successful answer without a
+ * usage object has its completion written, and its leftover reservation
+ * released, at the boundary that proves no usage is coming: the next
+ * request's message begin. That is where this is called, after both, and
+ * only when no answer to an earlier request was owed when that next request
+ * began (rid_prev_owed: a pipelining client's next request can begin under
+ * a response still in flight, which keeps its key). Whether one was owed is
+ * read by the request framer at ITS message begin: it runs on every read
+ * before the routing parser and counts a request that arrives whole, so by
+ * the routing parser's message begin the counters already include the new
+ * request and cannot answer the question. */
+static inline void
+proxy_request_id_response_done(proxy_fd_ent_t *pfe)
+{
+  pfe->resp_request_id[0] = '\0';
+}
+
+/* The ID of the request this connection has handed to a backend and is
+ * still owed an answer for: what an answer written in its response phase
+ * names (a backend leg that goes away before it answered). Not the live
+ * field: that one is cleared once the request is forwarded and belongs to
+ * the next request from the moment the client sends one. The snapshot is
+ * taken before the request's first byte is written to the backend, so it is
+ * this request's from the first moment a leg can fail under it. "" when the
+ * request had none. Whether an answer may echo it is decided by
+ * proxy_answer_forwarded_request_id (sockproxy_http.c): not when it was
+ * taken under an earlier answer still owed. */
+static inline const char *
+proxy_forwarded_request_id(const proxy_fd_ent_t *pfe)
+{
+  return pfe->resp_request_id;
 }
 
 /* Correlation key for response-phase consumers: the live request field first

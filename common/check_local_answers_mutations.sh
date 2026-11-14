@@ -75,6 +75,11 @@ mut sockproxy_h2.c '  stream->metric_response_status = status_code;
 expect "rule 1: the HTTP/2 outage sender drops its status" "h2_send_local_outage must record"
 
 fresh
+mut sockproxy_epp.c '    proxy_record_local_completion(pfe, (uint16_t)r->imm_code);
+' ''
+expect "rule 1: the EPP immediate answer drops its completion" "epp_send_immediate must record: proxy_record_local_completion(pfe, (uint16_t)r->imm_code)"
+
+fresh
 mut sockproxy_h2.c '  ai_gw_record_local_deny(stage, stream->request_id, notify_worker_id(),' '  ai_gw_record_local_xxxx(stage, stream->request_id, notify_worker_id(),'
 expect "rule 1: the HTTP/2 deny record drops its export" "h2_record_local_deny must record: ai_gw_record_local_deny(stage"
 

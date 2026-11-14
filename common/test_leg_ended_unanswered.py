@@ -2,7 +2,8 @@
 """A backend leg that goes away under the whole HTTP/1.1 request it was to
 answer, before any answer, on an AI-gateway rule that is not P/D: the client
 gets the 502 a refused connect gives it, once, and the request is recorded by
-proxy_send_backend_unreachable (completed, 502), as the TLS leg's failure is.
+proxy_send_backend_unreachable_forwarded (completed, 502, named by the ID the
+request was forwarded under), as the TLS leg's failure is.
 Without it the client got the bare close (F-18).
 
 Nothing is sent, and the teardown's rule decides the record, when:
@@ -64,10 +65,11 @@ static int sp_answer_started(proxy_fd_ent_t *p) { return p->started; }
 static void proxy_backend_leg_name(proxy_fd_ent_t *l, proxy_fd_ent_t *c, char *o, size_t n) {
   (void)l; (void)c; snprintf(o, n, "10.0.0.2:8000"); named++;
 }
-/* The product's sender, as test_backend_failure_audit.py runs it: the 502 is
- * written, the status latched and the request recorded completed. Called with
- * the client's lock held. */
-static int proxy_send_backend_unreachable(proxy_fd_ent_t *p, const char *d) {
+/* The product's sender for a request already forwarded, as
+ * test_backend_failure_audit.py runs it: the 502 is written with the ID the
+ * request was forwarded under, the status latched and the request recorded
+ * completed. Called with the client's lock held. */
+static int proxy_send_backend_unreachable_forwarded(proxy_fd_ent_t *p, const char *d) {
   (void)d; assert(p->locked); assert(p->odir == 0);
   sent++; p->metric_response_status = 502; p->metric_ai_recorded = 1; return 0;
 }
