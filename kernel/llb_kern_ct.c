@@ -2373,6 +2373,31 @@ dp_ct_in(void *ctx, struct xfi *xf)
     adat->ctd.pb.bytes = 0;
     adat->ctd.pb.packets = 0;
 
+    /* Octavia connectionLimit: increment the per-rule live
+     * concurrent-connection count on CT-create, SELECTOR-AGNOSTIC. conc_conns lives in the
+     * rule-index-keyed nat_ep_map so the teardown path can decrement it by rule id. Only count
+     * NAT'd flows (xi->nat_flags) — the same gate the SecurityRate / active_sess dec uses below.
+     * This is the SAME live count the connectionLimit gate (dp_do_nat) compares against and the
+     * stats active_connections endpoint reads. The (N+1)th SYN is refused BEFORE reaching here
+     * (sel=-1 => no NAT => no CT), so it is never counted. */
+    if (xi->nat_flags) {
+      __u32 cc_key = xf->pm.rule_id;
+      struct dp_nat_epacts *ccepa = bpf_map_lookup_elem(&nat_ep_map, &cc_key);
+      if (ccepa != NULL) {
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_lock(&ccepa->lock);
+#endif
+        ccepa->conc_conns++;
+        /* Octavia /stats total_connections ( "++ on CT-create"): cumulative,
+         * never decremented, so even a flow that tears down before the next RulesSync tick is
+         * still counted. conc_conns (above) is the live gauge; total_conns is the running total. */
+        ccepa->total_conns++;
+#ifndef HAVE_DP_DPU_SLIM
+        bpf_spin_unlock(&ccepa->lock);
+#endif
+      }
+    }
+
     axdat->ca.ftrap = 0;
     axdat->ca.oaux = 0;
     axdat->ca.cidx = adat->ca.cidx + 1;
@@ -2426,34 +2451,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
       return 0;
     }
     bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_ANY);
-    long cins = bpf_map_update_elem(&ct_map, &key, adat, BPF_ANY);
-
-    /* Octavia connectionLimit: increment the per-rule live
-     * concurrent-connection count on CT-create, SELECTOR-AGNOSTIC. conc_conns lives in the
-     * rule-index-keyed nat_ep_map so the teardown path can decrement it by rule id. Only count
-     * NAT'd flows (xi->nat_flags) — the same gate the SecurityRate / active_sess dec uses below.
-     * This is the SAME live count the connectionLimit gate (dp_do_nat) compares against and the
-     * stats active_connections endpoint reads. The (N+1)th SYN is refused BEFORE reaching here
-     * (sel=-1 => no NAT => no CT), so it is never counted. Counted only once the forward
-     * entry is in the map: a SYN dropped above because its reverse tuple is taken, or one
-     * the full table has no room for, creates no connection and must not take a slot. */
-    if (xi->nat_flags && cins == 0) {
-      __u32 cc_key = xf->pm.rule_id;
-      struct dp_nat_epacts *ccepa = bpf_map_lookup_elem(&nat_ep_map, &cc_key);
-      if (ccepa != NULL) {
-#ifndef HAVE_DP_DPU_SLIM
-        bpf_spin_lock(&ccepa->lock);
-#endif
-        ccepa->conc_conns++;
-        /* Octavia /stats total_connections ( "++ on CT-create"): cumulative,
-         * never decremented, so even a flow that tears down before the next RulesSync tick is
-         * still counted. conc_conns (above) is the live gauge; total_conns is the running total. */
-        ccepa->total_conns++;
-#ifndef HAVE_DP_DPU_SLIM
-        bpf_spin_unlock(&ccepa->lock);
-#endif
-      }
-    }
+    bpf_map_update_elem(&ct_map, &key, adat, BPF_ANY);
 
     atdat = bpf_map_lookup_elem(&ct_map, &key);
     axtdat = bpf_map_lookup_elem(&ct_map, &xkey);

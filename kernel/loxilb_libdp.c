@@ -4252,11 +4252,15 @@ ll_nat_conc_snapshot(struct dp_nat_epacts *epas)
  * later run. Every correction is logged and counted, because it means a
  * path was missed or an update was lost.
  *
- * The datapath takes a session at selection, before the connection's entries
- * exist, and counts the connection in total_conns once they do. A session
- * with no entry behind it is therefore either a connection that was never
- * created, which is a leak to correct, or one whose total_conns update falls
- * inside the pass, which makes the rule not quiet. */
+ * The datapath takes a session at selection and counts the connection in
+ * conc_conns and total_conns before it inserts the connection's entries, and
+ * it does not take either back when no connection follows: a SYN that
+ * connectionLimit refuses after selection keeps its session, and a SYN that
+ * is dropped because its reverse tuple is taken or the table is full keeps
+ * its count. Those are not prevented in the datapath; this pass is what
+ * corrects them, once the rule is quiet. A pass that falls between a count
+ * and the insert that follows it sees a quiet rule one entry short and
+ * corrects it down; the next pass on the quiet rule puts that right. */
 static void
 ll_nat_conc_reconcile(void)
 {
