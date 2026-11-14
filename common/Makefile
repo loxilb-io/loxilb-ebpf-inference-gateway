@@ -313,9 +313,72 @@ test_rid: test_request_id
 test_request_id_join: test_request_id_join.c sockproxy.h
 	$(CC) $(CFLAGS) -Wextra -o $@ $< -I.
 
+# The snapshot is forgotten where its last readers have run: in the next
+# request's message begin, after the completion that boundary writes for a
+# response that brought no usage object, and only when no answer to an
+# earlier request was owed as that request began, which the request framer
+# reads at its own message begin, before it counts the new request (source
+# invariants; clearing in the response framer would empty the key of that
+# completion, and reading the counters in the routing parser's message begin
+# would find the new request already counted). The two answers to a request
+# handed to a backend name it by the ID it is forwarded under, taken before
+# its first byte is written.
 .PHONY: test_ridjoin
 test_ridjoin: test_request_id_join
 	./test_request_id_join
+	@awk '/^handle_on_message_begin\(/ { on = 1 } \
+	      on && /proxy_ai_record_completion\(pfe\);/ { rec = NR } \
+	      on && /proxy_request_id_request_begin\(pfe\);/ { beg = NR; n++ } \
+	      on && /pfe->metric_response_status = 0;/ && !st { st = NR } \
+	      on && /^}/ { on = 0 } \
+	      /^proxy_request_id_request_begin\(/ { in_b = 1 } \
+	      in_b && /if \(!pfe->rid_prev_owed\) \{/ { guard = NR } \
+	      in_b && /proxy_request_id_response_done\(pfe\);/ { done = NR } \
+	      in_b && /^}/ { in_b = 0 } \
+	      /proxy_request_id_response_done\(/ { all++ } \
+	      END { exit !(n == 1 && all == 1 && rec && beg > rec && st == beg + 1 && guard && done == guard + 1) }' sockproxy_http.c || \
+	  { echo "FAIL: sockproxy_http.c must forget the request-ID snapshot once, in proxy_request_id_request_begin and only when no earlier answer was owed (rid_prev_owed), called from handle_on_message_begin after proxy_ai_record_completion(pfe) and on the line before the response status is cleared"; exit 1; }
+	@awk '/^creq_on_message_begin\(/ { on = 1 } \
+	      on && /pfe->rid_prev_owed =/ { set = NR } \
+	      on && /^}/ { on = 0 } \
+	      /^creq_on_message_complete\(/ { cmp = 1 } \
+	      cmp && /cresp_forwarded, 1/ { bump++; cmp = 0 } \
+	      /rid_prev_owed =/ { all++ } \
+	      END { exit !(set && all == 1 && bump == 1) }' sockproxy_http.c || \
+	  { echo "FAIL: rid_prev_owed is read once, in the request framer's message begin, before its message complete counts the request"; exit 1; }
+	@awk '/proxy_request_id_forward_snapshot\(pfe\);/ { snap = NR; calls++ } \
+	      /if \(proxy_multiplexor\(pfe, pfe->rcvbuf, pfe->rcv_off\)\) \{/ { n++; if (snap != NR - 1) bad = 1 } \
+	      /->pd_ops->dispatch\(pfe\);/ { d++; if (snap != NR - 1) bad = 1 } \
+	      /proxy_request_id_snapshot\(pfe\);/ { plain++ } \
+	      END { exit !(n == 1 && d == 1 && calls == 3 && plain == 1 && !bad) }' sockproxy_http.c || \
+	  { echo "FAIL: the request ID is snapshotted (proxy_request_id_forward_snapshot) on the line before the request is first written to a backend, in both branches of the forward step (proxy_multiplexor, pd_ops->dispatch), and at the reset; nowhere by the plain copy"; exit 1; }
+	@test "$$(grep -c 'proxy_send_backend_unreachable_forwarded(client,' sockproxy_http.c)" = 2 || \
+	  { echo "FAIL: the two backend-leg failures under a request handed to the leg (proxy_backend_leg_unanswered, proxy_backend_leg_ended_unanswered) answer through proxy_send_backend_unreachable_forwarded"; exit 1; }
+	@test "$$(grep -c 'const char \*rid = proxy_answer_forwarded_request_id(pfe);' sockproxy_http.c)" = 1 && \
+	 test "$$(grep -c 'proxy_forwarded_request_id(pfe)' sockproxy_http.c)" = 2 || \
+	  { echo "FAIL: the forwarded sender takes its ID from proxy_answer_forwarded_request_id, the only reader of the snapshot for an echo (no ID when it was taken under an earlier answer still owed)"; exit 1; }
+	@echo "request ID: the snapshot ends with its response, and a forwarded request's 502 names it PASS"
+
+# Which request headers are a conversation ID (an affinity key) on HTTP/1.1:
+# X-Request-Id is not. The unit carries the name test as it was and counts
+# its X-Request-Id cases only if that one takes them; the capture is checked
+# to ask the helper (source invariant).
+test_conv_hdr: test_conv_hdr.c sockproxy_conv_hdr.h
+	$(CC) -Wall -Wextra -Werror -o $@ $< -I.
+
+.PHONY: test_convhdr
+test_convhdr: test_conv_hdr
+	./test_conv_hdr
+	@test "$$(grep -c 'if (sp_h1_conv_id_header(pfe->last_header_name)) {' sockproxy_http.c)" = 1 && \
+	 ! grep -q 'strncasecmp("X-Conversation-ID"' sockproxy_http.c || \
+	  { echo "FAIL: handle_header_val must take a conversation ID from the headers sp_h1_conv_id_header names, and from no other test"; exit 1; }
+	@echo "conversation ID: the HTTP/1.1 capture asks sp_h1_conv_id_header PASS"
+
+# An Endpoint Picker's immediate answer carries exactly one X-Request-Id,
+# the request's own when it has one (the production sender, with stubs).
+.PHONY: test_eppimm
+test_eppimm:
+	python3 test_epp_immediate.py
 
 # US-503/US-504/US-510: P/D body rewriting and worker selection unit tests (standalone)
 # -fsanitize=address detects buffer overflows and use-after-free in JSON rewriting
@@ -1093,9 +1156,11 @@ test_refusal_mark: test_refusal_mark.c sockproxy_refusal_mark.h sockproxy_h1_hdr
 # response framer's mark, which the X-Api-Key strip clears: it has to be the
 # call right before that one, on the same read (source invariant).
 # The request ID an answer echoes is the request's live field, never the
-# audit key (proxy_request_id, whose snapshot can hold the previous
-# keep-alive request's ID): no statement that builds a mark names the key
-# or its snapshot (source invariant). And the one no_route answer written
+# audit key (proxy_request_id, which reads the live field first and would
+# name the next request under a response still owed): no statement that
+# builds a mark names the key or its snapshot (source invariant). The one
+# answer that names a request by the ID it was forwarded under is given that
+# ID by its caller (proxy_send_backend_unreachable_forwarded, test_ridjoin). And the one no_route answer written
 # through the outage sender carries its stage in its text (sockproxy_ep.c).
 .PHONY: test_refmark
 test_refmark: test_refusal_mark
@@ -1304,7 +1369,7 @@ test_sync: test_sockproxy_sync_emit
 
 clean:
 	rm -f test_pd_request_limit_bin test_pd_refusal_bin
-	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_refusal_mark test_obj_hint test_resp_head_assemble test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_h2_resp_mark test_h2_deny_leak test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
+	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_refusal_mark test_conv_hdr test_obj_hint test_resp_head_assemble test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_h2_resp_mark test_h2_deny_leak test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

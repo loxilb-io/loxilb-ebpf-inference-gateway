@@ -18,10 +18,13 @@
  * of no other: the connection's live field (SP_REFUSAL_LIVE_RID), or the
  * HTTP/2 stream's own. It is on a refusal and on an outage alike, and left
  * out when the request has no ID of its own at that moment (refused before
- * one was read or minted, or answered after it was forwarded and the field
- * cleared for the next request). It is never proxy_request_id(): that is
- * the audit key, which on a keep-alive connection falls back to a snapshot
- * that can still hold the previous request's ID.
+ * one was read or minted). It is never proxy_request_id(): that is the
+ * audit key, which reads the live field first and so names the NEXT request
+ * once a client has sent the start of one under an answer still owed. The
+ * one answer written for a request already handed to a backend (its leg
+ * went away before answering) is given that request's ID by its caller
+ * (proxy_answer_forwarded_request_id, sockproxy_http.c), and none when the
+ * gateway cannot tell which request it answers (a pipelining client).
  *
  * Pure helpers, kept in a header so the unit test runs the code the senders
  * run. No allocation, no logging.

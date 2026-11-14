@@ -188,6 +188,56 @@ test_snapshot_holds_a_full_key(void)
   free(pfe);
 }
 
+/* The snapshot belongs to ONE response. Once that response is over and its
+ * last readers have run (the next request's message begin), the key is
+ * forgotten: a later request refused before it has an ID of its own - one
+ * the parser could not frame, say - reports no key, not its predecessor's.
+ * Scored against the rule as it was, where nothing forgot the snapshot. */
+static void
+test_snapshot_ends_with_its_response(void)
+{
+  proxy_fd_ent_t *pfe = fresh_shell();
+  proxy_fd_ent_t *old = fresh_shell();
+
+  snprintf(pfe->vllm_request_id, sizeof(pfe->vllm_request_id), "%s", "first");
+  forward_and_reset(pfe);
+  CHECK(!strcmp(proxy_request_id(pfe), "first"),
+        "while its response is in flight the forwarded request keeps its key");
+  CHECK(!strcmp(proxy_forwarded_request_id(pfe), "first"),
+        "and an answer in its response phase names it by that key");
+
+  /* the pipelining client: the next request's ID is already in the live
+   * field while the first is unanswered */
+  snprintf(pfe->vllm_request_id, sizeof(pfe->vllm_request_id), "%s", "next");
+  CHECK(!strcmp(proxy_forwarded_request_id(pfe), "first"),
+        "the forwarded request's key is not the next request's live ID");
+  CHECK(strcmp(proxy_request_id(pfe), "first") != 0,
+        "which the connection's key reports here, so this case can go red");
+  pfe->vllm_request_id[0] = '\0';
+
+  proxy_request_id_response_done(pfe);
+  CHECK(proxy_request_id(pfe)[0] == '\0',
+        "after its response a request with no ID of its own reports no key");
+  CHECK(proxy_forwarded_request_id(pfe)[0] == '\0',
+        "and nothing is left to name as forwarded");
+
+  /* the rule as it was: the snapshot was never forgotten */
+  snprintf(old->vllm_request_id, sizeof(old->vllm_request_id), "%s", "first");
+  forward_and_reset(old);
+  CHECK(!strcmp(proxy_request_id(old), "first"),
+        "without the forget the next request inherits the key, so this case can go red");
+
+  /* the next request, once it has a key, is forwarded under its own */
+  snprintf(pfe->vllm_request_id, sizeof(pfe->vllm_request_id), "%s", "second");
+  forward_and_reset(pfe);
+  CHECK(!strcmp(proxy_request_id(pfe), "second") &&
+        !strcmp(proxy_forwarded_request_id(pfe), "second"),
+        "the next request crosses the boundary under its own key");
+
+  free(pfe);
+  free(old);
+}
+
 int
 main(void)
 {
@@ -197,6 +247,7 @@ main(void)
   test_next_request_wins();
   test_no_request_at_all();
   test_snapshot_holds_a_full_key();
+  test_snapshot_ends_with_its_response();
 
   printf("\n1..%d\n", checks);
   if (failures) {

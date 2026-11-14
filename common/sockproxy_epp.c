@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
@@ -20,6 +21,7 @@
 #include "sockproxy.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_epp.h"
+#include "sockproxy_refusal_mark.h"
 
 struct epp_pending {
   uint64_t sid;
@@ -281,26 +283,71 @@ epp_send_error(proxy_fd_ent_t *pfe, int status, const char *code, const char *de
   log_info("[EPP] fd=%d answered %d %s: %s", pfe->fd, status, code, detail ? detail : "");
 }
 
+/* Whether a "name: value\r\n" line of an EPP header set is the request-ID
+ * header (the whole name, any case). */
+static int
+epp_hdr_is_request_id(const char *line, size_t len)
+{
+  static const char name[] = SP_REFUSAL_RID_HDR;
+
+  return len > sizeof(name) - 1 && line[sizeof(name) - 1] == ':' &&
+         strncasecmp(line, name, sizeof(name) - 1) == 0;
+}
+
+/* The Endpoint Picker's immediate answer, relayed with its own headers and
+ * body. Like every answer the gateway writes it names the request by the
+ * request's own ID, once (sockproxy_refusal_mark.h): when the request has
+ * one that can be echoed, an X-Request-Id the EPP set is left out and the
+ * request's line is written here, whatever the answer's length; when it has
+ * none, the EPP's headers go out as they are. */
 void
 epp_send_immediate(proxy_fd_ent_t *pfe, const struct epp_result *r)
 {
-  size_t cap = 256 + (size_t)(r->hdr_set_len > 0 ? r->hdr_set_len : 0) +
-               (size_t)(r->imm_body_len > 0 ? r->imm_body_len : 0);
+  const char *rid = SP_REFUSAL_LIVE_RID(pfe);
+  int own = sp_refusal_rid_ok(rid);
+  int hlen = r->hdr_set && r->hdr_set_len > 0 ? r->hdr_set_len : 0;
+  int blen = r->imm_body && r->imm_body_len > 0 ? r->imm_body_len : 0;
+  size_t cap = 256 + SP_REFUSAL_MARK_MAX + (size_t)hlen + (size_t)blen;
   char *resp = malloc(cap);
-  int n;
+  int n, m, off = 0;
 
   if (!resp) return;
-  n = snprintf(resp, cap, "HTTP/1.1 %d %s\r\n%.*sContent-Length: %d\r\nConnection: close\r\n\r\n",
-               r->imm_code, epp_reason(r->imm_code),
-               r->hdr_set_len > 0 ? r->hdr_set_len : 0, r->hdr_set ? r->hdr_set : "",
-               r->imm_body_len > 0 ? r->imm_body_len : 0);
-  if (n > 0 && (size_t)n < cap) {
-    if (r->imm_body_len > 0 && r->imm_body) {
-      memcpy(resp + n, r->imm_body, (size_t)r->imm_body_len);
-      n += r->imm_body_len;
+  n = snprintf(resp, cap, "HTTP/1.1 %d %s\r\n", r->imm_code, epp_reason(r->imm_code));
+  if (own && n > 0 && (size_t)n < cap) {
+    m = snprintf(resp + n, cap - (size_t)n, SP_REFUSAL_RID_HDR ": %s\r\n", rid);
+    n = m > 0 && (size_t)m < cap - (size_t)n ? n + m : -1;
+  }
+  while (n > 0 && off < hlen) {
+    const char *line = r->hdr_set + off;
+    const char *eol = memchr(line, '\n', (size_t)(hlen - off));
+    size_t len = eol ? (size_t)(eol - line) + 1 : (size_t)(hlen - off);
+
+    off += (int)len;
+    if (own && epp_hdr_is_request_id(line, len))
+      continue;
+    if ((size_t)n + len >= cap) {
+      n = -1;
+      break;
     }
+    memcpy(resp + n, line, len);
+    n += (int)len;
+  }
+  if (n > 0) {
+    m = snprintf(resp + n, cap - (size_t)n,
+                 "Content-Length: %d\r\nConnection: close\r\n\r\n", blen);
+    n = m > 0 && (size_t)m < cap - (size_t)n ? n + m : -1;
+  }
+  if (n > 0 && (size_t)n + (size_t)blen < cap) {
+    if (blen > 0) {
+      memcpy(resp + n, r->imm_body, (size_t)blen);
+      n += blen;
+    }
+    resp[n] = '\0';
     pfe->lb_err_body_sent = 1;
-    if (sp_send_local_outage(pfe, (uint16_t)r->imm_code, resp, (size_t)n) != 0)
+    /* An outage answer, as sp_send_local_outage records and sends one; the
+     * request's ID is already in the head built above. */
+    proxy_record_local_completion(pfe, (uint16_t)r->imm_code);
+    if (proxy_send_local_response(pfe, resp, (size_t)n) != 0)
       log_error("[EPP] fd=%d failed to send the EPP's %d", pfe->fd, r->imm_code);
   }
   free(resp);
