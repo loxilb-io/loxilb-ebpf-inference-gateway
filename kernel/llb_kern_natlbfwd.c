@@ -180,7 +180,6 @@ dp_do_nat(void *ctx, struct xfi *xf)
   struct mf_xfrm_inf *nxfrm_act;
   struct dp_proxy_tacts *act;
   int sel;
-  int climit = 0;
 
   if (xf->pm.l4fin || xf->pm.il4fin) {
     return 0;
@@ -233,6 +232,8 @@ dp_do_nat(void *ctx, struct xfi *xf)
 
   if (act->ca.act_type == DP_SET_SNAT || 
       act->ca.act_type == DP_SET_DNAT) {
+    sel = dp_sel_nat_ep(ctx, xf, act);
+
     /* Octavia connectionLimit gate: refuse-by-drop at SYN time.
      * act->conn_limit == 0 means unlimited (legacy / back-compat). The live per-rule
      * concurrent-connection count (conc_conns) lives in the rule-index-keyed nat_ep_map
@@ -241,22 +242,15 @@ dp_do_nat(void *ctx, struct xfi *xf)
      * refuse branch below (xf->pm.nf = 0): the SYN is not NAT'd, not forwarded, and NO CT is
      * created — so conc_conns is NOT incremented for the refused SYN and the N in-flight
      * connections are untouched. A slot frees on the next CT-teardown decrement. This is the
-     * SAME live count the stats active_connections endpoint reads.
-     * The gate comes before endpoint selection: selection takes a per-endpoint session on a
-     * least-connections rule and moves the round-robin and persistence state, and a refused
-     * SYN must leave all of that as it was. */
-    sel = (uint16_t)(-1);
+ * SAME live count the stats active_connections endpoint reads. */
     if (act->conn_limit != 0) {
       __u32 climit_key = act->ca.cidx;
       struct dp_nat_epacts *cepa = bpf_map_lookup_elem(&nat_ep_map, &climit_key);
       if (cepa != NULL && cepa->conc_conns >= act->conn_limit) {
-        climit = 1;
+        sel = (uint16_t)(-1);
         BPF_TRACE_PRINTK("[NAT] conn-limit hit: conc=%u limit=%u",
                          cepa->conc_conns, act->conn_limit);
       }
-    }
-    if (!climit) {
-      sel = dp_sel_nat_ep(ctx, xf, act);
     }
 
     xf->nm.dsr = act->ca.oaux ? 1: 0;
