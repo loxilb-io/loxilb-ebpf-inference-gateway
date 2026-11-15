@@ -14,6 +14,7 @@
 #include "sockproxy_internal.h"
 #include "sockproxy_hold.h"
 #include "sockproxy_refusal.h"
+#include "sockproxy_refusal_mark.h"
 
 /* Exercise the real writer with only I/O/notifier boundaries substituted.
  * The kernel-backpressure case uses real nonblocking socketpair I/O. */
@@ -24,7 +25,7 @@ static uint64_t registration_gen, now_ns = 1000000000ULL;
 static int begun_answer, ended_answer;
 static int arm_error, deletes, shuts, notes, denies, arms, wanted;
 static int script[64], script_len, script_at, tls_error, real_io;
-static int fail_alloc, shutdown_at, drain_eof;
+static int fail_alloc, shutdown_at, drain_eof, deny_stage, nfail;
 static size_t drain_available, drained;
 static unsigned char accepted[1024];
 static size_t accepted_len;
@@ -53,10 +54,10 @@ int notify_delete_ent(void *ns, int fd, int evict) {
   return 0;
 }
 int proxy_note_local_refusal(proxy_fd_ent_t *p, uint16_t status) {
-  (void)p; assert(status == 413); notes++; return 0;
+  (void)p; assert(status >= 400 && status < 600); notes++; return 0;
 }
 void proxy_record_local_deny(proxy_fd_ent_t *p, int stage, int status, const char *code) {
-  (void)p; (void)stage; assert(status == 413 && code); denies++;
+  (void)p; deny_stage = stage; assert(status >= 400 && status < 600 && code); denies++;
 }
 int __real_clock_gettime(clockid_t, struct timespec *);
 int __wrap_clock_gettime(clockid_t id, struct timespec *t) {
@@ -129,6 +130,103 @@ static void complete(proxy_fd_ent_t *p) {
   assert(!memcmp(accepted, reply, accepted_len));
   assert(notes == 1 && denies == 1);
   sp_pd_refusal_tick();
+}
+/* ---- the refusal mark on the P/D refusals (stage and request ID) ----
+ * The texts are the ones sockproxy_pd_core.c builds (pd_check_request_body,
+ * pd_prepare_failed), with the same format strings: what leaves must be that
+ * text with the two lines after its status line and not one byte else. */
+#define EXPECT(c, ...) do { if (c) printf("PASS "); else { printf("FAIL "); nfail++; } \
+                            printf(__VA_ARGS__); putchar('\n'); } while (0)
+static size_t pd_body_text(char *out, size_t cap, unsigned status, const char *error,
+                           const char *detail, size_t limit) {
+  char body[320];
+  int bl = snprintf(body, sizeof(body),
+      "{\"error\":\"%s\",\"detail\":\"%s\",\"max_body_bytes\":%zu}\r\n", error, detail, limit);
+  int n = snprintf(out, cap,
+      "HTTP/1.1 %u %s\r\n"
+      "Content-Type: application/json\r\nContent-Length: %d\r\n"
+      "Connection: close\r\n\r\n%s",
+      status, status == 415 ? "Unsupported Media Type" :
+              status == 400 ? "Bad Request" : "Payload Too Large", bl, body);
+  assert(bl > 0 && bl < (int)sizeof(body) && n > 0 && (size_t)n < cap);
+  return (size_t)n;
+}
+static size_t pd_prepare_text(char *out, size_t cap) {
+  static const char body[] =
+      "{\"error\":\"pd_prepare_failed\","
+      "\"detail\":\"native prefill/decode request preparation failed\"}\r\n";
+  int n = snprintf(out, cap,
+      "HTTP/1.1 500 Internal Server Error\r\n"
+      "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+      "Connection: close\r\n\r\n%s", sizeof(body) - 1, body);
+  assert(n > 0 && (size_t)n < cap);
+  return (size_t)n;
+}
+/* One refusal at stage `framing` (8) on a request whose live ID is `rid`;
+ * `echo` is the ID the answer must carry, NULL for none. */
+static int pipelined_next;   /* the next marked(): a second request is already in the buffer */
+static void marked(proxy_fd_ent_t *p, const char *what, unsigned status, const char *code,
+                   const char *text, size_t len, const char *rid, const char *echo) {
+  char want[2048]; size_t head = (size_t)((const char *)memmem(text, len, "\r\n", 2) - text) + 2, wl;
+  int rc;
+  reset(p);
+  if (rid) snprintf(p->vllm_request_id, sizeof(p->vllm_request_id), "%s", rid);
+  p->http_pipelined = (uint8_t)pipelined_next; pipelined_next = 0;
+  memcpy(want, text, head); wl = head;
+  wl += (size_t)sprintf(want + wl, "X-Loxilb-Refusal-Stage: framing\r\n");
+  if (echo) wl += (size_t)sprintf(want + wl, "X-Request-Id: %s\r\n", echo);
+  memcpy(want + wl, text + head, len - head); wl += len - head;
+  rc = sp_pd_send_refusal(p, 8, (uint16_t)status, code, text, len, 0);
+  EXPECT(rc == 0 && accepted_len == wl && !memcmp(accepted, want, wl),
+         "%u %s, %s: the text with its stage%s after the status line, the rest byte-identical "
+         "(rc %d, %zu bytes sent, %zu wanted, text %zu)",
+         status, code, what, echo ? " and the request's ID" : " alone", rc, accepted_len, wl, len);
+  EXPECT(notes == 1 && denies == 1 && deny_stage == 8,
+         "%u %s, %s: one refusal note, one deny record at framing", status, code, what);
+}
+static void marked_group(proxy_fd_ent_t *p) {
+  static const struct { unsigned status; const char *code, *detail; } t[] = {
+    { 400, "pd_pipelining_unsupported", "send one P/D request at a time on a keep-alive connection" },
+    { 415, "pd_body_unsupported_media", "native prefill/decode requires an application/json request body" },
+    { 413, "pd_body_too_large", "request body exceeds the native prefill/decode byte limit" },
+    { 413, "pd_body_unbufferable", "native prefill/decode requires a complete buffered Content-Length body" },
+    { 400, "invalid_json_body", "native prefill/decode requires a JSON object" },
+  };
+  char text[512], id255[256], longest_code[40] = ""; size_t len, longest = 0;
+  memset(id255, 'r', 255); id255[255] = 0;
+  for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+    len = pd_body_text(text, sizeof(text), t[i].status, t[i].code, t[i].detail, 786432);
+    marked(p, "an ID", t[i].status, t[i].code, text, len, "req-7f3a", "req-7f3a");
+    /* the largest limit a size_t can print: the longest this text gets */
+    len = pd_body_text(text, sizeof(text), t[i].status, t[i].code, t[i].detail, (size_t)-1);
+    if (len > longest) { longest = len; snprintf(longest_code, sizeof(longest_code), "%s", t[i].code); }
+    marked(p, "a 255-byte ID, the largest limit", t[i].status, t[i].code, text, len, id255, id255);
+  }
+  /* The pipelining refusal: the live ID may be the SECOND request's by now
+   * (its headers were parsed in the same read), so the answer names none. */
+  len = pd_body_text(text, sizeof(text), t[0].status, t[0].code, t[0].detail, 786432);
+  pipelined_next = 1;
+  marked(p, "a second request in the buffer, the live ID is that request's", t[0].status, t[0].code,
+         text, len, "req-next-9c1d", NULL);
+  len = pd_prepare_text(text, sizeof(text));
+  /* The P/D routing ID carries endpoint addresses: never on a client's answer. */
+  marked(p, "the live ID is the P/D routing ID (endpoint addresses)", 500, "pd_prepare_failed", text, len,
+         "___prefill_addr_10.0.0.11:8000___decode_addr_10.0.0.12:8000_0123456789abcdef0123456789abcdef", NULL);
+  marked(p, "an ID", 500, "pd_prepare_failed", text, len, "req-7f3a", "req-7f3a");
+  marked(p, "a 255-byte ID", 500, "pd_prepare_failed", text, len, id255, id255);
+  len = pd_body_text(text, sizeof(text), 413, t[2].code, t[2].detail, 786432);
+  marked(p, "no ID", 413, t[2].code, text, len, NULL, NULL);
+  marked(p, "an ID that cannot be a header value", 413, t[2].code, text, len, "bad\x01id", NULL);
+  printf("INFO longest P/D refusal text: %zu bytes (%s, max_body_bytes %zu); with the largest mark "
+         "(%zu) %zu; with the largest framing mark (%zu) %zu; pd_reply.bytes holds %zu\n",
+         longest, longest_code, (size_t)-1, (size_t)SP_REFUSAL_MARK_MAX,
+         longest + (size_t)SP_REFUSAL_MARK_MAX,
+         (size_t)SP_REFUSAL_MARK_MAX - SP_REFUSAL_STAGE_MAX + 7,
+         longest + (size_t)SP_REFUSAL_MARK_MAX - SP_REFUSAL_STAGE_MAX + 7,
+         sizeof(p->pd_reply.bytes));
+  /* strictly: the splice ends its output with a NUL */
+  EXPECT(longest + (size_t)SP_REFUSAL_MARK_MAX < sizeof(p->pd_reply.bytes),
+         "pd_reply.bytes holds the longest text with SP_REFUSAL_MARK_MAX");
 }
 int main(void) {
   proxy_fd_ent_t *p = calloc(1, sizeof(*p)); assert(p);
@@ -237,7 +335,9 @@ int main(void) {
   assert(read(fds[1],pad,sizeof(pad))==0);
   close(fds[0]); close(fds[1]); sp_pd_refusal_tick();
   puts("PASS real kernel send-buffer EAGAIN and complete client EOF");
+  marked_group(p);
   registered=NULL; sp_pd_refusal_tick(); free(p);
-  puts("PASS D10 refusal writer (17 groups)");
+  if (nfail) { printf("FAIL D10 refusal writer: %d check(s) of the refusal mark failed\n", nfail); return 1; }
+  puts("PASS D10 refusal writer (17 groups, and the refusal mark)");
   return 0;
 }

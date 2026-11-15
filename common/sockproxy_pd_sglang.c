@@ -41,6 +41,7 @@
 #include "sockproxy_pd.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_ai_admit.h" /* AI_GW_STAGE_FRAMING: the oversize refusal's record */
+#include "sockproxy_refusal_mark.h"
 
 /* ==========================================================================
  * SGLang P/D dual dispatch
@@ -212,13 +213,22 @@ pd_sg_oversize_reject(proxy_fd_ent_t *client_pfe)
             "(client_fd=%d cl=%zu)",
             client_pfe->fd, client_pfe->http_content_length);
   /* A refusal before any backend bytes moved: the response, and a deny
-   * record at FRAMING. */
+   * record at FRAMING. The text carries the refusal mark after its status
+   * line, the stage and the request's own ID (sockproxy_refusal_mark.h);
+   * the stage alone when the live ID may be another request's
+   * (sp_refusal_pd_rid, as sp_pd_send_refusal). */
   proxy_note_local_refusal(client_pfe, 503);
   proxy_record_local_deny(client_pfe, AI_GW_STAGE_FRAMING, 503,
                           "pd_sg_oversize_unroutable");
   if (client_pfe->fd > 0) {
-    sp_raw_status_write(client_pfe, pd_sg_503, sizeof(pd_sg_503) - 1,
-                        MSG_DONTWAIT | MSG_NOSIGNAL);
+    char marked[sizeof(pd_sg_503) + SP_REFUSAL_MARK_MAX];
+    size_t ml = sp_refusal_mark_splice(marked, sizeof(marked), pd_sg_503, sizeof(pd_sg_503) - 1,
+                                       sp_refusal_stage_name(AI_GW_STAGE_FRAMING),
+                                       sp_refusal_pd_rid(client_pfe->http_pipelined,
+                                                         SP_REFUSAL_LIVE_RID(client_pfe)));
+
+    sp_raw_status_write(client_pfe, ml > 0 ? marked : pd_sg_503,
+                        ml > 0 ? ml : sizeof(pd_sg_503) - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
   }
   if (client_pfe->fd > 0) {
     shutdown(client_pfe->fd, SHUT_RDWR);

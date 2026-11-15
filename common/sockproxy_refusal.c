@@ -14,7 +14,12 @@
 #include "notify.h"
 #include "sockproxy_internal.h"
 #include "sockproxy_hold.h"
+#include "sockproxy_ai_admit.h" /* before the mark: its stage numbers are checked there */
+#include "sockproxy_refusal_mark.h"
 #include "sockproxy_refusal.h"
+
+_Static_assert(SP_PD_REPLY_MARK_ROOM == SP_REFUSAL_MARK_MAX,
+               "SP_PD_REPLY_MARK_ROOM is SP_REFUSAL_MARK_MAX, as a number (sockproxy_refusal.h)");
 
 /* Handles, never borrowed pfe pointers. Teardown/reuse invalidates the
  * registration generation. Only the owner tick removes/frees these nodes. */
@@ -145,12 +150,13 @@ sp_pd_send_refusal(proxy_fd_ent_t *pfe, int stage, uint16_t status,
                     size_t drain_remaining)
 {
   sp_pd_reply_t *r = &pfe->pd_reply;
+  size_t ml;
   if (r->active)
     return 1; /* terminal: never replace TLS retry bytes or record twice */
   proxy_note_local_refusal(pfe, status);
   proxy_record_local_deny(pfe, stage, status, code);
   pfe->lb_err_body_sent = 1;
-  if (!response || !len || len > sizeof(r->bytes))
+  if (!response || !len || len > SP_PD_REPLY_TEXT_MAX)
     return reply_fail(pfe, "response_size");
   /* Preserve the shared sender's begun-answer invariant. This is a fresh
    * pre-connect refusal, never a second status line inside an older answer. */
@@ -158,8 +164,23 @@ sp_pd_send_refusal(proxy_fd_ent_t *pfe, int stage, uint16_t status,
     sp_end_started_answer(pfe, response, len);
     return -1;
   }
-  memcpy(r->bytes, response, len);
-  r->len = (uint16_t)len;
+  /* The refusal mark, as sp_send_local_refusal places it: the stage that
+   * refused and the request's own ID after the status line, the rest of
+   * the text as the caller built it. An answer that takes no mark (no
+   * stage name and no ID, or not a response) goes out as built.
+   *
+   * A second request in the buffer (http_pipelined: the pipelining refusal)
+   * may already have put its own ID in the live field. The refusal answers
+   * the first, so it names no request: the stage alone, never the next
+   * request's ID. Nor the P/D routing ID (sp_refusal_pd_rid). */
+  ml = sp_refusal_mark_splice((char *)r->bytes, sizeof(r->bytes), response, len,
+                              sp_refusal_stage_name(stage),
+                              sp_refusal_pd_rid(pfe->http_pipelined, SP_REFUSAL_LIVE_RID(pfe)));
+  if (ml == 0) {
+    memcpy(r->bytes, response, len);
+    ml = len;
+  }
+  r->len = (uint16_t)ml;
   r->off = 0;
   r->draining = 0;
   r->active = 1;
