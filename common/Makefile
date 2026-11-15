@@ -1190,6 +1190,13 @@ test_refmark: test_refusal_mark
 test_stripinterim: sockproxy_http.c test_resp_strip_interim.py sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h sockproxy_refusal_mark.h
 	python3 test_resp_strip_interim.py
 
+# A backend's X-Api-Key is removed from the final head when interim heads
+# precede it in one read, on a service that declares api_key_auth:
+# sp_resp_strip_api_key from the source, ASan + UBSan.
+.PHONY: test_stripapikey
+test_stripapikey: sockproxy_http.c sockproxy_ai_security.c test_resp_strip_api_key_interim.py sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h
+	python3 test_resp_strip_api_key_interim.py
+
 # The SGLang oversize refusal (503 pd_sg_oversize_unroutable) carries the
 # refusal mark: pd_sg_oversize_reject from the source, ASan + UBSan.
 .PHONY: test_pdsgmark

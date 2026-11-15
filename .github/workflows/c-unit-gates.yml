@@ -131,6 +131,9 @@ jobs:
       - name: A backend's X-Loxilb-Refusal-* removed from the final head when interim heads precede it in one read (never past a final head or a 101; from the source, ASan + UBSan)
         run: make -C common test_stripinterim
 
+      - name: A backend's X-Api-Key removed from the final head when interim heads precede it in one read, on a service that declares api_key_auth (never past a final head or a 101; from the source, ASan + UBSan)
+        run: make -C common test_stripapikey
+
       - name: The SGLang oversize refusal carries the refusal mark (stage and request ID; from the source, ASan + UBSan)
         run: make -C common test_pdsgmark
 
