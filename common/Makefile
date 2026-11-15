@@ -207,7 +207,7 @@ sockproxy_pd.o: sockproxy_pd.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Native P/D non-blocking terminal response/linger state.
-sockproxy_refusal.o: sockproxy_refusal.c sockproxy_refusal.h sockproxy.h
+sockproxy_refusal.o: sockproxy_refusal.c sockproxy_refusal.h sockproxy_refusal_mark.h sockproxy.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # P/D engine-dialect core (ops-table resolution; machine-agnostic glue)
@@ -1182,6 +1182,20 @@ test_refmark: test_refusal_mark
 	  { echo "FAIL: sockproxy_ep.c no_rule_resp must name the stage every no_route answer names"; exit 1; }
 	@echo "refusal mark: the kept-listener no_route answer names its stage PASS"
 
+# A backend's X-Loxilb-Refusal-* on the final head when interim heads precede
+# it in one read: sp_resp_strip_refusal_mark from the source, on the real
+# header helpers, ASan + UBSan. It walks interim heads only: never past a
+# final head (a body) or a 101 (another protocol).
+.PHONY: test_stripinterim
+test_stripinterim: sockproxy_http.c test_resp_strip_interim.py sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h sockproxy_refusal_mark.h
+	python3 test_resp_strip_interim.py
+
+# The SGLang oversize refusal (503 pd_sg_oversize_unroutable) carries the
+# refusal mark: pd_sg_oversize_reject from the source, ASan + UBSan.
+.PHONY: test_pdsgmark
+test_pdsgmark: sockproxy_pd_sglang.c test_pd_sg_refusal_mark.py sockproxy_refusal_mark.h
+	python3 test_pd_sg_refusal_mark.py
+
 # The objective header's capture, the class headers of an admitted response
 # and the strip of a backend's X-Api-Key from its response head, on the
 # real framers under ASan and UBSan.
@@ -1468,5 +1482,5 @@ pd_resv_trt_test.o: sockproxy_pd_trtllm.c sockproxy.h
 .PHONY: test_pd_refusal
 test_pd_refusal: test_pd_refusal_bin
 	./test_pd_refusal_bin
-test_pd_refusal_bin: test_pd_refusal.c sockproxy_refusal.c log.c
-	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wl,--wrap=send,--wrap=recv,--wrap=shutdown,--wrap=clock_gettime,--wrap=malloc,--wrap=SSL_write,--wrap=SSL_get_error,--wrap=SSL_read,--wrap=SSL_shutdown -o $@ $^ -I. -lpthread -lssl -lcrypto
+test_pd_refusal_bin: test_pd_refusal.c sockproxy_refusal.c log.c sockproxy_refusal.h sockproxy_refusal_mark.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wl,--wrap=send,--wrap=recv,--wrap=shutdown,--wrap=clock_gettime,--wrap=malloc,--wrap=SSL_write,--wrap=SSL_get_error,--wrap=SSL_read,--wrap=SSL_shutdown -o $@ $(filter %.c,$^) -I. -lpthread -lssl -lcrypto

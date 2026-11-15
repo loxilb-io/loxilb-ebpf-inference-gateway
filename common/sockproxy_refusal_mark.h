@@ -50,6 +50,28 @@
  * A macro, so this header keeps depending on nothing. */
 #define SP_REFUSAL_LIVE_RID(pfe) ((pfe)->vllm_request_id)
 
+/* The ID a refusal written by the prefill/decode code may name: the live
+ * one, or none where it may not be this request's own to show.
+ *  - `pipelined`: a second request is already in the buffer and may have put
+ *    its ID in the live field; the answer is the first request's.
+ *  - the P/D routing ID (___prefill_addr_<ep>___decode_addr_<ep>_<uuid>)
+ *    replaces the live field once both engines are chosen; it carries
+ *    endpoint addresses and is for the engines, never for a client. Whether
+ *    a refusal can be written after that point was not traced for every
+ *    phase; this holds it if one is. */
+#define SP_PD_ROUTING_RID_PREFIX "___prefill_addr_"
+static inline const char *
+sp_refusal_pd_rid(int pipelined, const char *live)
+{
+  if (pipelined || !live) {
+    return NULL;
+  }
+  if (!strncmp(live, SP_PD_ROUTING_RID_PREFIX, sizeof(SP_PD_ROUTING_RID_PREFIX) - 1)) {
+    return NULL;
+  }
+  return live;
+}
+
 /* A request that ended in the capacity queue (deadline, drain, eviction,
  * TTL). Its audit record stays at the capacity stage. */
 #define SP_REFUSAL_STAGE_QUEUE  "queue"

@@ -128,6 +128,12 @@ jobs:
       - name: The refusal mark (stage and request ID on a gateway-written refusal, whole or absent; a backend's X-Loxilb-Refusal-* removed from a response head; ASan + UBSan)
         run: make -C common test_refmark
 
+      - name: A backend's X-Loxilb-Refusal-* removed from the final head when interim heads precede it in one read (never past a final head or a 101; from the source, ASan + UBSan)
+        run: make -C common test_stripinterim
+
+      - name: The SGLang oversize refusal carries the refusal mark (stage and request ID; from the source, ASan + UBSan)
+        run: make -C common test_pdsgmark
+
       - name: The objective header's capture, the class headers of an admitted response, and a backend's X-Api-Key in its response head (real framers, ASan + UBSan)
         run: make -C common test_objhint
 
