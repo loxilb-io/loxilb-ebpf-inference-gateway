@@ -1261,12 +1261,19 @@ proxy_svc_forwards_netid(proxy_map_ent_t *node)
  * first byte and holds its whole header block. A head split across reads
  * is left as it is, and so is every body byte. X-Auth-* response headers
  * are not touched on any service.
+ *
+ * A backend may send interim heads and the final head in one read
+ * ("100 Continue", then the answer): the head after an interim one is
+ * another head of the same response and is cleaned the same way, as long as
+ * it is whole in this read. The walk goes on from interim heads only, as
+ * sp_resp_strip_refusal_mark's does: what follows a final head is a body,
+ * and what follows a 101 is another protocol; neither is looked at.
  */
 static size_t
 sp_resp_strip_api_key(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen)
 {
   proxy_map_ent_t *node;
-  size_t cur = buflen;
+  size_t len = buflen, off = 0;
 
   if (!client || !buf || !client->cresp_blk.hdr_block)
     return buflen;
@@ -1275,9 +1282,23 @@ sp_resp_strip_api_key(proxy_fd_ent_t *client, uint8_t *buf, size_t buflen)
   proxy_epval_t *pool0 = sp_pool_first(node);
   if (!pool0 || !ai_security_should_strip_api_key(pool0->apikey_auth))
     return buflen;
-  if (!l7h1_strip_header(buf, &cur, "X-Api-Key"))
-    return buflen;
-  return cur;
+  for (;;) {
+    size_t cur = len - off;
+    const uint8_t *h = buf + off;
+    uint8_t *end = l7h1_strip_header(buf + off, &cur, "X-Api-Key");
+
+    if (!end)
+      return len;                /* no whole head here: as it came */
+    len = off + cur;
+    /* "HTTP/1.x 1dd", and not 101: an interim head, another head follows. */
+    if (cur < 12 || memcmp(h, "HTTP/1.", 7) != 0 || h[8] != ' ' || h[9] != '1' ||
+        h[10] < '0' || h[10] > '9' || h[11] < '0' || h[11] > '9' ||
+        (h[10] == '0' && h[11] == '1'))
+      return len;
+    off = (size_t)(end + 4 - buf);
+    if (len - off < 12 || memcmp(buf + off, "HTTP/1.", 7) != 0)
+      return len;                /* nothing more, or not a response head */
+  }
 }
 
 /*
