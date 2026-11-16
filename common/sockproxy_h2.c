@@ -309,7 +309,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                              stream->usage_res_epoch,
                              stream->request_id, notify_worker_id(),
                              (int)stream->auth_src, stream->auth_net_identity,
-                             NULL);
+                             NULL, sp_corr_rec(&stream->corr));
   stream->usage_reserved_toks = 0;
   stream->usage_res_epoch = 0;
 
@@ -351,7 +351,7 @@ proxy_h2_settle_stream(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
                           AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
                                            stream->adm_objective_denied,
                                            stream->adm_hint_not_applied),
-                          stream->adm_objective);
+                          stream->adm_objective, sp_corr_rec(&stream->corr));
 
     /* The same accounting hole the H1 paths report: this response was recorded
      * as completed and no dialect read a usage object out of it, so it was
@@ -451,6 +451,7 @@ proxy_h2_collect_inflight_settles(proxy_fd_ent_t *pfe,
                                      stream->adm_objective_denied,
                                      stream->adm_hint_not_applied);
     snprintf(e->objective, sizeof(e->objective), "%s", stream->adm_objective);
+    sp_corr_export(&stream->corr, &e->corr);
     e->response_is_sse = stream->response_is_sse;
     e->prompt_toks = up;
     e->complet_toks = uc;
@@ -845,6 +846,12 @@ proxy_h2_on_header_callback(nghttp2_session *session,
                     sp_obj_hint_which((const char *)name, namelen),
                     (const char *)value, valuelen);
   }
+
+  /* traceparent / x-client-session-id for the stream's audit records. An
+   * HPACK field is one whole value. A trailer is not a request header. */
+  if (frame->headers.cat == NGHTTP2_HCAT_REQUEST)
+    sp_corr_value(&stream->corr, sp_corr_field((const char *)name, namelen),
+                  (const char *)value, valuelen);
 
   // append into the bounded generic L7 header/cookie store on
   // the per-connection pfe — H1/H2 PARITY with handle_header_val. This
@@ -3254,7 +3261,8 @@ h2_record_local_deny(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                           AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
                                            stream->adm_objective_denied,
                                            stream->adm_hint_not_applied),
-                          stream->adm_objective);
+                          stream->adm_objective,
+                          stream->headers_complete ? &stream->corr.rec : NULL);
 }
 
 int
@@ -3784,7 +3792,8 @@ sp_fc_h2_shed(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream,
                              AI_GW_CLASS_INFO(stream->adm_class_set, stream->adm_class,
                                               stream->adm_objective_denied,
                                               stream->adm_hint_not_applied),
-                             stream->adm_objective);
+                             stream->adm_objective,
+                             stream->headers_complete ? &stream->corr.rec : NULL);
   log_debug("[AIGateway][HTTP/2] stream=%d capacity refused: status=%d code=%s "
            "role=%d inflight=%u limit=%u tenant=%s model=%s",
            stream->stream_id, status, code, role, inflight, limit,
@@ -4967,6 +4976,7 @@ proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
       .client_ip = pfe ? pfe->l7_peer_ip : "",
       .origin_ip = stream->l7_origin_ip,
       .trusted_hops = (int)stream->l7_trusted_hops,
+      .corr = &stream->corr.rec,
     };
     /* The interface the connection arrived on: the connection's, so every
      * stream reads the same one, and read once. */

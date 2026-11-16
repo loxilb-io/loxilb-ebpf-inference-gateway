@@ -22,11 +22,16 @@ prefix = r'''
 #include <string.h>
 #include <strings.h>
 #include "llhttp.h"
+#include "sockproxy_corr.h"
 typedef struct {
   char *rcvbuf;
   int odir, http_hdrs_done;
   size_t http_header_start, http_header_len, rcv_off;
   uint8_t http_content_type_field, http_body_media, http_content_type_count;
+  /* the correlation capture shares the span helpers (sockproxy_corr.h);
+   * the media cases here send neither header */
+  uint8_t http_corr_field;
+  sp_corr_cap_t http_corr;
 } proxy_fd_ent_t;
 '''
 suffix = r'''

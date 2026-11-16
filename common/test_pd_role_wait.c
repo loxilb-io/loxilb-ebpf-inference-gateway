@@ -51,6 +51,7 @@
 #include "sockproxy_fc.h"
 #include "sockproxy_llmd.h"
 #include "sockproxy_obj_hint.h"
+#include "sockproxy_corr.h"
 
 #define MS(n) ((uint64_t)(n) * 1000000ULL)
 
@@ -67,6 +68,7 @@ typedef struct proxy_fd_ent {
   uint8_t auth_src, adm_priority;
   char tenant_id[32], auth_key_id[32], auth_user_id[32], l7_peer_ip[32];
   char auth_net_identity[32], adm_objective[32];
+  sp_corr_cap_t http_corr;
 } proxy_fd_ent_t;
 
 typedef struct proxy_epval {
@@ -116,6 +118,9 @@ sp_h1_send_capacity_deny(proxy_fd_ent_t *pfe, int status, const char *code,
   return 0;
 }
 
+/* The refusal's correlation (sockproxy_http.c): not under test here. */
+static ai_corr_t *proxy_refusal_corr(const proxy_fd_ent_t *pfe) { (void)pfe; return NULL; }
+#undef AI_GW_CLASS_INFO
 #define AI_GW_CLASS_INFO(a, b, c, d) 0
 
 /* The refusal's deny record: counted, with its status and code. */
@@ -129,8 +134,9 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                            int trusted_hops, int auth_src,
                            const char *net_identity,
                            int priority, int class_info,
-                           const char *objective)
+                           const char *objective, const ai_corr_t *corr)
 {
+  (void)corr;
   (void)request_id; (void)producer_id; (void)svc_ident; (void)model;
   (void)tenant_id; (void)key_id; (void)user_id; (void)client_ip;
   (void)origin_ip; (void)trusted_hops; (void)auth_src; (void)net_identity;

@@ -359,6 +359,31 @@ test_ridjoin: test_request_id_join
 	  { echo "FAIL: the forwarded sender takes its ID from proxy_answer_forwarded_request_id, the only reader of the snapshot for an echo (no ID when it was taken under an earlier answer still owed)"; exit 1; }
 	@echo "request ID: the snapshot ends with its response, and a forwarded request's 502 names it PASS"
 
+# WP-D: what a request's traceparent and X-Client-Session-Id put in its audit
+# records. The capture alone (every valid, malformed and duplicate form, the
+# cross cases, the name match), then the HTTP/1.1 callbacks at every split and
+# the source invariants of where HTTP/1.1 and HTTP/2 call it.
+test_corr_capture: test_corr_capture.c sockproxy_corr.h sockproxy_ai_gw.h
+	$(CC) -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -o $@ $< -I.
+
+.PHONY: test_corr
+test_corr: test_corr_capture test_corr_h1.py sockproxy_http.c sockproxy_h2.c test_h2_corr
+	./test_corr_capture
+	python3 test_corr_h1.py
+	./test_h2_corr
+
+# WP-D: the record exports end in one ai_corr_t *, llb_ai_kv_best_worker has
+# no const, and the weak stubs are defined with exactly those prototypes.
+test_ai_gw_stub_proto: test_ai_gw_stub_proto.c sockproxy_ai_gw_stub.c sockproxy_ai_gw.h log.c
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -Wno-unused-parameter -g \
+	  -fsanitize=address,undefined -fno-sanitize-recover=undefined -I. \
+	  -ffunction-sections -fdata-sections -Wl,--gc-sections \
+	  -o $@ test_ai_gw_stub_proto.c sockproxy_ai_gw_stub.c log.c -lpthread
+
+.PHONY: test_aigwstub
+test_aigwstub: test_ai_gw_stub_proto
+	./test_ai_gw_stub_proto
+
 # Which request headers are a conversation ID (an affinity key) on HTTP/1.1:
 # X-Request-Id is not. The unit carries the name test as it was and counts
 # its X-Request-Id cases only if that one takes them; the capture is checked
@@ -524,7 +549,7 @@ test_pd_role_wait.gen.c: sockproxy_http.c
 	awk '/^($(PD_ROLE_WAIT_FNS))\(/ {print prev; on = 1} on {print} on && /^}/ {on = 0; n++; print ""} {prev = $$0} END {if (n != 3) exit 1}' \
 	  sockproxy_http.c > $@ || { rm -f $@; exit 1; }
 
-test_pd_role_wait: test_pd_role_wait.c test_pd_role_wait.gen.c sockproxy_fc.c sockproxy_fc.h sockproxy_llmd.h sockproxy_obj_hint.h
+test_pd_role_wait: test_pd_role_wait.c test_pd_role_wait.gen.c sockproxy_fc.c sockproxy_fc.h sockproxy_llmd.h sockproxy_obj_hint.h sockproxy_corr.h
 	$(CC) -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -o $@ test_pd_role_wait.c sockproxy_fc.c -I. -lpthread
 
@@ -765,7 +790,7 @@ test_h2leg: test_h2_leg_end
 # Nothing reads an HTTP/2 stream after an answer that may have freed it. The
 # gateway object itself is built with ASan here: a read after the free inside
 # sockproxy_h2.c is what this test must see.
-sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h sockproxy_refusal_mark.h
+sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h sockproxy_refusal_mark.h sockproxy_corr.h
 	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) -DSP_DEBUG_ASSERTS \
 		-ffunction-sections -fdata-sections -c -o $@ $<
 
@@ -793,6 +818,12 @@ test_h2_body_source: test_h2_body_source.c $(H2FX_DEPS)
 .PHONY: test_h2body
 test_h2body: test_h2_body_source
 	./test_h2_body_source
+
+# WP-D: each HTTP/2 stream's traceparent / x-client-session-id reaches its
+# own admission and no other stream's; a trailer is not a request header.
+test_h2_corr: test_h2_corr.c $(H2FX_DEPS) sockproxy_corr.h
+	$(H2FX_LINK) -o $@ test_h2_corr.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
 
 # A backend's X-Loxilb-Refusal-* is removed from every response head relayed
 # to an HTTP/2 client, interim and final, on a pool with nothing configured.
@@ -1390,7 +1421,7 @@ test_sync: test_sockproxy_sync_emit
 
 clean:
 	rm -f test_pd_request_limit_bin test_pd_refusal_bin
-	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_refusal_mark test_conv_hdr test_obj_hint test_resp_head_assemble test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_h2_resp_mark test_h2_deny_leak test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
+	rm -f *.o *.d test_pd_finish test_sockproxy_mcp_rr test_sockproxy_mcp test_sockproxy_mcp_capture test_l2_reflection test_admit_response test_request_id test_request_id_join test_pd_rewriter test_pd_cache_aware test_kv_exact test_model_routing test_conv_pool_alias test_conv_pool_alias_via_sockproxy test_ep_health_pool test_doca_root_v2 test_fdb_counter test_h2_route_ref test_h2_end_log test_sockproxy_sync_emit test_h2_inject test_ai_security test_in_ifindex test_log_ring test_cookie test_fc_gate test_fc_queue test_fc_adapt test_pd_leak test_pd_complete test_resp_framing test_pd_admission test_pd_ctrl test_pd_ids test_stream_fallback test_hc_metrics test_hold_core test_backend_tls test_hdr_deadline test_hdr_deadline_tsan test_parser_once test_parser_once_tsan test_fe_limit test_pdi_rmatch test_cache_mark_bin test_abandon_bin test_creq_block test_refusal_mark test_conv_hdr test_corr_capture test_ai_gw_stub_proto test_h2_corr test_obj_hint test_resp_head_assemble test_h2_leg_end test_h2_hold test_force_close test_h2_deny_free test_h2_resp_mark test_h2_deny_leak test_fc_band_ttl test_fc_band_wrr test_llmd test_pd_reservation test_pd_queue_generation test_pd_retry_lifecycle
 
 # Phase 93-06 build-hygiene (see DEPFLAGS above): pull in the gcc-generated header
 # dependency files so any header edit forces the correct recompiles. `-include` with

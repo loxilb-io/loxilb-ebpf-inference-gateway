@@ -57,6 +57,14 @@ main(void)
     "Host", "Content-Type", "X-Api-Key", "X-Conversation", "X-Session", "X-Trace",
     "X-Model", "Authorization", "",
   };
+  /* WP-D: the audit-correlation headers place nothing. Neither is a
+   * conversation ID, and neither name starts with one, before or after. */
+  static const char *const audit_only[] = {
+    "X-Client-Session-Id", "x-client-session-id", "traceparent", "TraceParent",
+  };
+  /* D-3 (a): the prefix match of the three conversation headers is kept, so
+   * a name that starts with one is still one. */
+  static const char *const prefix_kept[] = { "X-Session-IDx", "X-Trace-ID-Foo" };
   size_t i;
 
   for (i = 0; i < sizeof(keep) / sizeof(keep[0]); i++) {
@@ -70,6 +78,12 @@ main(void)
   for (i = 0; i < sizeof(never) / sizeof(never[0]); i++)
     CHECK(!sp_h1_conv_id_header(never[i]) && !prefix_rule(never[i]),
           "'%s' is not one, before or after", never[i]);
+  for (i = 0; i < sizeof(audit_only) / sizeof(audit_only[0]); i++)
+    CHECK(!sp_h1_conv_id_header(audit_only[i]) && !prefix_rule(audit_only[i]),
+          "%s is not a conversation ID, before or after", audit_only[i]);
+  for (i = 0; i < sizeof(prefix_kept) / sizeof(prefix_kept[0]); i++)
+    CHECK(sp_h1_conv_id_header(prefix_kept[i]),
+          "%s is still one: the prefix match is kept (D-3 a)", prefix_kept[i]);
   CHECK(!sp_h1_conv_id_header(NULL), "no name is no conversation ID");
 
   printf("\n1..%d\n", checks);

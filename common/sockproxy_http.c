@@ -220,10 +220,12 @@ proxy_owes_completion(const proxy_fd_ent_t *pfe)
  * `rid` is the record's key when the caller knows it better than the
  * connection's fields do (an answer to a request already forwarded, whose
  * live field may by now hold the next request's ID); NULL for the key every
- * other record of the request uses, proxy_request_id(). */
+ * other record of the request uses, proxy_request_id(). `corr` is the
+ * record's correlation, with the same caller: NULL for none; every other
+ * caller passes the connection's capture. */
 static void
 proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end,
-                            const char *rid)
+                            const char *rid, const ai_corr_t *corr)
 {
   char svc_ident[64];
   int64_t lat_ms = 0;
@@ -252,7 +254,7 @@ proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end,
                         AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
                                          pfe->adm_objective_denied,
                                          pfe->adm_hint_not_applied),
-                        (char *)pfe->adm_objective);
+                        (char *)pfe->adm_objective, (ai_corr_t *)corr);
   pfe->metric_ai_recorded = 1;
   /* The response is complete: the backend's work for this request is done
    * and its capacity unit goes back before the connection idles on
@@ -263,7 +265,7 @@ proxy_ai_record_completion_(proxy_fd_ent_t *pfe, int is_stream, int end,
 static void
 proxy_ai_record_completion(proxy_fd_ent_t *pfe)
 {
-  proxy_ai_record_completion_(pfe, 0, SP_END_NONE, NULL);
+  proxy_ai_record_completion_(pfe, 0, SP_END_NONE, NULL, proxy_request_corr(pfe));
 }
 
 /* An answer the client was receiving, ended by a reaper that frees the
@@ -275,7 +277,8 @@ proxy_ai_record_completion(proxy_fd_ent_t *pfe)
 void
 proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end)
 {
-  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0, end, NULL);
+  proxy_ai_record_completion_(pfe, pfe->stream_start_ts > 0, end, NULL,
+                              proxy_request_corr(pfe));
 }
 
 /* One P/D lifecycle record, for one request and one completion event: the
@@ -554,6 +557,25 @@ proxy_refused_model(const proxy_fd_ent_t *pfe)
   return pfe->prefix_key.model;
 }
 
+/* The correlation of a refusal written for the connection's request - the
+ * request in hand. None before its header block was whole (a header not
+ * read yet could still void a value already captured) and none on a read
+ * that held a second request. With a live key the refusal is keyed by the
+ * request in hand: its live capture. Without one, under an earlier answer
+ * still owed, the refusal is keyed by that earlier request's snapshot: none.
+ * Otherwise as proxy_request_corr. */
+ai_corr_t *
+proxy_refusal_corr(const proxy_fd_ent_t *pfe)
+{
+  if (!pfe->http_corr_whole || pfe->http_pipelined)
+    return NULL;
+  if (pfe->vllm_request_id[0] != '\0')
+    return (ai_corr_t *)&pfe->http_corr.rec;
+  if (pfe->rid_prev_owed)
+    return NULL;
+  return proxy_request_corr(pfe);
+}
+
 void
 proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                         const char *code)
@@ -574,7 +596,7 @@ proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                           AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
                                            pfe->adm_objective_denied,
                                            pfe->adm_hint_not_applied),
-                          pfe->adm_objective);
+                          pfe->adm_objective, proxy_refusal_corr(pfe));
 }
 
 /* The response record of a refusal: status and class, as every local
@@ -613,10 +635,11 @@ proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status)
 
 /* proxy_record_local_completion for an answer to a request that was already
  * forwarded: the same records, the completion keyed by `rid`, the ID that
- * request was forwarded under (NULL: the connection's key). */
+ * request was forwarded under (NULL: the connection's key), and carrying
+ * `corr`, that request's correlation (NULL: none). */
 static void
 proxy_record_forwarded_completion(proxy_fd_ent_t *pfe, uint16_t status,
-                                  const char *rid)
+                                  const char *rid, const ai_corr_t *corr)
 {
   int owed = pfe->odir == 0 && pfe->ai_gw_mode &&
              !pfe->metric_ai_recorded && pfe->metric_response_status == 0;
@@ -624,7 +647,7 @@ proxy_record_forwarded_completion(proxy_fd_ent_t *pfe, uint16_t status,
   proxy_note_local_answer(pfe, status);
   if (owed) {
     pfe->metric_response_status = status;
-    proxy_ai_record_completion_(pfe, 0, SP_END_NONE, rid);
+    proxy_ai_record_completion_(pfe, 0, SP_END_NONE, rid, corr);
   }
 }
 
@@ -827,6 +850,24 @@ proxy_answer_forwarded_request_id(const proxy_fd_ent_t *pfe)
   return proxy_forwarded_request_id(pfe);
 }
 
+/* The correlation the completion of that answer carries, chosen branch for
+ * branch as the ID above: the capture taken when the answered request was
+ * handed over (resp_corr) where the ID is its snapshot, the live capture
+ * where the ID is the live field, and none (NULL) where the answer carries
+ * no ID - never another request's. */
+static const ai_corr_t *
+proxy_answer_forwarded_corr(const proxy_fd_ent_t *pfe)
+{
+  if (pfe->rid_fwd & RID_FWD_TAKEN)
+    return (pfe->rid_fwd & RID_FWD_UNSURE) ? NULL : &pfe->resp_corr;
+  if (!pfe->rid_prev_owed)
+    return (pfe->http_pipelined || !pfe->http_corr_whole) ? NULL : &pfe->http_corr.rec;
+  if ((pfe->rid_fwd & (RID_FWD_UNSURE | RID_FWD_PREV_SEEN)) || pfe->resp_kernel ||
+      !pfe->resp_corr_set)
+    return NULL;
+  return &pfe->resp_corr;
+}
+
 /* The same answer for a request that was handed to a backend leg which
  * went away before it answered, or whose kept leg went away while it was
  * being read. The live field does not name a forwarded request: it is
@@ -846,7 +887,8 @@ proxy_send_backend_unreachable_forwarded(proxy_fd_ent_t *pfe, const char *detail
   if (n < 0) {
     return -1;
   }
-  proxy_record_forwarded_completion(pfe, 502, rid[0] != '\0' ? rid : NULL);
+  proxy_record_forwarded_completion(pfe, 502, rid[0] != '\0' ? rid : NULL,
+                                    proxy_answer_forwarded_corr(pfe));
   return proxy_send_local_response(pfe, resp, (size_t)n);
 }
 
@@ -2620,7 +2662,7 @@ skip_deferred_masking:
                                      notify_worker_id(),
                                      (int)rfd_ent->auth_src,
                                      (char *)rfd_ent->auth_net_identity,
-                                     NULL);
+                                     NULL, proxy_request_corr(rfd_ent));
           /* Settled: the admission claim is spent. Zero it so no later
            * consume on this connection can release it a second time. */
           rfd_ent->usage_reserved_toks = 0;
@@ -2819,7 +2861,8 @@ skip_deferred_masking:
                                    (char *)proxy_request_id(rfd_ent),
                                    notify_worker_id(),
                                    (int)rfd_ent->auth_src,
-                                   (char *)rfd_ent->auth_net_identity, NULL);
+                                   (char *)rfd_ent->auth_net_identity, NULL,
+                                   proxy_request_corr(rfd_ent));
         /* Settled: zero the claim so a spurious second [DONE] or a later
          * non-stream consume on this connection cannot double-release. */
         rfd_ent->usage_reserved_toks = 0;
@@ -2851,7 +2894,8 @@ skip_deferred_masking:
                                                rfd_ent->adm_class,
                                                rfd_ent->adm_objective_denied,
                                                rfd_ent->adm_hint_not_applied),
-                              (char *)rfd_ent->adm_objective);
+                              (char *)rfd_ent->adm_objective,
+                              proxy_request_corr(rfd_ent));
         rfd_ent->metric_ai_recorded = 1;   // mark counted so the non-SSE recorder below won't double-count
         fc_permit_release(&rfd_ent->fc);  /* the stream ended: its capacity unit goes back */
         log_debug("[SSE_DONE] client_fd=%d backend_fd=%d model=%s latency_ms=%lld",
@@ -6550,6 +6594,7 @@ typedef struct {
    * identity so the release names the actor the request's records do. */
   int     auth_src;
   char    net_identity[64];
+  ai_corr_t corr;   /* the request's trace and session correlation */
 } proxy_resv_rel_t;
 
 /* The connection's last response, copied out so it can be reported after the
@@ -6586,6 +6631,7 @@ typedef struct {
   int  priority;
   int  class_info;     /* AI_GW_CLASSF_* */
   char objective[64];
+  ai_corr_t corr;      /* the request's trace and session correlation */
   /* How the answer ended (enum sp_end_cause): SP_END_NONE when the client
    * got all of it; otherwise the request is aborted and error_code names it. */
   int  end;
@@ -6696,6 +6742,8 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
     proxy_pfe_svc_ident(pfe, r->svc_ident, sizeof(r->svc_ident));
     snprintf(r->request_id, sizeof(r->request_id), "%s",
              proxy_request_id(pfe));
+    if (proxy_request_corr(pfe))
+      r->corr = *proxy_request_corr(pfe);
     /* Zero under the lock: nothing may release this claim twice. */
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
@@ -6731,6 +6779,8 @@ proxy_collect_conn_settles(proxy_fd_ent_t *pfe, proxy_settle_batch_t *b,
                                        pfe->adm_objective_denied,
                                        pfe->adm_hint_not_applied);
     snprintf(u->objective, sizeof(u->objective), "%s", pfe->adm_objective);
+    if (proxy_request_corr(pfe))
+      u->corr = *proxy_request_corr(pfe);
     u->status       = (int)pfe->metric_response_status;
     u->prompt_toks  = pfe->usage_prompt_toks;
     u->complet_toks = pfe->usage_complet_toks;
@@ -7548,7 +7598,7 @@ proxy_pdestroy(void *priv)
                                r->svc_ident, 0, 0, 0,
                                r->reserved, r->res_epoch,
                                r->request_id, notify_worker_id(),
-                               r->auth_src, r->net_identity, NULL);
+                               r->auth_src, r->net_identity, NULL, &r->corr);
     log_debug("[AI_TOKENS] released %d unspent reserved tokens on teardown "
              "tenant=%s", r->reserved, r->tenant);
   }
@@ -7570,7 +7620,8 @@ proxy_pdestroy(void *priv)
                             0, notify_worker_id(),
                             u->client_ip, u->origin_ip, u->trusted_hops,
                             u->auth_src, u->net_identity,
-                            u->priority, u->class_info, u->objective);
+                            u->priority, u->class_info, u->objective,
+                            &u->corr);
       log_debug("[AI_NONSSE_RECORDED] on teardown tenant=%s model=%s status=%d end=%s",
                u->tenant, u->model, u->status, sp_end_code(u->end));
     }
@@ -7612,7 +7663,7 @@ proxy_pdestroy(void *priv)
                                e->svc_ident, e->prompt_toks, e->complet_toks,
                                0, e->reserved_toks, e->res_epoch,
                                e->request_id, notify_worker_id(),
-                               e->auth_src, e->net_identity, NULL);
+                               e->auth_src, e->net_identity, NULL, &e->corr);
     if (e->status > 0) {
       llb_ai_record_request(e->tenant, e->model, e->status, e->latency_ms,
                             e->prompt_toks, e->complet_toks, 0, 0, "",
@@ -7620,7 +7671,8 @@ proxy_pdestroy(void *priv)
                             e->response_is_sse, notify_worker_id(),
                             e->client_ip, e->origin_ip, e->trusted_hops,
                             e->auth_src, e->net_identity,
-                            e->priority, e->class_info, e->objective);
+                            e->priority, e->class_info, e->objective,
+                            &e->corr);
       /* Recorded as completed with no usage object to read — the H2 twin of
        * the H1 report above. Inside the status guard on purpose: a stream
        * with no backend status never completed a response, so it is a
@@ -9759,6 +9811,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->http_content_type_field = 0;
     pfe->http_body_media = 0;
     pfe->http_content_type_count = 0;
+    pfe->http_corr_field = 0;
     pfe->json_guard_active = pfe->json_guard_streaming = 0;
     pfe->json_guard_chunked = pfe->json_guard_tail_len = 0;
     sp_json_scan_init(&pfe->json_scan);
@@ -9795,7 +9848,8 @@ handle_on_message_begin(llhttp_t* parser)
                                  (char *)proxy_request_id(pfe),
                                  notify_worker_id(),
                                  (int)pfe->auth_src,
-                                 (char *)pfe->auth_net_identity, NULL);
+                                 (char *)pfe->auth_net_identity, NULL,
+                                 proxy_request_corr(pfe));
     }
     pfe->usage_reserved_toks = 0;
     pfe->usage_res_epoch = 0;
@@ -9818,6 +9872,10 @@ handle_on_message_begin(llhttp_t* parser)
                                   LLB_AI_UMISS_RESPONSE_COMPLETE);
       pfe->metric_ai_recorded = 0;   /* reported once */
     }
+    /* Request N's trace and session correlation: its release and its
+     * completion above were its last readers. */
+    sp_corr_reset(&pfe->http_corr);
+    pfe->http_corr_whole = 0;
     /* The release and the completion above were the last readers of request
      * N's key: forgotten here unless an answer to an earlier request was
      * owed when this request began. Before the status below is cleared: it
@@ -10251,7 +10309,7 @@ sp_fc_h1_refuse(proxy_fd_ent_t *pfe, proxy_epval_t *tepval, fc_verdict_t v,
                              AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
                                               pfe->adm_objective_denied,
                                               pfe->adm_hint_not_applied),
-                             pfe->adm_objective);
+                             pfe->adm_objective, proxy_refusal_corr(pfe));
   log_debug("[AIGateway] fd=%d capacity refused: status=%d code=%s role=%d "
            "inflight=%u queued=%u limit=%u%s tenant=%s model=%s%s",
            pfe->fd, status, code, role, inflight, queued, limit,
@@ -10811,6 +10869,10 @@ sp_h1_admit_req_from_headers(const proxy_fd_ent_t *pfe,
   req->client_ip = pfe->l7_peer_ip;
   req->origin_ip = proxy_origin_ip(pfe);
   req->trusted_hops = (int)proxy_origin_trusted_hops(pfe);
+  /* The request being admitted is the one in hand, whatever key its ID
+   * is minted under afterwards: its live capture (none on a read that held
+   * a second request). */
+  req->corr = pfe->http_pipelined ? NULL : &pfe->http_corr.rec;   /* whole: after headers */
 }
 
 /* True when the rule's admission policy enforces a credential. Mirrors the
@@ -11196,6 +11258,7 @@ handle_on_headers_complete(llhttp_t* parser)
    * sends. */
   if (pfe->odir == 0) {
     sp_hdr_disarm(&pfe->l7_hdr);   /* the block is complete, whatever the parse returns */
+    pfe->http_corr_whole = 1;      /* every header line has reached the capture */
     pfe->http_content_length = (parser->flags & F_CONTENT_LENGTH) ?
                               parser->content_length : 0;
   }
@@ -12405,6 +12468,7 @@ sp_h1_header_field_complete(llhttp_t *parser)
                                   strncasecmp(name, field, sizeof(field) - 1) == 0;
     if (pfe->http_content_type_field && pfe->http_content_type_count < 2)
       pfe->http_content_type_count++;
+    pfe->http_corr_field = (uint8_t)sp_corr_field(name, pfe->http_header_len);
     pfe->http_header_len = 0;
   }
   return 0;
@@ -12434,6 +12498,14 @@ sp_h1_header_value_complete(llhttp_t *parser)
       pfe->http_body_media = SP_H1_MEDIA_JSON;
     if (len == sizeof(form) - 1 && strncasecmp(value, form, len) == 0)
       pfe->http_body_media = SP_H1_MEDIA_FORM;
+    pfe->http_header_len = 0;
+  }
+  /* traceparent / X-Client-Session-Id, on the whole value however many reads
+   * it came in. An empty value has no span and is still a line received. */
+  if (pfe->odir == 0 && !pfe->http_hdrs_done && pfe->http_corr_field) {
+    sp_corr_value(&pfe->http_corr, pfe->http_corr_field,
+                  (const char *)pfe->rcvbuf + pfe->http_header_start,
+                  pfe->http_header_len);
     pfe->http_header_len = 0;
   }
   return 0;
@@ -12495,7 +12567,8 @@ handle_header_val(llhttp_t *parser, const char *at, size_t length)
   pfe = settings->uarg;
   assert(pfe);
   if (pfe->odir == 0 && (parser->flags & F_TRAILING) && !sp_mcp_enabled(pfe)) return 0;
-  if (pfe->odir == 0 && !pfe->http_hdrs_done && pfe->http_content_type_field)
+  if (pfe->odir == 0 && !pfe->http_hdrs_done &&
+      (pfe->http_content_type_field || pfe->http_corr_field))
     sp_h1_header_span(pfe, at, length);
 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
@@ -13190,6 +13263,7 @@ handle_new_connection(int fd, proxy_fd_ent_t *pfe, proxy_map_ent_t *ent,
   npfe1->has_vllm_request_id = 0;
   npfe1->request_id_injected = 0;
   npfe1->resp_request_id[0] = '\0';
+  npfe1->resp_corr_set = 0;
 
   /* C-7: Frontend socket keepalive — override TCP_KEEPIDLE on the client-facing
    * socket so that aggressive cloud NAT tables on the client side also stay alive.
@@ -15267,6 +15341,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           pfe->has_vllm_request_id = 0;
           pfe->request_id_injected = 0;
           pfe->resp_request_id[0] = '\0';
+          pfe->resp_corr_set = 0;
 
           // TRUNCATION FIX: also clear stale SSE/streaming state on the parse-error reset
           // path (same omission as the success-path keep-alive reset above).

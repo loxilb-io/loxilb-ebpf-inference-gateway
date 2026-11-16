@@ -157,7 +157,7 @@ ai_gw_admit(const ai_gw_req_ctx_t *req, ai_gw_admit_result_t *res)
                        AI_GW_CLASS_INFO(res->class_ran, res->priority_class,
                                         res->objective_denied,
                                         res->hint_not_applied),
-                       res->objective);
+                       res->objective, (ai_corr_t *)req->corr);
   }
   return rc;
 }
@@ -172,7 +172,7 @@ ai_gw_record_local_deny(int stage, const char *request_id, int producer_id,
                         int trusted_hops, int auth_src,
                         const char *net_identity,
                         int priority, int class_info,
-                        const char *objective)
+                        const char *objective, const ai_corr_t *corr)
 {
   /* The same attribution every other record carries, with the same
    * meaning: client_ip is the socket peer, origin_ip is "" unless the header
@@ -190,7 +190,8 @@ ai_gw_record_local_deny(int stage, const char *request_id, int producer_id,
                      trusted_hops, auth_src,
                      (char *)(net_identity ? net_identity : ""),
                      priority, class_info,
-                     (char *)(objective ? objective : ""));
+                     (char *)(objective ? objective : ""),
+                     (ai_corr_t *)corr);
 }
 
 void
@@ -203,13 +204,13 @@ ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                            int trusted_hops, int auth_src,
                            const char *net_identity,
                            int priority, int class_info,
-                           const char *objective)
+                           const char *objective, const ai_corr_t *corr)
 {
   ai_gw_record_local_deny((int)AI_GW_STAGE_CAPACITY, request_id, producer_id,
                           svc_ident, model, tenant_id, key_id, user_id,
                           http_status, error_code, client_ip, origin_ip,
                           trusted_hops, auth_src, net_identity, priority,
-                          class_info, objective);
+                          class_info, objective, corr);
 }
 
 /* ---- services with a network-identity binding ---------------------------

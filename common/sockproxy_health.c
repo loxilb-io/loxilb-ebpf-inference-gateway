@@ -630,7 +630,7 @@ sp_reap_fc_format(proxy_fd_ent_t *pfe, uint8_t kind, int keep, char *out,
                              AI_GW_CLASS_INFO(pfe->adm_class_set, pfe->adm_class,
                                               pfe->adm_objective_denied,
                                               pfe->adm_hint_not_applied),
-                             pfe->adm_objective);
+                             pfe->adm_objective, proxy_refusal_corr(pfe));
   log_info("[AIGateway] fd=%d ended while queued: status=%d code=%s "
            "queued_ms=%llu inflight=%u queued=%u tenant=%s model=%s%s",
            pfe->fd, status, code, (unsigned long long)queued_ms, inflight,

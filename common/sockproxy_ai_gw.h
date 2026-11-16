@@ -54,6 +54,28 @@ typedef struct {
     int  auth_flags;
 } ai_gw_decision_t;
 
+/*
+ * A request's trace and session correlation, as its audit records carry it
+ * (deny, completion, settle). Each field is NUL-terminated and "" when
+ * absent: the header was not sent, was not valid, or was received more than
+ * once (sockproxy_corr.h says which values are valid). A value is never cut
+ * or rewritten to fit.
+ *
+ *   trace_id        the 32 lower-case hex digits of the request's traceparent
+ *   parent_span_id  its 16 lower-case hex digits of parent-id: the client's
+ *                   span for this attempt (the gateway has no span of its own)
+ *   session_id      X-Client-Session-Id, 1-128 bytes of A-Z a-z 0-9 . _ : -
+ *
+ * The record exports take an ai_corr_t * as their last parameter; NULL means
+ * all three absent. The struct layout must stay in sync with the Go side,
+ * which reads it as C.ai_corr_t through this header.
+ */
+typedef struct {
+    char trace_id[33];
+    char parent_span_id[17];
+    char session_id[129];
+} ai_corr_t;
+
 /* auth_flags bits */
 #define AI_GW_AUTHF_STRIP_AUTHZ  0x1  /* strip Authorization before dispatch */
 #define AI_GW_AUTHF_FWD_IDENTITY 0x2  /* inject X-Auth-Tenant/X-Auth-User upstream */
@@ -216,6 +238,8 @@ extern int llb_ai_ratelimit_update(char *key_id, char *tenant_id, int rps, int b
  *                   when the class stage did not run for the request
  *   objective:      the hint that was applied: an objective name,
  *                   "tier:<value>", or ""
+ *   corr:           the request's trace and session correlation (ai_corr_t);
+ *                   NULL when the caller has none. Read only, never kept
  *
  * Returns void.
  */
@@ -236,7 +260,7 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
                                   int trusted_hops, int auth_src,
                                   char *net_identity,
                                   int priority, int class_info,
-                                  char *objective);
+                                  char *objective, ai_corr_t *corr);
 
 /*
  * llb_ai_record_deny – record one request refused at the admission gate.
@@ -276,6 +300,9 @@ extern void llb_ai_record_request(char *tenant_id, char *model_name, int status_
  *                 documents, so that the records of one request agree.
  *                 class_info is 0 for a refusal made before the class stage
  *                 ran (no tenant yet, or nothing configured)
+ *   corr:         the request's correlation, as llb_ai_record_request
+ *                 documents. A refusal made before the request's headers
+ *                 were complete has none: NULL, or fields that are ""
  */
 extern void llb_ai_record_deny(char *request_id, int producer_id,
                                char *svc_ident, char *model_name,
@@ -285,7 +312,7 @@ extern void llb_ai_record_deny(char *request_id, int producer_id,
                                int trusted_hops, int auth_src,
                                char *net_identity,
                                int priority, int class_info,
-                               char *objective);
+                               char *objective, ai_corr_t *corr);
 
 /*
  * llb_ai_stream_start – record the opening of an SSE stream.
@@ -366,6 +393,8 @@ extern int llb_ai_stream_end(char *tenant_id, char *model_name);
  *                  the charge's record names the same actor the request's
  *                  other records do
  *   result         output structure; decision may be set to 3 when quota exceeded
+ *   corr           the request's correlation for its settle record, as
+ *                  llb_ai_record_request documents (NULL: none)
  *
  * Returns:
  *    0  quota not exceeded (or no quota configured)
@@ -379,7 +408,8 @@ extern int llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                                       int64_t res_epoch,
                                       char *request_id, int producer_id,
                                       int auth_src, char *net_identity,
-                                      ai_gw_decision_t *result);
+                                      ai_gw_decision_t *result,
+                                      ai_corr_t *corr);
 
 /* Cancel an unused claim after a late framing refusal. No token charge or
  * data.ai.settle is emitted; the caller records the single sec.ai.deny and
@@ -1002,8 +1032,8 @@ extern int llb_ai_kv_tokenize_chat(char *raw_body, char *model_name,
 extern int llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
                                   int n_hashes, char *model_name,
                                   uint32_t prefill_mask, uint32_t excluded_mask,
-                                  const uint32_t *ep_load, const uint32_t *ep_cap,
-                                  const uint32_t *ep_weight,
+                                  uint32_t *ep_load, uint32_t *ep_cap,
+                                  uint32_t *ep_weight,
                                   int n_ep_slots, uint32_t kv_svc_id,
                                   uint32_t kv_exact_mode,
                                   int *out_score);

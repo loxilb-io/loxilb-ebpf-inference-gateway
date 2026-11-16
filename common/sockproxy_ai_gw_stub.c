@@ -125,9 +125,11 @@ llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                       char *svc_ident, int is_stream, int producer_id,
                       char *client_ip, char *origin_ip, int trusted_hops,
                       int auth_src, char *net_identity,
-                      int priority, int class_info, char *objective)
+                      int priority, int class_info, char *objective,
+                      ai_corr_t *corr)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)corr;
     (void)auth_src;
     (void)net_identity;
     (void)priority;
@@ -183,9 +185,11 @@ llb_ai_record_deny(char *request_id, int producer_id,
                    int stage, int http_status, char *error_code,
                    char *client_ip, char *origin_ip, int trusted_hops,
                    int auth_src, char *net_identity,
-                   int priority, int class_info, char *objective)
+                   int priority, int class_info, char *objective,
+                   ai_corr_t *corr)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)corr;
     (void)auth_src;
     (void)net_identity;
     (void)priority;
@@ -231,9 +235,10 @@ llb_ai_token_quota_consume(char *tenant_id, char *model_name,
                            int estimated, int reserved_toks,
                            int64_t res_epoch, char *request_id,
                            int producer_id, int auth_src, char *net_identity,
-                           ai_gw_decision_t *result)
+                           ai_gw_decision_t *result, ai_corr_t *corr)
 {
     AI_GW_STUB_TRIPWIRE(warned);
+    (void)corr;
     (void)auth_src;
     (void)net_identity;
     (void)tenant_id;
@@ -453,8 +458,8 @@ __attribute__((weak)) int
 llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
                        int n_hashes, char *model_name,
                        uint32_t prefill_mask, uint32_t excluded_mask,
-                       const uint32_t *ep_load, const uint32_t *ep_cap,
-                       const uint32_t *ep_weight,
+                       uint32_t *ep_load, uint32_t *ep_cap,
+                       uint32_t *ep_weight,
                        int n_ep_slots, uint32_t kv_svc_id,
                        uint32_t kv_exact_mode, int *out_score)
 {

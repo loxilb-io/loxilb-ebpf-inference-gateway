@@ -187,6 +187,12 @@ jobs:
       - name: Which HTTP/1.1 request headers are a conversation ID (X-Request-Id is not one; the capture asks the helper)
         run: make -C common test_convhdr
 
+      - name: What a request's traceparent and X-Client-Session-Id put in its audit records (the capture, the HTTP/1.1 callbacks at every split and on a kept connection, two HTTP/2 streams on the real relay; ASan + UBSan)
+        run: make -C common test_corr
+
+      - name: The record exports end in one ai_corr_t *, llb_ai_kv_best_worker has no const, the weak stubs match (ASan + UBSan)
+        run: make -C common test_aigwstub
+
       - name: An Endpoint Picker's immediate answer carries exactly one X-Request-Id, the request's own (production sender)
         run: make -C common test_eppimm
 

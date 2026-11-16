@@ -22,6 +22,7 @@
 #include "sockproxy_fc.h"   /* per-stream capacity admission permit */
 #include "sockproxy_obj_hint.h"   /* the objective a request asks for by header */
 #include "sockproxy_l7trust.h"   /* l7_hop_list_t on the per-stream request state */
+#include "sockproxy_corr.h"      /* the stream's trace and session correlation */
 
 // Forward declarations
 struct proxy_fd_ent;
@@ -207,6 +208,9 @@ typedef struct proxy_h2_stream {
   void *prefix_key;                  // llm_prefix_key_t* - extracted from request
   char conversation_id[128];         // X-Conversation-ID header
   int has_conv_id;                   // Flag: conversation ID present
+  sp_corr_cap_t corr;                // traceparent / x-client-session-id for the
+                                     // stream's audit records (sockproxy_corr.h);
+                                     // a stream starts zeroed (create_stream)
   
   // The forwarding chain this REQUEST arrived with, and the address the
   // attribution walk decided it came from. Per stream, not per connection,
@@ -541,6 +545,8 @@ typedef struct h2_inflight_settle {
   int     priority;
   int     class_info;   /* AI_GW_CLASSF_* */
   char    objective[64];
+  /* The stream's trace and session correlation, copied with the identity. */
+  ai_corr_t corr;
 } h2_inflight_settle_t;
 
 /*

@@ -28,6 +28,7 @@
 #include "sockproxy_obj_hint.h"     /* the objective a request asks for by header (proxy_fd_ent member) */
 #include "sockproxy_llmd.h"         /* the llm-d TTL a request asks for by header (proxy_fd_ent member) */
 #include "sockproxy_creq_block.h"   /* where a client read stands in its request (proxy_fd_ent member) */
+#include "sockproxy_corr.h"         /* the request's trace and session correlation (proxy_fd_ent member) */
 
 enum {
   SP_H1_MEDIA_JSON = 1,
@@ -1393,6 +1394,26 @@ struct proxy_fd_ent {
   uint8_t http_content_type_field;
   uint8_t http_body_media;
   uint8_t http_content_type_count;
+  /* The audit correlation of the request on the client leg: which
+   * correlation field the current header line is (SP_CORR_*; parser state,
+   * cleared with the spans above), and what the request's traceparent and
+   * X-Client-Session-Id gave (sockproxy_corr.h). The capture is request data:
+   * cleared with the request's identity in handle_on_message_begin, after the
+   * previous request's last records are written. */
+  uint8_t http_corr_field;
+  sp_corr_cap_t http_corr;
+  /* The request's header block was whole when the capture closed: set at its
+   * headers-complete, cleared with the capture. Until then a header not read
+   * yet could still void a value, so nothing reads the capture as the
+   * request's (proxy_request_corr). Not http_hdrs_done, which the hand-over
+   * to a backend clears again while the request is still in flight. */
+  uint8_t http_corr_whole;
+  /* The capture as it was when the request was handed to a backend, taken
+   * with resp_request_id and forgotten with it: what a record written in
+   * that request's response phase carries once the live capture may be the
+   * next request's (proxy_request_corr). resp_corr_set: it is valid. */
+  ai_corr_t resp_corr;
+  uint8_t resp_corr_set;
   sp_json_scan_t json_scan;
   uint8_t json_guard_active, json_guard_streaming, json_guard_chunked;
   uint8_t json_guard_tail_len;
@@ -2013,6 +2034,14 @@ proxy_request_id_snapshot(proxy_fd_ent_t *pfe)
   strncpy(pfe->resp_request_id, pfe->vllm_request_id,
           sizeof(pfe->resp_request_id) - 1);
   pfe->resp_request_id[sizeof(pfe->resp_request_id) - 1] = '\0';
+  /* The request's correlation goes with its key - none when the read held
+   * a second request, whose header callbacks may already have replaced the
+   * capture before this one is handed over. */
+  if (pfe->http_pipelined || !pfe->http_corr_whole)
+    memset(&pfe->resp_corr, 0, sizeof(pfe->resp_corr));
+  else
+    pfe->resp_corr = pfe->http_corr.rec;
+  pfe->resp_corr_set = 1;
 }
 
 /* The response the snapshot was taken for is over and its last reader has
@@ -2034,6 +2063,7 @@ static inline void
 proxy_request_id_response_done(proxy_fd_ent_t *pfe)
 {
   pfe->resp_request_id[0] = '\0';
+  pfe->resp_corr_set = 0;
 }
 
 /* The ID of the request this connection has handed to a backend and is
@@ -2068,6 +2098,38 @@ proxy_request_id(const proxy_fd_ent_t *pfe)
     return pfe->vllm_request_id;
   }
   return pfe->resp_request_id;
+}
+
+/* rid_fwd's "taken under an earlier answer still owed" bit, as
+ * sockproxy_http.c defines it with the rest of RID_FWD_*. */
+#define RID_FWD_UNSURE    0x02
+
+/* The trace and session correlation of the request proxy_request_id names,
+ * chosen the same way: the live capture while the live key is set or nothing
+ * was handed over, else the capture taken when the request was handed over.
+ * None (NULL) before the request's header block was whole
+ * (http_corr_whole), and wherever the key may name another request than the
+ * record is for - a correlation is absent rather than a guess:
+ *   - the read held a second request (http_pipelined): its header callbacks
+ *     have replaced the live capture, and the record may be the first's;
+ *   - a live key under an earlier answer still owed (rid_prev_owed): a record
+ *     of that earlier request would be keyed, and correlated, by this one;
+ *   - a snapshot taken under an owed answer (RID_FWD_UNSURE): it may be a
+ *     later request's while the record is the earlier one's.
+ * The record exports take a non-const pointer and NULL for none; none of
+ * them writes through it. */
+static inline ai_corr_t *
+proxy_request_corr(const proxy_fd_ent_t *pfe)
+{
+  if (pfe->vllm_request_id[0] != '\0' || !pfe->resp_corr_set) {
+    if (!pfe->http_corr_whole || pfe->http_pipelined ||
+        (pfe->vllm_request_id[0] != '\0' && pfe->rid_prev_owed))
+      return NULL;
+    return (ai_corr_t *)&pfe->http_corr.rec;
+  }
+  if (pfe->rid_fwd & RID_FWD_UNSURE)
+    return NULL;
+  return (ai_corr_t *)&pfe->resp_corr;
 }
 
 /* D2 root fix (pfe pool + generation, B-split) — implemented in sockproxy_conn.c.
