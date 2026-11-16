@@ -38,7 +38,7 @@ jobs:
       - name: Toolchain and unit dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -y install build-essential libnghttp2-dev libssl-dev libelf-dev zlib1g-dev python3
+          sudo apt-get -y install build-essential libnghttp2-dev libssl-dev libelf-dev zlib1g-dev openssl pkg-config python3
 
       - name: Host, listener identity, model and path routing
         run: |
@@ -63,6 +63,45 @@ jobs:
         run: |
           sudo sysctl -w vm.mmap_rnd_bits=28
           make -C common test_poolref
+
+      - name: SNI preserves listener client trust (ASan and LeakSanitizer)
+        run: |
+          make -C common test_sni_mtls
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./common/test_sni_mtls
+
+      - name: Frontend mTLS during concurrent SNI certificate rotation (ASan and LeakSanitizer)
+        run: |
+          fixture=$(mktemp -d)
+          certdir=/etc/loxilb/certs/igw-1b-stress
+          cleanup() {
+            rm -rf -- "$fixture"
+            sudo rm -rf -- "$certdir"
+          }
+          sudo test ! -e "$certdir"
+          trap cleanup EXIT
+          for ca in server client; do
+            openssl req -x509 -newkey rsa:2048 -noenc -days 1 -subj "/CN=$ca test CA" \
+              -keyout "$fixture/$ca.key" -out "$fixture/$ca.crt"
+          done
+          for leaf in default sni valid; do
+            ca=server
+            hostname=default.test
+            case "$leaf" in
+              sni) hostname=sni-1b.test ;;
+              valid) ca=client; hostname=valid.test ;;
+            esac
+            openssl req -new -newkey rsa:2048 -noenc -subj "/CN=$hostname" \
+              -addext "subjectAltName=DNS:$hostname" -keyout "$fixture/$leaf.key" \
+              -out "$fixture/$leaf.csr"
+            openssl x509 -req -in "$fixture/$leaf.csr" -CA "$fixture/$ca.crt" \
+              -CAkey "$fixture/$ca.key" -CAcreateserial -days 1 -copy_extensions copy \
+              -out "$fixture/$leaf.crt"
+          done
+          sudo install -d -m 0755 "$certdir"
+          sudo install -m 0644 "$fixture/sni.crt" "$certdir/server.crt"
+          sudo install -m 0600 -o "$(id -u)" "$fixture/sni.key" "$certdir/server.key"
+          openssl version
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./common/test_sni_mtls "$fixture"
 
       - name: An HTTP/2 stream gives its pool back on the real stream free (ASan + UBSan)
         run: make -C common test_h2rref

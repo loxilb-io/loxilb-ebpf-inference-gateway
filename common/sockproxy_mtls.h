@@ -83,17 +83,17 @@ extern int g_ssl_ctx_proxy_arg_index;
  *
  * Motivation: the SNI callback calls SSL_set_SSL_CTX() to swap in a per-hostname
  * SSL_CTX. That new SSL_CTX has no proxy_arg stored in its ex_data (it was stored
- * on the original SSL_CTX). To survive the SSL_CTX switch AND survive concurrent
- * rule deletion (which frees proxy_arg), we copy the needed fields into a small
- * heap-allocated struct that is owned by the SSL connection. It is freed
- * automatically by OpenSSL when SSL_free() is called via the cleanup callback
- * registered for g_ssl_proxy_arg_index.
+ * on the original SSL_CTX). The connection owns a copy of the CN policy
+ * and a reference to the listener verification store. Both survive context
+ * switches and repeated SNI callbacks. SSL_free() invokes the registered
+ * cleanup callback for g_ssl_proxy_arg_index.
  *
  * Lifecycle:
- *   alloc:  sni_servername_callback()    — once per TLS handshake
+ *   alloc:  sni_servername_callback()    — on the first SNI context switch
  *   free:   mtls_ssl_conn_state_cleanup() — called by SSL_free()
  */
 typedef struct {
+    X509_STORE *verify_store;        /* owned reference to the listener CA and CRL store */
     uint8_t require_client_cn;       /* copy of proxy_arg_t::require_client_cn  */
     char    client_cn_pattern[256];  /* copy of proxy_arg_t::client_cn_pattern  */
 } mtls_ssl_conn_state_t;

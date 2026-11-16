@@ -491,16 +491,20 @@ proxy_client_ssl_ctx_init(proxy_arg_t *arg)
 #endif /* HAVE_MTLS */
 
   return ctx;
-}/**
+}
+
+/**
  * SNI (Server Name Indication) callback for dynamic certificate selection (GLOBAL STORE)
  *
  * Called by OpenSSL during TLS handshake when client sends SNI extension.
  * Looks up certificate in GLOBAL certificate store (shared by all proxies).
  *
  * @param ssl    OpenSSL SSL connection object
- * @param ad     Alert descriptor (unused)
+ * @param ad     TLS alert on fatal error
  * @param arg    User-defined argument (unused - we use global store)
- * @return SSL_TLSEXT_ERR_OK (certificate found) or SSL_TLSEXT_ERR_NOACK (use default)
+ * @return SSL_TLSEXT_ERR_OK after selection, SSL_TLSEXT_ERR_NOACK for the
+ *         default certificate, or SSL_TLSEXT_ERR_ALERT_FATAL if selection
+ *         or policy preservation fails.
  */
 int
 sni_servername_callback(SSL *ssl, int *ad, void *arg)
@@ -508,10 +512,9 @@ sni_servername_callback(SSL *ssl, int *ad, void *arg)
   ssl_cert_entry_t *cert_entry = NULL;
   const char *servername = NULL;
 
-  (void)ad;   // Unused parameter
-
   if (!ssl) {
     log_error("SNI callback: Invalid SSL object");
+    if (ad) *ad = SSL_AD_INTERNAL_ERROR;
     return SSL_TLSEXT_ERR_ALERT_FATAL;
   }
   pthread_once(&alpn_conn_once, alpn_conn_index_init);
@@ -519,6 +522,7 @@ sni_servername_callback(SSL *ssl, int *ad, void *arg)
       SSL_set_ex_data(ssl, alpn_conn_index,
                      (void *)(uintptr_t)((arg ? *(uint8_t *)arg : 2) + 1)) != 1) {
     log_error("SNI callback: cannot preserve listener ALPN policy");
+    if (ad) *ad = SSL_AD_INTERNAL_ERROR;
     return SSL_TLSEXT_ERR_ALERT_FATAL;
   }
 
@@ -529,63 +533,99 @@ sni_servername_callback(SSL *ssl, int *ad, void *arg)
     return SSL_TLSEXT_ERR_NOACK;
   }
 
-  // Lookup hostname in GLOBAL certificate map (read lock for concurrent lookups)
+  // Keep a reference before unlocking the store. Rotation can replace or
+  // delete this entry while this handshake selects its certificate.
+  SSL_CTX *selected = NULL;
   pthread_rwlock_rdlock(&proxy_struct->global_cert_lock);
   HASH_FIND_STR(proxy_struct->global_cert_map, servername, cert_entry);
-  pthread_rwlock_unlock(&proxy_struct->global_cert_lock);
-
   if (cert_entry && cert_entry->ssl_ctx) {
-    // Found certificate for this hostname - switch SSL context.
-    //
-    // BUG PREVENTION: SSL_set_SSL_CTX() replaces the SSL_CTX on this connection.
-    // The new SSL_CTX does NOT carry the ex_data (proxy_arg_t*) that was stored on
-    // the original SSL_CTX by mtls_configure_frontend().  If we switch without
-    // preserving proxy_arg, the mTLS client-verify callback will see NULL and
-    // reject every client certificate.
-    //
-    // Fix: save the proxy_arg pointer on the SSL connection object itself
-    // (g_ssl_proxy_arg_index, no cleanup callback) before the switch so that
-    // mtls_client_verify_callback() can fall back to it.
-#ifdef HAVE_MTLS
-    if (g_ssl_ctx_proxy_arg_index >= 0 && g_ssl_proxy_arg_index >= 0) {
-      SSL_CTX *orig_ctx = SSL_get_SSL_CTX(ssl);
-      if (orig_ctx) {
-        proxy_arg_t *mtls_arg =
-            (proxy_arg_t *)SSL_CTX_get_ex_data(orig_ctx, g_ssl_ctx_proxy_arg_index);
-        if (mtls_arg) {
-          // Allocate an OWNED per-connection snapshot of the fields the verify
-          // callback needs.  Using an owned copy (instead of storing the raw
-          // proxy_arg_t pointer) is the production-safe design:
-          //   1. SSL_set_SSL_CTX() discards the SSL_CTX-level ex_data, so we
-          //      cannot read proxy_arg from the new SSL_CTX in the callback.
-          //   2. Rule deletion frees proxy_arg_t concurrently — storing the raw
-          //      pointer would be a use-after-free if a handshake is in progress.
-          // The snapshot is freed automatically by mtls_ssl_conn_state_cleanup()
-          // when the SSL connection is destroyed via SSL_free().
-          mtls_ssl_conn_state_t *conn_state =
-              (mtls_ssl_conn_state_t *)calloc(1, sizeof(mtls_ssl_conn_state_t));
-          if (conn_state) {
-            conn_state->require_client_cn = mtls_arg->require_client_cn;
-            memcpy(conn_state->client_cn_pattern, mtls_arg->client_cn_pattern,
-                   sizeof(conn_state->client_cn_pattern));
-            SSL_set_ex_data(ssl, g_ssl_proxy_arg_index, conn_state);
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-            log_debug("[mTLS] SNI: allocated conn_state=%p for SSL=%p (cn_pat='%s')",
-                      (void *)conn_state, (void *)ssl, conn_state->client_cn_pattern);
-#endif
-          } else {
-            log_error("[mTLS] SNI: failed to allocate per-connection mTLS snapshot");
-          }
-        }
-      }
+    selected = (SSL_CTX *)cert_entry->ssl_ctx;
+    if (SSL_CTX_up_ref(selected) != 1) {
+      pthread_rwlock_unlock(&proxy_struct->global_cert_lock);
+      if (ad) *ad = SSL_AD_INTERNAL_ERROR;
+      return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
-#endif /* HAVE_MTLS */
-    SSL_set_SSL_CTX(ssl, (SSL_CTX *)cert_entry->ssl_ctx);
-    return SSL_TLSEXT_ERR_OK;
+  }
+  pthread_rwlock_unlock(&proxy_struct->global_cert_lock);
+  if (!selected) {
+    return SSL_TLSEXT_ERR_NOACK;
   }
 
-  // Hostname not found in map - use default certificate
-  return SSL_TLSEXT_ERR_NOACK;
+  int result = SSL_TLSEXT_ERR_ALERT_FATAL;
+#ifdef HAVE_MTLS
+  SSL_CTX *listener = SSL_get_SSL_CTX(ssl);
+  int verify_mode = SSL_get_verify_mode(ssl);
+  int verify_depth = SSL_get_verify_depth(ssl);
+  SSL_verify_cb verify_cb = SSL_get_verify_callback(ssl);
+  X509_STORE *store = NULL;
+  STACK_OF(X509_NAME) *ca_names = NULL;
+  if (listener && (verify_mode & SSL_VERIFY_PEER)) {
+    if (g_ssl_proxy_arg_index < 0 || g_ssl_ctx_proxy_arg_index < 0) {
+      goto out;
+    }
+    // Keep the original listener policy across repeated SNI callbacks.
+    // OpenSSL 3.0.2 cannot read the per-SSL verification store back.
+    mtls_ssl_conn_state_t *state = SSL_get_ex_data(ssl, g_ssl_proxy_arg_index);
+    if (!state) {
+      const proxy_arg_t *mtls_arg = SSL_CTX_get_ex_data(listener, g_ssl_ctx_proxy_arg_index);
+      X509_STORE *listener_store = SSL_CTX_get_cert_store(listener);
+      if (!mtls_arg || !listener_store) {
+        goto out;
+      }
+      state = calloc(1, sizeof(*state));
+      if (!state) {
+        goto out;
+      }
+      if (X509_STORE_up_ref(listener_store) != 1) {
+        free(state);
+        goto out;
+      }
+      state->verify_store = listener_store;
+      state->require_client_cn = mtls_arg->require_client_cn;
+      memcpy(state->client_cn_pattern, mtls_arg->client_cn_pattern,
+             sizeof(state->client_cn_pattern));
+      if (SSL_set_ex_data(ssl, g_ssl_proxy_arg_index, state) != 1) {
+        X509_STORE_free(state->verify_store);
+        free(state);
+        goto out;
+      }
+    }
+    store = state->verify_store;
+    STACK_OF(X509_NAME) *names = SSL_get_client_CA_list(ssl);
+    if (names) {
+      ca_names = SSL_dup_CA_list(names);
+      if (!ca_names) {
+        goto out;
+      }
+    }
+  }
+#endif
+  if (!SSL_set_SSL_CTX(ssl, selected)) {
+    goto out;
+  }
+#ifdef HAVE_MTLS
+  if (store && SSL_set1_verify_cert_store(ssl, store) != 1) {
+    goto out;
+  }
+  if (ca_names) {
+    SSL_set_client_CA_list(ssl, ca_names);
+    ca_names = NULL;
+  }
+  SSL_set_verify(ssl, verify_mode, verify_cb);
+  SSL_set_verify_depth(ssl, verify_depth);
+#endif
+  result = SSL_TLSEXT_ERR_OK;
+
+out:
+#ifdef HAVE_MTLS
+  sk_X509_NAME_pop_free(ca_names, X509_NAME_free);
+#endif
+  SSL_CTX_free(selected);
+  if (result == SSL_TLSEXT_ERR_ALERT_FATAL) {
+    log_error("SNI callback: could not switch certificate and preserve client verification");
+    if (ad) *ad = SSL_AD_INTERNAL_ERROR;
+  }
+  return result;
 }
 
 /**
