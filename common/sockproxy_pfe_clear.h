@@ -53,6 +53,13 @@ _Static_assert(offsetof(proxy_fd_ent_t, fdlist_rule) < PFE_SKIP_OFF ||
 _Static_assert(offsetof(proxy_fd_ent_t, l7_origin_ip) < PFE_SKIP_OFF ||
                offsetof(proxy_fd_ent_t, l7_origin_ip) >= PFE_SKIP_END,
                "l7_origin_ip must lie outside the skipped span");
+/* The same for the previous connection's trace and session correlation. */
+_Static_assert(offsetof(proxy_fd_ent_t, http_corr) + sizeof(sp_corr_cap_t) <= PFE_SKIP_OFF ||
+               offsetof(proxy_fd_ent_t, http_corr) >= PFE_SKIP_END,
+               "http_corr must lie outside the skipped span");
+_Static_assert(offsetof(proxy_fd_ent_t, resp_corr_set) < PFE_SKIP_OFF ||
+               offsetof(proxy_fd_ent_t, resp_corr_set) >= PFE_SKIP_END,
+               "resp_corr_set must lie outside the skipped span");
 _Static_assert(offsetof(proxy_fd_ent_t, l7_inbound_hops) < PFE_SKIP_OFF ||
                offsetof(proxy_fd_ent_t, l7_inbound_hops) >= PFE_SKIP_END,
                "l7_inbound_hops must lie outside the skipped span");

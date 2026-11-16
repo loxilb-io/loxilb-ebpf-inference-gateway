@@ -117,6 +117,7 @@ prefix = r'''
 #define AI_GW_STAGE_CAPACITY 3
 #define AI_GW_CLASS_INFO(a,b,c,d) 0
 enum { SP_HOLD_END_NONE = 0, SP_HOLD_END_EXPIRED = 3, SP_HOLD_END_RELEASED = 4 };
+typedef struct { char trace_id[33]; char parent_span_id[17]; char session_id[129]; } ai_corr_t;
 typedef struct proxy_fd_ent proxy_fd_ent_t;
 struct proxy_fd_ent {
   int fd, odir, ai_gw_mode, metric_ai_recorded, metric_response_status, noted, fc;
@@ -128,6 +129,7 @@ struct proxy_fd_ent {
   uint64_t metric_req_start_ns;
   char tenant_id[32], auth_user_id[32], auth_key_id[32], l7_peer_ip[32];
   char auth_net_identity[32], adm_objective[32], request_id[32], model[32];
+  struct { ai_corr_t rec; } http_corr;
 };
 enum { SP_REAP_NONE = 0, SP_REAP_SSE_CAP, SP_REAP_PD_PREFILL_TIMEOUT, SP_REAP_PD_DECODE_TIMEOUT,
   SP_REAP_PD_PARK_TIMEOUT, SP_REAP_PD_GRACEFUL_DONE, SP_REAP_PD_STREAM_TIMEOUT, SP_REAP_PD_IDLE_TIMEOUT,
@@ -137,12 +139,14 @@ static int records, record_status, record_stream, freed_inline, pd_aborted;
 static char record_code[64];
 static void capture(int status, int stream, const char *code) {
   records++; record_status = status; record_stream = stream; snprintf(record_code, sizeof(record_code), "%s", code); }
-#define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj) \
+#define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj,corr) \
  ((void)(t),(void)(m),(void)(lat),(void)(ti),(void)(to),(void)(r),(void)(u),(void)(k),(void)(svc),(void)(worker), \
-  (void)(peer),(void)(origin),(void)(hops),(void)(auth),(void)(net),(void)(prio),(void)(cls),(void)(obj),capture(st,stream,c))
+  (void)(peer),(void)(origin),(void)(hops),(void)(auth),(void)(net),(void)(prio),(void)(cls),(void)(obj),(void)(corr), \
+  capture(st,stream,c))
 static uint64_t get_timestamp_ns(void) { return 2000000; }
 static const char *proxy_effective_model(proxy_fd_ent_t *p) { return p->model; }
 static const char *proxy_request_id(proxy_fd_ent_t *p) { return p->request_id; }
+static ai_corr_t *proxy_request_corr(proxy_fd_ent_t *p) { return &p->http_corr.rec; }
 static const char *proxy_origin_ip(proxy_fd_ent_t *p) { return p->l7_peer_ip; }
 static int proxy_origin_trusted_hops(proxy_fd_ent_t *p) { (void)p; return 0; }
 static int notify_worker_id(void) { return 2; }

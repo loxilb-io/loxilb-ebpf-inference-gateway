@@ -217,6 +217,9 @@ int sp_send_local_outage(proxy_fd_ent_t *pfe, uint16_t status, const void *buf,
                          size_t len);
 void proxy_record_local_deny(proxy_fd_ent_t *pfe, int stage, int status,
                              const char *code);
+/* The trace and session correlation a refusal of the connection's request
+ * carries (none before its header block is complete). */
+ai_corr_t *proxy_refusal_corr(const proxy_fd_ent_t *pfe);
 void proxy_record_local_completion(proxy_fd_ent_t *pfe, uint16_t status);
 void proxy_record_reaped_answer(proxy_fd_ent_t *pfe, int end);
 void sp_pd_record(proxy_fd_ent_t *pfe, const char *model, int64_t prefill_ms,

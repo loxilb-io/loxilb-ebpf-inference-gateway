@@ -268,8 +268,9 @@ void llb_ai_record_request(char *tenant_id, char *model_name, int status_code,
                            char *svc_ident, int is_stream, int producer_id,
                            char *client_ip, char *origin_ip, int trusted_hops,
                            int auth_src, char *net_identity, int priority,
-                           int class_info, char *objective)
+                           int class_info, char *objective, ai_corr_t *corr)
 {
+  (void)corr;
   (void)tenant_id; (void)model_name; (void)status_code; (void)latency_ms;
   (void)prompt_tokens; (void)complet_tokens; (void)stream_start; (void)stream_end;
   (void)error_code; (void)request_id; (void)user_id; (void)key_id; (void)svc_ident;

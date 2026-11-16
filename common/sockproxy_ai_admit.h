@@ -205,6 +205,9 @@ typedef struct ai_gw_req_ctx {
   const char *objective_hint;
   int         objective_strict;
   int       (*objective_strict_of)(void *arg, const char *model);
+  /* The request's trace and session correlation (sockproxy_corr.h), for
+   * the refusal record; NULL when the caller has none. Read, never kept. */
+  const ai_corr_t *corr;
 } ai_gw_req_ctx_t;
 
 typedef struct ai_gw_admit_result {
@@ -293,7 +296,7 @@ void ai_gw_record_local_deny(int stage, const char *request_id, int producer_id,
                              int trusted_hops, int auth_src,
                              const char *net_identity,
                              int priority, int class_info,
-                             const char *objective);
+                             const char *objective, const ai_corr_t *corr);
 
 /* Record a refusal the capacity gate made AFTER ai_gw_admit admitted the
  * request on policy. The policy arms refuse through ai_gw_admit's own
@@ -311,7 +314,8 @@ void ai_gw_record_capacity_deny(const char *request_id, int producer_id,
                                 int trusted_hops, int auth_src,
                                 const char *net_identity,
                                 int priority, int class_info,
-                                const char *objective);
+                                const char *objective,
+                                const ai_corr_t *corr);
 
 /* Write a fresh request ID into buf: 32 lowercase hex digits shaped as a
  * UUID v4, from a per-thread generator that needs neither the trace ring

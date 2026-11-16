@@ -6,6 +6,11 @@ root = Path(__file__).resolve().parent
 source = (root / 'sockproxy_http.c').read_text()
 if os.environ.get('AUDIT_TEST_SOURCE'):
     source = Path(os.environ['AUDIT_TEST_SOURCE']).read_text()
+sph = (root / 'sockproxy.h').read_text()
+def sph_fn(name):
+    k = sph.index('static inline void\n' + name + '(') if ('static inline void\n' + name + '(') in sph else sph.index('static inline ai_corr_t *\n' + name + '(')
+    return sph[k:sph.index('\n}\n', k) + 3].replace('static inline', 'static')
+sph_cut = '#define RID_FWD_UNSURE 0x02\n' + ''.join(sph_fn(n) for n in ('proxy_request_id_snapshot', 'proxy_request_id_response_done', 'proxy_request_corr'))
 a = source.index('static int\nproxy_owes_completion(')
 b = source.index('/* One P/D lifecycle record', a)
 c = source.index('/* ---- responses the gateway writes itself ----')
@@ -18,8 +23,10 @@ prefix = r'''
 #include <string.h>
 #include "sockproxy_end_cause.h"
 #include "sockproxy_refusal_mark.h"
+/* sockproxy_ai_gw.h's, as it is there */
+typedef struct { char trace_id[33]; char parent_span_id[17]; char session_id[129]; } ai_corr_t;
 typedef struct {
- int odir, ai_gw_mode, metric_ai_recorded, metric_response_status, fc, noted;
+ int odir, ai_gw_mode, metric_ai_recorded, metric_response_status, fc, noted, http_corr_whole;
  uint64_t metric_req_start_ns;
  long stream_start_ts;
  int usage_prompt_toks, usage_complet_toks, auth_src, adm_priority;
@@ -38,6 +45,10 @@ typedef struct {
   * earlier answer was owed when the request that began last began */
  unsigned char rid_fwd, rid_prev_owed, resp_kernel;
  struct { char model[32]; } prefix_key;
+ /* the request's correlation capture (sp_corr_cap_t's record): the cases
+  * below write the ID of the request it belongs to into trace_id */
+ struct { ai_corr_t rec; } http_corr;
+ ai_corr_t resp_corr; unsigned char resp_corr_set, http_pipelined;
 } proxy_fd_ent_t;
 static int emitted, released, sent, send_rc, observed_status;
 static char observed_request[32], observed_tenant[32], observed_key[32], observed_code[64];
@@ -45,12 +56,9 @@ static uint64_t get_timestamp_ns(void){return 2000000;}
 static const char *proxy_effective_model(proxy_fd_ent_t *p){return p->model;}
 static const char *proxy_request_id(proxy_fd_ent_t *p){return p->request_id;}
 static const char *proxy_forwarded_request_id(const proxy_fd_ent_t *p){return p->resp_request_id;}
-/* sockproxy.h's two, as they are there */
-static void proxy_request_id_snapshot(proxy_fd_ent_t *p){
- strncpy(p->resp_request_id,p->vllm_request_id,sizeof(p->resp_request_id)-1);
- p->resp_request_id[sizeof(p->resp_request_id)-1]=0;
-}
-static void proxy_request_id_response_done(proxy_fd_ent_t *p){p->resp_request_id[0]=0;}
+/* sockproxy.h's request-ID snapshot, its end, and the correlation chosen
+ * with the key: cut from the source below (SPH_CUT), not copied. */
+@@SPH_CUT@@
 static const char *proxy_origin_ip(proxy_fd_ent_t *p){return p->l7_peer_ip;}
 static int proxy_origin_trusted_hops(proxy_fd_ent_t *p){(void)p;return 0;}
 static int notify_worker_id(void){return 2;}
@@ -66,26 +74,33 @@ static int proxy_note_local_answer(proxy_fd_ent_t *p,uint16_t s){
  if(p->odir||p->noted) return 0;
  p->noted=1;p->metric_response_status=s;return 1;
 }
-static int denies, deny_stage, deny_status;
+static int denies, deny_stage, deny_status, deny_corr_null;
+static char deny_corr[40];
 static char deny_code[48], deny_model[32], deny_tenant[32], deny_request[32];
 static void ai_gw_record_local_deny(int stage,const char *rid,int prod,const char *svc,const char *model,
  const char *tenant,const char *key,const char *user,int status,const char *code,const char *cip,
- const char *oip,int hops,int auth,const char *net,int prio,int cls,const char *obj){
+ const char *oip,int hops,int auth,const char *net,int prio,int cls,const char *obj,
+ const ai_corr_t *corr){
+ deny_corr_null=corr==NULL;snprintf(deny_corr,sizeof(deny_corr),"%s",corr?corr->trace_id:"");
  (void)prod;(void)svc;(void)key;(void)user;(void)cip;(void)oip;(void)hops;(void)auth;(void)net;(void)prio;(void)cls;(void)obj;
  denies++;deny_stage=stage;deny_status=status;
  snprintf(deny_code,sizeof(deny_code),"%s",code);snprintf(deny_model,sizeof(deny_model),"%s",model);
  snprintf(deny_tenant,sizeof(deny_tenant),"%s",tenant);snprintf(deny_request,sizeof(deny_request),"%s",rid);
 }
 static int observed_stream;
-static void capture(const char *t,int status,const char *r,const char *k,int stream,const char *c){
+/* the completion's correlation: whose capture it was ("-" = none handed) */
+static char observed_corr[40];
+static void capture(const char *t,int status,const char *r,const char *k,int stream,const char *c,
+ const ai_corr_t *corr){
  emitted++;observed_status=status;observed_stream=stream;
+ snprintf(observed_corr,sizeof(observed_corr),"%s",corr?corr->trace_id:"-");
  snprintf(observed_code,sizeof(observed_code),"%s",c);
  snprintf(observed_tenant,sizeof(observed_tenant),"%s",t);
  snprintf(observed_request,sizeof(observed_request),"%s",r);
  snprintf(observed_key,sizeof(observed_key),"%s",k);
 }
-#define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj) \
- ((void)(m),(void)(lat),(void)(ti),(void)(to),(void)(svc),(void)(worker),(void)(origin),(void)(hops),capture(t,st,r,k,stream,c))
+#define llb_ai_record_request(t,m,st,lat,ti,to,a,b,c,r,u,k,svc,stream,worker,peer,origin,hops,auth,net,prio,cls,obj,corr) \
+ ((void)(m),(void)(lat),(void)(ti),(void)(to),(void)(svc),(void)(worker),(void)(origin),(void)(hops),capture(t,st,r,k,stream,c,corr))
 static char last_sent[2048];
 static int proxy_send_local_response(proxy_fd_ent_t *p,const void *buf,size_t n){
  (void)p;sent++;
@@ -99,11 +114,13 @@ static int proxy_send_local_response(proxy_fd_ent_t *p,const void *buf,size_t n)
 static const char outage503[]="HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n{\"error\":\"no_healthy_backend\"}\r\n";
 static const char route503[]="HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n{\"error\":\"model_unavailable\"}\r\n";
 '''
+prefix = prefix.replace('@@SPH_CUT@@', sph_cut)
 suffix = r'''
 static proxy_fd_ent_t request(void){
  proxy_fd_ent_t p={.ai_gw_mode=1,.metric_req_start_ns=1000000,.fc=1};
  strcpy(p.tenant_id,"tenant-a");strcpy(p.auth_key_id,"opaque-key-id");
  strcpy(p.request_id,"test-request-a");strcpy(p.vllm_request_id,"test-request-a");
+ strcpy(p.http_corr.rec.trace_id,"test-request-a");p.http_corr_whole=1;
  strcpy(p.model,"model-a");return p;
 }
 /* The source under test before these helpers existed (AUDIT_TEST_SOURCE):
@@ -121,6 +138,7 @@ static void proxy_request_id_request_begin(proxy_fd_ent_t *p){if(!p->rid_prev_ow
  * runs: the product's forward snapshot twice, then the live field cleared. */
 static void fwd(proxy_fd_ent_t *p,const char *id){
  strcpy(p->vllm_request_id,id);
+ strcpy(p->http_corr.rec.trace_id,id);   /* the capture of the request handed over */
  proxy_request_id_forward_snapshot(p);
  proxy_request_id_forward_snapshot(p);
  p->vllm_request_id[0]=0;
@@ -133,6 +151,23 @@ static void begin_next(proxy_fd_ent_t *p,const char *id,int owed,int status){
  proxy_request_id_request_begin(p);
  p->metric_response_status=0;p->noted=0;p->metric_ai_recorded=0;p->fc=1;
  strcpy(p->vllm_request_id,id);
+ strcpy(p->http_corr.rec.trace_id,id);   /* the new request's own capture */
+}
+/* The 502 to a forwarded request, and its completion's correlation: the
+ * capture of the request the record is keyed by, or none - never another
+ * request's (WP-D). An answer keyed by no request's ID carries none. */
+static int corr_given, corr_none;
+static void fwd502(proxy_fd_ent_t *p){
+ int e0=emitted;
+ observed_corr[0]=observed_request[0]=0;
+ assert(proxy_send_backend_unreachable_forwarded(p,"leg gone")==0);
+ if(emitted==e0) return;              /* no completion owed: nothing to check */
+ if(!strcmp(observed_corr,"-")){corr_none++;return;}
+ corr_given++;
+ if(strcmp(observed_corr,observed_request)!=0){
+  printf("FAIL: the 502 keyed by '%s' carries the correlation of '%s'\n",observed_request,observed_corr);
+  abort();
+ }
 }
 static void rid_case(int which){
  proxy_fd_ent_t p=request();
@@ -144,16 +179,16 @@ static void rid_case(int which){
    * 502 is positionally A's. It carries no ID: not B's, which the snapshot
    * now holds, and A's is gone. */
   fwd(&p,"request-a");begin_next(&p,"request-b",1,0);fwd(&p,"request-b");
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id") && !strstr(last_sent,"request-b"));
   /* and it stays so for a third request begun under the owed answers */
   begin_next(&p,"request-c",1,0);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id"));
   /* until a request begins with nothing owed: the echo is back */
   p=request();fwd(&p,"request-a");begin_next(&p,"request-b",1,0);fwd(&p,"request-b");
   begin_next(&p,"request-d",0,200);fwd(&p,"request-d");
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(strstr(last_sent,"\r\nX-Request-Id: request-d\r\n"));
   break;
  case 2:
@@ -162,7 +197,7 @@ static void rid_case(int which){
    * carries B's own ID; its completion is keyed by it. */
   fwd(&p,"request-a");begin_next(&p,"request-b",0,200);strcpy(p.request_id,"request-b");
   assert(p.resp_request_id[0]==0);      /* A's key was forgotten at B's begin */
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(strstr(last_sent,"\r\nX-Request-Id: request-b\r\nConnection: close\r\n"));
   assert(!strcmp(observed_request,"request-b"));
   break;
@@ -173,7 +208,7 @@ static void rid_case(int which){
    * the 502 carries the request's ID. (That the dispatch branch takes the
    * snapshot first is held in the source by make test_ridjoin.) */
   fwd(&p,"request-a");begin_next(&p,"request-b",0,200);strcpy(p.request_id,"request-b");
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(strstr(last_sent,"\r\nX-Request-Id: request-b\r\n"));
   break;
  case 4:
@@ -184,27 +219,28 @@ static void rid_case(int which){
    * client: no ID. */
   fwd(&p,"request-a");begin_next(&p,"request-b",1,200);
   assert(!strcmp(p.resp_request_id,"request-a"));
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id") && !strstr(last_sent,"request-a"));
   /* where the answers go by the kernel no status is ever seen: the same
    * state without one, and no ID either (not A's) */
   p=request();p.resp_kernel=1;fwd(&p,"request-a");begin_next(&p,"request-b",1,0);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id"));
   break;
  case 5:
   /* What must not change. The backend drops request A after the client sent
    * the start of B: the 502 is A's, by A's snapshot ... */
   fwd(&p,"request-a");begin_next(&p,"request-b",1,0);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(strstr(last_sent,"\r\nX-Request-Id: request-a\r\n") && !strstr(last_sent,"request-b"));
   /* ... an ordinary connection, nothing after A: A's ... */
   p=request();fwd(&p,"request-a");
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(strstr(last_sent,"\r\nX-Request-Id: request-a\r\n"));
   /* ... and a first write that fails before the reset, live field still set */
-  p=request();strcpy(p.vllm_request_id,"request-a");proxy_request_id_forward_snapshot(&p);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  p=request();strcpy(p.vllm_request_id,"request-a");strcpy(p.http_corr.rec.trace_id,"request-a");
+  proxy_request_id_forward_snapshot(&p);
+  fwd502(&p);
   assert(strstr(last_sent,"\r\nX-Request-Id: request-a\r\n"));
   break;
  case 6:
@@ -214,10 +250,10 @@ static void rid_case(int which){
    * is handed over or not. */
   fwd(&p,"request-a");begin_next(&p,"request-b",1,0);fwd(&p,"request-b");
   begin_next(&p,"request-c",1,200);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id"));
   fwd(&p,"request-c");p.noted=0;p.metric_ai_recorded=0;p.metric_response_status=0;
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id"));
   break;
  case 7:
@@ -228,7 +264,7 @@ static void rid_case(int which){
   fwd(&p,"request-z");begin_next(&p,"request-a",1,200);
   begin_next(&p,"request-b",1,0);
   proxy_request_id_forward_snapshot(&p);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id") && !strstr(last_sent,"request-b"));
   break;
  case 8:
@@ -240,23 +276,23 @@ static void rid_case(int which){
    * not, and A's cannot be told from here: none. */
   fwd(&p,"request-a");begin_next(&p,"request-b",1,0);
   begin_next(&p,"request-c",1,429);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id"));
   p=request();fwd(&p,"request-a");begin_next(&p,"request-b",1,0);
   begin_next(&p,"request-c",1,429);fwd(&p,"request-c");
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id"));
   /* the same when B left no status at all (not handed over, dropped):
    * C's begin finds a snapshot that is two requests old. Not echoed. */
   p=request();fwd(&p,"request-a");begin_next(&p,"request-b",1,0);
   begin_next(&p,"request-c",1,0);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id") && !strstr(last_sent,"request-a"));
   /* A request relayed under A's running stream has no begin of its own:
    * A's status is still there when C begins under the relayed request's
    * owed answer. The 502 is the relayed request's: no ID, not A's, not C's. */
   p=request();fwd(&p,"request-a");begin_next(&p,"request-c",1,200);
-  assert(proxy_send_backend_unreachable_forwarded(&p,"leg gone")==0);
+  fwd502(&p);
   assert(!strstr(last_sent,"X-Request-Id"));
   break;
  }
@@ -351,6 +387,65 @@ int main(void){
  {int e0=emitted,r0=released,n0=local_notes,s0=sent,st0=last_note_status;
  const char *only=getenv("RID_ONLY");
  for(int i=1;i<=8;i++) if(!only||atoi(only)==i) rid_case(i);
+ /* both ways seen: the rule is not "always none" nor "always the live one" */
+ if(!only) assert(corr_given>0 && corr_none>0);
+ printf("forwarded 502s: %d with the answered request's correlation, %d with none\n",corr_given,corr_none);
+ /* WP-D: a read holding a second request (pipelined): the first request's
+  * completion and its forwarded 502 carry no correlation, live or taken at
+  * the hand-over - the second request's header callbacks have run. */
+ {int e0=emitted,r0=released,n0=local_notes,s0=sent,st0=last_note_status,d0=denies;
+  proxy_fd_ent_t q=request();q.http_pipelined=1;
+  assert(proxy_send_backend_unreachable(&q,"connect failed")==0);
+  assert(!strcmp(observed_corr,"-"));
+  q=request();q.http_pipelined=1;fwd(&q,"request-a");q.http_pipelined=0;
+  assert(proxy_send_backend_unreachable_forwarded(&q,"leg gone")==0);
+  assert(observed_corr[0]==0);   /* the zeroed hand-over capture: every field "" */
+  assert(q.resp_corr_set && q.resp_corr.trace_id[0]==0);
+  q=request();fwd(&q,"request-a");
+  assert(proxy_send_backend_unreachable_forwarded(&q,"leg gone")==0);
+  assert(!strcmp(observed_corr,"request-a"));
+  /* the request in hand, never handed over, on a pipelined read: none */
+  q=request();q.http_pipelined=1;
+  assert(proxy_send_backend_unreachable_forwarded(&q,"leg gone")==0);
+  assert(!strcmp(observed_corr,"-"));
+ /* a refusal before the header block is complete carries none; after, the
+  * request's own */
+  q=request();q.http_corr_whole=0;proxy_record_local_deny(&q,1,431,"header_too_large");
+  assert(deny_corr_null);
+  q=request();proxy_record_local_deny(&q,1,400,"bad_request");
+  assert(!deny_corr_null && !strcmp(deny_corr,"test-request-a"));
+  /* A forwarded, its answer still owed when B begins (no ID of its own
+   * yet) and captures its own values; A's answer then completes: A's
+   * record, keyed by A's snapshot, carries A's correlation, not B's. */
+  q=request();fwd(&q,"request-a");begin_next(&q,"",1,0);
+  strcpy(q.http_corr.rec.trace_id,"request-b");
+  q.metric_response_status=200;proxy_ai_record_completion(&q);
+  assert(!strcmp(observed_corr,"request-a"));
+  /* A request abandoned before its header block was whole (the abort
+   * record at teardown, or any completion): none of what was seen. */
+  q=request();q.http_corr_whole=0;
+  q.metric_response_status=200;proxy_ai_record_completion(&q);
+  assert(!strcmp(observed_corr,"-"));
+  /* Where the key itself may name the other request, none: (a) B has a
+   * live key under A's owed answer; (b) B was handed over under A's owed
+   * answer (the snapshot is unsure); (c) B is refused before it has an ID,
+   * under A's owed answer (the key is A's snapshot). */
+  q=request();fwd(&q,"request-a");begin_next(&q,"request-b",1,0);
+  q.metric_response_status=200;proxy_ai_record_completion(&q);
+  assert(!strcmp(observed_corr,"-"));
+  q=request();fwd(&q,"request-a");begin_next(&q,"",1,0);fwd(&q,"request-b");q.vllm_request_id[0]=0;
+  q.metric_response_status=200;proxy_ai_record_completion(&q);
+  assert(!strcmp(observed_corr,"-"));
+  q=request();fwd(&q,"request-a");begin_next(&q,"",1,0);q.http_corr_whole=1;
+  proxy_record_local_deny(&q,1,401,"invalid_api_key");
+  assert(deny_corr_null);
+  /* ... and a refusal of the request in hand with its own key, under the
+   * owed answer: its own */
+  q=request();fwd(&q,"request-a");begin_next(&q,"request-b",1,0);q.http_corr_whole=1;
+  proxy_record_local_deny(&q,1,401,"invalid_api_key");
+  assert(!deny_corr_null && !strcmp(deny_corr,"request-b"));
+  puts("correlation: none under a pipelined read or before the headers are whole, the request's own otherwise PASS");
+  emitted=e0;released=r0;local_notes=n0;sent=s0;last_note_status=st0;denies=d0;}
  emitted=e0;released=r0;local_notes=n0;sent=s0;last_note_status=st0;}
  p=request();p.ai_gw_mode=0;sp_send_local_outage(&p,503,outage503,strlen(outage503));
  assert(emitted==3 && local_notes==9);

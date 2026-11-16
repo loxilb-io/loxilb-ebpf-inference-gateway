@@ -1021,7 +1021,7 @@ pd_kv_exact_select(proxy_epval_t *tepval, proxy_fd_ent_t *pfe,
    * C pd_ctrl_ep[] atomics, NOT the scraper map (same provenance rule as the
    * blind-blend fix for kv_load/kv_cap above). */
   uint32_t kv_weight[32];
-  const uint32_t *kv_weight_ptr = NULL;
+  uint32_t *kv_weight_ptr = NULL;
   if (atomic_load(&tepval->pd_ctrl_mode) != 0) {
     for (int i = 0; i < n_ep_slots; i++) {
       uint32_t p = atomic_load(&tepval->pd_ctrl_ep[i]);

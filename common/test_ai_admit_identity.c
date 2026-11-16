@@ -92,6 +92,8 @@ static struct {
   int  priority;
   int  class_info;
   char objective[64];
+  int  corr_null;          /* the record was handed no correlation */
+  ai_corr_t corr;
 } deny_stub;
 
 static struct {
@@ -149,9 +151,13 @@ llb_ai_record_deny(char *request_id, int producer_id,
                    int stage, int http_status, char *error_code,
                    char *client_ip, char *origin_ip, int trusted_hops,
                    int auth_src, char *net_identity,
-                   int priority, int class_info, char *objective)
+                   int priority, int class_info, char *objective,
+                   ai_corr_t *corr)
 {
   deny_stub.calls++;
+  deny_stub.corr_null = corr == NULL;
+  if (corr)
+    deny_stub.corr = *corr;
   deny_stub.priority = priority;
   deny_stub.class_info = class_info;
   snprintf(deny_stub.objective, sizeof(deny_stub.objective), "%s", objective);
@@ -1748,7 +1754,8 @@ test_capacity_deny_carries_the_binding(void)
   ai_gw_record_capacity_deny("req-cap", 3, NET_SVC, "m1", "line-1-tenant",
                              "", "", 429, "admission_capacity", NET_SRC, "",
                              0, AI_GW_AUTH_SRC_NETWORK, "line-1", -1,
-                             AI_GW_CLASSF_SET | AI_GW_CLASS_SHEDDABLE, "tier:flex");
+                             AI_GW_CLASSF_SET | AI_GW_CLASS_SHEDDABLE, "tier:flex",
+                             NULL);
   assert(deny_stub.calls == 1 && deny_stub.stage == AI_GW_STAGE_CAPACITY);
   assert(deny_stub.http_status == 429);
   assert(strcmp(deny_stub.tenant, "line-1-tenant") == 0);
@@ -1762,7 +1769,7 @@ test_capacity_deny_carries_the_binding(void)
   reset_stubs();
   ai_gw_record_capacity_deny("req-cap", 3, NET_SVC, "m1", "tenant-1", "key-1",
                              "", 503, "admission_no_capacity", NET_SRC, "",
-                             0, AI_GW_AUTH_SRC_CREDENTIAL, NULL, 0, 0, NULL);
+                             0, AI_GW_AUTH_SRC_CREDENTIAL, NULL, 0, 0, NULL, NULL);
   assert(deny_stub.calls == 1 && deny_stub.auth_src == AI_GW_AUTH_SRC_CREDENTIAL);
   assert(deny_stub.net_identity[0] == '\0');
   assert(deny_stub.class_info == 0 && deny_stub.objective[0] == '\0');
@@ -2678,7 +2685,7 @@ test_local_refusals_are_recorded_at_their_stage(void)
   reset_stubs();
   ai_gw_record_local_deny(AI_GW_STAGE_ROUTE, "req-route", 2, NET_SVC, "m9",
                           "", "", "", 503, "model_unavailable", NET_SRC, "",
-                          0, AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "");
+                          0, AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "", NULL);
   expect_one_deny(AI_GW_STAGE_ROUTE, 503, "model_unavailable");
   assert(strcmp(deny_stub.model, "m9") == 0);
   assert(strcmp(deny_stub.request_id, "req-route") == 0 && deny_stub.producer_id == 2);
@@ -2686,7 +2693,7 @@ test_local_refusals_are_recorded_at_their_stage(void)
   reset_stubs();
   ai_gw_record_local_deny(AI_GW_STAGE_ROUTE, "req-nr", 2, NET_SVC, NULL,
                           NULL, NULL, NULL, 503, "no_route", NET_SRC, NULL,
-                          0, AI_GW_AUTH_SRC_CREDENTIAL, NULL, 0, 0, NULL);
+                          0, AI_GW_AUTH_SRC_CREDENTIAL, NULL, 0, 0, NULL, NULL);
   expect_one_deny(AI_GW_STAGE_ROUTE, 503, "no_route");
   assert(deny_stub.model[0] == '\0' && deny_stub.tenant[0] == '\0');
 
@@ -2695,7 +2702,7 @@ test_local_refusals_are_recorded_at_their_stage(void)
   ai_gw_record_local_deny(AI_GW_STAGE_FRAMING, "req-413", 1, NET_SVC, "m1",
                           "tenant-1", "key-1", "", 413,
                           "request_body_too_large", NET_SRC, "", 0,
-                          AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "");
+                          AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "", NULL);
   expect_one_deny(AI_GW_STAGE_FRAMING, 413, "request_body_too_large");
   assert(strcmp(deny_stub.tenant, "tenant-1") == 0 && strcmp(deny_stub.key, "key-1") == 0);
 
@@ -2703,7 +2710,7 @@ test_local_refusals_are_recorded_at_their_stage(void)
   reset_stubs();
   ai_gw_record_capacity_deny("req-pd", 1, NET_SVC, "m1", "tenant-1", "key-1",
                              "", 429, "pd_overloaded", NET_SRC, "", 0,
-                             AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "");
+                             AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "", NULL);
   expect_one_deny(AI_GW_STAGE_CAPACITY, 429, "pd_overloaded");
 
   /* The values the Go side names a stage by: appended, none moved. */
@@ -2714,9 +2721,60 @@ test_local_refusals_are_recorded_at_their_stage(void)
          AI_GW_STAGE_FRAMING == 8 && AI_GW_STAGE_SECURITY == 9);
 }
 
+/* WP-D: every refusal record carries the correlation its caller handed
+ * over, unchanged, and none when it handed none - the gate's own frame and
+ * both local frames alike. */
+static void
+test_refusals_carry_the_callers_correlation(void)
+{
+  static const char body[] = "{\"model\":\"m1\"}";
+  ai_corr_t corr;
+  memset(&corr, 0, sizeof(corr));
+  snprintf(corr.trace_id, sizeof(corr.trace_id), "4bf92f3577b34da6a3ce929d0e0e4736");
+  snprintf(corr.parent_span_id, sizeof(corr.parent_span_id), "00f067aa0ba902b7");
+  snprintf(corr.session_id, sizeof(corr.session_id), "loxigpt.app:sess_01-A");
+  ai_gw_req_ctx_t req = {
+    .bearer = "",
+    .jwt_profile = "kc",
+    .body = body,
+    .body_len = sizeof(body) - 1,
+    .auth_mode = 3,
+    .svc_ident = "10.0.0.1:2040",
+    .corr = &corr,
+  };
+  ai_gw_admit_result_t res;
+
+  reset_stubs();
+  assert(ai_gw_admit(&req, &res) == -1 && res.http_status == 401);
+  assert(deny_stub.calls == 1 && !deny_stub.corr_null);
+  assert(memcmp(&deny_stub.corr, &corr, sizeof(corr)) == 0);
+
+  reset_stubs();
+  req.corr = NULL;
+  assert(ai_gw_admit(&req, &res) == -1);
+  assert(deny_stub.calls == 1 && deny_stub.corr_null);
+
+  reset_stubs();
+  ai_gw_record_local_deny(AI_GW_STAGE_FRAMING, "req-c", 1, NET_SVC, "m1", "",
+                          "", "", 400, "bad_request", NET_SRC, "", 0,
+                          AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "", &corr);
+  assert(deny_stub.calls == 1 && !deny_stub.corr_null &&
+         memcmp(&deny_stub.corr, &corr, sizeof(corr)) == 0);
+
+  reset_stubs();
+  ai_gw_record_capacity_deny("req-c", 1, NET_SVC, "m1", "t", "k", "", 429,
+                             "admission_capacity", NET_SRC, "", 0,
+                             AI_GW_AUTH_SRC_CREDENTIAL, "", 0, 0, "", &corr);
+  assert(deny_stub.calls == 1 && deny_stub.stage == AI_GW_STAGE_CAPACITY &&
+         !deny_stub.corr_null &&
+         memcmp(&deny_stub.corr, &corr, sizeof(corr)) == 0);
+  puts("PASS: refusal records carry the caller's correlation, or none");
+}
+
 int
 main(void)
 {
+  test_refusals_carry_the_callers_correlation();
   test_jwt_arm_forwards_user_and_service();
   test_bearer_is_named_as_the_source();
   test_apikey_arm_forwards_key_and_service();

@@ -282,8 +282,8 @@ int
 llb_ai_kv_best_worker(uint8_t *block_hashes, int hash_size,
                        int n_hashes, char *model_name,
                        uint32_t prefill_mask, uint32_t excluded_mask,
-                       const uint32_t *ep_load, const uint32_t *ep_cap,
-                       const uint32_t *ep_weight,
+                       uint32_t *ep_load, uint32_t *ep_cap,
+                       uint32_t *ep_weight,
                        int n_ep_slots, uint32_t kv_svc_id,
                        uint32_t kv_exact_mode, int *out_score)
 {
