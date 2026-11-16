@@ -100,7 +100,9 @@ static void mtls_ssl_conn_state_cleanup(void *parent, void *ptr, CRYPTO_EX_DATA 
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[mTLS] SSL conn state cleanup: freeing mtls_ssl_conn_state_t at %p", ptr);
 #endif
-        free(ptr);
+        mtls_ssl_conn_state_t *state = ptr;
+        X509_STORE_free(state->verify_store);
+        free(state);
     }
 }
 
@@ -561,9 +563,9 @@ static int mtls_derive_crl_path(const char *ca_path, char *crl_out, size_t crl_s
  * default which does not require a CRL for every CA in the chain. A revoked client leaf then drives
  * preverify_ok=0 → mtls_client_verify_callback returns 0 → handshake rejected.
  *
- * Pitfall 5: the CRL lives CTX-level on the X509_STORE, so it survives the SNI
- * SSL_set_SSL_CTX switch (the per-hostname CTX shares the same store config) —
- * no per-connection snapshot is needed for the CRL.
+ * The CRL belongs to the listener X509_STORE. For SNI, the selection callback
+ * reattaches that same reference-counted store to the SSL connection after
+ * switching to the server certificate context.
  */
 static int mtls_load_frontend_crl(SSL_CTX *ctx, const char *crl_path)
 {
@@ -726,7 +728,9 @@ int mtls_configure_frontend(SSL_CTX *ctx, proxy_arg_t *arg)
 #endif
         }
     } else {
-        log_warn("[mTLS] Client cert verification enabled but no CA bundle specified");
+        log_error("[mTLS] Client cert verification requires a CA bundle");
+        atomic_fetch_add(&global_stats.mtls_frontend_verify_failures, 1);
+        return -EINVAL;
     }
 
     log_info("[mTLS] Frontend mTLS configured successfully");
