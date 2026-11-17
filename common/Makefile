@@ -1015,12 +1015,23 @@ test_pd_ctrl: test_pd_ctrl.c sockproxy_pd.c sockproxy_pd_trie.c sockproxy_kv_exa
 test_pd_cache_aware: test_pd_cache_aware.c sockproxy_pd.c sockproxy_pd_trie.c
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< -I. -DTEST_PD_CACHE_AWARE -lpthread
 
+# P/D prefix trie safety: allocation failure in insert/split (ASan + UBSan) and
+# concurrent lookups under the read lock (TSan).
+test_pd_trie_safety: test_pd_trie_safety.c sockproxy_pd_trie.c
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
+
+test_pd_trie_safety_tsan: test_pd_trie_safety.c sockproxy_pd_trie.c
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $< -I. -pthread
+
 .PHONY: test_pd_cache
-test_pd_cache: test_pd_cache_aware test_chwbl_prefix_hash
+test_pd_cache: test_pd_cache_aware test_chwbl_prefix_hash test_pd_trie_safety test_pd_trie_safety_tsan
 	./test_pd_cache_aware
 	LLB_PD_MAX_INFLIGHT_PER_EP=4 ./test_pd_cache_aware cap
 	LLB_PD_DECODE_KV_WEIGHT=8 ./test_pd_cache_aware kv
 	./test_chwbl_prefix_hash
+	./test_pd_trie_safety
+	./test_pd_trie_safety_tsan
 
 # Phase 6: KV-cache exact routing unit tests (CBOR encoding + hash parity)
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h

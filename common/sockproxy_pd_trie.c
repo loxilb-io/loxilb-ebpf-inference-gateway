@@ -33,7 +33,10 @@ typedef struct pd_trie_node {
     struct pd_trie_node *parent;      /* back-pointer for removal/merge */
     unsigned char        parent_key;  /* key under which parent stores this node */
     int                  ep_idx;      /* -1 = no EP assigned, >=0 = EP with affinity */
-    uint64_t             access_ts;   /* last access timestamp (set via time(NULL)) */
+    uint64_t             access_ts;   /* last access timestamp (set via time(NULL)).
+                                       * pd_trie_match() stores it under the read
+                                       * lock, so that store is atomic; every other
+                                       * access holds the write lock. */
 } pd_trie_node_t;
 
 struct pd_trie {
@@ -98,12 +101,10 @@ static pd_trie_node_t *alloc_node(const char *label, size_t label_len)
     return n;
 }
 
-static void add_child(pd_trie_node_t *parent, unsigned char key,
-                       pd_trie_node_t *child)
+/* Link child under parent using a caller-allocated entry; cannot fail. */
+static void add_child(pd_trie_node_t *parent, pd_trie_child_t *entry,
+                       unsigned char key, pd_trie_node_t *child)
 {
-    pd_trie_child_t *entry = malloc(sizeof(*entry));
-    if (!entry)
-        return;
     entry->key = key;
     entry->node = child;
     entry->next = parent->children;
@@ -362,7 +363,8 @@ int pd_trie_match(pd_trie_t *t, const char *text, size_t len,
             if (cur->ep_idx >= 0) {
                 last_ep = cur->ep_idx;
                 last_ep_pos = pos;
-                cur->access_ts = (uint64_t)time(NULL);
+                __atomic_store_n(&cur->access_ts, (uint64_t)time(NULL),
+                                 __ATOMIC_RELAXED);
             }
         } else {
             /* Partial match on edge label -- can't descend further */
@@ -393,13 +395,20 @@ void pd_trie_insert(pd_trie_t *t, const char *text, size_t len, int ep_idx)
         pd_trie_child_t *child_entry = find_child(cur, (unsigned char)text[pos]);
 
         if (!child_entry) {
-            /* No matching child -- create a new leaf for remaining text */
+            /* No matching child -- create a new leaf for remaining text.
+             * Allocate everything first: a failure leaves the trie as it was. */
             pd_trie_node_t *leaf = alloc_node(text + pos, len - pos);
             if (!leaf)
                 return;
+            pd_trie_child_t *leaf_entry = malloc(sizeof(*leaf_entry));
+            if (!leaf_entry) {
+                free(leaf->label);
+                free(leaf);
+                return;
+            }
             leaf->ep_idx = ep_idx;
             leaf->access_ts = (uint64_t)time(NULL);
-            add_child(cur, (unsigned char)text[pos], leaf);
+            add_child(cur, leaf_entry, (unsigned char)text[pos], leaf);
             t->node_count++;
             return;
         }
@@ -421,19 +430,38 @@ void pd_trie_insert(pd_trie_t *t, const char *text, size_t len, int ep_idx)
              * (if no remaining text, mid gets the ep_idx directly)
              */
 
-            /* Create intermediate node with shared prefix */
-            pd_trie_node_t *mid = alloc_node(child->label, match);
-            if (!mid)
-                return;
-
-            /* Shorten old child's label to the suffix after the shared prefix */
+            /* Allocate everything the split needs before changing anything,
+             * so an allocation failure leaves the trie as it was:
+             * intermediate node with the shared prefix, the old child's
+             * shortened label, its entry under mid, and (if text remains
+             * after the split point) the new leaf and its entry. */
             size_t suffix_len = child->label_len - match;
-            char *new_child_label = malloc(suffix_len + 1);
-            if (!new_child_label) {
-                free(mid->label);
-                free(mid);
+            size_t rest_len = len - pos - match;
+            pd_trie_node_t *mid = alloc_node(child->label, match);
+            char *new_child_label = mid ? malloc(suffix_len + 1) : NULL;
+            pd_trie_child_t *child_link =
+                new_child_label ? malloc(sizeof(*child_link)) : NULL;
+            pd_trie_node_t *leaf = NULL;
+            pd_trie_child_t *leaf_entry = NULL;
+            if (child_link && rest_len > 0) {
+                leaf = alloc_node(text + pos + match, rest_len);
+                leaf_entry = leaf ? malloc(sizeof(*leaf_entry)) : NULL;
+            }
+            if (!child_link || (rest_len > 0 && !leaf_entry)) {
+                if (leaf) {
+                    free(leaf->label);
+                    free(leaf);
+                }
+                free(child_link);
+                free(new_child_label);
+                if (mid) {
+                    free(mid->label);
+                    free(mid);
+                }
                 return;
             }
+
+            /* Shorten old child's label to the suffix after the shared prefix */
             memcpy(new_child_label, child->label + match, suffix_len);
             new_child_label[suffix_len] = '\0';
 
@@ -447,19 +475,16 @@ void pd_trie_insert(pd_trie_t *t, const char *text, size_t len, int ep_idx)
             free(child->label);
             child->label = new_child_label;
             child->label_len = suffix_len;
-            add_child(mid, (unsigned char)new_child_label[0], child);
+            add_child(mid, child_link, (unsigned char)new_child_label[0], child);
 
             t->node_count++; /* mid is new */
 
             pos += match;
             if (pos < len) {
-                /* Still have remaining text -- create new leaf */
-                pd_trie_node_t *leaf = alloc_node(text + pos, len - pos);
-                if (!leaf)
-                    return;
+                /* Still have remaining text -- link the new leaf */
                 leaf->ep_idx = ep_idx;
                 leaf->access_ts = (uint64_t)time(NULL);
-                add_child(mid, (unsigned char)text[pos], leaf);
+                add_child(mid, leaf_entry, (unsigned char)text[pos], leaf);
                 t->node_count++;
                 /* Inherit old child's EP affinity — mid represents the shared
                  * prefix which already has cache locality from the prior
