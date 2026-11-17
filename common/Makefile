@@ -1015,11 +1015,23 @@ test_pd_ctrl: test_pd_ctrl.c sockproxy_pd.c sockproxy_pd_trie.c sockproxy_kv_exa
 test_pd_cache_aware: test_pd_cache_aware.c sockproxy_pd.c sockproxy_pd_trie.c
 	$(CC) -Wall -Wextra -fsanitize=address -o $@ $< -I. -DTEST_PD_CACHE_AWARE -lpthread
 
+# P/D prefix trie safety: allocation failure in insert/split (ASan + UBSan) and
+# concurrent lookups under the read lock (TSan).
+test_pd_trie_safety: test_pd_trie_safety.c sockproxy_pd_trie.c
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
+
+test_pd_trie_safety_tsan: test_pd_trie_safety.c sockproxy_pd_trie.c
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $< -I. -pthread
+
 .PHONY: test_pd_cache
-test_pd_cache: test_pd_cache_aware
+test_pd_cache: test_pd_cache_aware test_chwbl_prefix_hash test_pd_trie_safety test_pd_trie_safety_tsan
 	./test_pd_cache_aware
 	LLB_PD_MAX_INFLIGHT_PER_EP=4 ./test_pd_cache_aware cap
 	LLB_PD_DECODE_KV_WEIGHT=8 ./test_pd_cache_aware kv
+	./test_chwbl_prefix_hash
+	./test_pd_trie_safety
+	./test_pd_trie_safety_tsan
 
 # Phase 6: KV-cache exact routing unit tests (CBOR encoding + hash parity)
 test_kv_exact: test_kv_exact.c sockproxy_kv_exact.c sockproxy_kv_exact.h xxhash.h
@@ -1120,6 +1132,18 @@ test_chwbl_contract: test_chwbl_contract.c sockproxy_lb.c sockproxy_lb.h sockpro
 .PHONY: test_chwbl
 test_chwbl: test_chwbl_contract
 	./test_chwbl_contract
+
+# CHWBL prefix hash pinned for a synthetic corpus. The expected values depend on
+# HAVE_LLM_SYSTEM_PROMPT_HASH (user-prefix fallback) and HAVE_DP_GPU_ROUTING
+# (hash policy), so both are set here instead of taken from CFLAGS/EXTRA_CFLAGS.
+# It runs from test_pd_cache only because no CI job runs a CHWBL unit target
+# (test_chwbl is in no workflow) and test_pd_cache is already run by the
+# Gateway dp-unit-gate job; a failure there is a CHWBL hash change, not P/D.
+CHWBL_HASH_CFLAGS := -g -Wall -I../libbpf/src/ -DHAVE_DP_GPU_ROUTING=1 -DHAVE_LLM_SYSTEM_PROMPT_HASH=1
+test_chwbl_prefix_hash: test_chwbl_prefix_hash.c sockproxy_lb.c sockproxy_lb.h sockproxy_json.c sockproxy_json.h
+	$(CC) $(CHWBL_HASH_CFLAGS) -ffunction-sections -fdata-sections -c -o sockproxy_lb_hash_test.o sockproxy_lb.c
+	$(CC) $(CHWBL_HASH_CFLAGS) -ffunction-sections -fdata-sections -c -o test_chwbl_prefix_hash.o test_chwbl_prefix_hash.c
+	$(CC) -o $@ test_chwbl_prefix_hash.o sockproxy_lb_hash_test.o -Wl,--gc-sections -lpthread
 
 # Oversize JSON stream fallback: local Expect acknowledgement/removal and
 # byte-exact body/remaining accounting helpers.
