@@ -1534,7 +1534,7 @@ static void t_default_churn(void)
   struct mallinfo2 m0 = mallinfo2(), m1;
 #endif
 
-  case_begin("limits: churn at the default limits with 8 KiB-stream digest keys (256 B)");
+  case_begin("limits: churn at the default limits with keys of 8 to 32 digests (64 to 256 B)");
   t = radix_trie_create(NULL);
   CHECK(t != NULL);
   for (int i = 0; i < 10; i++) {
