@@ -1989,6 +1989,11 @@ proxy_origin_status_feed(proxy_fd_ent_t *client, uint16_t status)
   } else if (status < 400) {
     circuit_breaker_record_origin_success(repval, client->ep_num);
   }
+  /* Prefix routing learns the request on its first final 2xx, for the
+   * endpoint that answered, in the pool the connection holds. */
+  if (repval->radix && client->radix_req)
+    (void)radix_route_learn(repval->radix, client->radix_req, repval,
+                            client->ep_num, status, radix_now());
 }
 
 /* Record a response the gateway wrote itself to its client, in place of a
@@ -3889,6 +3894,18 @@ proxy_get_fe_conn_stats(struct proxy_ent *key, uint32_t *conns, uint32_t *limit,
   return rc;
 }
 
+/* Endpoint identities for the refresh-block purge (sockproxy_radix_route.h). */
+static void
+sp_radix_idents(const proxy_ent_t eps[MAX_PROXY_EP], radix_ep_ident_t out[MAX_PROXY_EP])
+{
+  for (int i = 0; i < MAX_PROXY_EP; i++) {
+    out[i].xip = eps[i].xip;
+    out[i].xport = eps[i].xport;
+    out[i].protocol = eps[i].protocol;
+    out[i].inv = eps[i].inv;
+  }
+}
+
 #ifdef HAVE_RADIX_TEST_SWITCH
 /* Test builds only, until the rule API carries the setting: with
  * LLB_RADIX_POOLS=1 every new pool that can use non-P/D prefix routing gets
@@ -4014,6 +4031,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
             if (arg->ep_role[i] == 1) tepval->n_prefill_eps++;
             if (arg->ep_role[i] == 2) tepval->n_decode_eps++;
           }
+        }
+        /* Prefix routing: the eps[] copy above changes a slot's backend or its
+         * health without a health transition; what radix learned for such a
+         * slot is no longer that endpoint's. */
+        if (tepval->radix) {
+          radix_ep_ident_t r_old[MAX_PROXY_EP], r_new[MAX_PROXY_EP];
+          sp_radix_idents(fc_old_eps, r_old);
+          sp_radix_idents(tepval->eps, r_new);
+          radix_pool_purge_mask(tepval->radix,
+                                radix_refresh_purge_mask(r_old, r_new, (unsigned)tepval->n_eps));
         }
         /* Per-VIP scalars that must follow a rule update. sockMapMode changes
          * arrive through this in-place path (no -EEXIST / re-create), so the
@@ -4920,6 +4947,8 @@ ep_health_apply(proxy_map_ent_t *ent, proxy_epval_t *tepval, int ep_index,
       pd_trie_remove_ep(tepval->pd_trie, ep_index);
       pthread_rwlock_unlock(&tepval->pd_trie_lock);
     }
+    if (tepval->radix)
+      radix_pool_purge_ep(tepval->radix, (unsigned)ep_index);
 
     /* Release every client parked on the now-dead EP for
      * re-selection (see pd_parked_drain_ep). */

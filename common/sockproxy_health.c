@@ -2272,6 +2272,8 @@ static void circuit_breaker_trip_actions(proxy_epval_t *pool, int ep, const char
     pd_trie_remove_ep(pool->pd_trie, ep);
     pthread_rwlock_unlock(&pool->pd_trie_lock);
   }
+  if (pool->radix)
+    radix_pool_purge_ep(pool->radix, (unsigned)ep);
   pd_parked_drain_ep(pool, ep, reason);
 }
 
