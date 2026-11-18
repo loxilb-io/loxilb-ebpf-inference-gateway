@@ -269,3 +269,14 @@ jobs:
 
       - name: Atomic P/D reservations, actual cleanup and generation-qualified FIFO wake (ASan + UBSan)
         run: make -C common test_i18 test_pd_request_limit test_pd_refusal
+
+      - name: P/D rewriter, HTTP/2 inject, cookie, leak, completion, framing, circuit breaker, admission and controller
+        run: make -C common test_pd
+
+      # ThreadSanitizer cannot map its shadow under the runner's 32-bit mmap
+      # randomisation (the pool lifetime step above); set here as well so the
+      # step does not depend on its position in the job.
+      - name: P/D cache-aware routing, CHWBL prefix hash, P/D trie safety and the radix trie (ASan + UBSan and TSan)
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          make -C common test_pd_cache
