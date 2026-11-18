@@ -1358,6 +1358,8 @@ pfe_recycle(proxy_fd_ent_t *pfe)
   free(pfe->pd_client_finish);
   pfe->pd_client_finish = NULL;
   atomic_store_explicit(&pfe->pd_client_finished, 0, memory_order_relaxed);
+  /* The last request's prefix-routing state: nothing reads it on the freelist. */
+  pfe_radix_req_release(pfe);
 
   /* Release the per-connection buffer to the cache with the span this user
    * wrote, so its next user gets exactly that zeroed. The shell is NEVER

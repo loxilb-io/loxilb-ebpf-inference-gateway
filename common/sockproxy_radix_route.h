@@ -14,7 +14,9 @@
  * but HIT means "keep the existing selector's pick":
  *   OFF            the pool has no radix state (p == NULL; not counted)
  *   ROUTE_SUBSET   the request is on an L7 route subset
- *   PINNED         a forced pin or the session overlay chose
+ *   PINNED         a forced pin or the session overlay chose, or the pool's
+ *                  selector is persistence (sticky): an operator's explicit
+ *                  choice that radix never overrides
  *   AI_GW_OFF      the pool is not in ai_gw_mode
  *   FC_INACTIVE    flow control is off for the pool (no in-flight counter)
  *   CHUNKED        chunked request body (not buffered for inspection)
@@ -63,6 +65,17 @@
  *   - no I/O, admission wait or other blocking call while it is held.
  * A build whose C library lacks the writer-preferring kind fails (#error in
  * sockproxy_radix_route.c) instead of falling back.
+ *
+ * HTTP/1.1 keep-alive (radix_route_keepalive): a kept-alive connection keeps
+ * its backend leg for the next request unless the same request, sent on a
+ * new connection, would get a radix HIT whose candidates do not include the
+ * kept endpoint. Every other outcome keeps the leg: no radix state, a gate
+ * that cannot be evaluated where the leg is decided (gates_unknown), a scan
+ * skip, a miss, the threshold or the spread guard. The request is scanned
+ * once; the selection that follows a release reuses the key. Each request
+ * counts one decision reason: a kept leg counts it here (plus kept_leg when
+ * the kept endpoint is a candidate of a HIT), a released leg counts ka_moved
+ * here and its reason at the selection.
  *
  * Counters live in the pool (relaxed atomics) and are never exported.
  */
@@ -135,6 +148,9 @@ typedef struct radix_route_stats {
   uint64_t lookup_wait_ns_max;           /* longest wait for the shared lock */
   uint64_t learn_wait_ns_max;            /* longest wait for the exclusive lock
                                             in a learn */
+  uint64_t kept_leg;                     /* keep-alive: kept endpoint among the
+                                            candidates of a HIT */
+  uint64_t ka_moved;                     /* keep-alive: leg released for radix */
 } radix_route_stats_t;
 
 typedef struct radix_pool {
@@ -146,6 +162,7 @@ typedef struct radix_pool {
                                         NOOP learn does not touch it) */
   radix_route_stats_t  st;
   uint64_t             stats_last_ms;
+  uint64_t             stats_last_sig; /* signature of the last line taken */
 } radix_pool_t;
 
 typedef struct radix_req {
@@ -167,6 +184,7 @@ typedef struct radix_route_in {
   size_t          body_len;     /* 0: no buffered body */
   uint8_t         route_subset;
   uint8_t         pinned;
+  uint8_t         sticky_select; /* the pool's selector is persistence (sticky) */
   uint8_t         ai_gw_mode;
   uint8_t         fc_active;
   uint8_t         chunked;
@@ -180,12 +198,15 @@ typedef struct radix_route_in {
   unsigned        n_eps;        /* at most RADIX_MAX_EP */
   int             selector_pick;
   uint32_t        now;          /* radix_now() */
+  uint8_t         gates_unknown; /* keep-alive site: a gate selection applies
+                                    cannot be evaluated there */
 } radix_route_in_t;
 
 typedef struct radix_route_out {
   radix_route_reason_t reason;
   radix_scan_rc_t      scan_rc;       /* valid when the request was scanned */
   int                  ep;            /* radix pick on HIT, else -1 */
+  uint32_t             cand_mask;     /* lookup candidates (eligible), when it hit */
   size_t               matched_bytes; /* key-stream bytes of the match */
   size_t               stream_bytes;
 } radix_route_out_t;
@@ -209,6 +230,12 @@ void radix_pool_free(radix_pool_t *p);
  * request that passes every gate before the scan; it stays NULL otherwise. */
 int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
                        const radix_route_in_t *in, radix_route_out_t *out);
+
+/* Keep-alive site: 1 when the kept leg (on kept_ep) must be released and the
+ * request selected again, 0 to keep it. See the keep-alive rule above. */
+int radix_route_keepalive(radix_pool_t *p, radix_req_t **rqp,
+                          const radix_route_in_t *in, int kept_ep,
+                          radix_route_out_t *out);
 
 /* The admission gate moved a HIT to another endpoint (counted only). */
 void radix_route_note_moved(radix_pool_t *p);
@@ -238,14 +265,19 @@ uint32_t radix_refresh_purge_mask(const radix_ep_ident_t old_eps[RADIX_MAX_EP],
  *   <reason>=n          radix_route_reason_name(), e.g. "hit=3 miss=1"
  *   scan.<result>=n     radix_scan_rc_name() of a SCAN_SKIP, e.g. "scan.short=2"
  *   learn.<result>=n    radix_learn_rc_name(), e.g. "learn.ok=4"
- *   moved=n purges=n scans=n scan_us_max=n
+ *   moved=n purges=n scans=n scan_us_max=n scan_us_sum=n
  *   lookup_wait_us_max=n learn_wait_us_max=n   lock waits, microseconds
+ *   kept_leg=n ka_moved=n                     keep-alive outcomes
  * Reason names are the enum suffixes in lower case ("route_subset",
  * "below_threshold"); learn names likewise ("ok", "too_large"). Truncated
  * at a pair boundary when cap is short; returns the length written. */
 size_t radix_pool_stats_format(radix_pool_t *p, char *buf, size_t cap);
 /* 1 at most once per period_ms per pool (claims the slot), else 0. */
 int radix_pool_stats_due(radix_pool_t *p, uint64_t now_ms, uint64_t period_ms);
+/* The counters line for the log: its length when the period is due and the
+ * line differs from the last one taken, else 0 (nothing to print). */
+size_t radix_pool_stats_take(radix_pool_t *p, uint64_t now_ms, uint64_t period_ms,
+                             char *buf, size_t cap);
 
 const char *radix_route_reason_name(radix_route_reason_t r);
 const char *radix_learn_rc_name(radix_learn_rc_t r);

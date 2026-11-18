@@ -9952,6 +9952,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->is_chat = 0;
     pfe->body_off = 0;
     pfe->body_len = 0;
+    radix_req_reset(pfe->radix_req);   /* the prefix-routing key is request N's too */
     /* Token-accounting state is per-response: without this reset, request
      * N+1 on a reused connection would inherit request N's consumed flag
      * (never charging again) or its stale counts. */
@@ -15169,14 +15170,20 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                   proxy_leg_tls_stale((proxy_map_ent_t *)pfe->head,
                                                       pfe->rfd_ent[0])),
               };
-              if (!sp_mcp_enabled(pfe) && ka_leg_reusable(&ka_ctx, &ka_reason)) {
+              int ka_keep = !sp_mcp_enabled(pfe) && ka_leg_reusable(&ka_ctx, &ka_reason);
+              /* Prefix routing: a kept leg is released only when this request,
+               * on a new connection, would get a radix HIT that excludes the
+               * kept endpoint; it then takes the release a model change takes. */
+              int ka_radix = ka_keep &&
+                  sp_radix_keepalive_moves(pfe, (const proxy_map_ent_t *)pfe->head);
+              if (ka_keep && !ka_radix) {
                 pfe->ka_keep_leg = 1;
                 log_trace("[KA_FIX] fd=%d keeping backend leg fd=%d ep=%d",
                           pfe->fd, pfe->rfd[0], pfe->ep_num);
               } else if (ka_ctx.leg_live) {
                 log_debug("[KA_FIX] fd=%d releasing backend leg fd=%d ep=%d (%s) "
                          "before re-selecting", pfe->fd, pfe->rfd[0],
-                         pfe->ep_num, ka_leg_reason_str(ka_reason));
+                         pfe->ep_num, ka_radix ? "prefix route" : ka_leg_reason_str(ka_reason));
                 proxy_release_rfd_ctx(pfe);
               }
             }

@@ -1558,6 +1558,11 @@ struct proxy_fd_ent {
   uint8_t is_chat;              // 1 = /v1/chat/completions; 0 = completions/other (fail-safe default)
   size_t  body_off;            // offset of the raw JSON body within rcvbuf (0 = unset)
   size_t  body_len;            // length of the raw JSON body within rcvbuf (0 = unset)
+  /* Non-P/D prefix routing state of the current request (digest key and
+   * namespace, sockproxy_radix_route.h). Allocated on the connection's first
+   * request to a radix pool, reset at every message begin, freed before the
+   * shell is cleared or recycled (sockproxy_pfe_clear.h). */
+  struct radix_req *radix_req;
 
   char conversation_id[MAX_CONV_ID_LEN];  // Conversation ID (P0.3)
   int has_conv_id;  // Flag: conversation ID present

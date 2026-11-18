@@ -55,6 +55,7 @@
 #include "sockproxy_pd.h"
 #include "sockproxy_ai_admit.h" /* AI_GW_STAGE_* of a local refusal */
 #include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
+#include "sockproxy_radix_route.h" /* non-P/D prefix routing decision */
 
 #define XXH_STATIC_LINKING_ONLY
 /* XXH_IMPLEMENTATION is defined ONLY in sockproxy_lb.c -- see sockproxy_refactoring_plan.md P4 */
@@ -895,6 +896,76 @@ sp_route_model(const proxy_fd_ent_t *pfe)
   return "";
 }
 
+_Static_assert(MAX_PROXY_EP == RADIX_MAX_EP,
+               "a radix endpoint mask covers every endpoint of a pool");
+
+void
+sp_radix_gather(proxy_fd_ent_t *pfe, proxy_epval_t *pool,
+                const proxy_map_ent_t *node, int selector_pick, int pinned,
+                int at_keepalive, radix_route_in_t *in, uint32_t *inflight)
+{
+  int n = pool->n_eps < MAX_PROXY_EP ? pool->n_eps : MAX_PROXY_EP;
+  const char *model = sp_route_model(pfe);
+
+  memset(in, 0, sizeof(*in));
+  in->pool_id = pool;
+  in->n_eps = (unsigned)(n > 0 ? n : 0);
+  for (int i = 0; i < n; i++) {
+    inflight[i] = fc_ep_inflight(&pool->fc, i, FC_ROLE_NORMAL);
+    /* circuit_breaker_candidate reads the breaker without taking a
+     * half-open probe (is_endpoint_healthy would spend one per endpoint). */
+    if (sp_route_allows(pfe, i) && pool->eps[i].inv == 0 && pool->ep_role[i] == 0 &&
+        circuit_breaker_candidate(pool, i))
+      in->eligible |= UINT32_C(1) << i;
+  }
+  in->inflight = inflight;
+  in->route_subset = sp_route_subset(pfe, pool) ? 1 : 0;
+  in->pinned = pinned ? 1 : 0;
+  in->sticky_select = pool->select == PROXY_SEL_STICKY ? 1 : 0;
+  in->ai_gw_mode = pool->ai_gw_mode ? 1 : 0;
+  in->fc_active = fc_active(&pool->fc) ? 1 : 0;
+  in->chunked = (pfe->json_guard_active && pfe->json_guard_chunked) ? 1 : 0;
+  in->over_inspect = (pfe->json_stream_route_pending ||
+                      pfe->http_content_length > SP_JSON_INSPECT_MAX) ? 1 : 0;
+  if (pfe->rcvbuf && pfe->body_len && pfe->body_off + pfe->body_len <= pfe->rcv_off) {
+    in->body = (const char *)pfe->rcvbuf + pfe->body_off;
+    in->body_len = pfe->body_len;
+  }
+  in->salt_invalid = pfe->prefix_key.cache_salt_invalid ? 1 : 0;
+  if (pfe->prefix_key.flags & PREFIX_HAS_CACHE_SALT) {
+    in->salt = pfe->prefix_key.cache_salt;
+    in->salt_len = strnlen(pfe->prefix_key.cache_salt, sizeof(pfe->prefix_key.cache_salt));
+  }
+  in->model = model;
+  in->model_len = strlen(model);
+  if (pfe->tenant_id[0]) {
+    in->tenant = pfe->tenant_id;
+    in->tenant_len = strnlen(pfe->tenant_id, sizeof(pfe->tenant_id));
+  }
+  in->selector_pick = selector_pick;
+  in->now = radix_now();
+  /* Selection applies the session overlay, an EPP pin and a route subset
+   * before radix; none of them is resolved where the keep-alive leg is
+   * decided, so a pool that can have one keeps its leg, as today. */
+  if (at_keepalive)
+    in->gates_unknown = (pool->session_header_enabled || pool->select == PROXY_SEL_STICKY ||
+                         pool->epp_mode != EPP_MODE_OFF || pool->mcp_stateless ||
+                         pfe->mcp_route_active || (node && l7_policy_on(node))) ? 1 : 0;
+}
+
+int
+sp_radix_keepalive_moves(proxy_fd_ent_t *pfe, const proxy_map_ent_t *node)
+{
+  proxy_epval_t *pool = pfe ? (proxy_epval_t *)pfe->epv : NULL;
+  radix_route_in_t in;
+  uint32_t inflight[MAX_PROXY_EP];
+
+  if (!pool || !pool->radix || pool->pd_disagg_enabled || pfe->ep_num < 0)
+    return 0;
+  sp_radix_gather(pfe, pool, node, pfe->ep_num, 0, 1, &in, inflight);
+  return radix_route_keepalive(pool->radix, &pfe->radix_req, &in, pfe->ep_num, NULL);
+}
+
 int
 proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
                  const char *host_str,
@@ -1177,6 +1248,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
          * binding takes precedence. Reuses the branch-agnostic conv_map helpers;
          * this is the DFL home for what used to live in PROXY_MODE_ALL. */
         int  ns_used_learned = 0;
+        ns_overlay_kind_t radix_nsk = NS_OVERLAY_NONE;  /* radix applies only when NONE */
         char ns_session_key[CONV_POOL_ID_MAX];
         ns_session_key[0] = '\0';
 
@@ -1653,6 +1725,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           }
           ns_overlay_kind_t nsk;
           algorithm_selection = ns_overlay_resolve(algorithm_selection, &nso, &nsk);
+          radix_nsk = nsk;
           if (nsk == NS_OVERLAY_LEARNED) {
             ns_used_learned = 1;
             /* Record the normal-mode session hit metric here, on the DFL
@@ -1716,6 +1789,29 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
           // Use algorithm-selected endpoint
           sel = algorithm_selection;
         }
+        /* Non-P/D prefix routing: after the pool's own selector, the session
+         * overlay and the round-robin fallback, before the admission gate. A
+         * HIT replaces the pick; the bounded-load unit the selector counted
+         * follows it (the same move the admission gate makes below). */
+        int radix_hit = 0;
+        if (pfe && tepval->radix && !tepval->pd_disagg_enabled) {
+          radix_route_in_t rin;
+          radix_route_out_t rout;
+          uint32_t rinflight[MAX_PROXY_EP];
+          sp_radix_gather(pfe, tepval, node, sel, radix_nsk != NS_OVERLAY_NONE, 0,
+                          &rin, rinflight);
+          int rsel = radix_route_decide(tepval->radix, &pfe->radix_req, &rin, &rout);
+          if (rsel >= 0) {
+            radix_hit = 1;
+            if (rsel != sel) {
+              if (h2_load_units_active(tepval)) {
+                chwbl_dec_runtime(tepval, sel);
+                chwbl_inc_runtime(tepval, rsel);
+              }
+              sel = rsel;
+            }
+          }
+        }
         /* The pool's own selector takes its bounded-load unit; the route's
          * does not, and the connection gives one back at its teardown. */
         if (l7_subset && h2_load_units_active(tepval))
@@ -1761,6 +1857,8 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
             /* So does the single-role KV unit: the request executes on
              * fc_sel, and that is the endpoint whose concurrency it adds to. */
             sp_kv_sr_unit_move(pfe, tepval, fc_sel);
+            if (radix_hit)
+              radix_route_note_moved(tepval->radix);
             log_info("[AIGateway] fd=%d capacity moved the pick: ep[%d] -> ep[%d]",
                      pfe->fd, sel, fc_sel);
             sel = fc_sel;
