@@ -15134,8 +15134,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                   // P1.1: Compute hash for CHWBL routing using xxHash
                   uint64_t prefix_hash = compute_prefix_hash(&pfe->prefix_key);
                   pfe->prefix_key.hash = prefix_hash;
-                  log_debug("[PREFIX_EXTRACTED] fd=%d: prefix_hash=0x%lx, model=%s, prefix=%s",
-                            fd, prefix_hash, pfe->prefix_key.model, pfe->prefix_key.prefix);
+                  log_debug("[PREFIX_EXTRACTED] fd=%d: prefix_hash=0x%lx, model=%s, prefix_len=%zu",
+                            fd, prefix_hash, pfe->prefix_key.model,
+                            strnlen(pfe->prefix_key.prefix, sizeof(pfe->prefix_key.prefix)));
 
                   // P0.3: Generate conversation ID if not provided by client
                   if (!pfe->has_conv_id && pfe->prefix_key.valid) {
