@@ -75,6 +75,7 @@
 #include "sockproxy_trace.h"
 #endif
 #include "notify.h"
+#include "sockproxy_radix_route.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
@@ -1536,6 +1537,8 @@ proxy_pool_finalize(proxy_epval_t *tepval)
     tepval->pd_trie = NULL;
     pthread_rwlock_destroy(&tepval->pd_trie_lock);
   }
+  radix_pool_free(tepval->radix);
+  tepval->radix = NULL;
   pthread_rwlock_destroy(&tepval->chwbl_state_lock);
   pthread_mutex_destroy(&tepval->pd_parked_lock);
   fc_state_destroy(&tepval->fc);

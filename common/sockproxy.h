@@ -772,6 +772,11 @@ typedef struct proxy_epval {
   pd_trie_t           *pd_trie;          /* NULL when pd_cache_aware_mode=0 */
   pthread_rwlock_t     pd_trie_lock;     /* Lock order: pd_session_lock BEFORE pd_trie_lock */
 
+  /* Non-P/D prefix routing (sockproxy_radix_route.h): trie, its leaf lock
+   * and counters. NULL when radix is off for the pool; freed with the pool
+   * (proxy_pool_finalize). */
+  struct radix_pool   *radix;
+
   // P/D Session stickiness table (Tier 0 cache-aware routing)
   pd_session_mapping_t *pd_session_map;    // P/D session table (NULL initially)
   pthread_rwlock_t      pd_session_lock;   // separate from conv_lock

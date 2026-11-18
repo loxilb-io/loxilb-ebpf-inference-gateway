@@ -74,7 +74,8 @@
 #define RADIX_MAX_EP                 32   /* width of an endpoint mask */
 #define RADIX_NS_MAX                 512  /* namespace bytes */
 /* Largest product key: the 16 KiB key-stream cap in 256-byte blocks, one
- * 8-byte digest each, plus one for a trailing partial block. */
+ * 8-byte digest each. The + 8 is headroom only: a trailing partial block is
+ * never hashed. */
 #define RADIX_DIGEST_KEY_MAX         (16384 / 256 * 8 + 8)
 #define RADIX_DEFAULT_MAX_NODES      8192
 #define RADIX_DEFAULT_MAX_BYTES      (4u << 20)

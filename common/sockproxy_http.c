@@ -56,6 +56,7 @@
 #include "sockproxy.h"
 #include "sockproxy_pd_reservation.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
+#include "sockproxy_radix_route.h" /* non-P/D prefix routing, per pool */
 #include "sockproxy_resp_note.h" /* once-per-request response record latch */
 #include "sockproxy_parser_once.h"
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
@@ -3888,6 +3889,26 @@ proxy_get_fe_conn_stats(struct proxy_ent *key, uint32_t *conns, uint32_t *limit,
   return rc;
 }
 
+#ifdef HAVE_RADIX_TEST_SWITCH
+/* Test builds only, until the rule API carries the setting: with
+ * LLB_RADIX_POOLS=1 every new pool that can use non-P/D prefix routing gets
+ * its state. A build without HAVE_RADIX_TEST_SWITCH never creates it. */
+static void
+sp_radix_test_attach(proxy_epval_t *tepval)
+{
+  const char *on = getenv("LLB_RADIX_POOLS");
+  radix_route_cfg_t cfg;
+
+  if (!on || strcmp(on, "1") != 0 || tepval->pd_disagg_enabled ||
+      tepval->kv_exact_mode != 0 || tepval->mcp_stateless)
+    return;
+  memset(&cfg, 0, sizeof(cfg));
+  tepval->radix = radix_pool_create(&cfg);
+  log_info("[RADIX] pool '%s': %s", tepval->ephash_key,
+           tepval->radix ? "on" : "off (no memory)");
+}
+#endif
+
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 {
@@ -4191,6 +4212,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         } else {
           tepval->pd_trie = NULL;
         }
+#ifdef HAVE_RADIX_TEST_SWITCH
+        sp_radix_test_attach(tepval);
+#endif
 #ifndef HAVE_LLM_SYSTEM_PROMPT_HASH
         if (tepval->pd_cache_aware_mode) {
             log_error("pd_cache_aware_mode=1 requires HAVE_LLM_SYSTEM_PROMPT_HASH build flag; degrading to mode=0");
@@ -4629,6 +4653,9 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   } else {
     tepval->pd_trie = NULL;
   }
+#ifdef HAVE_RADIX_TEST_SWITCH
+  sp_radix_test_attach(tepval);
+#endif
 #ifndef HAVE_LLM_SYSTEM_PROMPT_HASH
   if (tepval->pd_cache_aware_mode) {
       log_error("pd_cache_aware_mode=1 requires HAVE_LLM_SYSTEM_PROMPT_HASH build flag; degrading to mode=0");
