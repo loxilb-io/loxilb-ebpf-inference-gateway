@@ -988,7 +988,8 @@ proxy_setup_ep_connect_complete(int fd, const void *pp2hdr, int pp2len)
 }
 
 int
-proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol)
+proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol,
+                uint8_t ha_listener_freebind)
 {
   int listen_sd;
 
@@ -1007,6 +1008,15 @@ proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol)
   }
 
   if (listen_sd > 0) {
+    if (ha_listener_freebind && IP != INADDR_ANY && protocol == IPPROTO_TCP) {
+      int enabled = 1;
+      if (setsockopt(listen_sd, IPPROTO_IP, IP_FREEBIND,
+                     &enabled, sizeof(enabled)) < 0) {
+        log_error("HA listener IP_FREEBIND setup failed: %s", strerror(errno));
+        close(listen_sd);
+        return -1;
+      }
+    }
     if (!proxy_server_setup(listen_sd, IP, port, protocol)) {
       return listen_sd;
     }
