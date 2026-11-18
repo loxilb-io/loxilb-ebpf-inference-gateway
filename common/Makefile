@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_refusal.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_radix.o sockproxy_radix_scan.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_refusal.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_radix.o sockproxy_radix_scan.o sockproxy_radix_route.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -238,6 +238,9 @@ sockproxy_radix.o: sockproxy_radix.c sockproxy_radix.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_radix_scan.o: sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_radix_route.o: sockproxy_radix_route.c sockproxy_radix_route.h sockproxy_radix.h sockproxy_radix_scan.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_pd_terminal.o: sockproxy_pd_terminal.c sockproxy_pd_terminal.h jsmn.h
@@ -1047,11 +1050,26 @@ test_radix_scan: test_radix_scan.c sockproxy_radix_scan.c sockproxy_radix_scan.h
 	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -fno-omit-frame-pointer -o $@ $< -I.
 
+# Prefix routing decision of a non-P/D pool (gates, scan, lookup, guards,
+# learning, purge) over the trie and the scanner (ASan + UBSan + LSan);
+# decide, learn and purge on one pool from several threads (TSan).
+RADIX_ROUTE_SRCS = test_radix_route.c sockproxy_radix_route.c sockproxy_radix_route.h \
+  sockproxy_radix.c sockproxy_radix.h sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
+
+test_radix_route: $(RADIX_ROUTE_SRCS)
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
+
+test_radix_route_tsan: $(RADIX_ROUTE_SRCS)
+	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $< -I. -pthread
+
 .PHONY: test_radix
-test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan
+test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan
 	./test_radix_trie
 	./test_radix_trie_tsan
 	./test_radix_scan
+	./test_radix_route
+	./test_radix_route_tsan
 
 .PHONY: test_pd_cache
 test_pd_cache: test_pd_cache_aware test_chwbl_prefix_hash test_pd_trie_safety test_pd_trie_safety_tsan test_radix
