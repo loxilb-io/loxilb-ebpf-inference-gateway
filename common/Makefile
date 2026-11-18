@@ -232,16 +232,19 @@ sockproxy_pd_trtllm.o: sockproxy_pd_trtllm.c sockproxy_pd.h sockproxy.h \
 sockproxy_pd_trie.o: sockproxy_pd_trie.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Built with the product flags so a compile break shows now; linked into the
-# product (COMMON_OBJS in common.mk) only when the request path calls it.
+# Non-P/D prefix routing: trie, routing-key scanner and the per-pool decision
+# (linked into the product through COMMON_OBJS in common.mk). They run on
+# every request of a radix pool, so they are optimised; RADIX_OPT applies to
+# these three objects only, and their unit tests below build at the same level.
+RADIX_OPT := -O2
 sockproxy_radix.o: sockproxy_radix.c sockproxy_radix.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(RADIX_OPT) -c -o $@ $<
 
 sockproxy_radix_scan.o: sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(RADIX_OPT) -c -o $@ $<
 
 sockproxy_radix_route.o: sockproxy_radix_route.c sockproxy_radix_route.h sockproxy_radix.h sockproxy_radix_scan.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(RADIX_OPT) -c -o $@ $<
 
 sockproxy_pd_terminal.o: sockproxy_pd_terminal.c sockproxy_pd_terminal.h jsmn.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -1038,16 +1041,16 @@ test_pd_trie_safety_tsan: test_pd_trie_safety.c sockproxy_pd_trie.c
 # Non-disaggregated prefix trie: functional, model check, limits and
 # allocation failure (ASan + UBSan); lookups under the shared lock (TSan).
 test_radix_trie: test_radix_trie.c sockproxy_radix.c sockproxy_radix.h
-	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	$(CC) -Wall -Wextra -g $(RADIX_OPT) -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
 
 test_radix_trie_tsan: test_radix_trie.c sockproxy_radix.c sockproxy_radix.h
-	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $< -I. -pthread
+	$(CC) -Wall -Wextra -g $(RADIX_OPT) -fsanitize=thread -o $@ $< -I. -pthread
 
 # Chat-request routing-key scanner: digest key against a test-only reference,
 # skip reasons, work bounds, no request text in its output (ASan + UBSan).
 test_radix_scan: test_radix_scan.c sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
-	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	$(CC) -Wall -Wextra -g $(RADIX_OPT) -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -fno-omit-frame-pointer -o $@ $< -I.
 
 # Prefix routing decision of a non-P/D pool (gates, scan, lookup, guards,
@@ -1057,11 +1060,11 @@ RADIX_ROUTE_SRCS = test_radix_route.c sockproxy_radix_route.c sockproxy_radix_ro
   sockproxy_radix.c sockproxy_radix.h sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
 
 test_radix_route: $(RADIX_ROUTE_SRCS)
-	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	$(CC) -Wall -Wextra -g $(RADIX_OPT) -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
 
 test_radix_route_tsan: $(RADIX_ROUTE_SRCS)
-	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $< -I. -pthread
+	$(CC) -Wall -Wextra -g $(RADIX_OPT) -fsanitize=thread -o $@ $< -I. -pthread
 
 .PHONY: test_radix
 test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan
