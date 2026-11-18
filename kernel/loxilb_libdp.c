@@ -3113,6 +3113,7 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // Backend protocol capability (0=http1, 1=http2, 2=both)
   pval->backend_protocol_cap = dat->backend_protocol_cap;
   pval->mcp_stateless = dat->mcp_stateless;
+  pval->ha_listener_freebind = dat->ha_listener_freebind;
 
   // sockmap acceleration mode (0=off,1=both,2=request,3=response). Gates the
   // per-connection peer_map pairing in setup_proxy_path (sockproxy_http.c).

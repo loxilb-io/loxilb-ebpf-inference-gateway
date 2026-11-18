@@ -1031,7 +1031,8 @@ struct dp_proxy_tacts {
   uint64_t lts;
   uint64_t base_to;
   uint32_t pmhh[LLB_MAX_MHOSTS];
-  uint8_t pad2[4];
+  uint8_t ha_listener_freebind;   // Allow a protected HA listener to bind before VIP ownership.
+  uint8_t pad2[3];
   struct mf_xfrm_inf nxfrms[LLB_MAX_NXFRMS];
   uint8_t host_url[LLB_MAX_HOSTURL_LEN];
   uint8_t path_prefix[LLB_MAX_HOSTURL_LEN];  // P6: URL path prefix

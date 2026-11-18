@@ -2380,7 +2380,8 @@ struct proxy_arg {
   uint32_t hsts_max_age;             // 0 ⇒ no HSTS injection (default-off)
   uint8_t  hsts_include_subdomains;  // 0 ⇒ omit "; includeSubDomains"
   uint8_t  hsts_preload;             // 0 ⇒ omit "; preload"
-  uint8_t  _pad_tls77[2];            // 8-byte alignment for the following string
+  uint8_t  ha_listener_freebind;    // From the HA control plane after it installs the VIP guard.
+  uint8_t  _pad_tls77[1];
 
   // inline OpenSSL cipher string, passed to BOTH
   // SSL_CTX_set_cipher_list (TLS1.2) and SSL_CTX_set_ciphersuites (TLS1.3).

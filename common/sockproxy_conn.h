@@ -56,7 +56,8 @@ void proxy_connect_pending_clear(proxy_fd_ent_t *pfe);
 int proxy_connect_pending_legs(void);
 
 /* Listening socket initialization */
-int proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol);
+int proxy_sock_init(uint32_t IP, uint16_t port, uint8_t protocol,
+                    uint8_t ha_listener_freebind);
 
 /* Endpoint lookup */
 int proxy_find_ep(uint32_t xip, uint16_t xport, uint8_t protocol,

@@ -4384,7 +4384,8 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
 #endif
   }
 
-  lsd = proxy_sock_init(node->key.xip, node->key.xport, node->key.protocol);
+  lsd = proxy_sock_init(node->key.xip, node->key.xport, node->key.protocol,
+                       arg->ha_listener_freebind);
   if (lsd <= 0) {
     log_error("sockproxy : %s:%u sock-init failed",
         inet_ntoa(*(struct in_addr *)&node->key.xip), ntohs(node->key.xport));
