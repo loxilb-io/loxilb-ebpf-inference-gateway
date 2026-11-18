@@ -32,7 +32,7 @@ MTLS_OBJS :=
 CFLAGS_MTLS :=
 endif
 
-all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_refusal.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_radix.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
+all: common_libbpf.o common_pdi.o common_sum.o common_frame.o log.o throttler.o cgroup.o sockproxy.o sockproxy_metrics.o sockproxy_routing.o sockproxy_json.o sockproxy_trace.o sockproxy_cache.o sockproxy_lb.o sockproxy_health.o sockproxy_ssl.o sockproxy_conn.o sockproxy_ep.o sockproxy_http.o sockproxy_notifier.o sockproxy_ktls.o sockproxy_h2.o sockproxy_ai_security.o sockproxy_ai_admit.o sockproxy_ai_bench.o sockproxy_fc.o notify.o picohttpparser.o llhttp.o httpapi.o http.o xxhash.o sockproxy_pd.o sockproxy_pd_core.o sockproxy_refusal.o sockproxy_pd_vllm.o sockproxy_pd_sglang.o sockproxy_pd_trtllm.o sockproxy_pd_trie.o sockproxy_radix.o sockproxy_radix_scan.o sockproxy_pd_terminal.o sockproxy_kv_exact.o sockproxy_sync.o sockproxy_l7policy.o sockproxy_locktrace.o sockproxy_hc.o sockproxy_hold.o sockproxy_epp.o sockproxy_qsbr.o sockproxy_pool.o $(TRACE_OBJS) $(PII_OBJS) $(MTLS_OBJS)
 
 # EXTRA_CFLAGS is exported by ../common/common.mk (e.g. -DHAVE_SOCKOPS). It MUST
 # reach the sockproxy objects too: the sk_skb verdict (kernel/) consults peer_map
@@ -235,6 +235,9 @@ sockproxy_pd_trie.o: sockproxy_pd_trie.c
 # Built with the product flags so a compile break shows now; linked into the
 # product (COMMON_OBJS in common.mk) only when the request path calls it.
 sockproxy_radix.o: sockproxy_radix.c sockproxy_radix.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+sockproxy_radix_scan.o: sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 sockproxy_pd_terminal.o: sockproxy_pd_terminal.c sockproxy_pd_terminal.h jsmn.h
@@ -1038,10 +1041,17 @@ test_radix_trie: test_radix_trie.c sockproxy_radix.c sockproxy_radix.h
 test_radix_trie_tsan: test_radix_trie.c sockproxy_radix.c sockproxy_radix.h
 	$(CC) -Wall -Wextra -g -fsanitize=thread -o $@ $< -I. -pthread
 
+# Chat-request routing-key scanner: digest key against a test-only reference,
+# skip reasons, work bounds, no request text in its output (ASan + UBSan).
+test_radix_scan: test_radix_scan.c sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
+	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -fno-omit-frame-pointer -o $@ $< -I.
+
 .PHONY: test_radix
-test_radix: test_radix_trie test_radix_trie_tsan
+test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan
 	./test_radix_trie
 	./test_radix_trie_tsan
+	./test_radix_scan
 
 .PHONY: test_pd_cache
 test_pd_cache: test_pd_cache_aware test_chwbl_prefix_hash test_pd_trie_safety test_pd_trie_safety_tsan test_radix
