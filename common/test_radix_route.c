@@ -1072,6 +1072,56 @@ static void ka_keep_gate_unknown_or_off(void)
   free(a);
 }
 
+static void e5_pipelined_not_scanned(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint64_t s0;
+
+  case_begin("e5_pipelined_not_scanned (a request begun under an owed answer: PIPELINED first, not scanned, nothing learned; keep-alive keeps the leg)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);  /* learned on ep0 */
+  /* request N scanned and learnable, then N+1 begins under N's owed answer:
+   * the reset at its message begin drops N's pending learn */
+  radix_req_reset(rq);
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 0 && out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  CHECK(radix_route_learn(p, rq, p, 0, 200, 3) == RADIX_LEARN_NONE);
+  /* N+1 at selection: PIPELINED before every other gate, no scan */
+  radix_req_reset(rq);
+  s0 = radix_route_scan_calls();
+  in_base(&in, p, a, la);
+  in.pipelined = 1;
+  in.route_subset = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
+  CHECK(out.reason == RADIX_R_PIPELINED);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(decided(p, RADIX_R_PIPELINED) == 1 && decided(p, RADIX_R_ROUTE_SUBSET) == 0);
+  CHECK(radix_route_learn(p, rq, p, 0, 200, 3) == RADIX_LEARN_NONE);
+  /* N+1 at the keep-alive site, kept leg on ep2 (unpipelined it would be a
+   * HIT on ep0 that releases the leg): kept, one PIPELINED, no scan */
+  radix_req_reset(rq);
+  in_base(&in, p, a, la);
+  in.pipelined = 1;
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
+  CHECK(out.reason == RADIX_R_PIPELINED);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(st_of(p, &p->st.ka_moved) == 0 && st_of(p, &p->st.kept_leg) == 0);
+  CHECK(decided(p, RADIX_R_PIPELINED) == 2);
+  CHECK(radix_route_learn(p, rq, p, 2, 200, 4) == RADIX_LEARN_NONE);
+  /* the same request unpipelined does move: the gate is what kept it */
+  radix_req_reset(rq);
+  in.pipelined = 0;
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 1);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
 static void misc_stats_take(void)
 {
   char *a = malloc(BODY_CAP), line[1024];
@@ -1411,6 +1461,7 @@ int main(void)
   e3_pinned_not_learnable();
   e3_ineligible_never_picked();
   e3_sticky_is_pinned();
+  e5_pipelined_not_scanned();
   e4_threshold();
   e4_spread_and_tiebreak();
   e4_scan_skips();

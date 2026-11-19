@@ -13,6 +13,12 @@
  * first reason that applies, in this order, ends the decision; every reason
  * but HIT means "keep the existing selector's pick":
  *   OFF            the pool has no radix state (p == NULL; not counted)
+ *   PIPELINED      HTTP/1.1 pipelining: the request began while an answer
+ *                  to an earlier request on the connection was still owed.
+ *                  The per-connection state then cannot tell the two apart:
+ *                  the request is not scanned, and neither it nor the
+ *                  earlier one learns (the earlier one's pending learn was
+ *                  reset when this one began)
  *   ROUTE_SUBSET   the request is on an L7 route subset
  *   PINNED         a forced pin or the session overlay chose, or the pool's
  *                  selector is persistence (sticky): an operator's explicit
@@ -99,6 +105,7 @@
 typedef enum radix_route_reason {
   RADIX_R_HIT = 0,
   RADIX_R_OFF,
+  RADIX_R_PIPELINED,
   RADIX_R_ROUTE_SUBSET,
   RADIX_R_PINNED,
   RADIX_R_AI_GW_OFF,
@@ -182,6 +189,8 @@ typedef struct radix_route_in {
   const void     *pool_id;      /* identity of the pool (the caller's object) */
   const char     *body;
   size_t          body_len;     /* 0: no buffered body */
+  uint8_t         pipelined;    /* began under an answer still owed to an
+                                   earlier request on the connection */
   uint8_t         route_subset;
   uint8_t         pinned;
   uint8_t         sticky_select; /* the pool's selector is persistence (sticky) */

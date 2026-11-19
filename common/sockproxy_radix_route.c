@@ -196,7 +196,9 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
   if (!p || !in || !rqp)
     return -1;
 
-  if (in->route_subset)
+  if (in->pipelined)
+    gate = RADIX_R_PIPELINED;
+  else if (in->route_subset)
     gate = RADIX_R_ROUTE_SUBSET;
   else if (in->pinned || in->sticky_select)
     gate = RADIX_R_PINNED;
@@ -450,6 +452,7 @@ uint32_t radix_refresh_purge_mask(const radix_ep_ident_t old_eps[RADIX_MAX_EP],
 static const char *const rr_reason_names[RADIX_R__COUNT] = {
   [RADIX_R_HIT]             = "hit",
   [RADIX_R_OFF]             = "off",
+  [RADIX_R_PIPELINED]       = "pipelined",
   [RADIX_R_ROUTE_SUBSET]    = "route_subset",
   [RADIX_R_PINNED]          = "pinned",
   [RADIX_R_AI_GW_OFF]       = "ai_gw_off",
@@ -559,8 +562,15 @@ size_t radix_pool_stats_take(radix_pool_t *p, uint64_t now_ms, uint64_t period_m
   uint64_t sig = 1469598103934665603ull;     /* FNV-1a over the line */
   size_t len;
 
-  if (!buf || !cap)
+  if (!buf || !cap || !p)
     return 0;
+  /* Not due yet: return before formatting. A plain read, no claim: the
+   * slot is claimed below, only for a line that is printed. */
+  {
+    uint64_t last = __atomic_load_n(&p->stats_last_ms, __ATOMIC_RELAXED);
+    if (last && now_ms - last < period_ms)
+      return 0;
+  }
   len = radix_pool_stats_format(p, buf, cap);
   if (!len)
     return 0;
