@@ -58,6 +58,7 @@
 static int circuit_breaker_heal_guarded(circuit_breaker_t *cb, time_t now);
 #include "circuit_breaker_origin.h"  /* origin-5xx demotion predicate (also unit-tested) */
 #include "sockproxy_health.h"
+#include "sockproxy_radix_route.h" /* non-P/D prefix routing: purge, counters line */
 #include "sockproxy_ai_gw.h"
 #include "sockproxy_hold.h"
 #include "notify.h"
@@ -1303,18 +1304,43 @@ proxy_fc_deadline_thread(void *arg)
   return NULL;
 }
 
+/* Non-P/D prefix routing counters, names and counts only, at most every
+ * RADIX_STATS_PERIOD_MS per pool and only when they changed. */
+#define RADIX_STATS_PERIOD_MS 5000
+
+static void
+radix_stats_log(const proxy_map_ent_t *node, proxy_epval_t *tepval, uint64_t now_ms)
+{
+  char line[1024];
+  char ip[INET_ADDRSTRLEN];
+
+  if (!tepval->radix ||
+      !radix_pool_stats_take(tepval->radix, now_ms, RADIX_STATS_PERIOD_MS, line, sizeof(line)))
+    return;
+  if (!inet_ntop(AF_INET, &node->key.xip, ip, sizeof(ip)))
+    snprintf(ip, sizeof(ip), "?");
+  log_info("[RADIX_STATS] pool=%s:%u/%s %s", ip, (unsigned)ntohs(node->key.xport),
+           tepval->ephash_key, line);
+}
+
 static void
 check_draining_endpoints(void)
 {
   proxy_map_ent_t *node;
   proxy_epval_t *tepval, *tmp_epval;
   time_t now = time(NULL);
+  struct timespec rts;
+  uint64_t radix_now_ms;
+
+  clock_gettime(CLOCK_MONOTONIC, &rts);
+  radix_now_ms = (uint64_t)rts.tv_sec * 1000u + (uint64_t)rts.tv_nsec / 1000000u;
   
   PROXY_LOCK();
   
   node = proxy_struct->head;
   while (node) {
     HASH_ITER(hh, node->val.ephash, tepval, tmp_epval) {
+      radix_stats_log(node, tepval, radix_now_ms);
       // Check each endpoint for draining state
       for (int ep_idx = 0; ep_idx < tepval->n_eps; ep_idx++) {
         if (tepval->drain_state[ep_idx].is_draining) {
@@ -2246,6 +2272,8 @@ static void circuit_breaker_trip_actions(proxy_epval_t *pool, int ep, const char
     pd_trie_remove_ep(pool->pd_trie, ep);
     pthread_rwlock_unlock(&pool->pd_trie_lock);
   }
+  if (pool->radix)
+    radix_pool_purge_ep(pool->radix, (unsigned)ep);
   pd_parked_drain_ep(pool, ep, reason);
 }
 

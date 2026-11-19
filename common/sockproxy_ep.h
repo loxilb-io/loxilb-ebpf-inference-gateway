@@ -12,6 +12,23 @@
 #define CONVERSATION_MAPPING_TTL       3600  /* 1 hour TTL for learned session mappings */
 #define CONVERSATION_CLEANUP_INTERVAL  300   /* Cleanup every 5 minutes */
 
+struct radix_route_in;
+
+/* Non-P/D prefix routing inputs of a request for a pool, gathered the same
+ * way for the selection and for the HTTP/1.1 keep-alive leg decision:
+ * eligible endpoints (route, health, breaker, drain), in-flight counts,
+ * gates and namespace fields. At the keep-alive site (at_keepalive) a gate
+ * that selection would apply but that cannot be evaluated there sets
+ * gates_unknown. inflight must hold MAX_PROXY_EP entries. */
+void sp_radix_gather(proxy_fd_ent_t *pfe, proxy_epval_t *pool,
+                     const proxy_map_ent_t *node, int selector_pick, int pinned,
+                     int at_keepalive, struct radix_route_in *in,
+                     uint32_t *inflight);
+
+/* HTTP/1.1 keep-alive: 1 when the kept backend leg must be released so that
+ * the request is selected again (a radix HIT excludes the kept endpoint). */
+int sp_radix_keepalive_moves(proxy_fd_ent_t *pfe, const proxy_map_ent_t *node);
+
 /* Session key hash (also used by sockproxy_http.c) */
 uint32_t session_key_hash(const char *session_key);
 

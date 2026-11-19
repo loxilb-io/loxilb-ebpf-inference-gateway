@@ -19,6 +19,8 @@
  *        purge completes while readers run back to back
  *   e10  lookups, learns and purges concurrently on one pool (TSan build);
  *        a reply for another pool generation changes nothing
+ *   ka   HTTP/1.1 keep-alive: keep the leg unless a full HIT excludes the
+ *        kept endpoint; one decision per request; one scan per request
  *   d2   per-request state: reset and free leave nothing allocated (LSan)
  *   d4b  a body above 8,192 JSON tokens is routed
  *   misc counters line (names and counts only), rate limit, lock-wait
@@ -324,6 +326,38 @@ static void e3_pinned_not_learnable(void)
   radix_pool_free(p);
   case_end();
   free(b);
+}
+
+static void e3_sticky_is_pinned(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint64_t s0;
+
+  case_begin("e3_sticky_is_pinned (a persistence selector is never overridden: PINNED, not scanned)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK); /* learned on ep0 */
+  radix_req_reset(rq);
+  s0 = radix_route_scan_calls();
+  in_base(&in, p, a, la);
+  in.sticky_select = 1;
+  in.selector_pick = 2;                                    /* the sticky pick */
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);      /* keep the sticky pick */
+  CHECK(out.reason == RADIX_R_PINNED);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(decided(p, RADIX_R_PINNED) == 1);
+  CHECK(radix_route_learn(p, rq, p, 2, 200, 3) == RADIX_LEARN_NONE); /* pinned: no learn */
+  radix_req_reset(rq);
+  in.gates_unknown = 1;                                    /* the keep-alive site: kept */
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
+  CHECK(radix_route_scan_calls() == s0);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
 }
 
 /* Health, circuit breaker, drain and route mask all reach the decision as a
@@ -910,6 +944,162 @@ static void e7_refresh_purge_mask(void)
 /* ======================================================================== */
 /* E10                                                                       */
 
+/* ======================================================================== */
+/* KA: keep-alive leg decision                                               */
+
+static int ka(radix_pool_t *p, radix_req_t **rq, const char *body, size_t len,
+              int kept, radix_route_out_t *out)
+{
+  radix_route_in_t in;
+  in_base(&in, p, body, len);
+  return radix_route_keepalive(p, rq, &in, kept, out);
+}
+
+static uint64_t st_of(radix_pool_t *p, const uint64_t *f)
+{
+  (void)p;
+  return __atomic_load_n(f, __ATOMIC_RELAXED);
+}
+
+static void ka_keep_when_kept_is_candidate(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_out_t out;
+
+  case_begin("ka_keep_when_kept_is_candidate (HIT includes the kept endpoint: keep, kept_leg)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  CHECK(ka(p, &rq, a, la, 0, &out) == 0);
+  CHECK(out.reason == RADIX_R_HIT && (out.cand_mask & 0x1));
+  CHECK(st_of(p, &p->st.kept_leg) == 1 && st_of(p, &p->st.ka_moved) == 0);
+  CHECK(decided(p, RADIX_R_HIT) == 1);                     /* the request's one decision */
+  CHECK(radix_route_learn(p, rq, p, 0, 200, 3) == RADIX_LEARN_NOOP); /* scanned: learns */
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void ka_release_when_kept_not_candidate(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_out_t out;
+  uint64_t s0;
+
+  case_begin("ka_release_when_kept_not_candidate (HIT elsewhere: release; selection reuses the scan)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  s0 = radix_route_scan_calls();
+  CHECK(ka(p, &rq, a, la, 2, &out) == 1);                  /* kept leg on ep2 */
+  CHECK(out.reason == RADIX_R_HIT && out.cand_mask == 0x1);
+  CHECK(st_of(p, &p->st.ka_moved) == 1 && st_of(p, &p->st.kept_leg) == 0);
+  CHECK(decided(p, RADIX_R_HIT) == 0);                     /* counted at the selection */
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 0);       /* the selection that follows */
+  CHECK(radix_route_scan_calls() == s0 + 1);               /* one scan for the request */
+  CHECK(decided(p, RADIX_R_HIT) == 1);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void ka_keep_on_guards(void)
+{
+  char *a = malloc(BODY_CAP), *bb = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  size_t lb = body2(bb, 'x', 600, 'b', 1955);              /* 512 / 2561: below 20 % */
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+
+  case_begin("ka_keep_on_guards (below threshold, spread, miss: keep, reason counted)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  CHECK(ka(p, &rq, bb, lb, 2, &out) == 0);
+  CHECK(out.reason == RADIX_R_BELOW_THRESHOLD);
+  radix_req_reset(rq);
+  in_base(&in, p, a, la);
+  g_inflight[2] = 4;
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
+  CHECK(out.reason == RADIX_R_SPREAD);
+  memset(g_inflight, 0, sizeof(g_inflight));
+  radix_req_reset(rq);
+  bb[60] = 'Q';                                             /* another system prompt: miss */
+  CHECK(ka(p, &rq, bb, lb, 2, &out) == 0);
+  CHECK(out.reason == RADIX_R_MISS);
+  CHECK(radix_route_learn(p, rq, p, 2, 200, 3) == RADIX_LEARN_OK); /* kept leg learns */
+  CHECK(decided(p, RADIX_R_BELOW_THRESHOLD) == 1 && decided(p, RADIX_R_SPREAD) == 1);
+  CHECK(st_of(p, &p->st.ka_moved) == 0 && st_of(p, &p->st.kept_leg) == 0);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a); free(bb);
+}
+
+static void ka_keep_gate_unknown_or_off(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint64_t s0;
+  long c0;
+
+  case_begin("ka_keep_gate_unknown_or_off (gate unknown, no radix state: keep, no scan)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  radix_req_reset(rq);
+  s0 = radix_route_scan_calls();
+  in_base(&in, p, a, la);
+  in.gates_unknown = 1;
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(st_of(p, &p->st.ka_moved) == 0 && st_of(p, &p->st.kept_leg) == 0);
+  CHECK(decided(p, RADIX_R_HIT) == 0 && decided(p, RADIX_R_MISS) == 1); /* the teaching request only */
+  CHECK(radix_route_learn(p, rq, p, 2, 200, 3) == RADIX_LEARN_NONE);    /* not scanned */
+  radix_req_free(&rq);
+  c0 = fa_calls;
+  in_base(&in, NULL, a, la);
+  CHECK(radix_route_keepalive(NULL, &rq, &in, 2, &out) == 0);
+  CHECK(rq == NULL && fa_calls == c0 && radix_route_scan_calls() == s0);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void misc_stats_take(void)
+{
+  char *a = malloc(BODY_CAP), line[1024];
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+
+  case_begin("misc_stats_take (due and changed only; keep-alive counters in the line)");
+  CHECK(radix_pool_stats_take(p, 1000, 5000, line, sizeof(line)) == 0); /* nothing counted */
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  CHECK(radix_pool_stats_take(p, 2000, 5000, line, sizeof(line)) > 0);
+  CHECK(strstr(line, "miss=1") != NULL);
+  CHECK(radix_pool_stats_take(p, 3000, 5000, line, sizeof(line)) == 0); /* not due */
+  CHECK(radix_pool_stats_take(p, 8000, 5000, line, sizeof(line)) == 0); /* due, unchanged */
+  {
+    radix_route_out_t out;
+    radix_route_in_t in;
+    in_base(&in, p, a, la);
+    CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 1);
+  }
+  CHECK(radix_pool_stats_take(p, 14000, 5000, line, sizeof(line)) > 0);
+  CHECK(strstr(line, "ka_moved=1") != NULL);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
 static void e10_other_generation(void)
 {
   char *a = malloc(BODY_CAP);
@@ -1079,6 +1269,8 @@ static void misc_stats_line(void)
   CHECK(strstr(line, "miss=1") != NULL);
   CHECK(strstr(line, "scan.short=1") != NULL);
   CHECK(strstr(line, "learn.ok=1") != NULL);
+  CHECK(strstr(line, "scans=3") != NULL);
+  CHECK(strstr(line, "scan_us_sum=") != NULL);    /* scan time total, for the cost measurement */
   CHECK(strstr(line, marker) == NULL);
   CHECK(strstr(line, "=0") == NULL);                 /* non-zero only */
   for (int r = 0; r < RADIX_R__COUNT; r++) {
@@ -1218,6 +1410,7 @@ int main(void)
   e1_gates_before_scan();
   e3_pinned_not_learnable();
   e3_ineligible_never_picked();
+  e3_sticky_is_pinned();
   e4_threshold();
   e4_spread_and_tiebreak();
   e4_scan_skips();
@@ -1233,6 +1426,11 @@ int main(void)
   e7_learned_mask();
   e7_purge_under_readers();
   e7_refresh_purge_mask();
+  ka_keep_when_kept_is_candidate();
+  ka_release_when_kept_not_candidate();
+  ka_keep_on_guards();
+  ka_keep_gate_unknown_or_off();
+  misc_stats_take();
   e10_other_generation();
   e10_race();
   d2_req_lifecycle();

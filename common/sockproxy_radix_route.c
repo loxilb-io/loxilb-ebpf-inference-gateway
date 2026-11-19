@@ -95,13 +95,22 @@ void radix_pool_free(radix_pool_t *p)
   free(p);
 }
 
+/* Ends a decision; counting is the caller's (one reason per request). */
 static int rr_end(radix_pool_t *p, radix_route_out_t *out,
                   radix_route_reason_t r)
 {
+  (void)p;
   out->reason = r;
-  if (p)
-    RR_INC(p, decided[r]);
   return r == RADIX_R_HIT ? out->ep : -1;
+}
+
+static void rr_count(radix_pool_t *p, const radix_route_out_t *out)
+{
+  if (!p || out->reason == RADIX_R_OFF)
+    return;
+  RR_INC(p, decided[out->reason]);
+  if (out->reason == RADIX_R_SCAN_SKIP && (unsigned)out->scan_rc < RADIX_SCAN__COUNT)
+    RR_INC(p, scan_skip[out->scan_rc]);
 }
 
 static void rr_put_le64(uint8_t b[8], uint64_t v)
@@ -169,10 +178,9 @@ static void rr_scan(radix_pool_t *p, radix_req_t *rq, const radix_route_in_t *in
   rq->ns_len = rr_build_ns(rq->ns, in, &sr);
 }
 
-int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
-                       const radix_route_in_t *in, radix_route_out_t *out)
+static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
+                     const radix_route_in_t *in, radix_route_out_t *out)
 {
-  radix_route_out_t scratch;
   radix_lookup_res_t lr;
   radix_lookup_rc_t lrc;
   radix_route_reason_t gate = RADIX_R_HIT;
@@ -182,8 +190,6 @@ int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
   int pick = -1;
   uint64_t w0;
 
-  if (!out)
-    out = &scratch;
   memset(out, 0, sizeof(*out));
   out->ep = -1;
   out->reason = RADIX_R_OFF;
@@ -192,7 +198,7 @@ int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
 
   if (in->route_subset)
     gate = RADIX_R_ROUTE_SUBSET;
-  else if (in->pinned)
+  else if (in->pinned || in->sticky_select)
     gate = RADIX_R_PINNED;
   else if (!in->ai_gw_mode)
     gate = RADIX_R_AI_GW_OFF;
@@ -223,11 +229,8 @@ int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
   if (!rq->scanned || rq->pool != in->pool_id)
     rr_scan(p, rq, in);
   out->scan_rc = (radix_scan_rc_t)rq->scan_rc;
-  if (rq->scan_rc != RADIX_SCAN_OK) {
-    if (rq->scan_rc < RADIX_SCAN__COUNT)
-      RR_INC(p, scan_skip[rq->scan_rc]);
+  if (rq->scan_rc != RADIX_SCAN_OK)
     return rr_end(p, out, RADIX_R_SCAN_SKIP);
-  }
   if (!rq->ns_len)
     return rr_end(p, out, RADIX_R_NS_OVERFLOW);
 
@@ -250,6 +253,7 @@ int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
     return rr_end(p, out, RADIX_R_MISS);
   if (lr.full && lr.matched_len == rq->key_len)
     rq->full_mask = lr.cand_mask;
+  out->cand_mask = lr.cand_mask;
 
   out->matched_bytes = radix_scan_matched_bytes(lr.matched_len);
   if ((uint64_t)out->matched_bytes * 100u <
@@ -284,6 +288,44 @@ int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
     return rr_end(p, out, RADIX_R_MISS);
   out->ep = pick;
   return rr_end(p, out, RADIX_R_HIT);
+}
+
+int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
+                       const radix_route_in_t *in, radix_route_out_t *out)
+{
+  radix_route_out_t scratch;
+  int ep;
+
+  if (!out)
+    out = &scratch;
+  ep = rr_decide(p, rqp, in, out);
+  rr_count(p, out);
+  return ep;
+}
+
+int radix_route_keepalive(radix_pool_t *p, radix_req_t **rqp,
+                          const radix_route_in_t *in, int kept_ep,
+                          radix_route_out_t *out)
+{
+  radix_route_out_t scratch;
+  int ep;
+
+  if (!out)
+    out = &scratch;
+  memset(out, 0, sizeof(*out));
+  out->ep = -1;
+  out->reason = RADIX_R_OFF;
+  if (!p || !in || !rqp || in->gates_unknown || kept_ep < 0 || kept_ep >= RADIX_MAX_EP)
+    return 0;                      /* keep, as today: nothing scanned or counted */
+  ep = rr_decide(p, rqp, in, out);
+  if (ep >= 0 && !(out->cand_mask & (UINT32_C(1) << kept_ep))) {
+    RR_INC(p, ka_moved);           /* its reason is counted at the selection */
+    return 1;
+  }
+  rr_count(p, out);
+  if (ep >= 0)
+    RR_INC(p, kept_leg);
+  return 0;
 }
 
 void radix_route_note_moved(radix_pool_t *p)
@@ -487,10 +529,13 @@ size_t radix_pool_stats_format(radix_pool_t *p, char *buf, size_t cap)
   rr_pair(buf, cap, &len, &full, "", "purges", RR_LD(p->st.purges));
   rr_pair(buf, cap, &len, &full, "", "scans", RR_LD(p->st.scans));
   rr_pair(buf, cap, &len, &full, "", "scan_us_max", RR_LD(p->st.scan_ns_max) / 1000u);
+  rr_pair(buf, cap, &len, &full, "", "scan_us_sum", RR_LD(p->st.scan_ns_sum) / 1000u);
   rr_pair(buf, cap, &len, &full, "", "lookup_wait_us_max",
           RR_LD(p->st.lookup_wait_ns_max) / 1000u);
   rr_pair(buf, cap, &len, &full, "", "learn_wait_us_max",
           RR_LD(p->st.learn_wait_ns_max) / 1000u);
+  rr_pair(buf, cap, &len, &full, "", "kept_leg", RR_LD(p->st.kept_leg));
+  rr_pair(buf, cap, &len, &full, "", "ka_moved", RR_LD(p->st.ka_moved));
   return len;
 }
 
@@ -506,6 +551,27 @@ int radix_pool_stats_due(radix_pool_t *p, uint64_t now_ms, uint64_t period_ms)
     return 0;
   return __atomic_compare_exchange_n(&p->stats_last_ms, &last, next, 0,
                                      __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+
+size_t radix_pool_stats_take(radix_pool_t *p, uint64_t now_ms, uint64_t period_ms,
+                             char *buf, size_t cap)
+{
+  uint64_t sig = 1469598103934665603ull;     /* FNV-1a over the line */
+  size_t len;
+
+  if (!buf || !cap)
+    return 0;
+  len = radix_pool_stats_format(p, buf, cap);
+  if (!len)
+    return 0;
+  for (size_t i = 0; i < len; i++)
+    sig = (sig ^ (uint8_t)buf[i]) * 1099511628211ull;
+  if (sig == __atomic_load_n(&p->stats_last_sig, __ATOMIC_RELAXED))
+    return 0;                                /* unchanged since the last line */
+  if (!radix_pool_stats_due(p, now_ms, period_ms))
+    return 0;
+  __atomic_store_n(&p->stats_last_sig, sig, __ATOMIC_RELAXED);
+  return len;
 }
 
 uint64_t radix_route_scan_calls(void)

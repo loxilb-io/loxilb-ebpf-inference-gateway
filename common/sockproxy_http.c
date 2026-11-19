@@ -1989,6 +1989,11 @@ proxy_origin_status_feed(proxy_fd_ent_t *client, uint16_t status)
   } else if (status < 400) {
     circuit_breaker_record_origin_success(repval, client->ep_num);
   }
+  /* Prefix routing learns the request on its first final 2xx, for the
+   * endpoint that answered, in the pool the connection holds. */
+  if (repval->radix && client->radix_req)
+    (void)radix_route_learn(repval->radix, client->radix_req, repval,
+                            client->ep_num, status, radix_now());
 }
 
 /* Record a response the gateway wrote itself to its client, in place of a
@@ -3889,6 +3894,18 @@ proxy_get_fe_conn_stats(struct proxy_ent *key, uint32_t *conns, uint32_t *limit,
   return rc;
 }
 
+/* Endpoint identities for the refresh-block purge (sockproxy_radix_route.h). */
+static void
+sp_radix_idents(const proxy_ent_t eps[MAX_PROXY_EP], radix_ep_ident_t out[MAX_PROXY_EP])
+{
+  for (int i = 0; i < MAX_PROXY_EP; i++) {
+    out[i].xip = eps[i].xip;
+    out[i].xport = eps[i].xport;
+    out[i].protocol = eps[i].protocol;
+    out[i].inv = eps[i].inv;
+  }
+}
+
 #ifdef HAVE_RADIX_TEST_SWITCH
 /* Test builds only, until the rule API carries the setting: with
  * LLB_RADIX_POOLS=1 every new pool that can use non-P/D prefix routing gets
@@ -4014,6 +4031,16 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
             if (arg->ep_role[i] == 1) tepval->n_prefill_eps++;
             if (arg->ep_role[i] == 2) tepval->n_decode_eps++;
           }
+        }
+        /* Prefix routing: the eps[] copy above changes a slot's backend or its
+         * health without a health transition; what radix learned for such a
+         * slot is no longer that endpoint's. */
+        if (tepval->radix) {
+          radix_ep_ident_t r_old[MAX_PROXY_EP], r_new[MAX_PROXY_EP];
+          sp_radix_idents(fc_old_eps, r_old);
+          sp_radix_idents(tepval->eps, r_new);
+          radix_pool_purge_mask(tepval->radix,
+                                radix_refresh_purge_mask(r_old, r_new, (unsigned)tepval->n_eps));
         }
         /* Per-VIP scalars that must follow a rule update. sockMapMode changes
          * arrive through this in-place path (no -EEXIST / re-create), so the
@@ -4921,6 +4948,8 @@ ep_health_apply(proxy_map_ent_t *ent, proxy_epval_t *tepval, int ep_index,
       pd_trie_remove_ep(tepval->pd_trie, ep_index);
       pthread_rwlock_unlock(&tepval->pd_trie_lock);
     }
+    if (tepval->radix)
+      radix_pool_purge_ep(tepval->radix, (unsigned)ep_index);
 
     /* Release every client parked on the now-dead EP for
      * re-selection (see pd_parked_drain_ep). */
@@ -9953,6 +9982,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->is_chat = 0;
     pfe->body_off = 0;
     pfe->body_len = 0;
+    radix_req_reset(pfe->radix_req);   /* the prefix-routing key is request N's too */
     /* Token-accounting state is per-response: without this reset, request
      * N+1 on a reused connection would inherit request N's consumed flag
      * (never charging again) or its stale counts. */
@@ -15105,8 +15135,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                   // P1.1: Compute hash for CHWBL routing using xxHash
                   uint64_t prefix_hash = compute_prefix_hash(&pfe->prefix_key);
                   pfe->prefix_key.hash = prefix_hash;
-                  log_debug("[PREFIX_EXTRACTED] fd=%d: prefix_hash=0x%lx, model=%s, prefix=%s",
-                            fd, prefix_hash, pfe->prefix_key.model, pfe->prefix_key.prefix);
+                  log_debug("[PREFIX_EXTRACTED] fd=%d: prefix_hash=0x%lx, model=%s, prefix_len=%zu",
+                            fd, prefix_hash, pfe->prefix_key.model,
+                            strnlen(pfe->prefix_key.prefix, sizeof(pfe->prefix_key.prefix)));
 
                   // P0.3: Generate conversation ID if not provided by client
                   if (!pfe->has_conv_id && pfe->prefix_key.valid) {
@@ -15170,14 +15201,20 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                                   proxy_leg_tls_stale((proxy_map_ent_t *)pfe->head,
                                                       pfe->rfd_ent[0])),
               };
-              if (!sp_mcp_enabled(pfe) && ka_leg_reusable(&ka_ctx, &ka_reason)) {
+              int ka_keep = !sp_mcp_enabled(pfe) && ka_leg_reusable(&ka_ctx, &ka_reason);
+              /* Prefix routing: a kept leg is released only when this request,
+               * on a new connection, would get a radix HIT that excludes the
+               * kept endpoint; it then takes the release a model change takes. */
+              int ka_radix = ka_keep &&
+                  sp_radix_keepalive_moves(pfe, (const proxy_map_ent_t *)pfe->head);
+              if (ka_keep && !ka_radix) {
                 pfe->ka_keep_leg = 1;
                 log_trace("[KA_FIX] fd=%d keeping backend leg fd=%d ep=%d",
                           pfe->fd, pfe->rfd[0], pfe->ep_num);
               } else if (ka_ctx.leg_live) {
                 log_debug("[KA_FIX] fd=%d releasing backend leg fd=%d ep=%d (%s) "
                          "before re-selecting", pfe->fd, pfe->rfd[0],
-                         pfe->ep_num, ka_leg_reason_str(ka_reason));
+                         pfe->ep_num, ka_radix ? "prefix route" : ka_leg_reason_str(ka_reason));
                 proxy_release_rfd_ctx(pfe);
               }
             }

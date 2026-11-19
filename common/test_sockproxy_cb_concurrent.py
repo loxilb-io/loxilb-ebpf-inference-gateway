@@ -36,7 +36,7 @@ prefix=r'''
 '''+types+r'''
 #include "circuit_breaker_origin.h"
 #include "circuit_breaker_heal.h"
-typedef struct {int n_eps;_Atomic uint8_t cb_enabled;circuit_breaker_t circuit_breakers[32];void*pd_trie;pthread_rwlock_t pd_trie_lock;int fc;} proxy_epval_t;
+typedef struct {int n_eps;_Atomic uint8_t cb_enabled;circuit_breaker_t circuit_breakers[32];void*pd_trie;pthread_rwlock_t pd_trie_lock;void*radix;int fc;} proxy_epval_t;
 static struct {_Atomic uint64_t pd_cb_flips;} global_stats;
 static _Atomic unsigned drains,warms;
 static _Atomic int recover_callback;
@@ -45,6 +45,7 @@ void circuit_breaker_lock(void);void circuit_breaker_unlock(void);
 int circuit_breaker_candidate(proxy_epval_t*,int);
 static void pd_trie_remove_ep(void*t,int ep){(void)t;(void)ep;circuit_breaker_lock();circuit_breaker_unlock();}
 static void pd_parked_drain_ep(proxy_epval_t*p,int ep,const char*why){(void)why;atomic_fetch_add(&drains,1);if(atomic_exchange(&recover_callback,0))circuit_breaker_init(&p->circuit_breakers[ep]);(void)circuit_breaker_candidate(p,ep);}
+static void radix_pool_purge_ep(void*t,unsigned ep){(void)t;(void)ep;}
 static void fc_ep_warm_start(void*fc,int ep,int ts){(void)fc;(void)ep;(void)ts;atomic_fetch_add(&warms,1);}
 #define log_info(...) ((void)0)
 #define log_warn(...) ((void)0)

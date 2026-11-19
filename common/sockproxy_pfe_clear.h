@@ -6,6 +6,7 @@
 #define __SOCKPROXY_PFE_CLEAR_H__
 
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "sockproxy.h"
@@ -75,6 +76,23 @@ _Static_assert(offsetof(proxy_fd_ent_t, l7_peer_ip) < PFE_SKIP_OFF ||
 _Static_assert(offsetof(proxy_fd_ent_t, l7_in_ifindex) < PFE_SKIP_OFF ||
                offsetof(proxy_fd_ent_t, l7_in_ifindex) >= PFE_SKIP_END,
                "l7_in_ifindex must lie outside the skipped span");
+
+/* The prefix-routing state of the shell's last request (radix_req, a plain
+ * heap block from sockproxy_radix_route.c) lies in the first cleared run.
+ * The only way onto the freelist is pfe_recycle, which releases it, and the
+ * only clear (pfe_clear) runs on a shell popped from that freelist: so the
+ * clear always finds it NULL and frees nothing. A plain free() keeps this
+ * header link-free. */
+_Static_assert(offsetof(proxy_fd_ent_t, radix_req) < PFE_SKIP_OFF ||
+               offsetof(proxy_fd_ent_t, radix_req) >= PFE_SKIP_END,
+               "radix_req must lie outside the skipped span: the clear zeroes it");
+
+static inline void
+pfe_radix_req_release(proxy_fd_ent_t *pfe)
+{
+  free(pfe->radix_req);
+  pfe->radix_req = NULL;
+}
 
 static inline void
 pfe_clear(proxy_fd_ent_t *pfe)

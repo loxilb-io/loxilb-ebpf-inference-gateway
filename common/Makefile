@@ -1066,13 +1066,25 @@ test_radix_route: $(RADIX_ROUTE_SRCS)
 test_radix_route_tsan: $(RADIX_ROUTE_SRCS)
 	$(CC) -Wall -Wextra -g $(RADIX_OPT) -fsanitize=thread -o $@ $< -I. -pthread
 
+# The per-connection state on a real connection shell: every clear and recycle
+# frees it first (LeakSanitizer). Same struct flags as the objects that define
+# the shell; "leak" is the negative control and must be reported.
+test_radix_pfe: test_radix_pfe.c sockproxy_pfe_clear.h sockproxy.h $(RADIX_ROUTE_SRCS)
+	$(CC) $(CFLAGS) $(RADIX_OPT) -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
+
 .PHONY: test_radix
-test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan
+test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan test_radix_pfe
 	./test_radix_trie
 	./test_radix_trie_tsan
 	./test_radix_scan
 	./test_radix_route
 	./test_radix_route_tsan
+	./test_radix_pfe
+	python3 -B test_radix_wiring.py
+	! ./test_radix_pfe leak > test_radix_pfe.leak.log 2>&1 || { echo "test_radix_pfe: negative control not reported"; exit 1; }
+	grep -q 'LeakSanitizer: detected memory leaks' test_radix_pfe.leak.log
+	@echo "test_radix_pfe: negative control reported by LeakSanitizer"
 
 .PHONY: test_pd_cache
 test_pd_cache: test_pd_cache_aware test_chwbl_prefix_hash test_pd_trie_safety test_pd_trie_safety_tsan test_radix
