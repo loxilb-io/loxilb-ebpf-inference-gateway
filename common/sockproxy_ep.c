@@ -919,6 +919,9 @@ sp_radix_gather(proxy_fd_ent_t *pfe, proxy_epval_t *pool,
       in->eligible |= UINT32_C(1) << i;
   }
   in->inflight = inflight;
+  /* creq_on_message_begin read it when this request began: an answer to an
+   * earlier request was still owed (a pipelining client) */
+  in->pipelined = pfe->rid_prev_owed ? 1 : 0;
   in->route_subset = sp_route_subset(pfe, pool) ? 1 : 0;
   in->pinned = pinned ? 1 : 0;
   in->sticky_select = pool->select == PROXY_SEL_STICKY ? 1 : 0;
