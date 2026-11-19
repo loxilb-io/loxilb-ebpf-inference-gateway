@@ -1049,7 +1049,10 @@ test_radix_trie_tsan: test_radix_trie.c sockproxy_radix.c sockproxy_radix.h
 
 # Chat-request routing-key scanner: digest key against a test-only reference,
 # skip reasons, work bounds, no request text in its output (ASan + UBSan).
-test_radix_scan: test_radix_scan.c sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
+# test_radix_scan_golden.h holds results recorded from the per-character
+# append; regenerate only on purpose: build test_radix_scan.c with
+# -DRADIX_SCAN_GOLDEN_RECORD and run it (it prints the header).
+test_radix_scan: test_radix_scan.c test_radix_scan_golden.h sockproxy_radix_scan.c sockproxy_radix_scan.h xxhash.h
 	$(CC) -Wall -Wextra -g $(RADIX_OPT) -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -fno-omit-frame-pointer -o $@ $< -I.
 
