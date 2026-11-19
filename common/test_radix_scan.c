@@ -1196,9 +1196,338 @@ static void t_mutation(void)
   case_end();
 }
 
+/* ================= ASCII runs: pin the append path =================
+ *
+ * A run is a stretch of content bytes that decode to themselves (not '\',
+ * below 0x80). These cases pin, against the reference stream, what happens
+ * where a run meets a block boundary, the cap, an escape, a multi-byte
+ * character, a \u0000 and a text-part boundary. The differential case
+ * compares every counter of these bodies, and of a wider set, with values
+ * recorded from the per-character append (test_radix_scan_golden.h). */
+
+enum { RUN_EDGES, RUN_CAP, RUN_INTERRUPT, RUN_PARTS, RUN__GROUPS };
+
+static void fill_ascii(char *out, size_t n, uint32_t seed)
+{
+  uint32_t x = seed * 2654435761u + 7;
+  for (size_t i = 0; i < n; i++) {
+    x = x * 1103515245u + 12345u;
+    out[i] = (char)('a' + (x >> 16) % 26);
+  }
+}
+
+static size_t put_cp(char *out, uint32_t cp)
+{
+  if (cp < 0x80) { out[0] = (char)cp; return 1; }
+  if (cp < 0x800) { out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3F)); return 2; }
+  if (cp < 0x10000) {
+    out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[2] = (char)(0x80 | (cp & 0x3F)); return 3;
+  }
+  out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+  out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F)); return 4;
+}
+
+/* Body idx of the run cases: fills j, the cap, the reference messages and
+ * the group; 0 past the last body. One user message unless stated, so
+ * content byte i sits at stream offset 2 + i. */
+static int run_body(int idx, jb_t *j, size_t *cap, msg_t *m, int *nm, int *group)
+{
+  static const size_t edges[6] = { 255, 256, 257, 511, 512, 513 };
+  static const size_t caps[3] = { 4096, 8192, 16384 };
+  static const uint32_t inter[4] = { 0xE9, 0xAC00, 0x1F600, 0 };   /* 2, 3, 4 bytes; NUL */
+  static const char esc[5] = { '"', '\\', '\n', '\t', 1 };
+  int i = idx;
+
+  *nm = 1;
+  *cap = 8192;
+  m[0] = (msg_t){ 'u', tA, 0, F_STRING, 0 };
+
+  /* edges: the stream ends at e; a run ends at e before an escape; a run
+   * ends at e before a 3-byte character */
+  if (i < 18) {
+    size_t e = edges[i / 3];
+    *group = RUN_EDGES;
+    switch (i % 3) {
+    case 0:
+      fill_ascii(tA, e - 3, (uint32_t)e);
+      m[0].len = e - 3;
+      break;
+    case 1:
+      fill_ascii(tA, 1200, (uint32_t)e + 1);
+      tA[e - 2] = '\n';
+      m[0].len = 1200;
+      break;
+    default:
+      fill_ascii(tA, 1200, (uint32_t)e + 2);
+      put_cp(tA + e - 2, 0xAC00);
+      m[0].len = 1200;
+      break;
+    }
+    jb_chat(j, NULL, m, 1, NULL);
+    return 1;
+  }
+  i -= 18;
+
+  /* cap: a 600-byte run between two tabs; the cap 300 bytes into it, at
+   * its first byte (cap = start, cap = start + 1), at its last byte
+   * (cap = end - 1, cap = end), for 4, 8 and 16 KiB; then the run as the
+   * string's last bytes, ending at the cap and one byte past it (the next
+   * piece is the end marker, not a character) */
+  if (i < 15) {
+    size_t c = caps[i / 5], s, A, B = 600;
+    *group = RUN_CAP;
+    switch (i % 5) {
+    case 0: s = c - 300; break;
+    case 1: s = c; break;
+    case 2: s = c - 1; break;
+    case 3: s = c + 1 - B; break;
+    default: s = c - B; break;
+    }
+    A = s - 3;                         /* 2 marker bytes, A bytes, the tab */
+    fill_ascii(tA, A + 1 + B + 1 + 2000, (uint32_t)(c + i));
+    tA[A] = '\t';
+    tA[A + 1 + B] = '\t';
+    m[0].len = A + 1 + B + 1 + 2000;
+    *cap = c;
+    jb_chat(j, NULL, m, 1, NULL);
+    return 1;
+  }
+  i -= 15;
+  if (i < 6) {
+    size_t c = caps[i / 2], B = 600, e = c + (size_t)(i % 2), A = e - B - 3;
+    *group = RUN_CAP;
+    fill_ascii(tA, A + 1 + B, (uint32_t)(c + 40 + i));
+    tA[A] = '\t';
+    m[0].len = A + 1 + B;              /* the run ends the string at e */
+    *cap = c;
+    jb_chat(j, NULL, m, 1, NULL);
+    return 1;
+  }
+  i -= 6;
+
+  /* interrupt: at stream offsets 255, 256, 257 a run meets each escape,
+   * each multi-byte character and a \u0000 */
+  if (i < 27) {
+    size_t off = 255 + (size_t)(i % 3), at = off - 2;
+    int what = i / 3;                   /* 0-4 escapes, 5-8 characters */
+    *group = RUN_INTERRUPT;
+    fill_ascii(tA, 1500, (uint32_t)(off * 10 + (size_t)what));
+    if (what < 5) {
+      tA[at] = esc[what];
+    } else {
+      char cbuf[4];
+      size_t k = put_cp(cbuf, inter[what - 5]);
+      memcpy(tA + at, cbuf, k);
+    }
+    m[0].len = 1500;
+    jb_chat(j, NULL, m, 1, NULL);
+    return 1;
+  }
+  i -= 27;
+
+  /* A inside a run: an escape that decodes to ASCII */
+  if (i < 3) {
+    size_t off = 255 + (size_t)i, at = off - 2;
+    *group = RUN_INTERRUPT;
+    fill_ascii(tA, 900, (uint32_t)(off + 77));
+    tA[at] = 'A';
+    m[0].len = 900;
+    j->n = 0;
+    jb_raw(j, "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"");
+    jb_bytes(j, tA, at);
+    jb_raw(j, "\\u0041");
+    jb_bytes(j, tA + at + 1, 900 - at - 1);
+    jb_raw(j, "\"}]}");
+    return 1;
+  }
+  i -= 3;
+
+  /* parts: one run split across two text parts at stream offsets 255..257
+   * and 511..513 (the builder splits at len / 2) */
+  if (i < 6) {
+    size_t off = edges[i], len = 2 * (off - 2);
+    *group = RUN_PARTS;
+    fill_ascii(tA, len, (uint32_t)(off + 500));
+    m[0].len = len;
+    m[0].form = F_PARTS;
+    m[0].nparts = 2;
+    jb_chat(j, NULL, m, 1, NULL);
+    m[0].form = F_STRING;               /* the reference: same stream */
+    m[0].nparts = 0;
+    return 1;
+  }
+  return 0;
+}
+
+static void t_runs(void)
+{
+  static const char *names[RUN__GROUPS] = {
+    "runs: a run or the stream ends at a block boundary and one byte either side (255-257, 511-513)",
+    "runs: the cap inside a run, at its first byte and at its last, at 4, 8 and 16 KiB",
+    "runs: a run meets an escape, a 2/3/4-byte character, a \\u0000 and a \\u0041 at 255-257",
+    "runs: one run split across two text parts at a block boundary and one byte either side",
+  };
+  jb_t j = {0};
+  msg_t m[2];
+  size_t cap;
+  int nm, g;
+
+  for (int grp = 0; grp < RUN__GROUPS; grp++) {
+    int n = 0;
+    case_begin(names[grp]);
+    for (int i = 0; run_body(i, &j, &cap, m, &nm, &g); i++) {
+      if (g != grp)
+        continue;
+      expect_ref(&j, cap, m, nm);
+      n++;
+    }
+    CHECK(n > 0);
+    case_end();
+  }
+  free(j.b);
+}
+
+/* ---- differential: results recorded from the per-character append ---- */
+
+typedef struct {
+  int      rc;
+  size_t   key_len, stream_bytes;
+  uint32_t n_blocks, n_messages;
+  unsigned truncated, has_tools, has_tmpl_kwargs;
+  uint64_t tools_hash, tmpl_kwargs_hash, skim_bytes, decode_bytes, hash_bytes;
+  const char *key_hex;
+} golden_t;
+
+/* Body idx of the differential set: every run body, then generated bodies
+ * (ASCII and mixed text, three escaping levels, four sizes, string and
+ * four-part content), four caps on one long body, and the robustness
+ * bodies (tools, kwargs, five roles, null and absent content). */
+static int diff_body(int idx, jb_t *j, size_t *cap)
+{
+  static const size_t sizes[4] = { 300, 2900, 9000, 20000 };
+  static const size_t caps[4] = { 256, 4096, 8192, 16384 };
+  msg_t m[2];
+  int nm, g, i = idx;
+
+  if (run_body(i, j, cap, m, &nm, &g))
+    return 1;
+  for (int k = 0; run_body(k, j, cap, m, &nm, &g); k++)
+    i--;                                /* i -= number of run bodies */
+  *cap = 8192;
+  if (i < 48) {
+    int mix = i / 24, esc = (i / 8) % 3, sz = (i / 2) % 4, parts = i % 2;
+    size_t n = gen_text(tB, sizes[sz], (uint32_t)(100 + i), mix);
+    m[0] = (msg_t){ 's', "you answer in one line", 22, F_STRING, 0 };
+    m[1] = (msg_t){ 'u', tB, n, parts ? F_PARTS : F_STRING, parts ? 4 : 0 };
+    g_esc = esc;
+    jb_chat(j, NULL, m, 2, NULL);
+    g_esc = 0;
+    return 1;
+  }
+  i -= 48;
+  if (i < 4) {
+    size_t n = gen_text(tB, 20000, 999, 1);
+    m[0] = (msg_t){ 'u', tB, n, F_STRING, 0 };
+    *cap = caps[i];
+    jb_chat(j, NULL, m, 1, NULL);
+    return 1;
+  }
+  i -= 4;
+  if (i < ROB_N) {
+    if (i == 0)
+      rob_bodies();
+    if (!g_rob[i].b)
+      return 0;
+    j->n = 0;
+    jb_bytes(j, g_rob[i].b, g_rob[i].n);
+    return 1;
+  }
+  return 0;
+}
+
+static void key_hex(char *out, const uint8_t *k, size_t n)
+{
+  static const char hx[] = "0123456789abcdef";
+  for (size_t i = 0; i < n; i++) {
+    out[2 * i] = hx[k[i] >> 4];
+    out[2 * i + 1] = hx[k[i] & 15];
+  }
+  out[2 * n] = 0;
+}
+
+#ifdef RADIX_SCAN_GOLDEN_RECORD
+/* Prints test_radix_scan_golden.h from the scanner this file includes. */
+static void record_golden(void)
+{
+  jb_t j = {0};
+  size_t cap;
+  static char hex[2 * KEYCAP_MAX + 1];
+  printf("/* SPDX-License-Identifier: (GPL-2.0) */\n"
+         "/* test_radix_scan_golden.h - scan results of the differential set in\n"
+         " * test_radix_scan.c, recorded from the per-character append (before\n"
+         " * the ASCII-run append). Generated: build test_radix_scan.c with\n"
+         " * -DRADIX_SCAN_GOLDEN_RECORD and run it; do not edit by hand. */\n"
+         "static const golden_t g_golden[] = {\n");
+  for (int i = 0; diff_body(i, &j, &cap); i++) {
+    radix_scan_res_t r;
+    radix_scan_rc_t rc = scan(&j, cap, &r);
+    key_hex(hex, g_key, rc == RADIX_SCAN_OK ? r.key_len : 0);
+    printf("  { %d, %zu, %zu, %u, %u, %u, %u, %u, 0x%016llxull, 0x%016llxull, %llu, %llu, %llu,\n    \"%s\" },\n",
+           (int)rc, r.key_len, r.stream_bytes, r.n_blocks, r.n_messages,
+           (unsigned)r.truncated, (unsigned)r.has_tools, (unsigned)r.has_tmpl_kwargs,
+           (unsigned long long)r.tools_hash, (unsigned long long)r.tmpl_kwargs_hash,
+           (unsigned long long)r.skim_bytes, (unsigned long long)r.decode_bytes,
+           (unsigned long long)r.hash_bytes, hex);
+  }
+  printf("};\n");
+  free(j.b);
+}
+#else
+#include "test_radix_scan_golden.h"
+
+static void t_differential(void)
+{
+  jb_t j = {0};
+  size_t cap, n = 0;
+  static char hex[2 * KEYCAP_MAX + 1];
+
+  case_begin("runs: differential: key bytes and every counter equal the recorded per-character results");
+  for (int i = 0; diff_body(i, &j, &cap); i++, n++) {
+    radix_scan_res_t r;
+    radix_scan_rc_t rc;
+    const golden_t *gd;
+    if (i >= (int)(sizeof(g_golden) / sizeof(g_golden[0]))) {
+      CHECK(!"more bodies than recorded results");
+      break;
+    }
+    gd = &g_golden[i];
+    rc = scan(&j, cap, &r);
+    key_hex(hex, g_key, rc == RADIX_SCAN_OK ? r.key_len : 0);
+    CHECK((int)rc == gd->rc);
+    CHECK(r.key_len == gd->key_len && !strcmp(hex, gd->key_hex));
+    CHECK(r.stream_bytes == gd->stream_bytes && r.n_blocks == gd->n_blocks);
+    CHECK(r.n_messages == gd->n_messages && r.truncated == gd->truncated);
+    CHECK(r.has_tools == gd->has_tools && r.has_tmpl_kwargs == gd->has_tmpl_kwargs);
+    CHECK(r.tools_hash == gd->tools_hash && r.tmpl_kwargs_hash == gd->tmpl_kwargs_hash);
+    CHECK(r.skim_bytes == gd->skim_bytes && r.decode_bytes == gd->decode_bytes);
+    CHECK(r.hash_bytes == gd->hash_bytes);
+  }
+  CHECK(n == sizeof(g_golden) / sizeof(g_golden[0]));
+  printf("    %zu bodies compared\n", n);
+  free(j.b);
+  case_end();
+}
+#endif
+
 int main(void)
 {
   setvbuf(stdout, NULL, _IONBF, 0);
+
+#ifdef RADIX_SCAN_GOLDEN_RECORD
+  record_golden();
+  return 0;
+#endif
 
   t_string_vs_parts();
   t_order_and_escapes();
@@ -1219,6 +1548,11 @@ int main(void)
   t_bounds_parts();
   t_bounds_escapes();
   t_no_text_retained();
+
+  t_runs();
+#ifndef RADIX_SCAN_GOLDEN_RECORD
+  t_differential();
+#endif
 
   t_truncation();
   t_mutation();

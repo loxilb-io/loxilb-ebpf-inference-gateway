@@ -74,6 +74,41 @@ static int put(scan_t *s, const uint8_t *b, size_t k, int content)
   return 1;
 }
 
+/* Append n content bytes that are each a whole character (a run of ASCII
+ * that decodes to itself), as n one-byte puts would: as many as fit under
+ * the cap, then the stream stops. Copies up to each block boundary and
+ * digests full blocks exactly as put() does. Returns the bytes stored. */
+static size_t put_run(scan_t *s, const uint8_t *b, size_t n)
+{
+  size_t room, take, done = 0;
+
+  if (s->full)
+    return 0;
+  room = s->cap - s->stream;
+  take = n < room ? n : room;
+  while (done < take) {
+    size_t k = RADIX_SCAN_BLOCK - s->fill;
+    if (k > take - done)
+      k = take - done;
+    memcpy(s->blk + s->fill, b + done, k);
+    s->fill += k;
+    done += k;
+    if (s->fill == RADIX_SCAN_BLOCK) {
+      uint8_t *d = s->dig + (size_t)s->n_blocks * RADIX_SCAN_DIGEST;
+      s->h = XXH64(s->blk, RADIX_SCAN_BLOCK, s->h);
+      for (int j = 0; j < RADIX_SCAN_DIGEST; j++)
+        d[j] = (uint8_t)(s->h >> (8 * j));
+      s->n_blocks++;
+      s->fill = 0;
+    }
+  }
+  s->stream += take;
+  s->content += take;
+  if (take < n)
+    s->full = 1;
+  return take;
+}
+
 static int hexval(uint8_t c)
 {
   if (c >= '0' && c <= '9') return c - '0';
@@ -178,8 +213,20 @@ static radix_scan_rc_t decode_string(scan_t *s, const uint8_t *p, const uint8_t 
       }
       k = utf8_put(cp, o);
     } else if (*p < 0x80) {
-      o[0] = *p;
-      k = used = 1;
+      /* a run of bytes that decode to themselves, appended at once; the
+       * work counter matches one character at a time, which counts the
+       * character that no longer fits as well. The run is looked for only
+       * as far as one byte past the room left under the cap: that byte, if
+       * the run reaches it, is the one that no longer fits. */
+      size_t room = s->cap - s->stream, got;
+      const uint8_t *q = p + 1;
+      const uint8_t *lim = (size_t)(e - p) > room + 1 ? p + room + 1 : e;
+      while (q < lim && *q != '\\' && *q < 0x80)
+        q++;
+      got = put_run(s, p, (size_t)(q - p));
+      s->decode += got + (got < (size_t)(q - p));
+      p += got;
+      continue;
     } else {
       k = used = utf8_seq(p, e);
       if (!k)
