@@ -768,8 +768,10 @@ test_poolref: test_pool_ref test_pool_ref_tsan
 
 # An HTTP/2 stream holds the pool it was routed to until the REAL stream free
 # (sockproxy_h2.c, through proxy_h2_cleanup_session) gives it back. Linked like
-# test_h2_inject: --gc-sections keeps only what that teardown reaches.
-H2RREF_SRCS = test_h2_route_ref.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+# test_h2_inject: --gc-sections keeps only what that teardown reaches (the
+# stream free reaches radix_req_free).
+H2RREF_SRCS = test_h2_route_ref.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c \
+  sockproxy_radix_route.c sockproxy_radix.c sockproxy_radix_scan.c
 test_h2_route_ref: $(H2RREF_SRCS) sockproxy_h2_gc.o sockproxy_pool.h sockproxy_h2.h
 	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
 		-ffunction-sections -fdata-sections -o $@ $(H2RREF_SRCS) sockproxy_h2_gc.o -I. \
@@ -791,7 +793,8 @@ test_h2end: test_h2_end_log
 
 # One HTTP/2 backend leg ending answers only the client streams it carries
 # and is detached from its client (sockproxy_h2.c). Linked like test_h2_inject.
-H2LEG_SRCS = test_h2_leg_end.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
+H2LEG_SRCS = test_h2_leg_end.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c \
+  sockproxy_radix_route.c sockproxy_radix.c sockproxy_radix_scan.c
 test_h2_leg_end: $(H2LEG_SRCS) sockproxy_h2_gc.o sockproxy_pool.h sockproxy_h2.h
 	$(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
 		-ffunction-sections -fdata-sections -o $@ $(H2LEG_SRCS) sockproxy_h2_gc.o -I. \
@@ -811,8 +814,10 @@ sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h sockproxy_refusal_mark.h sock
 # The shared HTTP/2 fixture (test_h2_fixture.h): the gateway object with ASan,
 # working fakes for the forward path, fake backends, link stand-ins for the
 # rest. It wraps calloc (allocation failure injection).
-H2FX_SRCS = test_h2_fixture.c test_h2_fixture_links.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c
-H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h sockproxy_json_scan.h
+H2FX_SRCS = test_h2_fixture.c test_h2_fixture_links.c sockproxy_pool.c sockproxy_qsbr.c sockproxy_fc.c log.c \
+  sockproxy_radix_route.c sockproxy_radix.c sockproxy_radix_scan.c
+H2FX_DEPS = $(H2FX_SRCS) test_h2_fixture.h sockproxy_h2_asan.o sockproxy_pool.h sockproxy_h2.h sockproxy_json_scan.h \
+  sockproxy_radix_route.h sockproxy_radix.h sockproxy_radix_scan.h
 H2FX_LINK = $(CC) -Wall -Wextra -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) \
 		-ffunction-sections -fdata-sections -I. -Wl,--wrap=calloc -Wl,--gc-sections
 
@@ -848,6 +853,17 @@ test_h2_resp_mark: test_h2_resp_mark.c $(H2FX_DEPS)
 .PHONY: test_h2rmark
 test_h2rmark: test_h2_resp_mark
 	./test_h2_resp_mark
+
+# Non-P/D prefix routing on HTTP/2 streams: off unchanged, the on cases, the
+# per-stream decided mark and the stream state's lifetime, over the shared
+# fixture with a real radix pool state (sockproxy_radix_route.h).
+test_h2_radix: test_h2_radix.c $(H2FX_DEPS)
+	$(H2FX_LINK) -o $@ test_h2_radix.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2radix
+test_h2radix: test_h2_radix
+	ASAN_OPTIONS=detect_leaks=1 ./test_h2_radix
 
 # The HTTP/2 answers the gateway writes itself (the eight-field refusal, the
 # 401, each read and each reset with its body still queued) and the strip of a

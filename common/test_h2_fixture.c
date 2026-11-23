@@ -70,6 +70,7 @@ int (*h2fx_chwbl)(proxy_epval_t *epv, llm_prefix_key_t *key, int *ep);
 h2fx_backend_t h2fx_be[H2FX_MAX_BACKENDS];
 int h2fx_n_be;
 int h2fx_connect_calls;
+int h2fx_be_body_count;
 int32_t h2fx_be_window = 65535;
 
 size_t h2fx_fail_calloc_size;
@@ -224,20 +225,30 @@ cl_body_read(nghttp2_session *s, int32_t id, uint8_t *buf, size_t len,
 }
 
 int32_t
-h2fx_submit(const char *model, const uint8_t *body, size_t len)
+h2fx_submit_req(const char *path, const char *content_type, const char *conv_id,
+                const char *model, const uint8_t *body, size_t len)
 {
   nghttp2_nv req[] = {
     { (uint8_t *)":method", (uint8_t *)"POST", 7, 4, 0 },
-    { (uint8_t *)":path", (uint8_t *)"/v1/chat/completions", 5, 20, 0 },
+    { (uint8_t *)":path", (uint8_t *)path, 5, strlen(path), 0 },
     { (uint8_t *)":scheme", (uint8_t *)"http", 7, 4, 0 },
     { (uint8_t *)":authority", (uint8_t *)"all.example", 10, 11, 0 },
     { (uint8_t *)"x-model", (uint8_t *)model, 7, strlen(model), 0 },
+    { NULL, NULL, 0, 0, 0 },
+    { NULL, NULL, 0, 0, 0 },
   };
+  size_t nreq = 5;
   nghttp2_data_provider prd;
   int32_t id;
 
+  if (content_type)
+    req[nreq++] = (nghttp2_nv){ (uint8_t *)"content-type", (uint8_t *)content_type,
+                                12, strlen(content_type), 0 };
+  if (conv_id)
+    req[nreq++] = (nghttp2_nv){ (uint8_t *)"x-conversation-id", (uint8_t *)conv_id,
+                                17, strlen(conv_id), 0 };
   if (!len) {
-    id = nghttp2_submit_request(h2fx_cl, NULL, req, 5, NULL, NULL);
+    id = nghttp2_submit_request(h2fx_cl, NULL, req, nreq, NULL, NULL);
   } else {
     cl_body_t *b;
 
@@ -250,10 +261,16 @@ h2fx_submit(const char *model, const uint8_t *body, size_t len)
     b->off = 0;
     prd.source.ptr = b;
     prd.read_callback = cl_body_read;
-    id = nghttp2_submit_request(h2fx_cl, NULL, req, 5, &prd, NULL);
+    id = nghttp2_submit_request(h2fx_cl, NULL, req, nreq, &prd, NULL);
   }
   assert(id > 0 && id / 2 < H2FX_MAX_STREAMS);
   return id;
+}
+
+int32_t
+h2fx_submit(const char *model, const uint8_t *body, size_t len)
+{
+  return h2fx_submit_req("/v1/chat/completions", NULL, NULL, model, body, len);
 }
 
 /* ---- pools ---- */
@@ -328,8 +345,11 @@ be_on_data(nghttp2_session *s, uint8_t flags, int32_t id, const uint8_t *data,
 
   (void)s; (void)flags;
   if (id == b->stream) {
-    assert(b->body_len + len <= H2FX_BODY_CAP);
-    memcpy(b->body + b->body_len, data, len);
+    if (!h2fx_be_body_count)
+      assert(b->body_len + len <= H2FX_BODY_CAP);
+    if (b->body_len < H2FX_BODY_CAP)
+      memcpy(b->body + b->body_len, data,
+             len < H2FX_BODY_CAP - b->body_len ? len : H2FX_BODY_CAP - b->body_len);
     b->body_len += len;
   }
   return 0;

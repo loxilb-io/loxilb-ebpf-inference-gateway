@@ -18,7 +18,13 @@ Source-order checks of sockproxy_ep.c that the unit harness cannot drive
      the gatherer passes not_chat from is_chat, and no other copy of the
      path compare remains;
   6. the HTTP/1.1 gatherer passes the request's decided mark, and message
-     begin clears it together with the radix_req reset.
+     begin clears it together with the radix_req reset;
+  7. HTTP/2: the gatherer calls the eligible helper once and passes not_chat
+     from sp_is_chat_path and the stream's decided mark; the decision sits
+     after the cookie and conversation pins (both passed as pinned) and the
+     healthy-endpoint fallback, before the endpoint admission gate (a HIT
+     the gate moves is noted) and before the stream mapping's bounded-load
+     unit is taken on the final endpoint.
 Each check runs on the real files, then on a mutated copy where it must fail
 (the check has teeth).
 """
@@ -124,6 +130,33 @@ def check_shared(f):
     return errs
 
 
+def check_h2(f):
+    errs = []
+    h2 = f["sockproxy_h2.c"]
+    fwd = body_of(h2, "proxy_h2_forward_to_backend")
+    if h2.count("sp_radix_eligible(") != 1 or "sp_radix_eligible(" not in h2.split("\nproxy_h2_forward_to_backend(")[0]:
+        errs.append("the HTTP/2 gatherer does not call the eligible helper once, before the forward")
+    if "not_chat = sp_is_chat_path(stream->path) ? 0 : 1;" not in h2:
+        errs.append("the HTTP/2 gatherer does not pass not_chat from sp_is_chat_path")
+    if "circuit_breaker_candidate" in fwd:
+        errs.append("the HTTP/2 forward reads the breaker outside the helper")
+    healthy = fwd.find("ep_idx = select_healthy_endpoint(tepval, ep_idx);")
+    radix = fwd.find("radix_route_decide(")
+    gate = fwd.find("sp_fc_h2_gate_endpoint(pfe, stream, tepval, ep_idx)")
+    moved = fwd.find("radix_route_note_moved(")
+    unit = fwd.find("h2_load_unit_take(tepval, ep_idx)")
+    if min(healthy, radix, gate, moved, unit) < 0:
+        errs.append("HTTP/2: a radix landmark is missing")
+    elif not (healthy < radix < gate < moved < unit):
+        errs.append("HTTP/2 order healthy fallback < radix < admission gate < note_moved < unit broken")
+    if "decided = &stream->radix_decided" not in h2:
+        errs.append("HTTP/2 does not pass the stream's decided mark")
+    pin = fwd[:radix] if radix >= 0 else fwd
+    if "radix_pinned = 1" not in pin.split("// P0.3")[0] or "radix_pinned = 1" not in pin.split("// P0.3")[-1]:
+        errs.append("HTTP/2: the cookie pin and the conversation pin are not both passed as pinned")
+    return errs
+
+
 def main():
     src = open(SRC).read()
     fails = 0
@@ -176,6 +209,26 @@ def main():
     }
     for name, m in shared_mutants.items():
         caught = m is not None and bool(check_shared(m))
+        print("[%s] negative control: %s" % ("PASS" if caught else "FAIL", name))
+        fails += not caught
+    errs = check_h2(files)
+    print("[%s] HTTP/2 gatherer and decision placement%s" % (
+        "FAIL" if errs else "PASS", "".join("\n    " + e for e in errs)))
+    fails += bool(errs)
+    h2_mutants = {
+        "HTTP/2 decision after the admission gate":
+            mut("sockproxy_h2.c", "sp_fc_h2_gate_endpoint(pfe, stream, tepval, ep_idx)",
+                "sp_fc_h2_gate_endpoint_x"),
+        "HTTP/2 without the decided mark":
+            mut("sockproxy_h2.c", "decided = &stream->radix_decided", "decided = NULL"),
+        "HTTP/2 conversation pin not passed":
+            mut("sockproxy_h2.c", "    radix_pinned = 1;   /* a conversation id pins", "    /* a conversation id pins"),
+        "HTTP/2 gatherer reads the breaker itself":
+            mut("sockproxy_h2.c", "in->eligible = sp_radix_eligible(pfe, pool, n, inflight);",
+                "in->eligible = circuit_breaker_candidate(pool, 0);"),
+    }
+    for name, m in h2_mutants.items():
+        caught = m is not None and bool(check_h2(m))
         print("[%s] negative control: %s" % ("PASS" if caught else "FAIL", name))
         fails += not caught
     print("test_radix_wiring: %s" % ("FAIL" if fails else "PASS"))
