@@ -14,6 +14,10 @@
  * the ones that do
  * run return int, void or a pointer, where 0 in the return register is the
  * same answer for each.
+ *
+ * Every stand-in here is weak: a test that drives a path through one of them
+ * defines its own working fake, with the product's prototype, in its own
+ * file (test_h2_radix.c); every other test keeps the stand-in.
  */
 #include <string.h>
 #include "sockproxy_json_scan.h"
@@ -21,9 +25,9 @@
 int puts(const char *s);
 void abort(void);
 
-#define REACHED(name) long name(void) { return 0; }
+#define REACHED(name) __attribute__((weak)) long name(void) { return 0; }
 #define NOT_REACHED(name) \
-  long name(void) { puts("test_h2_fixture_links: " #name " reached"); abort(); return 0; }
+  __attribute__((weak)) long name(void) { puts("test_h2_fixture_links: " #name " reached"); abort(); return 0; }
 
 /* A request's completion record. Only a test that relays an admitted
  * request's answer gets here, and it says so first (h2fx_allow_completion);
@@ -43,13 +47,13 @@ int h2fx_allow_completion, h2fx_completion_requests, h2fx_completion_usage_missi
 /* Every stream initializes fixed scanner storage, including non-JSON
  * streams. These fixtures declare no JSON media type: reaching JSON body
  * inspection would change the lifetime test's setup and must fail loudly. */
-void
+__attribute__((weak)) void
 sp_json_scan_init(sp_json_scan_t *scan)
 {
   memset(scan, 0, sizeof(*scan));
 }
 
-int
+__attribute__((weak)) int
 sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
 {
   (void)scan; (void)data; (void)len;
@@ -57,7 +61,7 @@ sp_json_scan_feed(sp_json_scan_t *scan, const char *data, size_t len)
   abort();
 }
 
-int
+__attribute__((weak)) int
 sp_json_scan_finish(sp_json_scan_t *scan)
 {
   (void)scan;

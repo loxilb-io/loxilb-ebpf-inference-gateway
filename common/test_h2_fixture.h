@@ -89,6 +89,11 @@ proxy_h2_stream_t *h2fx_stream(int32_t id);
  * body len bytes (none: END_STREAM on HEADERS). Queued on the client only:
  * h2fx_gw_read or h2fx_to_gateway sends it. Returns the stream id. */
 int32_t h2fx_submit(const char *model, const uint8_t *body, size_t len);
+/* The same with the path, a content-type and an x-conversation-id of the
+ * test's (NULL: no such header). */
+int32_t h2fx_submit_req(const char *path, const char *content_type,
+                        const char *conv_id, const char *model,
+                        const uint8_t *body, size_t len);
 
 /* A pool of n_eps endpoints 10.0.9.(i+1):8000+i keyed key, linked to the
  * rule; h2fx_fini unlinks and frees it. */
@@ -106,7 +111,7 @@ extern int (*h2fx_chwbl)(proxy_epval_t *epv, llm_prefix_key_t *key, int *ep);
                                   /* NULL hook: aborts (not reached) */
 
 /* The fake backends, in connect order. */
-#define H2FX_MAX_BACKENDS 4
+#define H2FX_MAX_BACKENDS 16
 #define H2FX_BODY_CAP (1 << 16)
 typedef struct {
   int gw_fd;                /* the gateway's end, the leg's fd */
@@ -122,6 +127,10 @@ extern h2fx_backend_t h2fx_be[H2FX_MAX_BACKENDS];
 extern int h2fx_n_be;
 extern int h2fx_connect_calls;
 extern int32_t h2fx_be_window;    /* the stream window the next backend advertises */
+/* A body above H2FX_BODY_CAP fails the backend's assert, unless a test that
+ * sends one opts in here: the backend then keeps the first H2FX_BODY_CAP
+ * bytes in body and counts the whole length in body_len. */
+extern int h2fx_be_body_count;
 
 /* The gateway's pending bytes into backend i. */
 void h2fx_be_pump(int i);
