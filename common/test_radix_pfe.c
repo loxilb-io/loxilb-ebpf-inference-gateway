@@ -16,6 +16,12 @@
  * "./test_radix_pfe leak" is the negative control: the shell is cleared
  * without the recycle's release, and LeakSanitizer must report it.
  *
+ * The decided mark (proxy_fd_ent_t.radix_decided) lives with the request: a
+ * request decided again on a park's wake is counted once; message begin
+ * clears it with the reset (the two statements sockproxy_http.c runs there,
+ * held together by test_radix_wiring), so the next request on the connection
+ * is counted again; pfe_clear zeroes it.
+ *
  * Build: make test_radix_pfe
  */
 #define _GNU_SOURCE
@@ -48,6 +54,22 @@ static void use(radix_pool_t *p, proxy_fd_ent_t *pfe, const char *b, size_t len)
   in.pool_id = p; in.ai_gw_mode = 1; in.fc_active = 1; in.model = "m"; in.model_len = 1;
   in.body = b; in.body_len = len; in.eligible = 0x3; in.n_eps = 2;
   radix_route_decide(p, &pfe->radix_req, &in, &out);
+}
+
+static void use_marked(radix_pool_t *p, proxy_fd_ent_t *pfe, const char *b, size_t len)
+{
+  radix_route_in_t in;
+  radix_route_out_t out;
+  memset(&in, 0, sizeof(in));
+  in.pool_id = p; in.ai_gw_mode = 1; in.fc_active = 1; in.model = "m"; in.model_len = 1;
+  in.body = b; in.body_len = len; in.eligible = 0x3; in.n_eps = 2;
+  in.decided = &pfe->radix_decided;
+  radix_route_decide(p, &pfe->radix_req, &in, &out);
+}
+
+static uint64_t misses(radix_pool_t *p)
+{
+  return __atomic_load_n(&p->st.decided[RADIX_R_MISS], __ATOMIC_RELAXED);
 }
 
 int main(int argc, char **argv)
@@ -92,6 +114,24 @@ int main(int argc, char **argv)
     pfe_clear(pfe);
     CHECK(pfe->radix_req == NULL);
   }
+  /* the decided mark: decide, a park's wake decides again (counted once);
+   * message begin; the next request is counted again */
+  {
+    uint64_t m0 = misses(p);
+    CHECK(offsetof(proxy_fd_ent_t, radix_decided) < PFE_SKIP_OFF);
+    use_marked(p, pfe, b, len);
+    CHECK(pfe->radix_decided == 1 && misses(p) == m0 + 1);
+    use_marked(p, pfe, b, len);                /* the wake */
+    CHECK(misses(p) == m0 + 1);
+    radix_req_reset(pfe->radix_req);           /* message begin */
+    pfe->radix_decided = 0;
+    use_marked(p, pfe, b, len);
+    CHECK(pfe->radix_decided == 1 && misses(p) == m0 + 2);
+    pfe_radix_req_release(pfe);
+    pfe_clear(pfe);
+    CHECK(pfe->radix_decided == 0);
+  }
+
   /* a release of a shell that never met a radix pool is a no-op */
   pfe_radix_req_release(pfe);
   CHECK(pfe->radix_req == NULL);

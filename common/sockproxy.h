@@ -1563,6 +1563,10 @@ struct proxy_fd_ent {
    * request to a radix pool, reset at every message begin, freed before the
    * shell is cleared or recycled (sockproxy_pfe_clear.h). */
   struct radix_req *radix_req;
+  /* The current request's radix decision was counted (a park's wake decides
+   * again and is not counted again). Cleared with the radix_req reset at
+   * message begin. */
+  uint8_t radix_decided;
 
   char conversation_id[MAX_CONV_ID_LEN];  // Conversation ID (P0.3)
   int has_conv_id;  // Flag: conversation ID present
@@ -2972,5 +2976,16 @@ uint64_t get_timestamp_ns(void);
 int is_tracing_enabled(void);
 void emit_trace_event(proxy_fd_ent_t *pfe, uint8_t event_type, uint32_t duration_us);
 #endif
+
+/* The one chat-completion predicate: the request path is exactly
+ * /v1/chat/completions, optionally followed by a query. It sets is_chat for
+ * the KV-exact tokenize stage and tells prefix routing on both protocols
+ * which requests are chat completions. */
+static inline int
+sp_is_chat_path(const char *path)
+{
+  return path && strncmp(path, "/v1/chat/completions", 20) == 0 &&
+         (path[20] == '\0' || path[20] == '?');
+}
 
 #endif

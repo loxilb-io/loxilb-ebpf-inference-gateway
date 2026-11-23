@@ -298,6 +298,94 @@ static void e1_gates_before_scan(void)
   free(b);
 }
 
+/* NOT_CHAT: a request that is not a chat completion stops before the
+ * allocation and the scan, after every existing gate (their order and
+ * answers unchanged). */
+static void e1_not_chat_gate(void)
+{
+  char *b = malloc(BODY_CAP);
+  size_t len = body2(b, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint64_t s0 = radix_route_scan_calls();
+  long c0 = fa_calls;
+
+  case_begin("e1_not_chat_gate (after the existing gates, before allocation and scan)");
+  in_base(&in, p, b, len);
+  in.not_chat = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
+  CHECK(out.reason == RADIX_R_NOT_CHAT && out.ep == -1);
+  CHECK(rq == NULL && fa_calls == c0);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(decided(p, RADIX_R_NOT_CHAT) == 1);
+  CHECK(!strcmp(radix_route_reason_name(RADIX_R_NOT_CHAT), "not_chat"));
+  /* every existing gate still answers first */
+  in.pipelined = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_PIPELINED);
+  in.pipelined = 0; in.pinned = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_PINNED);
+  in.pinned = 0; in.body_len = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_NO_BODY);
+  in.body_len = len; in.salt_invalid = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_SALT_INVALID);
+  CHECK(decided(p, RADIX_R_NOT_CHAT) == 1);
+  /* a chat request still scans */
+  in.salt_invalid = 0; in.not_chat = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_MISS);
+  CHECK(rq != NULL && radix_route_scan_calls() == s0 + 1);
+  /* a request state kept from an earlier request learns nothing */
+  radix_req_reset(rq);
+  in.not_chat = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_NOT_CHAT);
+  CHECK(radix_route_learn(p, rq, p, 0, 200, 2) == RADIX_LEARN_NONE);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(b);
+}
+
+/* The caller's decided mark: a request decided again (an HTTP/2 stream
+ * forwarded a second time) is counted once, whatever the reason; the mark
+ * cleared (the request state reused) counts again; no mark counts every
+ * call, as HTTP/1.1 does today. */
+static void d_decided_mark(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint8_t mark = 0;
+
+  case_begin("d_decided_mark (decide again: counted once; cleared on reuse)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);   /* MISS, counted */
+  in_base(&in, p, a, la);
+  in.decided = &mark;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0 && out.reason == RADIX_R_HIT);
+  CHECK(mark == 1 && decided(p, RADIX_R_HIT) == 1);
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0 && out.reason == RADIX_R_HIT);
+  CHECK(decided(p, RADIX_R_HIT) == 1);                 /* decided again: once */
+  in.pinned = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_PINNED);
+  CHECK(decided(p, RADIX_R_PINNED) == 0);              /* a gate, too */
+  in.pinned = 0;
+  radix_req_reset(rq);
+  mark = 0;                                            /* reused */
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(mark == 1 && decided(p, RADIX_R_HIT) == 2);
+  in.decided = NULL;                                   /* no mark: every call */
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(decided(p, RADIX_R_HIT) == 4 && decided(p, RADIX_R_MISS) == 1);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
 /* ======================================================================== */
 /* E3                                                                        */
 
@@ -429,20 +517,20 @@ static void e4_spread_and_tiebreak(void)
   radix_route_in_t in;
   radix_route_out_t out;
 
-  case_begin("e4_spread_and_tiebreak (balance 3, eligible only)");
+  case_begin("e4_spread_and_tiebreak (balance 3: pick - min over eligible)");
   CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
 
   in_base(&in, p, a, la);
-  g_inflight[0] = 0; g_inflight[1] = 0; g_inflight[2] = 4;
-  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
+  g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* pick - min = 4 */
   CHECK(out.reason == RADIX_R_SPREAD);
   radix_req_reset(rq);
-  g_inflight[2] = 3;
-  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  g_inflight[0] = 3;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* pick - min = 3 */
   CHECK(out.reason == RADIX_R_HIT);
   radix_req_reset(rq);
-  g_inflight[2] = 9;                       /* ep2 ineligible: not in the spread */
-  in.eligible = 0x3;
+  g_inflight[0] = 0; g_inflight[2] = 9;
+  in.eligible = 0x3;                       /* ep2 ineligible */
   CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
   CHECK(out.reason == RADIX_R_HIT);
   radix_req_reset(rq);
@@ -460,6 +548,60 @@ static void e4_spread_and_tiebreak(void)
   radix_req_reset(rq);
   in.selector_pick = 2;
   CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* tie: lowest index */
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  memset(g_inflight, 0, sizeof(g_inflight));
+  case_end();
+  free(a);
+}
+
+/* The cases that tell the guard rules apart (rule B: fall back only when the
+ * chosen candidate sits more than balance_abs above the least-loaded
+ * eligible endpoint; the spread of the other endpoints does not count). */
+static void e4_rule_b(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+
+  case_begin("e4_rule_b (max - min > abs with pick - min <= abs: HIT)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);   /* on ep0 */
+  in_base(&in, p, a, la);
+  g_inflight[0] = 0; g_inflight[1] = 0; g_inflight[2] = 4;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* max - min 4, pick - min 0 */
+  CHECK(out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  g_inflight[0] = 3; g_inflight[1] = 0; g_inflight[2] = 20;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* pick - min == abs */
+  CHECK(out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 4;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* pick - min > abs */
+  CHECK(out.reason == RADIX_R_SPREAD);
+  radix_req_reset(rq);
+  g_inflight[0] = 4; g_inflight[1] = 4; g_inflight[2] = 0;
+  in.eligible = 0x3;                       /* min over eligible only: 4 */
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  CHECK(decided(p, RADIX_R_HIT) == 3 && decided(p, RADIX_R_SPREAD) == 1);
+  memset(g_inflight, 0, sizeof(g_inflight));
+
+  /* a candidate that is not eligible never becomes the pick: learned on
+   * ep0 and ep2, ep2 ineligible and idle */
+  CHECK(request(p, &rq, a, la, 2, 200, NULL) == RADIX_LEARN_OK);
+  in_base(&in, p, a, la);
+  in.eligible = 0x3;
+  g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* ep0: 4 - 0 */
+  CHECK(out.reason == RADIX_R_SPREAD && !(out.cand_mask & 0x4));
+  radix_req_reset(rq);
+  g_inflight[0] = 3;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* ep0, never ep2 */
+  CHECK(out.reason == RADIX_R_HIT && !(out.cand_mask & 0x4));
   radix_req_free(&rq);
   radix_pool_free(p);
   memset(g_inflight, 0, sizeof(g_inflight));
@@ -704,7 +846,7 @@ static void e5_learnable_outcomes(void)
   CHECK(request(p, &rq, bb, lb, 1, 200, &out) == RADIX_LEARN_OK); /* BELOW */
   CHECK(out.reason == RADIX_R_BELOW_THRESHOLD);
   in_base(&in, p, a, la);
-  g_inflight[2] = 4;
+  g_inflight[0] = 4;                       /* the candidate ep0 */
   CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
   CHECK(out.reason == RADIX_R_SPREAD);
   CHECK(radix_route_learn(p, rq, p, 2, 200, 2) == RADIX_LEARN_OK);
@@ -1023,7 +1165,7 @@ static void ka_keep_on_guards(void)
   CHECK(out.reason == RADIX_R_BELOW_THRESHOLD);
   radix_req_reset(rq);
   in_base(&in, p, a, la);
-  g_inflight[2] = 4;
+  g_inflight[0] = 4;                                       /* the candidate ep0 */
   CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
   CHECK(out.reason == RADIX_R_SPREAD);
   memset(g_inflight, 0, sizeof(g_inflight));
@@ -1038,6 +1180,31 @@ static void ka_keep_on_guards(void)
   radix_pool_free(p);
   case_end();
   free(a); free(bb);
+}
+
+/* Rule B at the keep-alive leg: an idle candidate is a HIT although another
+ * endpoint is busy, so a kept leg off the candidates is released. */
+static void ka_rule_b_hit_releases(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+
+  case_begin("ka_rule_b_hit_releases (max - min > abs, pick - min <= abs: release)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  in_base(&in, p, a, la);
+  g_inflight[0] = 0; g_inflight[1] = 0; g_inflight[2] = 4;
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 1);
+  CHECK(out.reason == RADIX_R_HIT && out.cand_mask == 0x1);
+  CHECK(st_of(p, &p->st.ka_moved) == 1 && decided(p, RADIX_R_SPREAD) == 0);
+  memset(g_inflight, 0, sizeof(g_inflight));
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
 }
 
 static void ka_keep_gate_unknown_or_off(void)
@@ -1458,12 +1625,14 @@ int main(void)
 {
   e1_off_no_scan_no_alloc();
   e1_gates_before_scan();
+  e1_not_chat_gate();
   e3_pinned_not_learnable();
   e3_ineligible_never_picked();
   e3_sticky_is_pinned();
   e5_pipelined_not_scanned();
   e4_threshold();
   e4_spread_and_tiebreak();
+  e4_rule_b();
   e4_scan_skips();
   e4_miss_workcap_ns_nomem();
   e5_once_on_2xx();
@@ -1480,11 +1649,13 @@ int main(void)
   ka_keep_when_kept_is_candidate();
   ka_release_when_kept_not_candidate();
   ka_keep_on_guards();
+  ka_rule_b_hit_releases();
   ka_keep_gate_unknown_or_off();
   misc_stats_take();
   e10_other_generation();
   e10_race();
   d2_req_lifecycle();
+  d_decided_mark();
   d4b_many_tokens();
   misc_stats_line();
   misc_lock_wait_counters();

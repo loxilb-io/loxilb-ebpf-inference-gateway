@@ -93,6 +93,23 @@ static inline int sp_route_subset(const proxy_fd_ent_t *pfe, const proxy_epval_t
 {
   return pfe && pfe->mcp_route_active && pool && !pool->mcp_stateless;
 }
+/* Prefix routing (sockproxy_radix_route.h), both protocols: the endpoints of
+ * the first n a request may be routed to by radix, and each one's in-flight
+ * count into inflight[]. Eligible: in the request's route, not drained, a
+ * normal role, a breaker candidate (read without taking a half-open probe;
+ * is_endpoint_healthy would spend one per endpoint). */
+static inline uint32_t sp_radix_eligible(const proxy_fd_ent_t *pfe, proxy_epval_t *pool,
+                                         int n, uint32_t *inflight)
+{
+  uint32_t eligible = 0;
+  for (int i = 0; i < n; i++) {
+    inflight[i] = fc_ep_inflight(&pool->fc, i, FC_ROLE_NORMAL);
+    if (sp_route_allows(pfe, i) && pool->eps[i].inv == 0 && pool->ep_role[i] == 0 &&
+        circuit_breaker_candidate(pool, i))
+      eligible |= UINT32_C(1) << i;
+  }
+  return eligible;
+}
 typedef struct sp_mcp_fc_scope {
   proxy_epval_t *pool;
   proxy_fd_ent_t *request;
