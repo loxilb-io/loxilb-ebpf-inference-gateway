@@ -69,6 +69,11 @@ jobs:
           make -C common test_sni_mtls
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./common/test_sni_mtls
 
+      - name: SNI selects a wildcard for one label, an exact name first, in any case (ASan + UBSan)
+        run: |
+          make -C common test_sni_wildcard
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ./common/test_sni_wildcard
+
       - name: Frontend mTLS during concurrent SNI certificate rotation (ASan and LeakSanitizer)
         run: |
           fixture=$(mktemp -d)
