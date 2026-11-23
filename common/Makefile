@@ -1076,14 +1076,21 @@ test_radix_pfe: test_radix_pfe.c sockproxy_pfe_clear.h sockproxy.h $(RADIX_ROUTE
 	$(CC) $(CFLAGS) $(RADIX_OPT) -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
 
+# sp_is_chat_path gives the HTTP/1.1 is_chat line's previous value on every
+# kind of path (that value feeds KV-exact).
+test_chat_path: test_chat_path.c sockproxy.h
+	$(CC) $(CFLAGS) -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
+
 .PHONY: test_radix
-test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan test_radix_pfe
+test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan test_radix_pfe test_chat_path
 	./test_radix_trie
 	./test_radix_trie_tsan
 	./test_radix_scan
 	./test_radix_route
 	./test_radix_route_tsan
 	./test_radix_pfe
+	./test_chat_path
 	python3 -B test_radix_wiring.py
 	! ./test_radix_pfe leak > test_radix_pfe.leak.log 2>&1 || { echo "test_radix_pfe: negative control not reported"; exit 1; }
 	grep -q 'LeakSanitizer: detected memory leaks' test_radix_pfe.leak.log

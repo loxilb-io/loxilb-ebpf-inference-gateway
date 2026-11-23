@@ -29,6 +29,7 @@
  *   INSPECT_SIZE   body above the H1 inspection limit (streamed)
  *   NO_BODY        no buffered body located
  *   SALT_INVALID   cache_salt present but invalid
+ *   NOT_CHAT       the request is not a chat completion (sp_is_chat_path)
  *   NOMEM          the per-request state could not be allocated
  *   SCAN_SKIP      radix_scan_chat() skipped (its reason counted apart)
  *   NS_OVERFLOW    the namespace does not fit RADIX_NS_MAX
@@ -122,6 +123,7 @@ typedef enum radix_route_reason {
   RADIX_R_WORK_CAP,
   RADIX_R_BELOW_THRESHOLD,
   RADIX_R_SPREAD,
+  RADIX_R_NOT_CHAT,      /* after SPREAD: the earlier indices are unchanged */
   RADIX_R__COUNT
 } radix_route_reason_t;
 
@@ -210,6 +212,13 @@ typedef struct radix_route_in {
   uint32_t        now;          /* radix_now() */
   uint8_t         gates_unknown; /* keep-alive site: a gate selection applies
                                     cannot be evaluated there */
+  uint8_t         not_chat;     /* the request is not a chat completion
+                                   (sp_is_chat_path) */
+  uint8_t        *decided;      /* the caller's per-request decided mark:
+                                   NULL counts every call; else the decision
+                                   is counted only while *decided is 0, which
+                                   it then sets. The caller clears it when it
+                                   reuses the request state. */
 } radix_route_in_t;
 
 typedef struct radix_route_out {

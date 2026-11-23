@@ -910,14 +910,7 @@ sp_radix_gather(proxy_fd_ent_t *pfe, proxy_epval_t *pool,
   memset(in, 0, sizeof(*in));
   in->pool_id = pool;
   in->n_eps = (unsigned)(n > 0 ? n : 0);
-  for (int i = 0; i < n; i++) {
-    inflight[i] = fc_ep_inflight(&pool->fc, i, FC_ROLE_NORMAL);
-    /* circuit_breaker_candidate reads the breaker without taking a
-     * half-open probe (is_endpoint_healthy would spend one per endpoint). */
-    if (sp_route_allows(pfe, i) && pool->eps[i].inv == 0 && pool->ep_role[i] == 0 &&
-        circuit_breaker_candidate(pool, i))
-      in->eligible |= UINT32_C(1) << i;
-  }
+  in->eligible = sp_radix_eligible(pfe, pool, n, inflight);
   in->inflight = inflight;
   /* creq_on_message_begin read it when this request began: an answer to an
    * earlier request was still owed (a pipelining client) */
@@ -935,6 +928,7 @@ sp_radix_gather(proxy_fd_ent_t *pfe, proxy_epval_t *pool,
     in->body_len = pfe->body_len;
   }
   in->salt_invalid = pfe->prefix_key.cache_salt_invalid ? 1 : 0;
+  in->not_chat = pfe->is_chat ? 0 : 1;
   if (pfe->prefix_key.flags & PREFIX_HAS_CACHE_SALT) {
     in->salt = pfe->prefix_key.cache_salt;
     in->salt_len = strnlen(pfe->prefix_key.cache_salt, sizeof(pfe->prefix_key.cache_salt));

@@ -2973,4 +2973,15 @@ int is_tracing_enabled(void);
 void emit_trace_event(proxy_fd_ent_t *pfe, uint8_t event_type, uint32_t duration_us);
 #endif
 
+/* The one chat-completion predicate: the request path is exactly
+ * /v1/chat/completions, optionally followed by a query. It sets is_chat for
+ * the KV-exact tokenize stage and tells prefix routing on both protocols
+ * which requests are chat completions. */
+static inline int
+sp_is_chat_path(const char *path)
+{
+  return path && strncmp(path, "/v1/chat/completions", 20) == 0 &&
+         (path[20] == '\0' || path[20] == '?');
+}
+
 #endif

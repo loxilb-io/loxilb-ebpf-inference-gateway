@@ -104,10 +104,16 @@ static int rr_end(radix_pool_t *p, radix_route_out_t *out,
   return r == RADIX_R_HIT ? out->ep : -1;
 }
 
-static void rr_count(radix_pool_t *p, const radix_route_out_t *out)
+static void rr_count(radix_pool_t *p, const radix_route_in_t *in,
+                     const radix_route_out_t *out)
 {
   if (!p || out->reason == RADIX_R_OFF)
     return;
+  if (in && in->decided) {
+    if (*in->decided)
+      return;                  /* this request's decision is counted */
+    *in->decided = 1;
+  }
   RR_INC(p, decided[out->reason]);
   if (out->reason == RADIX_R_SCAN_SKIP && (unsigned)out->scan_rc < RADIX_SCAN__COUNT)
     RR_INC(p, scan_skip[out->scan_rc]);
@@ -214,6 +220,8 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
     gate = RADIX_R_NO_BODY;
   else if (in->salt_invalid)
     gate = RADIX_R_SALT_INVALID;
+  else if (in->not_chat)
+    gate = RADIX_R_NOT_CHAT;
   if (gate != RADIX_R_HIT) {
     if (*rqp)
       (*rqp)->learnable = 0;   /* not scanned for this decision: never learns */
@@ -299,7 +307,7 @@ int radix_route_decide(radix_pool_t *p, radix_req_t **rqp,
   if (!out)
     out = &scratch;
   ep = rr_decide(p, rqp, in, out);
-  rr_count(p, out);
+  rr_count(p, in, out);
   return ep;
 }
 
@@ -322,7 +330,7 @@ int radix_route_keepalive(radix_pool_t *p, radix_req_t **rqp,
     RR_INC(p, ka_moved);           /* its reason is counted at the selection */
     return 1;
   }
-  rr_count(p, out);
+  rr_count(p, in, out);
   if (ep >= 0)
     RR_INC(p, kept_leg);
   return 0;
@@ -466,6 +474,7 @@ static const char *const rr_reason_names[RADIX_R__COUNT] = {
   [RADIX_R_WORK_CAP]        = "work_cap",
   [RADIX_R_BELOW_THRESHOLD] = "below_threshold",
   [RADIX_R_SPREAD]          = "spread",
+  [RADIX_R_NOT_CHAT]        = "not_chat",
 };
 
 static const char *const rr_learn_names[RADIX_LEARN__COUNT] = {

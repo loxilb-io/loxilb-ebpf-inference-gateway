@@ -298,6 +298,94 @@ static void e1_gates_before_scan(void)
   free(b);
 }
 
+/* NOT_CHAT: a request that is not a chat completion stops before the
+ * allocation and the scan, after every existing gate (their order and
+ * answers unchanged). */
+static void e1_not_chat_gate(void)
+{
+  char *b = malloc(BODY_CAP);
+  size_t len = body2(b, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint64_t s0 = radix_route_scan_calls();
+  long c0 = fa_calls;
+
+  case_begin("e1_not_chat_gate (after the existing gates, before allocation and scan)");
+  in_base(&in, p, b, len);
+  in.not_chat = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
+  CHECK(out.reason == RADIX_R_NOT_CHAT && out.ep == -1);
+  CHECK(rq == NULL && fa_calls == c0);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(decided(p, RADIX_R_NOT_CHAT) == 1);
+  CHECK(!strcmp(radix_route_reason_name(RADIX_R_NOT_CHAT), "not_chat"));
+  /* every existing gate still answers first */
+  in.pipelined = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_PIPELINED);
+  in.pipelined = 0; in.pinned = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_PINNED);
+  in.pinned = 0; in.body_len = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_NO_BODY);
+  in.body_len = len; in.salt_invalid = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_SALT_INVALID);
+  CHECK(decided(p, RADIX_R_NOT_CHAT) == 1);
+  /* a chat request still scans */
+  in.salt_invalid = 0; in.not_chat = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_MISS);
+  CHECK(rq != NULL && radix_route_scan_calls() == s0 + 1);
+  /* a request state kept from an earlier request learns nothing */
+  radix_req_reset(rq);
+  in.not_chat = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_NOT_CHAT);
+  CHECK(radix_route_learn(p, rq, p, 0, 200, 2) == RADIX_LEARN_NONE);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(b);
+}
+
+/* The caller's decided mark: a request decided again (an HTTP/2 stream
+ * forwarded a second time) is counted once, whatever the reason; the mark
+ * cleared (the request state reused) counts again; no mark counts every
+ * call, as HTTP/1.1 does today. */
+static void d_decided_mark(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint8_t mark = 0;
+
+  case_begin("d_decided_mark (decide again: counted once; cleared on reuse)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);   /* MISS, counted */
+  in_base(&in, p, a, la);
+  in.decided = &mark;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0 && out.reason == RADIX_R_HIT);
+  CHECK(mark == 1 && decided(p, RADIX_R_HIT) == 1);
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0 && out.reason == RADIX_R_HIT);
+  CHECK(decided(p, RADIX_R_HIT) == 1);                 /* decided again: once */
+  in.pinned = 1;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1 && out.reason == RADIX_R_PINNED);
+  CHECK(decided(p, RADIX_R_PINNED) == 0);              /* a gate, too */
+  in.pinned = 0;
+  radix_req_reset(rq);
+  mark = 0;                                            /* reused */
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(mark == 1 && decided(p, RADIX_R_HIT) == 2);
+  in.decided = NULL;                                   /* no mark: every call */
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(decided(p, RADIX_R_HIT) == 4 && decided(p, RADIX_R_MISS) == 1);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
 /* ======================================================================== */
 /* E3                                                                        */
 
@@ -1537,6 +1625,7 @@ int main(void)
 {
   e1_off_no_scan_no_alloc();
   e1_gates_before_scan();
+  e1_not_chat_gate();
   e3_pinned_not_learnable();
   e3_ineligible_never_picked();
   e3_sticky_is_pinned();
@@ -1566,6 +1655,7 @@ int main(void)
   e10_other_generation();
   e10_race();
   d2_req_lifecycle();
+  d_decided_mark();
   d4b_many_tokens();
   misc_stats_line();
   misc_lock_wait_counters();

@@ -15110,12 +15110,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
                 // (completions/other) is fail-safe to the existing single-text
                 // tokenize path (threat). Reuse the parsed pfe->request_path
                 // (set by the on_url parser callback) rather than re-scanning rcvbuf.
-                pfe->is_chat = 0;
-                if (pfe->request_path[0] != '\0' &&
-                    strncmp(pfe->request_path, "/v1/chat/completions", 20) == 0 &&
-                    (pfe->request_path[20] == '\0' || pfe->request_path[20] == '?')) {
-                  pfe->is_chat = 1;
-                }
+                pfe->is_chat = sp_is_chat_path(pfe->request_path) ? 1 : 0;
                 pfe->body_off = (size_t)(body_start - (const char *)pfe->rcvbuf);
                 pfe->body_len = body_len;
                 log_debug("[KV_CHAT_DETECT] fd=%d path=%s is_chat=%u body_off=%zu body_len=%zu",
