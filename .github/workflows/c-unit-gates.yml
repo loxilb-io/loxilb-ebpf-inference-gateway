@@ -126,6 +126,9 @@ jobs:
       - name: Nothing reads an HTTP/2 stream after an answer that may have freed it (ASan + UBSan, gateway object included)
         run: make -C common test_h2deny
 
+      - name: An HTTP/2 stream whose rule has no endpoints is answered, 503 or 500 (ASan + UBSan)
+        run: make -C common test_h2noep
+
       - name: HTTP/2 request body outlives its client stream (ASan)
         run: make -C common test_h2body
 

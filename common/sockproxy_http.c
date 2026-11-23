@@ -4053,6 +4053,10 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
          * their order. */
         sp_fc_apply_rule(tepval, arg, new_ent, 0);
         tepval->hold_mode = arg->half_close_mode;   /* new holds only; held ones stay */
+        /* The answer while the pool has no endpoints follows the rule in
+         * place: a rule emptied or refilled keeps its pool, so a request
+         * never reaches another rule's pool in between. */
+        tepval->no_ep_status = arg->no_ep_status;
         /* Requests admitted from here on; a claim already held settles
          * for what it was granted. */
         tepval->ai_default_tokens = arg->ai_default_tokens;
@@ -4230,6 +4234,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         fc_state_init_slots(&tepval->fc, fc_tenant_slots_from_env());
         sp_fc_apply_rule(tepval, arg, new_ent, 1);
         tepval->hold_mode = arg->half_close_mode;
+        tepval->no_ep_status = arg->no_ep_status;
         tepval->ai_default_tokens = arg->ai_default_tokens;
         tepval->ai_objective_strict = arg->ai_objective_strict;
         /* allocate radix trie for Tier 1 cache affinity */
@@ -4672,6 +4677,7 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
   fc_state_init_slots(&tepval->fc, fc_tenant_slots_from_env());
   sp_fc_apply_rule(tepval, arg, new_ent, 1);
   tepval->hold_mode = arg->half_close_mode;
+  tepval->no_ep_status = arg->no_ep_status;
   tepval->ai_default_tokens = arg->ai_default_tokens;
   tepval->ai_objective_strict = arg->ai_objective_strict;
   /* allocate radix trie for Tier 1 cache affinity */

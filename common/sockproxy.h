@@ -696,6 +696,7 @@ typedef struct proxy_epval {
   uint8_t  pd_disagg_enabled;       // 1=P/D mode enabled for this service
   uint8_t  ai_gw_mode;             // 1=AI Gateway mode (auto-derived)
   uint8_t  hold_mode;              // enum sp_hold_mode: hold a client that half-closed after its request
+  uint8_t  no_ep_status;           // SP_NO_EP_STATUS_*: the answer while the pool has no endpoints (sockproxy_no_ep.h)
   uint8_t  ai_objective_strict;    // 1 = a request naming an objective it may not use is refused 403
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)
   char     jwt_auth_profile[64];   // JWT auth profile for the Bearer arm (empty unless apikey_auth 3/4)
@@ -2427,6 +2428,9 @@ struct proxy_arg {
   // Half-close hold mode, same hop as the admission fields: enum
   // sp_hold_mode (0 = the process default).
   uint8_t  half_close_mode;
+  // Same hop: the answer while the rule has no endpoints, SP_NO_EP_STATUS_*
+  // (sockproxy_no_ep.h).
+  uint8_t  no_ep_status;
   // Same hop: 1 = a request naming an objective it may not use is refused.
   uint8_t  ai_objective_strict;
   uint8_t  apikey_auth;            // 0=unset, 1=required, 2=declared disabled, 3=jwt, 4=apikey-or-jwt (per-service policy, NOT derived)

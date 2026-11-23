@@ -34,6 +34,7 @@
 #include "sockproxy.h"
 #include "sockproxy_pd_reservation.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_no_ep.h"     /* the answer of a rule with no endpoints */
 #include "sockproxy_h2_load.h"   /* bounded-load units follow a moved pick */
 #include "sockproxy_metrics.h"
 #include "sockproxy_cache.h"    /* cmp_proxy_ent */
@@ -1196,6 +1197,28 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
 #endif
           break;
         }
+
+        /* A rule installed with no endpoints (sockproxy_no_ep.h): the
+         * request it takes is answered here and goes to no other rule. No
+         * admission gate, picker or selector below sees an empty pool. A
+         * connection with no HTTP request (no pfe) is closed. */
+        if (tepval->n_eps <= 0) {
+          if (pfe) {
+            char no_ep_resp[256];
+            int no_ep_len = sp_no_ep_h1_text(tepval->no_ep_status, no_ep_resp,
+                                             sizeof(no_ep_resp));
+            if (no_ep_len > 0) {
+              sp_send_local_outage(pfe,
+                  (uint16_t)sp_no_ep_answer(tepval->no_ep_status).status,
+                  no_ep_resp, (size_t)no_ep_len);
+              pfe->lb_err_body_sent = 1;
+            }
+            log_info("[PROXY_NO_EP] %d sent: rule %u has no endpoints, fd=%d",
+                     sp_no_ep_answer(tepval->no_ep_status).status, tepval->_id,
+                     pfe->fd);
+          }
+          return -1;
+        }
         
         /* Capacity admission, service level. The pool and its ceilings are
          * known here and no selector has run yet; a refusal is answered on
@@ -2221,6 +2244,8 @@ pd_failover_ok: /* NORMAL success path falls through this label too — the
         int ep = 0;
         tepval = sp_pool_first(node);
         if (tepval == NULL) break;
+        /* No endpoint to hash over: closed (sockproxy_no_ep.h). */
+        if (tepval->n_eps <= 0) return -1;
 
         /* PROXY_MODE_ALL is dedicated to N2 / non-L7 protocols only and is never
          * TLS-terminated. All L7 proxy behaviour (session stickiness, E2E-HTTPS,
