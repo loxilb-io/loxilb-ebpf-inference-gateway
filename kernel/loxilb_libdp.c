@@ -3212,6 +3212,7 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   pval->fc_tenant_share_pct = dat->fc_tenant_share_pct;
   pval->fc_expose_headers = dat->fc_expose_headers;
   pval->half_close_mode = dat->half_close_mode;
+  pval->no_ep_status = dat->no_ep_status;
   pval->ai_objective_strict = dat->ai_objective_strict;
   pval->ai_default_tokens = dat->ai_default_tokens;
   pval->fc_wake_policy = dat->fc_wake_policy;
@@ -3302,9 +3303,11 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
     j = dat->nxfrm;  // Total number of slots (may include duplicates)
   }
 
-  if (j <= 0) {
-    return -1;
-  }
+  /* A rule with no endpoints is converted whole, like any other: its
+   * selector, TLS mode, rule id and the rest below are the listener's and
+   * the pool's as much as for a rule with endpoints. Its pool answers a
+   * request by no_ep_status (sockproxy_no_ep.h). Returning here once left
+   * all of them unset while both callers installed the pool anyway. */
 
   // Map NAT_LB_SEL_* to PROXY_SEL_* for all selection modes
   switch (dat->sel_type) {

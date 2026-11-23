@@ -1208,7 +1208,11 @@ struct dp_proxy_tacts {
   uint8_t  fc_band_min_share_pct[3];  // floor, % of the ceiling in force (binds while the band has a waiter)
   uint8_t  fc_critical_reserve_pct;   // the critical floor under its own name
   uint8_t  fc_band_queue_pct[3];      // % of the queue depth a band may hold
-  uint8_t  fc_band_pad[2];
+  // The answer to a request while the rule has no endpoints:
+  // SP_NO_EP_STATUS_503 (0) or SP_NO_EP_STATUS_500 (1), sockproxy_no_ep.h.
+  // Takes the first byte of fc_band_pad: no size change.
+  uint8_t  no_ep_status;
+  uint8_t  fc_band_pad[1];
   uint32_t fc_band_wait_ms[3];        // a band's wait window, 0 = the queue's
 #ifdef HAVE_MTLS
   // mTLS frontend configuration (only used for FullProxy rules in userspace; never in eBPF kernel map)
@@ -1277,6 +1281,7 @@ struct dp_proxy_tacts {
 // fc_tenant_share_pct(1)+fc_pad3[3] replace the u32 fc_pad3: no size change.
 // fc_expose_headers(1)+fc_pad3[2] replace fc_pad3[3]: no size change.
 // half_close_mode(1)+fc_pad3[1] replace fc_pad3[2]: no size change.
+// no_ep_status(1)+fc_band_pad[1] replace fc_band_pad[2]: no size change.
 // epp_mode(1) takes one byte of the former fc_pad3[1] padding and
 //   ai_objective_strict(1) the next; epp_timeout_ms(4)+epp_pad(4),
 //   ai_default_tokens(4) and the priority bands follow. The merged struct

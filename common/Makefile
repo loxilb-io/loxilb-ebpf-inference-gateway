@@ -804,7 +804,7 @@ test_h2leg: test_h2_leg_end
 # Nothing reads an HTTP/2 stream after an answer that may have freed it. The
 # gateway object itself is built with ASan here: a read after the free inside
 # sockproxy_h2.c is what this test must see.
-sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h sockproxy_refusal_mark.h sockproxy_corr.h
+sockproxy_h2_asan.o: sockproxy_h2.c sockproxy_h2.h sockproxy_refusal_mark.h sockproxy_corr.h sockproxy_no_ep.h
 	$(CC) -g -fsanitize=address,undefined -fno-omit-frame-pointer $(CFLAGS) -DSP_DEBUG_ASSERTS \
 		-ffunction-sections -fdata-sections -c -o $@ $<
 
@@ -823,6 +823,15 @@ test_h2_deny_free: test_h2_deny_free.c $(H2FX_DEPS)
 .PHONY: test_h2deny
 test_h2deny: test_h2_deny_free
 	./test_h2_deny_free
+
+# A stream whose rule has no endpoints is answered, 503 or 500 (sockproxy_no_ep.h).
+test_h2_no_ep: test_h2_no_ep.c $(H2FX_DEPS) sockproxy_no_ep.h
+	$(H2FX_LINK) -o $@ test_h2_no_ep.c $(H2FX_SRCS) sockproxy_h2_asan.o \
+		-lnghttp2 -lssl -lcrypto -lpthread
+
+.PHONY: test_h2noep
+test_h2noep: test_h2_no_ep
+	./test_h2_no_ep
 
 # A request body forwarded to an HTTP/2 backend outlives its client stream.
 test_h2_body_source: test_h2_body_source.c $(H2FX_DEPS)

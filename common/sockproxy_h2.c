@@ -27,6 +27,7 @@
 
 #include "sockproxy_h2.h"
 #include "sockproxy_internal.h"
+#include "sockproxy_no_ep.h"
 #include "sockproxy.h"
 #include "sockproxy_ai_security.h"
 #include "sockproxy_in_ifindex.h"
@@ -5234,6 +5235,18 @@ h2_have_tepval:
     }
 
     return -1;
+  }
+
+  /* A rule installed with no endpoints (sockproxy_no_ep.h): the stream is
+   * answered here and goes to no other rule. No admission gate or selector
+   * below sees an empty pool. */
+  if (tepval->n_eps <= 0) {
+    sp_no_ep_answer_t no_ep = sp_no_ep_answer(tepval->no_ep_status);
+
+    log_info("[HTTP/2][PROXY_NO_EP] stream %d: %d sent, rule %u has no endpoints",
+             stream->stream_id, no_ep.status, tepval->_id);
+    h2_send_local_outage(pfe, stream, no_ep.status, no_ep.error, no_ep.detail);
+    return 0;
   }
   
   /* Capacity admission, service level, on AI-gateway pools only: the pool
