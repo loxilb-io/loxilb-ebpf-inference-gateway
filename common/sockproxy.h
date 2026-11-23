@@ -1004,7 +1004,7 @@ l7_policy_on(const proxy_map_ent_t *ent)
  *   - Multiple proxies can share the same certificate (e.g., api.example.com)
  */
 typedef struct ssl_cert_entry {
-  char hostname[256];          // Store key: lower-case host name, or "*.<rest>" for a wildcard (sni_store_key)
+  char hostname[256];          // Hostname (e.g., "api.example.com")
   char cert_path[256];         // Certificate path (e.g., "/opt/loxilb/cert/hostname" or custom path)
   void *ssl_ctx;              // Dedicated SSL context for this hostname (SSL_CTX*)
   int ref_count;              // Reference count (how many proxies use this cert)

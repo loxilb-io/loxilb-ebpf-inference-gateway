@@ -53,10 +53,7 @@ int sni_servername_callback(SSL *ssl, int *ad, void *arg);
 /* Hostname-based SSL context lookup (returns void* to avoid SSL_CTX exposure) */
 void *proxy_get_ssl_ctx_for_hostname(const char *hostname);
 
-/* SNI certificate management. The store is keyed by the lower-case name
- * (sni_store_key); a client's name selects its own entry first, then the
- * "*.<rest>" entry for its left-most label. */
-int sni_store_key(const char *name, char *out, size_t out_sz);
+/* SNI certificate management */
 int proxy_add_sni_certificate(const char *hostname, const char *cert_path);
 int proxy_remove_sni_certificate(const char *hostname);
 int proxy_list_sni_certificates(void (*callback)(const char *hostname, void *data),

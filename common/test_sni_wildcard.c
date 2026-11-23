@@ -19,6 +19,11 @@
 
 proxy_struct_t *proxy_struct;
 
+/* The store's key function (sockproxy_ssl.c). Declared here, not in a shared
+ * header: every header under common/ is an input of the BPF/native ABI
+ * fingerprint, and a test-only symbol is no reason to change it. */
+int sni_store_key(const char *name, char *out, size_t out_sz);
+
 static SSL_CTX *listener;
 
 /* A self-signed certificate whose CN names it, written as server.crt and
