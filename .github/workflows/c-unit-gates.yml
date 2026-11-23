@@ -127,6 +127,9 @@ jobs:
       - name: A backend's X-Loxilb-Refusal-* is removed from every response head relayed to an HTTP/2 client (real relay, ASan + UBSan)
         run: make -C common test_h2rmark
 
+      - name: Prefix routing on HTTP/2 streams (off unchanged, routed by a learned prefix, gates, counted once, units, stream state freed; ASan + UBSan + LeakSanitizer)
+        run: make -C common test_h2radix
+
       # The default run: about 33000 streams on one connection, past stream ID
       # 65535, the two paced reset paths in every 6th cycle. The full run (every
       # path in every cycle, 50000 streams, about 13 minutes) is not a gate:

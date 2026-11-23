@@ -40,6 +40,7 @@
 #define SP_MCP_PROXY_SELECTOR
 #include "sockproxy_mcp_rr.h"
 #include "sockproxy_h2_load.h"    /* per-stream bounded-load units */
+#include "sockproxy_radix_route.h" /* non-P/D prefix routing, per pool */
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "sockproxy_l7hdr_guard.h" /* same field guard as the H1 splice */
 #include "notify.h"
@@ -525,6 +526,7 @@ h2_stream_free(proxy_h2_session_t *session, proxy_h2_stream_t *stream)
     free(stream->prefix_key);
     stream->prefix_key = NULL;
   }
+  radix_req_free(&stream->radix_req);   /* the stream's prefix-routing key */
 
   // Free request headers if allocated (pattern from backend response headers cleanup)
   if (stream->request_headers) {
@@ -1591,9 +1593,16 @@ proxy_h2_backend_on_header_callback(nghttp2_session *session,
       memcpy(st, value, valuelen);
       int status = atoi(st);
       if (status >= 200) {
-        h2_note_backend_response(ai_stream, (uint16_t)status);
+        int noted = h2_note_backend_response(ai_stream, (uint16_t)status);
+        proxy_epval_t *rpool = (proxy_epval_t *)ai_stream->route_epv;
         if (ai_stream->ai_admitted || ai_stream->ai_unmetered)
           ai_stream->metric_response_status = status;
+        /* Prefix routing learns the request on its first final 2xx (the
+         * status whose note took the latch), for the endpoint that answered,
+         * in the pool the stream holds. */
+        if (noted && rpool && rpool->radix && ai_stream->radix_req)
+          (void)radix_route_learn(rpool->radix, ai_stream->radix_req, rpool,
+                                  mapping->ep_idx, (unsigned)status, radix_now());
       }
     }
   }
@@ -4850,12 +4859,56 @@ sp_h2_json_media(const char *value)
   return end - value == 16 && strncasecmp(value, "application/json", 16) == 0;
 }
 
+/* Prefix routing's inputs for one stream (sockproxy_radix_route.h); the
+ * HTTP/1.1 counterpart is sp_radix_gather. The whole body is in data_buf
+ * when a stream is forwarded: never pipelined, never chunked. A body the
+ * JSON pre-scan did not read (another media type) is not passed. */
+static void
+h2_radix_gather(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream, proxy_epval_t *pool,
+                const sp_json_scan_t *scan, int json_media, const char *model,
+                int selector_pick, int pinned, radix_route_in_t *in, uint32_t *inflight)
+{
+  int n = pool->n_eps < MAX_PROXY_EP ? pool->n_eps : MAX_PROXY_EP;
+
+  memset(in, 0, sizeof(*in));
+  in->pool_id = pool;
+  in->n_eps = (unsigned)(n > 0 ? n : 0);
+  in->eligible = sp_radix_eligible(pfe, pool, n, inflight);
+  in->inflight = inflight;
+  in->route_subset = sp_route_subset(pfe, pool) ? 1 : 0;
+  in->pinned = pinned ? 1 : 0;
+  in->sticky_select = pool->select == PROXY_SEL_STICKY ? 1 : 0;
+  in->ai_gw_mode = pool->ai_gw_mode ? 1 : 0;
+  in->fc_active = fc_active(&pool->fc) ? 1 : 0;
+  in->over_inspect = stream->data_len > SP_JSON_INSPECT_MAX ? 1 : 0;
+  if (json_media && stream->data_buf && stream->data_len) {
+    in->body = (const char *)stream->data_buf;
+    in->body_len = stream->data_len;
+  }
+  in->salt_invalid = scan->salt_invalid ? 1 : 0;
+  if (scan->salt_seen && !scan->salt_invalid) {
+    in->salt = scan->salt;
+    in->salt_len = strnlen(scan->salt, sizeof(scan->salt));
+  }
+  in->not_chat = sp_is_chat_path(stream->path) ? 0 : 1;
+  in->model = model;
+  in->model_len = strlen(model);
+  if (stream->tenant_id[0]) {
+    in->tenant = stream->tenant_id;
+    in->tenant_len = strnlen(stream->tenant_id, sizeof(stream->tenant_id));
+  }
+  in->selector_pick = selector_pick;
+  in->now = radix_now();
+  in->decided = &stream->radix_decided;
+}
+
 int
 proxy_h2_forward_to_backend(proxy_fd_ent_t *pfe, proxy_h2_stream_t *stream)
 {
   proxy_map_ent_t *ent;
   proxy_epval_t *tepval;
   int ep_idx = -1;
+  int radix_pinned = 0, radix_hit = 0;
   int backend_fd = -1;
   
   if (!pfe || !stream || !pfe->head) {
@@ -5308,6 +5361,7 @@ h2_have_tepval:
       if (cep != L7_COOKIE_MISS && cep >= 0 && cep < tepval->n_eps &&
           is_endpoint_healthy(tepval, cep) && sp_route_allows(pfe, cep)) {
         ep_idx = cep;
+        radix_pinned = 1;
         log_debug("[HTTP/2][COOKIE_PIN] stream %d: valid LB cookie -> ep[%d] (PROXY_AFFINITY_COOKIE)",
                  stream->stream_id, cep);
       } else {
@@ -5319,6 +5373,7 @@ h2_have_tepval:
 
   // P0.3: Check conversation tracking first (sticky routing)
   if (ep_idx < 0 && stream->has_conv_id && stream->conversation_id[0] != '\0') {
+    radix_pinned = 1;   /* a conversation id pins: never scanned, never learned */
     /* tepval is the pool THIS stream resolved to. A row stored by the other
      * model's pool on this VIP must not answer here: it would both hand us an
      * index chosen for a different endpoint list and suppress the store of our
@@ -5467,6 +5522,24 @@ h2_have_tepval:
     return -1;
   }
 
+  /* Prefix routing on a non-P/D pool with radix state: after the pins, the
+   * selector and the healthy fallback (ep_idx is the selector's pick), before
+   * the endpoint admission gate. A HIT moves ep_idx; every other reason keeps
+   * it. A stream forwarded again decides again and is counted once. */
+  if (tepval->radix && !tepval->pd_disagg_enabled) {
+    radix_route_in_t rin;
+    uint32_t rinflight[MAX_PROXY_EP];
+    int rsel;
+
+    h2_radix_gather(pfe, stream, tepval, &body_scan, json_media, lookup_model, ep_idx,
+                    radix_pinned, &rin, rinflight);
+    rsel = radix_route_decide(tepval->radix, &stream->radix_req, &rin, NULL);
+    if (rsel >= 0) {
+      ep_idx = rsel;
+      radix_hit = 1;
+    }
+  }
+
   /* Capacity admission, endpoint level: the pick is a preference, the unit
    * is the decision. The bounded-load unit the selector counted was handed
    * back above, so a moved pick owes nothing. */
@@ -5477,6 +5550,8 @@ h2_have_tepval:
     if (fc_ep != ep_idx)
       log_debug("[AIGateway][HTTP/2] stream=%d capacity moved the pick: ep[%d] -> ep[%d]",
                stream->stream_id, ep_idx, fc_ep);
+    if (radix_hit && fc_ep != ep_idx)
+      radix_route_note_moved(tepval->radix);   /* the gate moved a HIT */
     ep_idx = fc_ep;
   }
 

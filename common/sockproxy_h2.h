@@ -206,6 +206,9 @@ typedef struct proxy_h2_stream {
 
   // LLM-specific fields (for CHWBL/GPU routing)
   void *prefix_key;                  // llm_prefix_key_t* - extracted from request
+  struct radix_req *radix_req;       // non-P/D prefix routing state of this
+                                     // stream's request (sockproxy_radix_route.h)
+  uint8_t radix_decided;             // the radix decision was counted
   char conversation_id[128];         // X-Conversation-ID header
   int has_conv_id;                   // Flag: conversation ID present
   sp_corr_cap_t corr;                // traceparent / x-client-session-id for the
