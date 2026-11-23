@@ -429,20 +429,20 @@ static void e4_spread_and_tiebreak(void)
   radix_route_in_t in;
   radix_route_out_t out;
 
-  case_begin("e4_spread_and_tiebreak (balance 3, eligible only)");
+  case_begin("e4_spread_and_tiebreak (balance 3: pick - min over eligible)");
   CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
 
   in_base(&in, p, a, la);
-  g_inflight[0] = 0; g_inflight[1] = 0; g_inflight[2] = 4;
-  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
+  g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* pick - min = 4 */
   CHECK(out.reason == RADIX_R_SPREAD);
   radix_req_reset(rq);
-  g_inflight[2] = 3;
-  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  g_inflight[0] = 3;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* pick - min = 3 */
   CHECK(out.reason == RADIX_R_HIT);
   radix_req_reset(rq);
-  g_inflight[2] = 9;                       /* ep2 ineligible: not in the spread */
-  in.eligible = 0x3;
+  g_inflight[0] = 0; g_inflight[2] = 9;
+  in.eligible = 0x3;                       /* ep2 ineligible */
   CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
   CHECK(out.reason == RADIX_R_HIT);
   radix_req_reset(rq);
@@ -460,6 +460,60 @@ static void e4_spread_and_tiebreak(void)
   radix_req_reset(rq);
   in.selector_pick = 2;
   CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* tie: lowest index */
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  memset(g_inflight, 0, sizeof(g_inflight));
+  case_end();
+  free(a);
+}
+
+/* The cases that tell the guard rules apart (rule B: fall back only when the
+ * chosen candidate sits more than balance_abs above the least-loaded
+ * eligible endpoint; the spread of the other endpoints does not count). */
+static void e4_rule_b(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+
+  case_begin("e4_rule_b (max - min > abs with pick - min <= abs: HIT)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);   /* on ep0 */
+  in_base(&in, p, a, la);
+  g_inflight[0] = 0; g_inflight[1] = 0; g_inflight[2] = 4;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* max - min 4, pick - min 0 */
+  CHECK(out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  g_inflight[0] = 3; g_inflight[1] = 0; g_inflight[2] = 20;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* pick - min == abs */
+  CHECK(out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 4;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* pick - min > abs */
+  CHECK(out.reason == RADIX_R_SPREAD);
+  radix_req_reset(rq);
+  g_inflight[0] = 4; g_inflight[1] = 4; g_inflight[2] = 0;
+  in.eligible = 0x3;                       /* min over eligible only: 4 */
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
+  CHECK(out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  CHECK(decided(p, RADIX_R_HIT) == 3 && decided(p, RADIX_R_SPREAD) == 1);
+  memset(g_inflight, 0, sizeof(g_inflight));
+
+  /* a candidate that is not eligible never becomes the pick: learned on
+   * ep0 and ep2, ep2 ineligible and idle */
+  CHECK(request(p, &rq, a, la, 2, 200, NULL) == RADIX_LEARN_OK);
+  in_base(&in, p, a, la);
+  in.eligible = 0x3;
+  g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 0;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* ep0: 4 - 0 */
+  CHECK(out.reason == RADIX_R_SPREAD && !(out.cand_mask & 0x4));
+  radix_req_reset(rq);
+  g_inflight[0] = 3;
+  CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* ep0, never ep2 */
+  CHECK(out.reason == RADIX_R_HIT && !(out.cand_mask & 0x4));
   radix_req_free(&rq);
   radix_pool_free(p);
   memset(g_inflight, 0, sizeof(g_inflight));
@@ -704,7 +758,7 @@ static void e5_learnable_outcomes(void)
   CHECK(request(p, &rq, bb, lb, 1, 200, &out) == RADIX_LEARN_OK); /* BELOW */
   CHECK(out.reason == RADIX_R_BELOW_THRESHOLD);
   in_base(&in, p, a, la);
-  g_inflight[2] = 4;
+  g_inflight[0] = 4;                       /* the candidate ep0 */
   CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
   CHECK(out.reason == RADIX_R_SPREAD);
   CHECK(radix_route_learn(p, rq, p, 2, 200, 2) == RADIX_LEARN_OK);
@@ -1023,7 +1077,7 @@ static void ka_keep_on_guards(void)
   CHECK(out.reason == RADIX_R_BELOW_THRESHOLD);
   radix_req_reset(rq);
   in_base(&in, p, a, la);
-  g_inflight[2] = 4;
+  g_inflight[0] = 4;                                       /* the candidate ep0 */
   CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
   CHECK(out.reason == RADIX_R_SPREAD);
   memset(g_inflight, 0, sizeof(g_inflight));
@@ -1038,6 +1092,31 @@ static void ka_keep_on_guards(void)
   radix_pool_free(p);
   case_end();
   free(a); free(bb);
+}
+
+/* Rule B at the keep-alive leg: an idle candidate is a HIT although another
+ * endpoint is busy, so a kept leg off the candidates is released. */
+static void ka_rule_b_hit_releases(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+
+  case_begin("ka_rule_b_hit_releases (max - min > abs, pick - min <= abs: release)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  in_base(&in, p, a, la);
+  g_inflight[0] = 0; g_inflight[1] = 0; g_inflight[2] = 4;
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 1);
+  CHECK(out.reason == RADIX_R_HIT && out.cand_mask == 0x1);
+  CHECK(st_of(p, &p->st.ka_moved) == 1 && decided(p, RADIX_R_SPREAD) == 0);
+  memset(g_inflight, 0, sizeof(g_inflight));
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
 }
 
 static void ka_keep_gate_unknown_or_off(void)
@@ -1464,6 +1543,7 @@ int main(void)
   e5_pipelined_not_scanned();
   e4_threshold();
   e4_spread_and_tiebreak();
+  e4_rule_b();
   e4_scan_skips();
   e4_miss_workcap_ns_nomem();
   e5_once_on_2xx();
@@ -1480,6 +1560,7 @@ int main(void)
   ka_keep_when_kept_is_candidate();
   ka_release_when_kept_not_candidate();
   ka_keep_on_guards();
+  ka_rule_b_hit_releases();
   ka_keep_gate_unknown_or_off();
   misc_stats_take();
   e10_other_generation();

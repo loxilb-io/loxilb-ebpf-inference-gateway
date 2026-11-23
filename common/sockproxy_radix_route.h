@@ -35,7 +35,8 @@
  *   MISS           no eligible endpoint has seen a prefix of the key
  *   WORK_CAP       the lookup reached its work cap
  *   BELOW_THRESHOLD matched_bytes * 100 < match_pct * stream_bytes
- *   SPREAD         max - min in-flight over eligible endpoints > balance_abs
+ *   SPREAD         the chosen candidate's in-flight minus the lowest in-flight
+ *                  over eligible endpoints > balance_abs
  *   HIT            out->ep is the radix pick
  * No request reaches the scanner before NOMEM, so a request stopped by an
  * earlier reason costs no parsing and no allocation.

@@ -185,7 +185,7 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
   radix_lookup_rc_t lrc;
   radix_route_reason_t gate = RADIX_R_HIT;
   radix_req_t *rq;
-  uint32_t eligible, cand, lo = UINT32_MAX, hi = 0, best = UINT32_MAX;
+  uint32_t eligible, cand, lo = UINT32_MAX, best = UINT32_MAX;
   unsigned n;
   int pick = -1;
   uint64_t w0;
@@ -269,11 +269,7 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
     v = in->inflight ? in->inflight[i] : 0;
     if (v < lo)
       lo = v;
-    if (v > hi)
-      hi = v;
   }
-  if (hi - lo > p->cfg.balance_abs)
-    return rr_end(p, out, RADIX_R_SPREAD);
 
   cand = lr.cand_mask & eligible;
   for (unsigned i = 0; i < n; i++) {
@@ -288,6 +284,8 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
   }
   if (pick < 0)
     return rr_end(p, out, RADIX_R_MISS);
+  if (best - lo > p->cfg.balance_abs)
+    return rr_end(p, out, RADIX_R_SPREAD);
   out->ep = pick;
   return rr_end(p, out, RADIX_R_HIT);
 }
