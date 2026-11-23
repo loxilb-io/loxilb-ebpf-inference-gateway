@@ -493,11 +493,77 @@ proxy_client_ssl_ctx_init(proxy_arg_t *arg)
   return ctx;
 }
 
+/*
+ * The SNI store is keyed by the lower-case form of a name. DNS names compare
+ * without regard to case (RFC 4343), so the name a client sends and the name a
+ * certificate lists must meet in one form for the hash lookup to be the
+ * comparison. Only ASCII letters fold: SNI carries A-labels.
+ * Returns 0, or -1 when the name does not fit a key of out_sz bytes.
+ */
+int
+sni_store_key(const char *name, char *out, size_t out_sz)
+{
+  size_t i;
+
+  if (out_sz == 0)
+    return -1;
+  for (i = 0; name[i] != '\0'; i++) {
+    unsigned char c = (unsigned char)name[i];
+
+    if (i + 1 >= out_sz)
+      return -1;
+    out[i] = (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+  }
+  out[i] = '\0';
+  return 0;
+}
+
+/*
+ * The key a wildcard certificate for this name is stored under: the left-most
+ * label replaced by "*" (RFC 6125 6.4.3). The wildcard stands for exactly one
+ * label, so "*.example.com" serves "a.example.com" and neither "example.com"
+ * nor "a.b.example.com". No key is formed over a single remaining label
+ * ("*.com"). Returns 0, or -1 when the name has no wildcard key.
+ */
+static int
+sni_wildcard_key(const char *key, char *out, size_t out_sz)
+{
+  const char *rest = strchr(key, '.');
+
+  if (!rest || rest == key || !strchr(rest + 1, '.'))
+    return -1;
+  if ((size_t)snprintf(out, out_sz, "*%s", rest) >= out_sz)
+    return -1;
+  return 0;
+}
+
+/*
+ * The store entry that serves a client's SNI name: the entry for the name
+ * itself, else the wildcard entry for its left-most label. A name with a "*"
+ * in it is no host name and selects nothing. Called with global_cert_lock held.
+ */
+static ssl_cert_entry_t *
+sni_store_find(const char *servername)
+{
+  char key[sizeof(((ssl_cert_entry_t *)0)->hostname)];
+  char wild[sizeof(key)];
+  ssl_cert_entry_t *entry = NULL;
+
+  if (strchr(servername, '*') || sni_store_key(servername, key, sizeof(key)) != 0)
+    return NULL;
+  HASH_FIND_STR(proxy_struct->global_cert_map, key, entry);
+  if (!entry && sni_wildcard_key(key, wild, sizeof(wild)) == 0)
+    HASH_FIND_STR(proxy_struct->global_cert_map, wild, entry);
+  return entry;
+}
+
 /**
  * SNI (Server Name Indication) callback for dynamic certificate selection (GLOBAL STORE)
  *
  * Called by OpenSSL during TLS handshake when client sends SNI extension.
- * Looks up certificate in GLOBAL certificate store (shared by all proxies).
+ * Looks up certificate in GLOBAL certificate store (shared by all proxies):
+ * the name itself first, then a wildcard for its left-most label, without
+ * regard to case (sni_store_find).
  *
  * @param ssl    OpenSSL SSL connection object
  * @param ad     TLS alert on fatal error
@@ -537,7 +603,7 @@ sni_servername_callback(SSL *ssl, int *ad, void *arg)
   // delete this entry while this handshake selects its certificate.
   SSL_CTX *selected = NULL;
   pthread_rwlock_rdlock(&proxy_struct->global_cert_lock);
-  HASH_FIND_STR(proxy_struct->global_cert_map, servername, cert_entry);
+  cert_entry = sni_store_find(servername);
   if (cert_entry && cert_entry->ssl_ctx) {
     selected = (SSL_CTX *)cert_entry->ssl_ctx;
     if (SSL_CTX_up_ref(selected) != 1) {
@@ -680,7 +746,9 @@ proxy_load_ssl_ctx_for_host(const char *host_url, int mtls_en)
  * Multiple loadbalancer rules can share the same certificate by hostname.
  * The certificate is stored independently and looked up during TLS handshake.
  *
- * @param hostname    Hostname for SNI matching (e.g., "api.example.com")
+ * @param hostname    Hostname for SNI matching (e.g., "api.example.com"), or a
+ *                    wildcard for one left-most label ("*.example.com"). It is
+ *                    stored in lower case (sni_store_key).
  * @param cert_path   Optional certificate path (defaults to /opt/loxilb/cert/{hostname})
  * @return 0 on success, negative error code on failure
  */
@@ -688,15 +756,17 @@ int
 proxy_add_sni_certificate(const char *hostname, const char *cert_path)
 {
   ssl_cert_entry_t *cert_entry = NULL;
+  char key[sizeof(cert_entry->hostname)];
 
-  if (!hostname || hostname[0] == '\0') {
+  if (!hostname || hostname[0] == '\0' ||
+      sni_store_key(hostname, key, sizeof(key)) != 0) {
     log_error("proxy_add_sni_certificate: Invalid hostname");
     return -EINVAL;
   }
 
   // Check if certificate already registered (globally)
   pthread_rwlock_rdlock(&proxy_struct->global_cert_lock);
-  HASH_FIND_STR(proxy_struct->global_cert_map, hostname, cert_entry);
+  HASH_FIND_STR(proxy_struct->global_cert_map, key, cert_entry);
   pthread_rwlock_unlock(&proxy_struct->global_cert_lock);
 
   if (cert_entry) {
@@ -714,10 +784,10 @@ proxy_add_sni_certificate(const char *hostname, const char *cert_path)
     return -ENOMEM;
   }
 
-  strncpy(cert_entry->hostname, hostname, sizeof(cert_entry->hostname) - 1);
-  cert_entry->hostname[sizeof(cert_entry->hostname) - 1] = '\0';
-  
-  // Store the cert_path (use provided path or default to hostname)
+  memcpy(cert_entry->hostname, key, strlen(key) + 1);
+
+  // Store the cert_path (use provided path or default to hostname, as given:
+  // the directory name keeps its case)
   const char *actual_cert_path = cert_path ? cert_path : hostname;
   strncpy(cert_entry->cert_path, actual_cert_path, sizeof(cert_entry->cert_path) - 1);
   cert_entry->cert_path[sizeof(cert_entry->cert_path) - 1] = '\0';
@@ -757,15 +827,17 @@ int
 proxy_remove_sni_certificate(const char *hostname)
 {
   ssl_cert_entry_t *cert_entry = NULL;
+  char key[sizeof(cert_entry->hostname)];
 
-  if (!hostname || hostname[0] == '\0') {
+  if (!hostname || hostname[0] == '\0' ||
+      sni_store_key(hostname, key, sizeof(key)) != 0) {
     log_error("proxy_remove_sni_certificate: Invalid hostname");
     return -EINVAL;
   }
 
   // Find certificate in global map
   pthread_rwlock_wrlock(&proxy_struct->global_cert_lock);
-  HASH_FIND_STR(proxy_struct->global_cert_map, hostname, cert_entry);
+  HASH_FIND_STR(proxy_struct->global_cert_map, key, cert_entry);
 
   if (!cert_entry) {
     pthread_rwlock_unlock(&proxy_struct->global_cert_lock);
@@ -851,8 +923,8 @@ proxy_list_sni_certificates_with_path(void (*callback)(const char *hostname, con
 
 /**
  * Get SSL context for hostname (internal function for SNI callback)
- * 
- * @param hostname  Hostname to lookup
+ *
+ * @param hostname  Hostname to lookup, selected as the SNI callback selects
  * @return SSL_CTX pointer if found, NULL otherwise
  */
 void *
@@ -866,7 +938,7 @@ proxy_get_ssl_ctx_for_hostname(const char *hostname)
   }
 
   pthread_rwlock_rdlock(&proxy_struct->global_cert_lock);
-  HASH_FIND_STR(proxy_struct->global_cert_map, hostname, cert_entry);
+  cert_entry = sni_store_find(hostname);
   if (cert_entry) {
     ssl_ctx = cert_entry->ssl_ctx;
   }
@@ -1092,8 +1164,10 @@ proxy_rotate_cert(const char *certId)
     // it is unlinked from the map (in-flight SSL objects keep their own ref).
     SSL_CTX *old_ctx = NULL;
     ssl_cert_entry_t *sni = NULL;
+    char key[sizeof(sni->hostname)];
     pthread_rwlock_wrlock(&proxy_struct->global_cert_lock);
-    HASH_FIND_STR(proxy_struct->global_cert_map, cid->hostnames[i], sni);
+    if (sni_store_key(cid->hostnames[i], key, sizeof(key)) == 0)
+      HASH_FIND_STR(proxy_struct->global_cert_map, key, sni);
     if (sni) {
       old_ctx = (SSL_CTX *)sni->ssl_ctx;
       sni->ssl_ctx = new_ctx;

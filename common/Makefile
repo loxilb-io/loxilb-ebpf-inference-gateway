@@ -955,6 +955,10 @@ test_sni_alpn: test_sni_alpn.c sockproxy_ssl.c sockproxy_ssl.h
 test_sni_mtls: test_sni_mtls.c sockproxy_ssl.c sockproxy_mtls.c sockproxy_ssl.h sockproxy_mtls.h
 	$(CC) -DHAVE_MTLS=1 -g -fsanitize=address -fno-omit-frame-pointer -ffunction-sections -fdata-sections -I. -I../libbpf/src -I../headers -I../kernel $$(pkg-config --cflags openssl) -o $@ test_sni_mtls.c sockproxy_ssl.c sockproxy_mtls.c log.c -Wl,--gc-sections,--wrap=SSL_CTX_up_ref,--wrap=SSL_dup_CA_list,--wrap=SSL_set_ex_data,--wrap=SSL_set_SSL_CTX,--wrap=SSL_ctrl $$(pkg-config --libs openssl) -lpthread
 
+# SNI selection: wildcard for one left-most label, exact name first, any case.
+test_sni_wildcard: test_sni_wildcard.c sockproxy_ssl.c sockproxy_ssl.h
+	$(CC) -Wall -g -fsanitize=address,undefined -fno-omit-frame-pointer -ffunction-sections -fdata-sections -I. -I../libbpf/src -I../headers -I../kernel $$(pkg-config --cflags openssl) -o $@ test_sni_wildcard.c sockproxy_ssl.c log.c -Wl,--gc-sections $$(pkg-config --libs openssl) -lpthread
+
 test_admit_response: test_admit_response.c sockproxy_admit_response.h sockproxy_refusal_mark.h llhttp.c httpapi.c http.c
 	$(CC) -Wall -Wextra -Werror -Wno-unused-parameter -fsanitize=address,undefined -o $@ $< llhttp.c httpapi.c http.c -I.
 
@@ -988,10 +992,11 @@ test_admit: test_admit_response
 	python3 test_http_media.py
 
 .PHONY: test_uc3
-test_uc3: test_model_routing test_sni_alpn test_sni_mtls test_sse_observe test_resp_framing
+test_uc3: test_model_routing test_sni_alpn test_sni_mtls test_sni_wildcard test_sse_observe test_resp_framing
 	./test_model_routing
 	./test_sni_alpn
 	ASAN_OPTIONS=detect_leaks=1 ./test_sni_mtls
+	ASAN_OPTIONS=detect_leaks=1 ./test_sni_wildcard
 	./test_sse_observe
 	./test_resp_framing
 
