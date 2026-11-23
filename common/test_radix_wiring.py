@@ -16,7 +16,9 @@ Source-order checks of sockproxy_ep.c that the unit harness cannot drive
      HTTP/1.1 gatherer calls it and keeps no loop of its own;
   5. one chat predicate (sp_is_chat_path): HTTP/1.1 sets is_chat from it,
      the gatherer passes not_chat from is_chat, and no other copy of the
-     path compare remains.
+     path compare remains;
+  6. the HTTP/1.1 gatherer passes the request's decided mark, and message
+     begin clears it together with the radix_req reset.
 Each check runs on the real files, then on a mutated copy where it must fail
 (the check has teeth).
 """
@@ -113,6 +115,12 @@ def check_shared(f):
     for n in ("sockproxy_ep.c", "sockproxy_http.c", "sockproxy_h2.c"):
         if '"/v1/chat/completions"' in f[n]:
             errs.append("a second chat path compare in " + n)
+    if "in->decided = &pfe->radix_decided;" not in g:
+        errs.append("the HTTP/1.1 gatherer does not pass the decided mark")
+    begin = "    radix_req_reset(pfe->radix_req);   /* the prefix-routing key is request N's too */\n" \
+            "    pfe->radix_decided = 0;"
+    if begin not in f["sockproxy_http.c"]:
+        errs.append("message begin does not clear the decided mark with the radix_req reset")
     return errs
 
 
@@ -158,6 +166,10 @@ def main():
         "HTTP/1.1 is_chat by its own compare":
             mut("sockproxy_http.c", "pfe->is_chat = sp_is_chat_path(pfe->request_path) ? 1 : 0;",
                 'pfe->is_chat = !strcmp(pfe->request_path, "/v1/chat/completions");'),
+        "the HTTP/1.1 gatherer passes no decided mark":
+            mut("sockproxy_ep.c", "in->decided = &pfe->radix_decided;", ""),
+        "message begin keeps the decided mark":
+            mut("sockproxy_http.c", "    pfe->radix_decided = 0;", ""),
         "the HTTP/1.1 gatherer keeps its own loop":
             mut("sockproxy_ep.c", "in->eligible = sp_radix_eligible(pfe, pool, n, inflight);",
                 "for (int i = 0; i < n; i++) if (circuit_breaker_candidate(pool, i)) in->eligible |= 1u << i;"),

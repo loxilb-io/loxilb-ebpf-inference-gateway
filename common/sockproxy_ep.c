@@ -941,6 +941,7 @@ sp_radix_gather(proxy_fd_ent_t *pfe, proxy_epval_t *pool,
   }
   in->selector_pick = selector_pick;
   in->now = radix_now();
+  in->decided = &pfe->radix_decided;
   /* Selection applies the session overlay, an EPP pin and a route subset
    * before radix; none of them is resolved where the keep-alive leg is
    * decided, so a pool that can have one keeps its leg, as today. */

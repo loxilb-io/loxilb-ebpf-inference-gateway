@@ -9983,6 +9983,7 @@ handle_on_message_begin(llhttp_t* parser)
     pfe->body_off = 0;
     pfe->body_len = 0;
     radix_req_reset(pfe->radix_req);   /* the prefix-routing key is request N's too */
+    pfe->radix_decided = 0;
     /* Token-accounting state is per-response: without this reset, request
      * N+1 on a reused connection would inherit request N's consumed flag
      * (never charging again) or its stale counts. */
