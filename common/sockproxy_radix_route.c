@@ -293,7 +293,7 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
   if (pick < 0)
     return rr_end(p, out, RADIX_R_MISS);
   if (best - lo > p->cfg.balance_abs)
-    return rr_end(p, out, RADIX_R_SPREAD);
+    return rr_end(p, out, RADIX_R_BALANCE);
   out->ep = pick;
   return rr_end(p, out, RADIX_R_HIT);
 }
@@ -473,7 +473,7 @@ static const char *const rr_reason_names[RADIX_R__COUNT] = {
   [RADIX_R_MISS]            = "miss",
   [RADIX_R_WORK_CAP]        = "work_cap",
   [RADIX_R_BELOW_THRESHOLD] = "below_threshold",
-  [RADIX_R_SPREAD]          = "spread",
+  [RADIX_R_BALANCE]         = "balance",
   [RADIX_R_NOT_CHAT]        = "not_chat",
 };
 

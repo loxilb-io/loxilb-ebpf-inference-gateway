@@ -36,7 +36,7 @@
  *   MISS           no eligible endpoint has seen a prefix of the key
  *   WORK_CAP       the lookup reached its work cap
  *   BELOW_THRESHOLD matched_bytes * 100 < match_pct * stream_bytes
- *   SPREAD         the chosen candidate's in-flight minus the lowest in-flight
+ *   BALANCE        the chosen candidate's in-flight minus the lowest in-flight
  *                  over eligible endpoints > balance_abs
  *   HIT            out->ep is the radix pick
  * No request reaches the scanner before NOMEM, so a request stopped by an
@@ -52,7 +52,7 @@
  * present). The order is fixed once learned state exists.
  *
  * Learning: a request is learnable only when its scan returned
- * RADIX_SCAN_OK in this pool (HIT, MISS, WORK_CAP, BELOW_THRESHOLD, SPREAD).
+ * RADIX_SCAN_OK in this pool (HIT, MISS, WORK_CAP, BELOW_THRESHOLD, BALANCE).
  * radix_route_learn() is called with each response status of the request:
  * an interim 1xx changes nothing; the first final status consumes the
  * request, and only a 2xx learns. When the lookup had already matched the
@@ -79,7 +79,7 @@
  * new connection, would get a radix HIT whose candidates do not include the
  * kept endpoint. Every other outcome keeps the leg: no radix state, a gate
  * that cannot be evaluated where the leg is decided (gates_unknown), a scan
- * skip, a miss, the threshold or the spread guard. The request is scanned
+ * skip, a miss, the threshold or the balance guard. The request is scanned
  * once; the selection that follows a release reuses the key. Each request
  * counts one decision reason: a kept leg counts it here (plus kept_leg when
  * the kept endpoint is a candidate of a HIT), a released leg counts ka_moved
@@ -122,8 +122,8 @@ typedef enum radix_route_reason {
   RADIX_R_MISS,
   RADIX_R_WORK_CAP,
   RADIX_R_BELOW_THRESHOLD,
-  RADIX_R_SPREAD,
-  RADIX_R_NOT_CHAT,      /* after SPREAD: the earlier indices are unchanged */
+  RADIX_R_BALANCE,
+  RADIX_R_NOT_CHAT,      /* after BALANCE: the earlier indices are unchanged */
   RADIX_R__COUNT
 } radix_route_reason_t;
 

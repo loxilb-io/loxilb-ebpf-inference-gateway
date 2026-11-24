@@ -508,7 +508,7 @@ static void e4_threshold(void)
   free(a); free(bb);
 }
 
-static void e4_spread_and_tiebreak(void)
+static void e4_balance_and_tiebreak(void)
 {
   char *a = malloc(BODY_CAP);
   size_t la = body2(a, 'x', 600, 'a', 300);
@@ -517,13 +517,13 @@ static void e4_spread_and_tiebreak(void)
   radix_route_in_t in;
   radix_route_out_t out;
 
-  case_begin("e4_spread_and_tiebreak (balance 3: pick - min over eligible)");
+  case_begin("e4_balance_and_tiebreak (balance 3: pick - min over eligible)");
   CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
 
   in_base(&in, p, a, la);
   g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 0;
   CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* pick - min = 4 */
-  CHECK(out.reason == RADIX_R_SPREAD);
+  CHECK(out.reason == RADIX_R_BALANCE);
   radix_req_reset(rq);
   g_inflight[0] = 3;
   CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* pick - min = 3 */
@@ -557,7 +557,7 @@ static void e4_spread_and_tiebreak(void)
 
 /* The cases that tell the guard rules apart (rule B: fall back only when the
  * chosen candidate sits more than balance_abs above the least-loaded
- * eligible endpoint; the spread of the other endpoints does not count). */
+ * eligible endpoint; how far apart the other endpoints sit does not count). */
 static void e4_rule_b(void)
 {
   char *a = malloc(BODY_CAP);
@@ -580,14 +580,14 @@ static void e4_rule_b(void)
   radix_req_reset(rq);
   g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 4;
   CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* pick - min > abs */
-  CHECK(out.reason == RADIX_R_SPREAD);
+  CHECK(out.reason == RADIX_R_BALANCE);
   radix_req_reset(rq);
   g_inflight[0] = 4; g_inflight[1] = 4; g_inflight[2] = 0;
   in.eligible = 0x3;                       /* min over eligible only: 4 */
   CHECK(radix_route_decide(p, &rq, &in, &out) == 0);
   CHECK(out.reason == RADIX_R_HIT);
   radix_req_reset(rq);
-  CHECK(decided(p, RADIX_R_HIT) == 3 && decided(p, RADIX_R_SPREAD) == 1);
+  CHECK(decided(p, RADIX_R_HIT) == 3 && decided(p, RADIX_R_BALANCE) == 1);
   memset(g_inflight, 0, sizeof(g_inflight));
 
   /* a candidate that is not eligible never becomes the pick: learned on
@@ -597,7 +597,7 @@ static void e4_rule_b(void)
   in.eligible = 0x3;
   g_inflight[0] = 4; g_inflight[1] = 0; g_inflight[2] = 0;
   CHECK(radix_route_decide(p, &rq, &in, &out) == -1);   /* ep0: 4 - 0 */
-  CHECK(out.reason == RADIX_R_SPREAD && !(out.cand_mask & 0x4));
+  CHECK(out.reason == RADIX_R_BALANCE && !(out.cand_mask & 0x4));
   radix_req_reset(rq);
   g_inflight[0] = 3;
   CHECK(radix_route_decide(p, &rq, &in, &out) == 0);    /* ep0, never ep2 */
@@ -840,7 +840,7 @@ static void e5_learnable_outcomes(void)
   radix_route_in_t in;
   radix_route_out_t out;
 
-  case_begin("e5_learnable_outcomes (miss, below threshold, spread)");
+  case_begin("e5_learnable_outcomes (miss, below threshold, balance)");
   CHECK(request(p, &rq, a, la, 0, 200, &out) == RADIX_LEARN_OK);  /* MISS */
   CHECK(out.reason == RADIX_R_MISS);
   CHECK(request(p, &rq, bb, lb, 1, 200, &out) == RADIX_LEARN_OK); /* BELOW */
@@ -848,7 +848,7 @@ static void e5_learnable_outcomes(void)
   in_base(&in, p, a, la);
   g_inflight[0] = 4;                       /* the candidate ep0 */
   CHECK(radix_route_decide(p, &rq, &in, &out) == -1);
-  CHECK(out.reason == RADIX_R_SPREAD);
+  CHECK(out.reason == RADIX_R_BALANCE);
   CHECK(radix_route_learn(p, rq, p, 2, 200, 2) == RADIX_LEARN_OK);
   memset(g_inflight, 0, sizeof(g_inflight));
   radix_req_free(&rq);
@@ -1159,7 +1159,7 @@ static void ka_keep_on_guards(void)
   radix_route_in_t in;
   radix_route_out_t out;
 
-  case_begin("ka_keep_on_guards (below threshold, spread, miss: keep, reason counted)");
+  case_begin("ka_keep_on_guards (below threshold, balance, miss: keep, reason counted)");
   CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
   CHECK(ka(p, &rq, bb, lb, 2, &out) == 0);
   CHECK(out.reason == RADIX_R_BELOW_THRESHOLD);
@@ -1167,14 +1167,14 @@ static void ka_keep_on_guards(void)
   in_base(&in, p, a, la);
   g_inflight[0] = 4;                                       /* the candidate ep0 */
   CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
-  CHECK(out.reason == RADIX_R_SPREAD);
+  CHECK(out.reason == RADIX_R_BALANCE);
   memset(g_inflight, 0, sizeof(g_inflight));
   radix_req_reset(rq);
   bb[60] = 'Q';                                             /* another system prompt: miss */
   CHECK(ka(p, &rq, bb, lb, 2, &out) == 0);
   CHECK(out.reason == RADIX_R_MISS);
   CHECK(radix_route_learn(p, rq, p, 2, 200, 3) == RADIX_LEARN_OK); /* kept leg learns */
-  CHECK(decided(p, RADIX_R_BELOW_THRESHOLD) == 1 && decided(p, RADIX_R_SPREAD) == 1);
+  CHECK(decided(p, RADIX_R_BELOW_THRESHOLD) == 1 && decided(p, RADIX_R_BALANCE) == 1);
   CHECK(st_of(p, &p->st.ka_moved) == 0 && st_of(p, &p->st.kept_leg) == 0);
   radix_req_free(&rq);
   radix_pool_free(p);
@@ -1199,7 +1199,7 @@ static void ka_rule_b_hit_releases(void)
   g_inflight[0] = 0; g_inflight[1] = 0; g_inflight[2] = 4;
   CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 1);
   CHECK(out.reason == RADIX_R_HIT && out.cand_mask == 0x1);
-  CHECK(st_of(p, &p->st.ka_moved) == 1 && decided(p, RADIX_R_SPREAD) == 0);
+  CHECK(st_of(p, &p->st.ka_moved) == 1 && decided(p, RADIX_R_BALANCE) == 0);
   memset(g_inflight, 0, sizeof(g_inflight));
   radix_req_free(&rq);
   radix_pool_free(p);
@@ -1621,6 +1621,39 @@ static void misc_time_and_create(void)
   case_end();
 }
 
+static void s6_balance_name(void)
+{
+  case_begin("s6_balance_name (the guard reason is balance; no reason is named spread)");
+  CHECK(!strcmp(radix_route_reason_name(RADIX_R_BALANCE), "balance"));
+  for (int r = 0; r < RADIX_R__COUNT; r++) {
+    const char *nm = radix_route_reason_name((radix_route_reason_t)r);
+    CHECK(nm && !strstr(nm, "spread"));
+  }
+  case_end();
+}
+
+static void s6_balance_in_line(void)
+{
+  char *a = malloc(BODY_CAP), line[1024];
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_out_t out;
+
+  case_begin("s6_balance_in_line (the counters line says balance=, never spread)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  g_inflight[0] = 4;
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == -1 && out.reason == RADIX_R_BALANCE);
+  CHECK(radix_pool_stats_format(p, line, sizeof(line)) > 0);
+  CHECK(strstr(line, "balance=1") != NULL);
+  CHECK(strstr(line, "spread") == NULL);
+  memset(g_inflight, 0, sizeof(g_inflight));
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
 int main(void)
 {
   e1_off_no_scan_no_alloc();
@@ -1631,7 +1664,7 @@ int main(void)
   e3_sticky_is_pinned();
   e5_pipelined_not_scanned();
   e4_threshold();
-  e4_spread_and_tiebreak();
+  e4_balance_and_tiebreak();
   e4_rule_b();
   e4_scan_skips();
   e4_miss_workcap_ns_nomem();
@@ -1660,6 +1693,8 @@ int main(void)
   misc_stats_line();
   misc_lock_wait_counters();
   misc_time_and_create();
+  s6_balance_name();
+  s6_balance_in_line();
   CHECK(fa_live == 0);
   printf("test_radix_route: %s (%d failed checks)\n", g_fail ? "FAIL" : "PASS", g_fail);
   return g_fail ? 1 : 0;
