@@ -3186,6 +3186,10 @@ llb_conv_nat2proxy(void *k, void *v, struct proxy_ent *pent, struct proxy_arg *p
   // Endpoint Picker mode + request-phase deadline — same hop.
   pval->epp_mode = dat->epp_mode;
   pval->epp_timeout_ms = dat->epp_timeout_ms;
+  // Prefix affinity of a non-P/D pool (off = 0) — same hop.
+  pval->prefix_affinity_mode = dat->prefix_affinity_mode;
+  pval->prefix_affinity_match_pct = dat->prefix_affinity_match_pct;
+  pval->prefix_affinity_balance_abs = dat->prefix_affinity_balance_abs;
 
   // P/D Buffer: runtime-configurable kv_transfer_params limit
   pval->pd_kv_params_max = dat->pd_kv_params_max;

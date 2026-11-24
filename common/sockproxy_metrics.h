@@ -18,6 +18,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "sockproxy_radix_route.h" /* the prefix-affinity counter enums */
+
 /* =========================================================================
  * proxy_metrics_snapshot_t - snapshot returned to Go CGO on each scrape.
  *
@@ -441,6 +443,35 @@ _Static_assert(offsetof(proxy_fc_svc_stat_t, band_outcome) == 448, "band_outcome
  * (api/prometheus/ai_admission_metrics.go) off the hot path.
  */
 int proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max);
+
+/* =========================================================================
+ * Prefix affinity (non-P/D radix routing): the counters of every pool whose
+ * radix is on, for the metrics exporter. The array lengths are the enum
+ * counts of sockproxy_radix_route.h (decisions by reason, learn outcomes)
+ * and sockproxy_radix_scan.h (scan-skip causes); index RADIX_R_OFF is never
+ * counted. Its cgo twin lives with the exporter: same order, tail-append
+ * only.
+ * ========================================================================= */
+#define PROXY_RADIX_STAT_MAX 256   /* pools reported per proxy_get_radix_stats call */
+#define PROXY_RADIX_POOL_LEN 64    /* pool key as exported; longer keys are cut */
+
+typedef struct proxy_radix_svc_stat {
+  uint32_t xip;                    /* service VIP, network order */
+  uint16_t xport;                  /* service port, host order */
+  uint8_t  protocol;
+  uint8_t  pad;
+  char     pool[PROXY_RADIX_POOL_LEN];
+  uint64_t decided[RADIX_R__COUNT];
+  uint64_t learn[RADIX_LEARN__COUNT];
+  uint64_t scan_skip[RADIX_SCAN__COUNT];
+} proxy_radix_svc_stat_t;
+
+/*
+ * proxy_get_radix_stats - fill `out` with one entry per pool whose prefix
+ * affinity is on. Returns the number written, at most `max`: pools beyond
+ * `max` are not reported (as proxy_get_fc_stats). Off the hot path.
+ */
+int proxy_get_radix_stats(proxy_radix_svc_stat_t *out, int max);
 
 /*
  * proxy_get_fc_anomaly - the process-wide anomaly counter for `kind`
