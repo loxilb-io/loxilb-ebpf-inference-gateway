@@ -26,6 +26,15 @@
  *   misc counters line (names and counts only), rate limit, lock-wait
  *        maxima (lookup and learn), time source,
  *        allocation failure in create
+ *   s6   the rule's arguments applied in place: off stops lookup, scan,
+ *        counting and learning and purges what was learned, the object
+ *        kept; on again starts empty and a request scanned before the off
+ *        never learns; threshold and balance for the next decision (0 is
+ *        the default), trie kept; no allocation across toggles; a pool with
+ *        no endpoints is not scanned at the keep-alive site; the counters
+ *        snapshot; the guard reason is named balance
+ *   e10  also: decisions and learns while off, on and retune run, and while
+ *        the values are retuned with lookups hitting (TSan)
  *
  * Build: make test_radix_route test_radix_route_tsan
  */
@@ -1621,6 +1630,35 @@ static void misc_time_and_create(void)
   case_end();
 }
 
+/* ======================================================================== */
+/* S6: the rule's prefix-affinity arguments applied in place                 */
+/*
+ * radix_pool_disable: from the next request no lookup, no scan, no count,
+ *   no learn; everything learned is purged; the object (trie root, lock,
+ *   counters) stays until the pool is freed, so no reader ever sees it go.
+ * radix_pool_enable: on again, empty; a request scanned before the off
+ *   (an older generation) never learns into it.
+ * radix_pool_set_cfg: threshold and balance for the next decision; 0 is the
+ *   default; the trie is kept.
+ * radix_pool_stats_read: one snapshot of the counters (for the exporter).
+ */
+
+static uint64_t decided_total(radix_pool_t *p)
+{
+  uint64_t t = 0;
+  for (int r = 0; r < RADIX_R__COUNT; r++)
+    t += decided(p, (radix_route_reason_t)r);
+  return t;
+}
+
+static uint64_t learned_total(radix_pool_t *p)
+{
+  uint64_t t = 0;
+  for (int r = 0; r < RADIX_LEARN__COUNT; r++)
+    t += __atomic_load_n(&p->st.learn[r], __ATOMIC_RELAXED);
+  return t;
+}
+
 static void s6_balance_name(void)
 {
   case_begin("s6_balance_name (the guard reason is balance; no reason is named spread)");
@@ -1652,6 +1690,325 @@ static void s6_balance_in_line(void)
   radix_pool_free(p);
   case_end();
   free(a);
+}
+
+static void s6_off_stops_and_forgets(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL, *rq2 = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  radix_trie_t *trie;
+  uint64_t s0, d0, l0;
+  long c0;
+
+  case_begin("s6_off_stops_and_forgets (no lookup, scan, count or learn; learned state purged; object kept)");
+  CHECK(radix_pool_is_on(p));
+  CHECK(request(p, &rq, a, la, 1, 200, NULL) == RADIX_LEARN_OK);
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 1 && out.reason == RADIX_R_HIT);
+  /* a request decided before the off; its reply comes after it */
+  radix_req_reset(rq);
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 1);
+  trie = p->trie;
+
+  radix_pool_disable(p);
+  CHECK(!radix_pool_is_on(p));
+  CHECK(p->trie == trie);                       /* the object stays */
+  CHECK(p->learned_mask == 0);                  /* everything learned is gone */
+  s0 = radix_route_scan_calls(); d0 = decided_total(p); l0 = learned_total(p);
+  c0 = fa_calls;
+  /* the reply of the request in flight learns nothing and is not counted */
+  CHECK(radix_route_learn(p, rq, p, 1, 200, 3) == RADIX_LEARN_NONE);
+  CHECK(learned_total(p) == l0);
+  /* the next request: off, not counted, not scanned, nothing allocated */
+  in_base(&in, p, a, la);
+  CHECK(radix_route_decide(p, &rq2, &in, &out) == -1);
+  CHECK(out.reason == RADIX_R_OFF && out.ep == -1);
+  CHECK(rq2 == NULL && fa_calls == c0);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(decided_total(p) == d0);
+  /* the keep-alive site keeps the leg and counts nothing */
+  radix_req_reset(rq);
+  CHECK(radix_route_keepalive(p, &rq, &in, 2, &out) == 0);
+  CHECK(radix_route_scan_calls() == s0 && decided_total(p) == d0);
+  CHECK(p->learned_mask == 0);
+  radix_req_free(&rq);
+  radix_req_free(&rq2);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void s6_on_again_starts_empty(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_out_t out;
+
+  case_begin("s6_on_again_starts_empty (off then on: nothing learned before the off matches)");
+  CHECK(request(p, &rq, a, la, 1, 200, NULL) == RADIX_LEARN_OK);
+  radix_pool_disable(p);
+  radix_pool_enable(p);
+  CHECK(radix_pool_is_on(p));
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == -1 && out.reason == RADIX_R_MISS);
+  CHECK(radix_route_learn(p, rq, p, 2, 200, 4) == RADIX_LEARN_OK);   /* learns again */
+  radix_req_reset(rq);
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 2 && out.reason == RADIX_R_HIT);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void s6_stale_learn_refused(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL, *rq2 = NULL;
+  radix_route_out_t out;
+
+  case_begin("s6_stale_learn_refused (scanned before off, reply after on again: no learn)");
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == -1 && out.reason == RADIX_R_MISS);
+  CHECK(rq && rq->learnable);
+  radix_pool_disable(p);
+  radix_pool_enable(p);
+  CHECK(radix_route_learn(p, rq, p, 0, 200, 5) == RADIX_LEARN_NONE);
+  CHECK(p->learned_mask == 0);
+  CHECK(decide_body(p, &rq2, a, la, 0x7, &out) == -1 && out.reason == RADIX_R_MISS);
+  radix_req_free(&rq);
+  radix_req_free(&rq2);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void s6_cfg_next_decision(void)
+{
+  char *a = malloc(BODY_CAP), *q = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  size_t lq = body2(q, 'x', 600, 'b', 300);   /* two of three blocks match: 512 of 906 */
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_out_t out;
+  uint32_t learned;
+
+  case_begin("s6_cfg_next_decision (threshold and balance apply to the next decision; trie kept; 0 is the default)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  learned = p->learned_mask;
+  CHECK(decide_body(p, &rq, q, lq, 0x7, &out) == 0 && out.reason == RADIX_R_HIT);
+  CHECK(out.matched_bytes == 512 && out.stream_bytes == 906);
+  radix_req_reset(rq);
+  radix_pool_set_cfg(p, 60, 0);                 /* 56 % < 60 % */
+  CHECK(decide_body(p, &rq, q, lq, 0x7, &out) == -1 && out.reason == RADIX_R_BELOW_THRESHOLD);
+  radix_req_reset(rq);
+  radix_pool_set_cfg(p, 50, 0);
+  CHECK(decide_body(p, &rq, q, lq, 0x7, &out) == 0 && out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  radix_pool_set_cfg(p, 0, 0);                  /* 0: the default, 20 */
+  CHECK(p->cfg.match_pct == RADIX_ROUTE_MATCH_PCT && p->cfg.balance_abs == RADIX_ROUTE_BALANCE_ABS);
+  /* balance: the pick 2 above the least-loaded */
+  g_inflight[0] = 2;
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 0 && out.reason == RADIX_R_HIT);
+  radix_req_reset(rq);
+  radix_pool_set_cfg(p, 0, 1);
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == -1 && out.reason == RADIX_R_BALANCE);
+  radix_req_reset(rq);
+  radix_pool_set_cfg(p, 0, 0);                  /* 0: the default, 3 */
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 0 && out.reason == RADIX_R_HIT);
+  CHECK(p->learned_mask == learned);            /* nothing purged by a retune */
+  CHECK(radix_pool_is_on(p));
+  memset(g_inflight, 0, sizeof(g_inflight));
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a); free(q);
+}
+
+static void s6_toggle_no_alloc(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  long live0;
+
+  case_begin("s6_toggle_no_alloc (off/on/retune cycles allocate nothing, leak nothing)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);
+  radix_req_free(&rq);
+  live0 = fa_live;
+  for (int i = 0; i < 100; i++) {
+    radix_pool_disable(p);
+    radix_pool_disable(p);                      /* twice: no change */
+    radix_pool_set_cfg(p, (unsigned)(i % 100), (unsigned)(i % 7));
+    radix_pool_enable(p);
+    radix_pool_enable(p);
+  }
+  /* the purge on off freed the learned nodes: back to the empty trie */
+  CHECK(fa_live <= live0);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void s6_ka_zero_endpoints(void)
+{
+  char *a = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_in_t in;
+  radix_route_out_t out;
+  uint64_t s0, d0;
+  long c0;
+
+  case_begin("s6_ka_zero_endpoints (a pool with no endpoints: keep-alive site scans and counts nothing)");
+  s0 = radix_route_scan_calls(); d0 = decided_total(p); c0 = fa_calls;
+  in_base(&in, p, a, la);
+  in.n_eps = 0;
+  in.eligible = 0;
+  CHECK(radix_route_keepalive(p, &rq, &in, 0, &out) == 0);
+  CHECK(radix_route_scan_calls() == s0);
+  CHECK(decided_total(p) == d0);
+  CHECK(rq == NULL && fa_calls == c0);
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a);
+}
+
+static void s6_stats_read(void)
+{
+  char *a = malloc(BODY_CAP), *s = malloc(BODY_CAP);
+  size_t la = body2(a, 'x', 600, 'a', 300);
+  radix_pool_t *p = pool_new();
+  radix_req_t *rq = NULL;
+  radix_route_out_t out;
+  radix_route_stats_t st;
+
+  case_begin("s6_stats_read (one snapshot equals the counters)");
+  CHECK(request(p, &rq, a, la, 0, 200, NULL) == RADIX_LEARN_OK);   /* miss, learn ok */
+  CHECK(decide_body(p, &rq, a, la, 0x7, &out) == 0);                /* hit */
+  radix_req_reset(rq);
+  CHECK(decide_body(p, &rq, s, body_raw(s, "{\"model\":\"m\",\"messages\":[{\"role\":"
+                    "\"user\",\"content\":\"short\"}]}"), 0x7, &out) == -1);
+  CHECK(out.reason == RADIX_R_SCAN_SKIP && out.scan_rc == RADIX_SKIP_SHORT);
+  memset(&st, 0xA5, sizeof(st));
+  radix_pool_stats_read(p, &st);
+  CHECK(st.decided[RADIX_R_MISS] == 1 && st.decided[RADIX_R_HIT] == 1);
+  CHECK(st.decided[RADIX_R_SCAN_SKIP] == 1 && st.scan_skip[RADIX_SKIP_SHORT] == 1);
+  CHECK(st.decided[RADIX_R_OFF] == 0 && st.decided[RADIX_R_BALANCE] == 0);
+  CHECK(st.learn[RADIX_LEARN_OK] == 1);
+  CHECK(st.scans == 3);
+  radix_pool_stats_read(NULL, &st);             /* no pool: no write, no crash */
+  radix_req_free(&rq);
+  radix_pool_free(p);
+  case_end();
+  free(a); free(s);
+}
+
+/* TSan: decisions, learns and purges on one pool while another thread turns
+ * it off and on and retunes it (the refresh block's writer). */
+static volatile int toggle_stop;
+
+static void *toggle_worker(void *arg)
+{
+  (void)arg;
+  while (!__atomic_load_n(&race_go, __ATOMIC_ACQUIRE))
+    ;
+  for (unsigned i = 0; !__atomic_load_n(&toggle_stop, __ATOMIC_ACQUIRE); i++) {
+    if (i % 3 == 0)
+      radix_pool_disable(race_pool);
+    else if (i % 3 == 1)
+      radix_pool_enable(race_pool);
+    else
+      radix_pool_set_cfg(race_pool, i % 101, i % 9);
+  }
+  radix_pool_enable(race_pool);
+  return NULL;
+}
+
+static void e10_toggle_race(void)
+{
+  pthread_t th[RACE_THREADS], tg;
+
+  case_begin("e10_toggle_race (decide / learn / purge while off, on and retune run; TSan build)");
+  race_pool = pool_new();
+  race_bad = 0;
+  race_go = 0;
+  toggle_stop = 0;
+  pthread_create(&tg, NULL, toggle_worker, NULL);
+  for (long i = 0; i < RACE_THREADS; i++)
+    pthread_create(&th[i], NULL, race_worker, (void *)i);
+  __atomic_store_n(&race_go, 1, __ATOMIC_RELEASE);
+  for (int i = 0; i < RACE_THREADS; i++)
+    pthread_join(th[i], NULL);
+  __atomic_store_n(&toggle_stop, 1, __ATOMIC_RELEASE);
+  pthread_join(tg, NULL);
+  CHECK(race_bad == 0);
+  CHECK(race_pool && radix_pool_is_on(race_pool));
+  radix_pool_free(race_pool);
+  case_end();
+}
+
+/* TSan: decisions and learns on one pool while another thread retunes it
+ * without pause and turns it off and on once every RETUNE_OFF_MS of wall
+ * time, so lookups hit and the threshold and balance are read while they are
+ * written (e10_toggle_race purges too often for that). Wall time, not an
+ * iteration count, paces the off: the toggler's loop runs at very different
+ * speeds under ASan and TSan. */
+#define RETUNE_OFF_MS 20
+
+static void *retune_worker(void *arg)
+{
+  uint64_t next = 0;
+
+  (void)arg;
+  while (!__atomic_load_n(&race_go, __ATOMIC_ACQUIRE))
+    ;
+  for (unsigned i = 0; !__atomic_load_n(&toggle_stop, __ATOMIC_ACQUIRE); i++) {
+    uint64_t now = rr_mono_ns();
+    if (!next)
+      next = now + RETUNE_OFF_MS * 1000000ull;
+    if (now >= next) {
+      radix_pool_disable(race_pool);
+      radix_pool_enable(race_pool);
+      next = now + RETUNE_OFF_MS * 1000000ull;
+    } else {
+      radix_pool_set_cfg(race_pool, i % 101, i % 9);
+    }
+  }
+  radix_pool_enable(race_pool);
+  return NULL;
+}
+
+static void e10_retune_race(void)
+{
+  pthread_t th[RACE_THREADS], tg;
+
+  case_begin("e10_retune_race (decide / learn / purge while the values are retuned; TSan build)");
+  race_pool = pool_new();
+  race_bad = 0;
+  race_go = 0;
+  toggle_stop = 0;
+  pthread_create(&tg, NULL, retune_worker, NULL);
+  for (long i = 0; i < RACE_THREADS; i++)
+    pthread_create(&th[i], NULL, race_worker, (void *)i);
+  __atomic_store_n(&race_go, 1, __ATOMIC_RELEASE);
+  for (int i = 0; i < RACE_THREADS; i++)
+    pthread_join(th[i], NULL);
+  __atomic_store_n(&toggle_stop, 1, __ATOMIC_RELEASE);
+  pthread_join(tg, NULL);
+  CHECK(race_bad == 0);
+  CHECK(race_pool && radix_pool_is_on(race_pool));
+  CHECK(race_pool && __atomic_load_n(&race_pool->st.decided[RADIX_R_HIT],
+                                     __ATOMIC_RELAXED) > 0);
+  radix_pool_free(race_pool);
+  case_end();
 }
 
 int main(void)
@@ -1695,6 +2052,15 @@ int main(void)
   misc_time_and_create();
   s6_balance_name();
   s6_balance_in_line();
+  s6_off_stops_and_forgets();
+  s6_on_again_starts_empty();
+  s6_stale_learn_refused();
+  s6_cfg_next_decision();
+  s6_toggle_no_alloc();
+  s6_ka_zero_endpoints();
+  s6_stats_read();
+  e10_toggle_race();
+  e10_retune_race();
   CHECK(fa_live == 0);
   printf("test_radix_route: %s (%d failed checks)\n", g_fail ? "FAIL" : "PASS", g_fail);
   return g_fail ? 1 : 0;
