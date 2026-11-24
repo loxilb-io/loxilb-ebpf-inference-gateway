@@ -2255,11 +2255,35 @@ dp_ct_ctd(struct xfi *xf,
   return 0;
 }
 
+/* dp_ct_in()'s conntrack key pair: entry 0 is key, entry 1 is xkey, as in
+ * xctk. The keys used to live on the stack. From Linux 6.14 the verifier
+ * keeps tracking the contents of a stack buffer passed read-only to a helper,
+ * and several key fields hold a constant on some paths and a packet value on
+ * others (v6, ident, type, and what dp_ct_proto_xfk_init() takes from the NAT
+ * flags). The conntrack state machine was then verified once for each
+ * combination, and tc_packet_func_slow went past the 1M-instruction limit.
+ * The verifier does not track map values. Both keys are rewritten in full on
+ * every call: dp_ct_in() sets all nine fields of key, and
+ * dp_ct_proto_xfk_init() copies all nine into xkey before it applies NAT. No
+ * field of an earlier packet reaches a lookup. Defined here rather than in
+ * llb_kern_cdefs.h: it is private to the datapath, and the headers are inputs
+ * of the ABI fingerprint. */
+struct xctkey_d {
+#ifdef HAVE_DP_DPU_SLIM
+        __uint(type,        BPF_MAP_TYPE_ARRAY);
+#else
+        __uint(type,        BPF_MAP_TYPE_PERCPU_ARRAY);
+#endif
+        __type(key,         __u32);
+        __type(value,       struct dp_ct_key);
+        __uint(max_entries, 2);
+} xctkey SEC(".maps");
+
 static int __always_inline
 dp_ct_in(void *ctx, struct xfi *xf)
 {
-  struct dp_ct_key key;
-  struct dp_ct_key xkey;
+  struct dp_ct_key *key;
+  struct dp_ct_key *xkey;
   struct dp_ct_tact_scratch *adat;
   struct dp_ct_tact_scratch *axdat;
   struct dp_ct_tact *atdat;
@@ -2272,11 +2296,13 @@ dp_ct_in(void *ctx, struct xfi *xf)
 
   k = 0;
   adat = bpf_map_lookup_elem(&xctk, &k);
+  key = bpf_map_lookup_elem(&xctkey, &k);
 
   k = 1;
   axdat = bpf_map_lookup_elem(&xctk, &k);
+  xkey = bpf_map_lookup_elem(&xctkey, &k);
 
-  if (adat == NULL || axdat == NULL) {
+  if (adat == NULL || axdat == NULL || key == NULL || xkey == NULL) {
     return smr;
   }
 
@@ -2284,21 +2310,21 @@ dp_ct_in(void *ctx, struct xfi *xf)
   xxi = &axdat->ctd.xi;
  
   /* CT Key */
-  DP_XADDR_CP(key.daddr, xf->l34m.daddr);
-  DP_XADDR_CP(key.saddr, xf->l34m.saddr);
-  key.sport = xf->l34m.source;
-  key.dport = xf->l34m.dest;
-  key.l4proto = xf->l34m.nw_proto;
-  key.zone = xf->pm.zone;
-  key.v6 = xf->l2m.dl_type == bpf_ntohs(ETH_P_IPV6) ? 1: 0;
-  key.ident = xf->tm.tun_decap ? 0 : xf->tm.tunnel_id;
-  key.type = xf->tm.tun_decap ? 0 : xf->tm.tun_type;
+  DP_XADDR_CP(key->daddr, xf->l34m.daddr);
+  DP_XADDR_CP(key->saddr, xf->l34m.saddr);
+  key->sport = xf->l34m.source;
+  key->dport = xf->l34m.dest;
+  key->l4proto = xf->l34m.nw_proto;
+  key->zone = xf->pm.zone;
+  key->v6 = xf->l2m.dl_type == bpf_ntohs(ETH_P_IPV6) ? 1: 0;
+  key->ident = xf->tm.tun_decap ? 0 : xf->tm.tunnel_id;
+  key->type = xf->tm.tun_decap ? 0 : xf->tm.tun_type;
 
-  if (key.l4proto != IPPROTO_TCP &&
-      key.l4proto != IPPROTO_UDP &&
-      key.l4proto != IPPROTO_ICMP &&
-      key.l4proto != IPPROTO_SCTP &&
-      key.l4proto != IPPROTO_ICMPV6) {
+  if (key->l4proto != IPPROTO_TCP &&
+      key->l4proto != IPPROTO_UDP &&
+      key->l4proto != IPPROTO_ICMP &&
+      key->l4proto != IPPROTO_SCTP &&
+      key->l4proto != IPPROTO_ICMPV6) {
     return 0;
   }
 
@@ -2324,9 +2350,9 @@ dp_ct_in(void *ctx, struct xfi *xf)
     }
   }
 
-  dp_ct_proto_xfk_init(&key, xi, &xkey, xxi);
+  dp_ct_proto_xfk_init(key, xi, xkey, xxi);
 
-  atdat = bpf_map_lookup_elem(&ct_map, &key);
+  atdat = bpf_map_lookup_elem(&ct_map, key);
   if (atdat == NULL) {
 
     BPF_TRACE_PRINTK("[CTRK] new-ct ent");
@@ -2413,7 +2439,7 @@ dp_ct_in(void *ctx, struct xfi *xf)
       axdat->nat_act.doct = 1;
       axdat->nat_act.rid = xf->pm.rule_id;
       axdat->nat_act.aid = xf->nm.sel_aid;
-      axdat->nat_act.nv6 = key.v6 ? 1:0;
+      axdat->nat_act.nv6 = key->v6 ? 1:0;
       axdat->nat_act.dsr = xf->nm.dsr;
       axdat->nat_act.cdis = xf->nm.cdis;
       axdat->nat_act.nmh = xf->nm.npmhh;
@@ -2445,18 +2471,18 @@ dp_ct_in(void *ctx, struct xfi *xf)
     axdat->ctd.pb.bytes = 0;
     axdat->ctd.pb.packets = 0;
 
-    axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
+    axtdat = bpf_map_lookup_elem(&ct_map, xkey);
     if (axtdat != NULL) {
       LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
       return 0;
     }
-    bpf_map_update_elem(&ct_map, &xkey, axdat, BPF_ANY);
-    bpf_map_update_elem(&ct_map, &key, adat, BPF_ANY);
+    bpf_map_update_elem(&ct_map, xkey, axdat, BPF_ANY);
+    bpf_map_update_elem(&ct_map, key, adat, BPF_ANY);
 
-    atdat = bpf_map_lookup_elem(&ct_map, &key);
-    axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
+    atdat = bpf_map_lookup_elem(&ct_map, key);
+    axtdat = bpf_map_lookup_elem(&ct_map, xkey);
   } else {
-    axtdat = bpf_map_lookup_elem(&ct_map, &xkey);
+    axtdat = bpf_map_lookup_elem(&ct_map, xkey);
     if (axtdat == NULL) {
       LLBS_PPLN_DROPC(xf, LLB_PIPE_CT_ERR);
       return 0;
@@ -2490,9 +2516,9 @@ dp_ct_in(void *ctx, struct xfi *xf)
         atdat->nat_act.doct = 0;
         axtdat->nat_act.doct = 0;
         if (atdat->ctd.dir == CT_DIR_IN) {
-          dp_ct_est(xf, &key, &xkey, atdat, axtdat);
+          dp_ct_est(xf, key, xkey, atdat, axtdat);
         } else {
-          dp_ct_est(xf, &xkey, &key, axtdat, atdat);
+          dp_ct_est(xf, xkey, key, axtdat, atdat);
         }
         atdat->ctd.xi.mhon = 0;
         axtdat->ctd.xi.mhon = 0;
@@ -2500,24 +2526,24 @@ dp_ct_in(void *ctx, struct xfi *xf)
         /* Emit HW offload events for BOTH directions (key + xkey) on first EST only.
          * For UDP, EST may fire on DIR_OUT; both DNAT+SNAT need offloading.
          * One-shot: prevents perf ring flooding that kills DOCA worker. */
-        if (first_est && !key.v6 &&
-            (key.l4proto == IPPROTO_TCP || key.l4proto == IPPROTO_UDP)) {
+        if (first_est && !key->v6 &&
+            (key->l4proto == IPPROTO_TCP || key->l4proto == IPPROTO_UDP)) {
           struct ll_dp_ct_hwev ev;
           __builtin_memset(&ev, 0, sizeof(ev));
           ev.rcode = LLB_PIPE_RC_HW_UPD;
           ev.rid = atdat->ctd.rid;
-          ev.saddr = key.saddr[0];
-          ev.daddr = key.daddr[0];
-          ev.sport = key.sport;
-          ev.dport = key.dport;
-          ev.l4proto = key.l4proto;
+          ev.saddr = key->saddr[0];
+          ev.daddr = key->daddr[0];
+          ev.sport = key->sport;
+          ev.dport = key->dport;
+          ev.l4proto = key->l4proto;
           bpf_perf_event_output(ctx, &cp_ring,
                                 BPF_F_CURRENT_CPU, &ev, sizeof(ev));
           /* Reverse direction so both DNAT+SNAT get offloaded */
-          ev.saddr = xkey.saddr[0];
-          ev.daddr = xkey.daddr[0];
-          ev.sport = xkey.sport;
-          ev.dport = xkey.dport;
+          ev.saddr = xkey->saddr[0];
+          ev.daddr = xkey->daddr[0];
+          ev.sport = xkey->sport;
+          ev.dport = xkey->dport;
           bpf_perf_event_output(ctx, &cp_ring,
                                 BPF_F_CURRENT_CPU, &ev, sizeof(ev));
         }
@@ -2528,31 +2554,31 @@ dp_ct_in(void *ctx, struct xfi *xf)
         axtdat->ca.act_type = DP_SET_NOP;
 
         /* Emit HW offload event for non-NAT established/uest flows on first EST only. */
-        if (first_est_nonat && !key.v6 &&
-            (key.l4proto == IPPROTO_TCP || key.l4proto == IPPROTO_UDP)) {
+        if (first_est_nonat && !key->v6 &&
+            (key->l4proto == IPPROTO_TCP || key->l4proto == IPPROTO_UDP)) {
           struct ll_dp_ct_hwev ev;
           __builtin_memset(&ev, 0, sizeof(ev));
           ev.rcode = LLB_PIPE_RC_HW_UPD;
           ev.rid = atdat->ctd.rid;
-          ev.saddr = key.saddr[0];
-          ev.daddr = key.daddr[0];
-          ev.sport = key.sport;
-          ev.dport = key.dport;
-          ev.l4proto = key.l4proto;
+          ev.saddr = key->saddr[0];
+          ev.daddr = key->daddr[0];
+          ev.sport = key->sport;
+          ev.dport = key->dport;
+          ev.l4proto = key->l4proto;
           bpf_perf_event_output(ctx, &cp_ring,
                                 BPF_F_CURRENT_CPU, &ev, sizeof(ev));
         }
       }
     } else if (smr == CT_SMR_ERR || smr == CT_SMR_CTD) {
-      bpf_map_delete_elem(&ct_map, &xkey);
-      bpf_map_delete_elem(&ct_map, &key);
-      dp_ct_related_fc_rm(&xkey);
-      dp_ct_related_fc_rm(&key); 
+      bpf_map_delete_elem(&ct_map, xkey);
+      bpf_map_delete_elem(&ct_map, key);
+      dp_ct_related_fc_rm(xkey);
+      dp_ct_related_fc_rm(key); 
 
       if (atdat->ctd.dir == CT_DIR_IN) {
-        dp_ct_ctd(xf, &key, &xkey, atdat, axtdat);
+        dp_ct_ctd(xf, key, xkey, atdat, axtdat);
       } else {
-        dp_ct_ctd(xf, &xkey, &key, axtdat, atdat);
+        dp_ct_ctd(xf, xkey, key, axtdat, atdat);
       }
 
       if (xi->nat_flags) {
