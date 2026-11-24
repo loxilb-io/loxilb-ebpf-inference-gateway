@@ -57,6 +57,7 @@
 #include "sockproxy_ai_admit.h" /* AI_GW_STAGE_* of a local refusal */
 #include "sockproxy_ns_overlay.h" /* session-header/IP overlay resolution + G-1 P/D gate */
 #include "sockproxy_radix_route.h" /* non-P/D prefix routing decision */
+#include "sockproxy_radix_cfg.h"   /* the pool's active radix state */
 
 #define XXH_STATIC_LINKING_ONLY
 /* XXH_IMPLEMENTATION is defined ONLY in sockproxy_lb.c -- see sockproxy_refactoring_plan.md P4 */
@@ -956,13 +957,14 @@ int
 sp_radix_keepalive_moves(proxy_fd_ent_t *pfe, const proxy_map_ent_t *node)
 {
   proxy_epval_t *pool = pfe ? (proxy_epval_t *)pfe->epv : NULL;
+  radix_pool_t *rpool = sp_radix_active(pool);
   radix_route_in_t in;
   uint32_t inflight[MAX_PROXY_EP];
 
-  if (!pool || !pool->radix || pool->pd_disagg_enabled || pfe->ep_num < 0)
+  if (!rpool || pool->pd_disagg_enabled || pfe->ep_num < 0)
     return 0;
   sp_radix_gather(pfe, pool, node, pfe->ep_num, 0, 1, &in, inflight);
-  return radix_route_keepalive(pool->radix, &pfe->radix_req, &in, pfe->ep_num, NULL);
+  return radix_route_keepalive(rpool, &pfe->radix_req, &in, pfe->ep_num, NULL);
 }
 
 int
@@ -1815,13 +1817,14 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
          * HIT replaces the pick; the bounded-load unit the selector counted
          * follows it (the same move the admission gate makes below). */
         int radix_hit = 0;
-        if (pfe && tepval->radix && !tepval->pd_disagg_enabled) {
+        radix_pool_t *rpool = pfe ? sp_radix_active(tepval) : NULL;
+        if (rpool && !tepval->pd_disagg_enabled) {
           radix_route_in_t rin;
           radix_route_out_t rout;
           uint32_t rinflight[MAX_PROXY_EP];
           sp_radix_gather(pfe, tepval, node, sel, radix_nsk != NS_OVERLAY_NONE, 0,
                           &rin, rinflight);
-          int rsel = radix_route_decide(tepval->radix, &pfe->radix_req, &rin, &rout);
+          int rsel = radix_route_decide(rpool, &pfe->radix_req, &rin, &rout);
           if (rsel >= 0) {
             radix_hit = 1;
             if (rsel != sel) {
@@ -1879,7 +1882,7 @@ proxy_setup_ep__(uint32_t xip, uint16_t xport, uint8_t protocol,
              * fc_sel, and that is the endpoint whose concurrency it adds to. */
             sp_kv_sr_unit_move(pfe, tepval, fc_sel);
             if (radix_hit)
-              radix_route_note_moved(tepval->radix);
+              radix_route_note_moved(rpool);
             log_info("[AIGateway] fd=%d capacity moved the pick: ep[%d] -> ep[%d]",
                      pfe->fd, sel, fc_sel);
             sel = fc_sel;

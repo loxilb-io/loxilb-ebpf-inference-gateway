@@ -1028,6 +1028,13 @@ struct dp_proxy_tacts {
   uint8_t pd_cache_threshold;      // Cache hit % threshold (default 20)
   uint8_t pd_balance_abs_threshold; // Load balance absolute threshold (default 3);
   uint8_t apikey_auth;             // X-Api-Key policy: 0=unset, 1=required (enforce+strip), 2=declared disabled (strip only)
+  // Prefix affinity of a non-P/D pool (sockproxy_radix_cfg.h). The three
+  // bytes take the padding before lts: no size change. 0 = off, 1 = radix;
+  // the threshold (percent) and the balance bound as the control plane
+  // resolved them, 0 = the default. An all-zero block leaves radix off.
+  uint8_t prefix_affinity_mode;
+  uint8_t prefix_affinity_match_pct;
+  uint8_t prefix_affinity_balance_abs;
   uint64_t lts;
   uint64_t base_to;
   uint32_t pmhh[LLB_MAX_MHOSTS];
@@ -1293,6 +1300,26 @@ struct dp_proxy_tacts {
 //   against the pre-merge fork (2968/4000) and main (2992/4024) sizes.
 //   Set from Go through cgo (dpebpf_linux.go); copied verbatim into
 //   proxy_arg by llb_conv_nat2proxy; no Go mirror (cgo direct).
+// The prefix-affinity bytes sit in the padding after apikey_auth and lts
+// stays where it was, in both shapes (the DPU-slim shape has no lock).
+#ifndef HAVE_DP_DPU_SLIM
+_Static_assert(__builtin_offsetof(struct dp_proxy_tacts, prefix_affinity_mode) == 53,
+              "dp_proxy_tacts prefix_affinity_mode moved");
+_Static_assert(__builtin_offsetof(struct dp_proxy_tacts, prefix_affinity_match_pct) == 54,
+              "dp_proxy_tacts prefix_affinity_match_pct moved");
+_Static_assert(__builtin_offsetof(struct dp_proxy_tacts, prefix_affinity_balance_abs) == 55,
+              "dp_proxy_tacts prefix_affinity_balance_abs moved");
+#else
+_Static_assert(__builtin_offsetof(struct dp_proxy_tacts, prefix_affinity_mode) == 49,
+              "dp_proxy_tacts prefix_affinity_mode moved (DPU)");
+_Static_assert(__builtin_offsetof(struct dp_proxy_tacts, prefix_affinity_match_pct) == 50,
+              "dp_proxy_tacts prefix_affinity_match_pct moved (DPU)");
+_Static_assert(__builtin_offsetof(struct dp_proxy_tacts, prefix_affinity_balance_abs) == 51,
+              "dp_proxy_tacts prefix_affinity_balance_abs moved (DPU)");
+#endif
+_Static_assert(__builtin_offsetof(struct dp_proxy_tacts, lts) == 56,
+              "dp_proxy_tacts lts moved");
+
 #ifndef HAVE_MTLS
 #ifndef HAVE_DP_DPU_SLIM
 _Static_assert(sizeof(struct dp_proxy_tacts) == 3008,

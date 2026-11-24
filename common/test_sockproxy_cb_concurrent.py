@@ -45,6 +45,8 @@ void circuit_breaker_lock(void);void circuit_breaker_unlock(void);
 int circuit_breaker_candidate(proxy_epval_t*,int);
 static void pd_trie_remove_ep(void*t,int ep){(void)t;(void)ep;circuit_breaker_lock();circuit_breaker_unlock();}
 static void pd_parked_drain_ep(proxy_epval_t*p,int ep,const char*why){(void)why;atomic_fetch_add(&drains,1);if(atomic_exchange(&recover_callback,0))circuit_breaker_init(&p->circuit_breakers[ep]);(void)circuit_breaker_candidate(p,ep);}
+typedef struct radix_pool radix_pool_t;
+static radix_pool_t*sp_radix_active(const proxy_epval_t*p){return (radix_pool_t*)p->radix;}
 static void radix_pool_purge_ep(void*t,unsigned ep){(void)t;(void)ep;}
 static void fc_ep_warm_start(void*fc,int ep,int ts){(void)fc;(void)ep;(void)ts;atomic_fetch_add(&warms,1);}
 #define log_info(...) ((void)0)

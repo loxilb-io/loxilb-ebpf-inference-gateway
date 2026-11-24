@@ -42,6 +42,7 @@
 #include "sockproxy_mcp_rr.h"
 #include "sockproxy_h2_load.h"    /* per-stream bounded-load units */
 #include "sockproxy_radix_route.h" /* non-P/D prefix routing, per pool */
+#include "sockproxy_radix_cfg.h"   /* the pool's active radix state */
 #include "sockproxy_l7policy.h" /* l7_route_dispatch (L7 content routing) */
 #include "sockproxy_l7hdr_guard.h" /* same field guard as the H1 splice */
 #include "notify.h"
@@ -1601,8 +1602,9 @@ proxy_h2_backend_on_header_callback(nghttp2_session *session,
         /* Prefix routing learns the request on its first final 2xx (the
          * status whose note took the latch), for the endpoint that answered,
          * in the pool the stream holds. */
-        if (noted && rpool && rpool->radix && ai_stream->radix_req)
-          (void)radix_route_learn(rpool->radix, ai_stream->radix_req, rpool,
+        radix_pool_t *rradix = sp_radix_active(rpool);
+        if (noted && rradix && ai_stream->radix_req)
+          (void)radix_route_learn(rradix, ai_stream->radix_req, rpool,
                                   mapping->ep_idx, (unsigned)status, radix_now());
       }
     }
@@ -5539,14 +5541,15 @@ h2_have_tepval:
    * selector and the healthy fallback (ep_idx is the selector's pick), before
    * the endpoint admission gate. A HIT moves ep_idx; every other reason keeps
    * it. A stream forwarded again decides again and is counted once. */
-  if (tepval->radix && !tepval->pd_disagg_enabled) {
+  radix_pool_t *h2radix = sp_radix_active(tepval);
+  if (h2radix && !tepval->pd_disagg_enabled) {
     radix_route_in_t rin;
     uint32_t rinflight[MAX_PROXY_EP];
     int rsel;
 
     h2_radix_gather(pfe, stream, tepval, &body_scan, json_media, lookup_model, ep_idx,
                     radix_pinned, &rin, rinflight);
-    rsel = radix_route_decide(tepval->radix, &stream->radix_req, &rin, NULL);
+    rsel = radix_route_decide(h2radix, &stream->radix_req, &rin, NULL);
     if (rsel >= 0) {
       ep_idx = rsel;
       radix_hit = 1;
@@ -5564,7 +5567,7 @@ h2_have_tepval:
       log_debug("[AIGateway][HTTP/2] stream=%d capacity moved the pick: ep[%d] -> ep[%d]",
                stream->stream_id, ep_idx, fc_ep);
     if (radix_hit && fc_ep != ep_idx)
-      radix_route_note_moved(tepval->radix);   /* the gate moved a HIT */
+      radix_route_note_moved(h2radix);   /* the gate moved a HIT */
     ep_idx = fc_ep;
   }
 

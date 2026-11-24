@@ -57,6 +57,7 @@
 #include "sockproxy_pd_reservation.h"
 #include "sockproxy_pd.h"       /* P/D engine-dialect ops table */
 #include "sockproxy_radix_route.h" /* non-P/D prefix routing, per pool */
+#include "sockproxy_radix_cfg.h"   /* the rule's prefix affinity applied to its pool */
 #include "sockproxy_resp_note.h" /* once-per-request response record latch */
 #include "sockproxy_parser_once.h"
 #include "sockproxy_l7policy.h" /* l7_apply_req_filters + L7HDR_* ops */
@@ -1991,8 +1992,9 @@ proxy_origin_status_feed(proxy_fd_ent_t *client, uint16_t status)
   }
   /* Prefix routing learns the request on its first final 2xx, for the
    * endpoint that answered, in the pool the connection holds. */
-  if (repval->radix && client->radix_req)
-    (void)radix_route_learn(repval->radix, client->radix_req, repval,
+  radix_pool_t *rradix = sp_radix_active(repval);
+  if (rradix && client->radix_req)
+    (void)radix_route_learn(rradix, client->radix_req, repval,
                             client->ep_num, status, radix_now());
 }
 
@@ -3907,24 +3909,32 @@ sp_radix_idents(const proxy_ent_t eps[MAX_PROXY_EP], radix_ep_ident_t out[MAX_PR
 }
 
 #ifdef HAVE_RADIX_TEST_SWITCH
-/* Test builds only, until the rule API carries the setting: with
- * LLB_RADIX_POOLS=1 every new pool that can use non-P/D prefix routing gets
- * its state. A build without HAVE_RADIX_TEST_SWITCH never creates it. */
+/* Test builds only: with LLB_RADIX_POOLS=1 every rule that leaves prefix
+ * affinity off is treated as one that declares radix with the default
+ * values, at every apply site (create and refresh), so the state goes
+ * through the same transitions as a declared one. A build without
+ * HAVE_RADIX_TEST_SWITCH never changes the rule's arguments. */
 static void
-sp_radix_test_attach(proxy_epval_t *tepval)
+sp_radix_test_arg(proxy_arg_t *arg)
 {
   const char *on = getenv("LLB_RADIX_POOLS");
-  radix_route_cfg_t cfg;
 
-  if (!on || strcmp(on, "1") != 0 || tepval->pd_disagg_enabled ||
-      tepval->kv_exact_mode != 0 || tepval->mcp_stateless)
-    return;
-  memset(&cfg, 0, sizeof(cfg));
-  tepval->radix = radix_pool_create(&cfg);
-  log_info("[RADIX] pool '%s': %s", tepval->ephash_key,
-           tepval->radix ? "on" : "off (no memory)");
+  if (on && strcmp(on, "1") == 0 &&
+      arg->prefix_affinity_mode == SP_PREFIX_AFFINITY_OFF)
+    arg->prefix_affinity_mode = SP_PREFIX_AFFINITY_RADIX;
 }
 #endif
+
+/* The info line of a prefix-affinity transition (sp_radix_line): one line
+ * per real change, nothing for a refresh that changes nothing. */
+static void
+sp_radix_log(const proxy_epval_t *tepval, const sp_radix_prev_t *pv, int rc)
+{
+  char line[640];
+
+  if (sp_radix_line(line, sizeof(line), tepval, pv, rc))
+    log_info("%s", line);
+}
 
 int
 proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
@@ -4035,12 +4045,24 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
         /* Prefix routing: the eps[] copy above changes a slot's backend or its
          * health without a health transition; what radix learned for such a
          * slot is no longer that endpoint's. */
-        if (tepval->radix) {
+        radix_pool_t *rradix = sp_radix_active(tepval);
+        if (rradix) {
           radix_ep_ident_t r_old[MAX_PROXY_EP], r_new[MAX_PROXY_EP];
           sp_radix_idents(fc_old_eps, r_old);
           sp_radix_idents(tepval->eps, r_new);
-          radix_pool_purge_mask(tepval->radix,
+          radix_pool_purge_mask(rradix,
                                 radix_refresh_purge_mask(r_old, r_new, (unsigned)tepval->n_eps));
+        }
+        /* The rule's prefix affinity follows an update in place: a CHWBL or
+         * WRR_HASH pool is refreshed, not re-created, so this is the only
+         * place its mode and values change. */
+#ifdef HAVE_RADIX_TEST_SWITCH
+        sp_radix_test_arg(arg);
+#endif
+        {
+          /* Prefix affinity of the pool: the rule's mode and values. */
+          sp_radix_prev_t rprev = sp_radix_prev(tepval);
+          sp_radix_log(tepval, &rprev, sp_radix_apply(tepval, arg));
         }
         /* Per-VIP scalars that must follow a rule update. sockMapMode changes
          * arrive through this in-place path (no -EEXIST / re-create), so the
@@ -4245,8 +4267,13 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
           tepval->pd_trie = NULL;
         }
 #ifdef HAVE_RADIX_TEST_SWITCH
-        sp_radix_test_attach(tepval);
+        sp_radix_test_arg(arg);
 #endif
+        {
+          /* Prefix affinity of the pool: the rule's mode and values. */
+          sp_radix_prev_t rprev = sp_radix_prev(tepval);
+          sp_radix_log(tepval, &rprev, sp_radix_apply(tepval, arg));
+        }
 #ifndef HAVE_LLM_SYSTEM_PROMPT_HASH
         if (tepval->pd_cache_aware_mode) {
             log_error("pd_cache_aware_mode=1 requires HAVE_LLM_SYSTEM_PROMPT_HASH build flag; degrading to mode=0");
@@ -4688,8 +4715,13 @@ proxy_add_entry(proxy_ent_t *new_ent, proxy_arg_t *arg)
     tepval->pd_trie = NULL;
   }
 #ifdef HAVE_RADIX_TEST_SWITCH
-  sp_radix_test_attach(tepval);
+  sp_radix_test_arg(arg);
 #endif
+  {
+    /* Prefix affinity of the pool: the rule's mode and values. */
+    sp_radix_prev_t rprev = sp_radix_prev(tepval);
+    sp_radix_log(tepval, &rprev, sp_radix_apply(tepval, arg));
+  }
 #ifndef HAVE_LLM_SYSTEM_PROMPT_HASH
   if (tepval->pd_cache_aware_mode) {
       log_error("pd_cache_aware_mode=1 requires HAVE_LLM_SYSTEM_PROMPT_HASH build flag; degrading to mode=0");
@@ -4954,8 +4986,9 @@ ep_health_apply(proxy_map_ent_t *ent, proxy_epval_t *tepval, int ep_index,
       pd_trie_remove_ep(tepval->pd_trie, ep_index);
       pthread_rwlock_unlock(&tepval->pd_trie_lock);
     }
-    if (tepval->radix)
-      radix_pool_purge_ep(tepval->radix, (unsigned)ep_index);
+    radix_pool_t *rradix = sp_radix_active(tepval);
+    if (rradix)
+      radix_pool_purge_ep(rradix, (unsigned)ep_index);
 
     /* Release every client parked on the now-dead EP for
      * re-selection (see pd_parked_drain_ep). */
@@ -5748,6 +5781,52 @@ proxy_get_fc_stats(proxy_fc_svc_stat_t *out, int max)
   }
   PROXY_UNLOCK();
 
+  return n;
+}
+
+/*
+ * proxy_get_radix_stats - one entry per pool whose prefix affinity is on, for
+ * the metrics exporter. Like proxy_get_fc_stats: the pools are walked under
+ * the read lock in listener and table order, at most `max` are written and
+ * the rest are not reported (the return value is the count written).
+ */
+int
+proxy_get_radix_stats(proxy_radix_svc_stat_t *out, int max)
+{
+  proxy_map_ent_t *ent;
+  proxy_epval_t *tepval, *tmp_epval;
+  radix_route_stats_t rs;
+  radix_pool_t *r;
+  int n = 0;
+
+  if (!out || max <= 0 || !proxy_struct)
+    return 0;
+  memset(out, 0, (size_t)max * sizeof(*out));
+
+  PROXY_RDLOCK();
+  for (ent = proxy_struct->head; ent && n < max; ent = ent->next) {
+    HASH_ITER(hh, ent->val.ephash, tepval, tmp_epval) {
+      if ((r = sp_radix_active(tepval)) == NULL)
+        continue;
+      if (n >= max)
+        break;
+
+      proxy_radix_svc_stat_t *st = &out[n];
+
+      memset(&rs, 0, sizeof(rs));
+      radix_pool_stats_read(r, &rs);
+      st->xip = ent->key.xip;
+      st->xport = ntohs(ent->key.xport);
+      st->protocol = ent->key.protocol;
+      strncpy(st->pool, tepval->ephash_key, sizeof(st->pool) - 1);
+      st->pool[sizeof(st->pool) - 1] = '\0';
+      memcpy(st->decided, rs.decided, sizeof(st->decided));
+      memcpy(st->learn, rs.learn, sizeof(st->learn));
+      memcpy(st->scan_skip, rs.scan_skip, sizeof(st->scan_skip));
+      n++;
+    }
+  }
+  PROXY_UNLOCK();
   return n;
 }
 

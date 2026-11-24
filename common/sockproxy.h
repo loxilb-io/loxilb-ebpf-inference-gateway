@@ -2521,7 +2521,12 @@ struct proxy_arg {
   // deadline in ms. Copied verbatim from dp_proxy_tacts by
   // llb_conv_nat2proxy and into proxy_epval_t by proxy_add_entry.
   uint8_t  epp_mode;
-  uint8_t  epp_pad[3];
+  // Prefix affinity of the pool (sockproxy_radix_cfg.h), copied verbatim from
+  // dp_proxy_tacts by llb_conv_nat2proxy; applied by proxy_add_entry on both
+  // create paths and in the refresh block. They take the former epp_pad.
+  uint8_t  prefix_affinity_mode;
+  uint8_t  prefix_affinity_match_pct;
+  uint8_t  prefix_affinity_balance_abs;
   uint32_t epp_timeout_ms;
 
 #ifdef HAVE_MTLS

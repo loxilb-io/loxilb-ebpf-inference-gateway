@@ -12,7 +12,8 @@
  * fallback have chosen (selector_pick), and before the admission gate. The
  * first reason that applies, in this order, ends the decision; every reason
  * but HIT means "keep the existing selector's pick":
- *   OFF            the pool has no radix state (p == NULL; not counted)
+ *   OFF            the pool has no radix state, or its radix is switched
+ *                  off (p == NULL or !radix_pool_is_on(p); not counted)
  *   PIPELINED      HTTP/1.1 pipelining: the request began while an answer
  *                  to an earlier request on the connection was still owed.
  *                  The per-connection state then cannot tell the two apart:
@@ -36,7 +37,7 @@
  *   MISS           no eligible endpoint has seen a prefix of the key
  *   WORK_CAP       the lookup reached its work cap
  *   BELOW_THRESHOLD matched_bytes * 100 < match_pct * stream_bytes
- *   SPREAD         the chosen candidate's in-flight minus the lowest in-flight
+ *   BALANCE        the chosen candidate's in-flight minus the lowest in-flight
  *                  over eligible endpoints > balance_abs
  *   HIT            out->ep is the radix pick
  * No request reaches the scanner before NOMEM, so a request stopped by an
@@ -52,7 +53,9 @@
  * present). The order is fixed once learned state exists.
  *
  * Learning: a request is learnable only when its scan returned
- * RADIX_SCAN_OK in this pool (HIT, MISS, WORK_CAP, BELOW_THRESHOLD, SPREAD).
+ * RADIX_SCAN_OK in this pool (HIT, MISS, WORK_CAP, BELOW_THRESHOLD, BALANCE),
+ * and only while the pool's radix is on and has not been switched off since
+ * the scan (the generation, radix_pool_disable).
  * radix_route_learn() is called with each response status of the request:
  * an interim 1xx changes nothing; the first final status consumes the
  * request, and only a 2xx learns. When the lookup had already matched the
@@ -79,13 +82,29 @@
  * new connection, would get a radix HIT whose candidates do not include the
  * kept endpoint. Every other outcome keeps the leg: no radix state, a gate
  * that cannot be evaluated where the leg is decided (gates_unknown), a scan
- * skip, a miss, the threshold or the spread guard. The request is scanned
+ * skip, a miss, the threshold or the balance guard, a pool with no
+ * endpoints (not scanned, not counted). The request is scanned
  * once; the selection that follows a release reuses the key. Each request
  * counts one decision reason: a kept leg counts it here (plus kept_leg when
  * the kept endpoint is a candidate of a HIT), a released leg counts ka_moved
  * here and its reason at the selection.
  *
- * Counters live in the pool (relaxed atomics) and are never exported.
+ * Counters live in the pool (relaxed atomics); radix_pool_stats_read gives
+ * one snapshot to the metrics exporter.
+ *
+ * Switching (the rule's prefix_affinity_* arguments, applied in place):
+ *   radix_pool_disable  from the next request: no lookup, scan, count or
+ *                       learn; everything learned is purged (blocking write
+ *                       lock); the generation moves on, so a request scanned
+ *                       before never learns. The object stays until the pool
+ *                       is freed: a reader that loaded the pointer keeps a
+ *                       valid object.
+ *   radix_pool_enable   on again, empty.
+ *   radix_pool_set_cfg  threshold and balance for the next decision (0 is
+ *                       the default; the threshold is held at 100); the trie
+ *                       is kept.
+ * The three are called by the pool's writer (under the proxy lock); readers
+ * load on, the generation and the two values with atomic loads.
  */
 #ifndef __SOCKPROXY_RADIX_ROUTE_H__
 #define __SOCKPROXY_RADIX_ROUTE_H__
@@ -122,8 +141,8 @@ typedef enum radix_route_reason {
   RADIX_R_MISS,
   RADIX_R_WORK_CAP,
   RADIX_R_BELOW_THRESHOLD,
-  RADIX_R_SPREAD,
-  RADIX_R_NOT_CHAT,      /* after SPREAD: the earlier indices are unchanged */
+  RADIX_R_BALANCE,
+  RADIX_R_NOT_CHAT,      /* after BALANCE: the earlier indices are unchanged */
   RADIX_R__COUNT
 } radix_route_reason_t;
 
@@ -171,6 +190,8 @@ typedef struct radix_pool {
                                         written only under the exclusive lock (a
                                         NOOP learn does not touch it) */
   radix_route_stats_t  st;
+  uint8_t              on;           /* 1: decide and learn; atomic */
+  uint32_t             gen;          /* moves on at every off; atomic */
   uint64_t             stats_last_ms;
   uint64_t             stats_last_sig; /* signature of the last line taken */
 } radix_pool_t;
@@ -186,6 +207,7 @@ typedef struct radix_req {
   uint8_t     scanned;       /* scan_rc is this request's */
   uint8_t     scan_rc;       /* radix_scan_rc_t */
   uint8_t     learnable;
+  uint32_t    gen;           /* the pool's generation at the scan */
 } radix_req_t;
 
 typedef struct radix_route_in {
@@ -241,9 +263,19 @@ typedef struct radix_ep_ident {
 /* Coarse time in RADIX_ROUTE_TICK_MS ticks of CLOCK_MONOTONIC_COARSE. */
 uint32_t radix_now(void);
 
-/* NULL when an allocation fails (nothing leaked). */
+/* NULL when an allocation fails (nothing leaked). Created on. */
 radix_pool_t *radix_pool_create(const radix_route_cfg_t *cfg);
 void radix_pool_free(radix_pool_t *p);
+
+/* Switching; see "Switching" above. NULL is accepted (is_on gives 0). */
+int  radix_pool_is_on(const radix_pool_t *p);
+void radix_pool_enable(radix_pool_t *p);
+void radix_pool_disable(radix_pool_t *p);
+void radix_pool_set_cfg(radix_pool_t *p, unsigned match_pct, unsigned balance_abs);
+
+/* One snapshot of the counters (relaxed loads); nothing written when p is
+ * NULL. */
+void radix_pool_stats_read(const radix_pool_t *p, radix_route_stats_t *out);
 
 /* Returns out->ep on HIT, -1 otherwise. *rqp is allocated on the first
  * request that passes every gate before the scan; it stays NULL otherwise. */

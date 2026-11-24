@@ -67,8 +67,9 @@ def check(src):
     for g in others:
         if not (pd_block >= 0 and pd_block < g):
             errs.append("a jump past the radix decision outside the EPP pin and the P/D path")
-    if "if (pfe && tepval->radix && !tepval->pd_disagg_enabled)" not in f:
-        errs.append("the radix block does not exclude P/D pools")
+    if "radix_pool_t *rpool = pfe ? sp_radix_active(tepval) : NULL;" not in f \
+            or "if (rpool && !tepval->pd_disagg_enabled)" not in f:
+        errs.append("the radix block does not take the active state once and exclude P/D pools")
     if "radix_nsk != NS_OVERLAY_NONE" not in f[:radix + 200]:
         errs.append("the session overlay is not passed as a pin")
     g = body_of(src, "sp_radix_gather")

@@ -65,6 +65,8 @@ radix_pool_t *radix_pool_create(const radix_route_cfg_t *cfg)
     p->cfg = *cfg;
   if (!p->cfg.match_pct)
     p->cfg.match_pct = RADIX_ROUTE_MATCH_PCT;
+  if (p->cfg.match_pct > 100)
+    p->cfg.match_pct = 100;
   if (!p->cfg.balance_abs)
     p->cfg.balance_abs = RADIX_ROUTE_BALANCE_ABS;
   if (!p->cfg.max_body)
@@ -83,7 +85,49 @@ radix_pool_t *radix_pool_create(const radix_route_cfg_t *cfg)
     free(p);
     return NULL;
   }
+  p->on = 1;
   return p;
+}
+
+int radix_pool_is_on(const radix_pool_t *p)
+{
+  return p && __atomic_load_n(&p->on, __ATOMIC_ACQUIRE);
+}
+
+void radix_pool_enable(radix_pool_t *p)
+{
+  if (p)
+    __atomic_store_n(&p->on, 1, __ATOMIC_RELEASE);
+}
+
+/* Exclusive lock held. */
+static void rr_purge_locked(radix_pool_t *p, uint32_t mask);
+
+void radix_pool_disable(radix_pool_t *p)
+{
+  if (!p || !__atomic_load_n(&p->on, __ATOMIC_ACQUIRE))
+    return;
+  __atomic_store_n(&p->on, 0, __ATOMIC_RELEASE);
+  /* A learn that read the old generation re-checks it under the write
+   * lock: it either finished before the purge below or inserts nothing. */
+  __atomic_fetch_add(&p->gen, 1, __ATOMIC_ACQ_REL);
+  pthread_rwlock_wrlock(&p->lock);
+  rr_purge_locked(p, UINT32_MAX);
+  pthread_rwlock_unlock(&p->lock);
+}
+
+void radix_pool_set_cfg(radix_pool_t *p, unsigned match_pct, unsigned balance_abs)
+{
+  if (!p)
+    return;
+  if (!match_pct)
+    match_pct = RADIX_ROUTE_MATCH_PCT;
+  if (match_pct > 100)
+    match_pct = 100;
+  if (!balance_abs)
+    balance_abs = RADIX_ROUTE_BALANCE_ABS;
+  __atomic_store_n(&p->cfg.match_pct, (uint32_t)match_pct, __ATOMIC_RELAXED);
+  __atomic_store_n(&p->cfg.balance_abs, (uint32_t)balance_abs, __ATOMIC_RELAXED);
 }
 
 void radix_pool_free(radix_pool_t *p)
@@ -170,6 +214,7 @@ static void rr_scan(radix_pool_t *p, radix_req_t *rq, const radix_route_in_t *in
   rr_max(&p->st.scan_ns_max, dt);
 
   rq->pool = in->pool_id;
+  rq->gen = __atomic_load_n(&p->gen, __ATOMIC_ACQUIRE);
   rq->scanned = 1;
   rq->scan_rc = (uint8_t)rc;
   rq->learnable = 0;
@@ -199,7 +244,7 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
   memset(out, 0, sizeof(*out));
   out->ep = -1;
   out->reason = RADIX_R_OFF;
-  if (!p || !in || !rqp)
+  if (!p || !in || !rqp || !radix_pool_is_on(p))
     return -1;
 
   if (in->pipelined)
@@ -236,7 +281,8 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
     *rqp = rq;
   }
   /* A request driven again (a park's wake) keeps its scan. */
-  if (!rq->scanned || rq->pool != in->pool_id)
+  if (!rq->scanned || rq->pool != in->pool_id ||
+      rq->gen != __atomic_load_n(&p->gen, __ATOMIC_ACQUIRE))
     rr_scan(p, rq, in);
   out->scan_rc = (radix_scan_rc_t)rq->scan_rc;
   if (rq->scan_rc != RADIX_SCAN_OK)
@@ -267,7 +313,7 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
 
   out->matched_bytes = radix_scan_matched_bytes(lr.matched_len);
   if ((uint64_t)out->matched_bytes * 100u <
-      (uint64_t)p->cfg.match_pct * rq->stream_bytes)
+      (uint64_t)__atomic_load_n(&p->cfg.match_pct, __ATOMIC_RELAXED) * rq->stream_bytes)
     return rr_end(p, out, RADIX_R_BELOW_THRESHOLD);
 
   for (unsigned i = 0; i < n; i++) {
@@ -292,8 +338,8 @@ static int rr_decide(radix_pool_t *p, radix_req_t **rqp,
   }
   if (pick < 0)
     return rr_end(p, out, RADIX_R_MISS);
-  if (best - lo > p->cfg.balance_abs)
-    return rr_end(p, out, RADIX_R_SPREAD);
+  if (best - lo > __atomic_load_n(&p->cfg.balance_abs, __ATOMIC_RELAXED))
+    return rr_end(p, out, RADIX_R_BALANCE);
   out->ep = pick;
   return rr_end(p, out, RADIX_R_HIT);
 }
@@ -323,7 +369,8 @@ int radix_route_keepalive(radix_pool_t *p, radix_req_t **rqp,
   memset(out, 0, sizeof(*out));
   out->ep = -1;
   out->reason = RADIX_R_OFF;
-  if (!p || !in || !rqp || in->gates_unknown || kept_ep < 0 || kept_ep >= RADIX_MAX_EP)
+  if (!p || !in || !rqp || in->gates_unknown || kept_ep < 0 || kept_ep >= RADIX_MAX_EP ||
+      !in->n_eps || !radix_pool_is_on(p))
     return 0;                      /* keep, as today: nothing scanned or counted */
   ep = rr_decide(p, rqp, in, out);
   if (ep >= 0 && !(out->cand_mask & (UINT32_C(1) << kept_ep))) {
@@ -357,7 +404,9 @@ radix_learn_rc_t radix_route_learn(radix_pool_t *p, radix_req_t *rq,
   uint32_t bit;
   uint64_t w0;
 
-  if (!p || !rq || !rq->learnable || rq->pool != pool_id)
+  if (!radix_pool_is_on(p))
+    return RADIX_LEARN_NONE;                 /* off: nothing learned, nothing counted */
+  if (!rq || !rq->learnable || rq->pool != pool_id)
     return rr_learn_end(p, RADIX_LEARN_NONE);
   if (status < 200)
     return rr_learn_end(p, RADIX_LEARN_INTERIM);
@@ -372,6 +421,11 @@ radix_learn_rc_t radix_route_learn(radix_pool_t *p, radix_req_t *rq,
   w0 = rr_mono_ns();
   pthread_rwlock_wrlock(&p->lock);
   rr_max(&p->st.learn_wait_ns_max, rr_mono_ns() - w0);
+  if (rq->gen != __atomic_load_n(&p->gen, __ATOMIC_ACQUIRE) ||
+      !__atomic_load_n(&p->on, __ATOMIC_ACQUIRE)) {
+    pthread_rwlock_unlock(&p->lock);           /* scanned before an off */
+    return rr_learn_end(p, RADIX_LEARN_NONE);
+  }
   ir = radix_trie_insert(p->trie, rq->ns, rq->ns_len, rq->key, rq->key_len,
                          (unsigned)ep, now);
   if (ir == RADIX_INSERT_OK || ir == RADIX_INSERT_NOOP)
@@ -398,6 +452,7 @@ void radix_req_reset(radix_req_t *rq)
   rq->scanned = 0;
   rq->scan_rc = 0;
   rq->learnable = 0;
+  rq->gen = 0;
 }
 
 void radix_req_free(radix_req_t **rqp)
@@ -473,7 +528,7 @@ static const char *const rr_reason_names[RADIX_R__COUNT] = {
   [RADIX_R_MISS]            = "miss",
   [RADIX_R_WORK_CAP]        = "work_cap",
   [RADIX_R_BELOW_THRESHOLD] = "below_threshold",
-  [RADIX_R_SPREAD]          = "spread",
+  [RADIX_R_BALANCE]         = "balance",
   [RADIX_R_NOT_CHAT]        = "not_chat",
 };
 
@@ -589,6 +644,27 @@ size_t radix_pool_stats_take(radix_pool_t *p, uint64_t now_ms, uint64_t period_m
     return 0;
   __atomic_store_n(&p->stats_last_sig, sig, __ATOMIC_RELAXED);
   return len;
+}
+
+void radix_pool_stats_read(const radix_pool_t *p, radix_route_stats_t *out)
+{
+  if (!p || !out)
+    return;
+  for (int r = 0; r < RADIX_R__COUNT; r++)
+    out->decided[r] = RR_LD(p->st.decided[r]);
+  for (int r = 0; r < RADIX_SCAN__COUNT; r++)
+    out->scan_skip[r] = RR_LD(p->st.scan_skip[r]);
+  for (int r = 0; r < RADIX_LEARN__COUNT; r++)
+    out->learn[r] = RR_LD(p->st.learn[r]);
+  out->admission_moved = RR_LD(p->st.admission_moved);
+  out->purges = RR_LD(p->st.purges);
+  out->scans = RR_LD(p->st.scans);
+  out->scan_ns_sum = RR_LD(p->st.scan_ns_sum);
+  out->scan_ns_max = RR_LD(p->st.scan_ns_max);
+  out->lookup_wait_ns_max = RR_LD(p->st.lookup_wait_ns_max);
+  out->learn_wait_ns_max = RR_LD(p->st.learn_wait_ns_max);
+  out->kept_leg = RR_LD(p->st.kept_leg);
+  out->ka_moved = RR_LD(p->st.ka_moved);
 }
 
 uint64_t radix_route_scan_calls(void)

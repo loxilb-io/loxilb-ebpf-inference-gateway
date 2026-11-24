@@ -1106,6 +1106,15 @@ test_radix_pfe: test_radix_pfe.c sockproxy_pfe_clear.h sockproxy.h $(RADIX_ROUTE
 	$(CC) $(CFLAGS) $(RADIX_OPT) -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined \
 	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
 
+# A rule's prefix-affinity arguments from the NAT map value to the pool: the
+# layout of the three bytes (dp_proxy_tacts, proxy_arg), the mode words, and
+# every transition of sp_radix_apply on a real proxy_epval_t (ASan + UBSan +
+# LSan). The conversion and the call sites: test_radix_cfg_wiring.py.
+test_radix_cfg: test_radix_cfg.c sockproxy_radix_cfg.h llb_dpapi.h sockproxy.h $(RADIX_ROUTE_SRCS)
+	$(CC) -Wall -Wextra -Wno-unused-function -g $(RADIX_OPT) -fsanitize=address,undefined \
+	  -fno-sanitize-recover=undefined -fno-omit-frame-pointer -o $@ $< -I. -I../libbpf/src \
+	  -I../libbpf/include/uapi $(CFLAGS_MTLS) -pthread
+
 # sp_is_chat_path gives the HTTP/1.1 is_chat line's previous value on every
 # kind of path (that value feeds KV-exact).
 test_chat_path: test_chat_path.c sockproxy.h
@@ -1113,15 +1122,17 @@ test_chat_path: test_chat_path.c sockproxy.h
 	  -fno-omit-frame-pointer -o $@ $< -I. -pthread
 
 .PHONY: test_radix
-test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan test_radix_pfe test_chat_path
+test_radix: test_radix_trie test_radix_trie_tsan test_radix_scan test_radix_route test_radix_route_tsan test_radix_pfe test_radix_cfg test_chat_path
 	./test_radix_trie
 	./test_radix_trie_tsan
 	./test_radix_scan
 	./test_radix_route
 	./test_radix_route_tsan
 	./test_radix_pfe
+	./test_radix_cfg
 	./test_chat_path
 	python3 -B test_radix_wiring.py
+	python3 -B test_radix_cfg_wiring.py
 	! ./test_radix_pfe leak > test_radix_pfe.leak.log 2>&1 || { echo "test_radix_pfe: negative control not reported"; exit 1; }
 	grep -q 'LeakSanitizer: detected memory leaks' test_radix_pfe.leak.log
 	@echo "test_radix_pfe: negative control reported by LeakSanitizer"
