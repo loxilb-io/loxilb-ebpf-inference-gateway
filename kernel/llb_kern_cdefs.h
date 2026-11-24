@@ -88,14 +88,14 @@ struct bpf_map_def SEC("maps") pkt_ring = {
   .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
   .key_size = sizeof(int),
   .value_size = sizeof(__u32),
-  .max_entries = MAX_REAL_CPUS,
+  .max_entries = LLB_PERF_RING_ENTRIES,
 };
 
 struct bpf_map_def SEC("maps") cp_ring = {
   .type = BPF_MAP_TYPE_PERF_EVENT_ARRAY,
   .key_size = sizeof(int),
   .value_size = sizeof(__u32),
-  .max_entries = MAX_REAL_CPUS,
+  .max_entries = LLB_PERF_RING_ENTRIES,
 };
 
 struct bpf_map_def SEC("maps") pkts = {
@@ -346,14 +346,14 @@ struct pkt_ring_d {
         __uint(type,        BPF_MAP_TYPE_PERF_EVENT_ARRAY);
         __type(key,         int);
         __type(value,       __u32);
-        __uint(max_entries, MAX_REAL_CPUS);
+        __uint(max_entries, LLB_PERF_RING_ENTRIES);
 } pkt_ring SEC(".maps");
 
 struct cp_ring_d {
         __uint(type,        BPF_MAP_TYPE_PERF_EVENT_ARRAY);
         __type(key,         int);
         __type(value,       __u32);
-        __uint(max_entries, MAX_REAL_CPUS);
+        __uint(max_entries, LLB_PERF_RING_ENTRIES);
 } cp_ring SEC(".maps");
 
 struct pkts_d {
@@ -1873,10 +1873,10 @@ dp_set_udp_src_ip6(void *md, struct xfi *xf, __be32 *xip)
 
   /* UDP checksum = 0 is valid */
   //bpf_skb_store_bytes(md, udp_csum_off, &csum, sizeof(csum), 0);
-  bpf_l4_csum_replace(md, udp_csum_off, old_sip[0], xip[0], BPF_F_PSEUDO_HDR |sizeof(*xip));
-  bpf_l4_csum_replace(md, udp_csum_off, old_sip[1], xip[1], BPF_F_PSEUDO_HDR |sizeof(*xip));
-  bpf_l4_csum_replace(md, udp_csum_off, old_sip[2], xip[2], BPF_F_PSEUDO_HDR |sizeof(*xip));
-  bpf_l4_csum_replace(md, udp_csum_off, old_sip[3], xip[3], BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_sip[0], xip[0], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_sip[1], xip[1], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_sip[2], xip[2], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_sip[3], xip[3], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
 
   bpf_skb_store_bytes(md, ip_src_off, xip, sizeof(xf->l34m.saddr), 0);
   //DP_XADDR_CP(xf->l34m.saddr, xip);
@@ -1895,7 +1895,7 @@ dp_set_udp_src_ip(void *md, struct xfi *xf, __be32 xip)
   
   /* UDP checksum = 0 is valid */
   //bpf_skb_store_bytes(md, udp_csum_off, &csum, sizeof(csum), 0);
-  bpf_l4_csum_replace(md, udp_csum_off, old_sip, xip, BPF_F_PSEUDO_HDR |sizeof(xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_sip, xip, BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(xip));
   bpf_l3_csum_replace(md, ip_csum_off, old_sip, xip, sizeof(xip));
   bpf_skb_store_bytes(md, ip_src_off, &xip, sizeof(xip), 0);
   xf->l34m.saddr4 = xip;
@@ -1913,10 +1913,10 @@ dp_set_udp_dst_ip6(void *md, struct xfi *xf, __be32 *xip)
 
   /* UDP checksum = 0 is valid */
   //bpf_skb_store_bytes(md, udp_csum_off, &csum, sizeof(csum), 0);
-  bpf_l4_csum_replace(md, udp_csum_off, old_dip[0], xip[0], BPF_F_PSEUDO_HDR |sizeof(*xip));
-  bpf_l4_csum_replace(md, udp_csum_off, old_dip[1], xip[1], BPF_F_PSEUDO_HDR |sizeof(*xip));
-  bpf_l4_csum_replace(md, udp_csum_off, old_dip[2], xip[2], BPF_F_PSEUDO_HDR |sizeof(*xip));
-  bpf_l4_csum_replace(md, udp_csum_off, old_dip[3], xip[3], BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_dip[0], xip[0], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_dip[1], xip[1], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_dip[2], xip[2], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_dip[3], xip[3], BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR |sizeof(*xip));
   bpf_skb_store_bytes(md, ip_dst_off, xip, sizeof(xf->l34m.daddr), 0);
   //DP_XADDR_CP(xf->l34m.daddr, xip);
 
@@ -1934,7 +1934,7 @@ dp_set_udp_dst_ip(void *md, struct xfi *xf, __be32 xip)
   
   /* UDP checksum = 0 is valid */
   //bpf_skb_store_bytes(md, udp_csum_off, &csum, sizeof(csum), 0);
-  bpf_l4_csum_replace(md, udp_csum_off, old_dip, xip, BPF_F_PSEUDO_HDR | sizeof(xip));
+  bpf_l4_csum_replace(md, udp_csum_off, old_dip, xip, BPF_F_MARK_MANGLED_0 | BPF_F_PSEUDO_HDR | sizeof(xip));
   bpf_l3_csum_replace(md, ip_csum_off, old_dip, xip, sizeof(xip));
   bpf_skb_store_bytes(md, ip_dst_off, &xip, sizeof(xip), 0);
   //xf->l34m.daddr4 = xip;
@@ -1954,7 +1954,7 @@ dp_set_udp_sport(void *md, struct xfi *xf, __be16 xport)
 
   /* UDP checksum = 0 is valid */
   //bpf_skb_store_bytes(md, udp_csum_off, &csum, sizeof(csum), 0);
-  bpf_l4_csum_replace(md, udp_csum_off, old_sport, xport, sizeof(xport));
+  bpf_l4_csum_replace(md, udp_csum_off, old_sport, xport, BPF_F_MARK_MANGLED_0 | sizeof(xport));
   bpf_skb_store_bytes(md, udp_sport_off, &xport, sizeof(xport), 0);
   //xf->l34m.source = xport;
 
@@ -1973,7 +1973,7 @@ dp_set_udp_dport(void *md, struct xfi *xf, __be16 xport)
 
   /* UDP checksum = 0 is valid */
   //bpf_skb_store_bytes(md, udp_csum_off, &csum, sizeof(csum), 0);
-  bpf_l4_csum_replace(md, udp_csum_off, old_dport, xport, sizeof(xport));
+  bpf_l4_csum_replace(md, udp_csum_off, old_dport, xport, BPF_F_MARK_MANGLED_0 | sizeof(xport));
   bpf_skb_store_bytes(md, udp_dport_off, &xport, sizeof(xport), 0);
   //xf->l34m.dest = xport;
 
