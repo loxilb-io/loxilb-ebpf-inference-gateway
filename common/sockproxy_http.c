@@ -913,6 +913,22 @@ proxy_send_local_100_continue(proxy_fd_ent_t *pfe)
   return 0;
 }
 
+/* The first occurrence of `needle` in hay[0..hlen), compared without regard
+ * to case; NULL when there is none. */
+static const uint8_t *
+sp_mem_casefind(const uint8_t *hay, size_t hlen, const char *needle)
+{
+  size_t nlen = strlen(needle);
+
+  if (nlen == 0 || hlen < nlen)
+    return NULL;
+  for (size_t i = 0; i + nlen <= hlen; i++) {
+    if (strncasecmp((const char *)hay + i, needle, nlen) == 0)
+      return hay + i;
+  }
+  return NULL;
+}
+
 /**
  * Inject X-Forwarded-* headers into HTTP request before forwarding to backend
  *
@@ -922,6 +938,13 @@ proxy_send_local_100_continue(proxy_fd_ent_t *pfe)
  * Headers injected:
  * - X-Forwarded-Proto: https  (tells backend original protocol)
  * - X-Forwarded-Host: domain  (tells backend original hostname)
+ *
+ * An upgrade request (a WebSocket handshake and the like) is ordinary HTTP/1.1
+ * text and gets the headers like any other request. Every search stays
+ * inside buflen: the buffer is not NUL-terminated at its data, and what lies
+ * past it may be an earlier request's bytes on the same connection. So a
+ * body that contains "Connection: Upgrade" or "Transfer-Encoding: chunked"
+ * changes nothing, and neither do stale bytes.
  *
  * @param buf     Buffer containing HTTP request (modified in-place)
  * @param buflen  Current length of data in buffer
@@ -949,13 +972,6 @@ inject_forwarded_headers(uint8_t *buf, size_t buflen, size_t bufsize,
     return buflen;  // Return unchanged - this is binary data
   }
 
-  // P7: Skip injection for WebSocket upgrade requests (binary handshake data)
-  if (strcasestr((char *)buf, "Connection: Upgrade") != NULL) {
-#ifdef HAVE_PROXY_EXTRA_DEBUG
-    log_debug("[WS_SKIP] Skipping header injection for WebSocket upgrade request");
-#endif
-    return 0;
-  }
   char *headers_end;
   size_t header_insert_len = 0;
   char inject_buf[512];
@@ -966,7 +982,7 @@ inject_forwarded_headers(uint8_t *buf, size_t buflen, size_t bufsize,
   }
 
   // Find end of headers (\r\n\r\n marker)
-  headers_end = strstr((char *)buf, "\r\n\r\n");
+  headers_end = memmem(buf, buflen, "\r\n\r\n", 4);
   if (!headers_end) {
     // Malformed HTTP request - no header end marker
     log_trace("inject_forwarded_headers: No header end marker found");
@@ -976,7 +992,9 @@ inject_forwarded_headers(uint8_t *buf, size_t buflen, size_t bufsize,
   // SAFETY: Skip modification if Transfer-Encoding: chunked is present
   // (Rare for requests, but possible with POST/PUT uploads)
   // NOTE: This is for REQUEST chunking only. Response chunking is detected elsewhere.
-  if (strcasestr((char *)buf, "Transfer-Encoding: chunked") != NULL) {
+  // Looked for in the header block only (through the CRLF that ends its last line).
+  if (sp_mem_casefind(buf, (size_t)(headers_end - (char *)buf) + 2,
+                      "Transfer-Encoding: chunked") != NULL) {
 #ifdef HAVE_PROXY_EXTRA_DEBUG
     log_debug("[FORWARDED_INJECT_SKIP] Skipping header injection for chunked request "
               "(would corrupt chunk boundaries)");
@@ -2070,6 +2088,7 @@ proxy_try_epxmit(proxy_fd_ent_t *ent, void *msg, size_t len, int sel)
   proxy_fd_ent_t *rfd_ent = NULL;
   fc_expose_t fc_xv;
   int fc_x = 0;
+  int resp_switched = 0;
 
 #ifdef HAVE_PII_DETECTION
   // CRITICAL FIX: Apply deferred PII masking NOW (before forwarding)
@@ -2198,6 +2217,14 @@ skip_deferred_masking:
 
   if (rfd_ent) {
     PROXY_ENT_LOCK(rfd_ent);
+
+    /* The client's connection switched protocols before this read: its
+     * response framer holds a 101 (sp_h1_switched). These backend bytes are
+     * the other protocol's, so no response-head sniff or edit below applies
+     * to them. The read that carries the 101 still gets them. */
+    resp_switched = ent->odir == 1 && rfd_ent->odir == 0 &&
+                    rfd_ent->cresp_parser_inited &&
+                    llhttp_get_errno(&rfd_ent->cresp_parser) == HPE_PAUSED_UPGRADE;
 
     // DEFENSIVE: Check if peer connection is being torn down (EOF deferred)
     // Avoid processing data on connections marked for closure
@@ -2627,7 +2654,7 @@ skip_deferred_masking:
 
     /* The HTTP_RESPONSE parser observes header fragments and dechunked body.
      * The raw sniff is only a fallback when that observer could not frame. */
-    if (ent->odir == 1 && !rfd_ent->cresp_payload_observed &&
+    if (ent->odir == 1 && !resp_switched && !rfd_ent->cresp_payload_observed &&
         rfd_ent->sse_mode == 1 && !rfd_ent->sse_active && len > 16) {
       size_t scan = len < 2048 ? len : 2048;
       if (memmem(msg, scan, "Content-Type: text/event-stream", 31) ||
@@ -3042,7 +3069,8 @@ skip_deferred_masking:
     // Only apply when forwarding FROM backend (ent->odir=1) TO client (rfd_ent->odir=0)
     // P7 FIX: Check chunked flag on SOURCE (backend/ent), not target (client/rfd_ent)
 
-    if (!ent->is_chunked_response && ent->odir == 1 && rfd_ent->odir == 0) {
+    if (!resp_switched && !ent->is_chunked_response && ent->odir == 1 &&
+        rfd_ent->odir == 0) {
 
       ssize_t new_len = rewrite_location_header((uint8_t *)msg, len, SP_SOCK_MSG_LEN,
                                                  rfd_ent->ssl != NULL);
@@ -12217,10 +12245,18 @@ creq_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
     creq_parser_init(client);
   }
   creq_block_read_begin(&client->creq_blk);
+  if (llhttp_get_errno(&client->creq_parser) == HPE_PAUSED_UPGRADE) {
+    /* The connection switched protocols (sp_h1_switched): these bytes are
+     * the other protocol's, and no read is a header block any more. */
+    creq_block_read_end(&client->creq_blk, 0);
+    return;
+  }
   rerr = llhttp_execute(&client->creq_parser, (const char *)msg, len);
   if (rerr == HPE_PAUSED_UPGRADE) {
+    /* An upgrade request. It is framed like any other, and the framer stays
+     * paused until the client's next read, when sp_h1_switched() looks at
+     * the answer. */
     creq_block_read_end(&client->creq_blk, 1);
-    llhttp_resume_after_upgrade(&client->creq_parser);
     return;
   }
   if (rerr != HPE_OK && rerr != HPE_PAUSED) {
@@ -12484,6 +12520,15 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   if (!client->cresp_parser_inited) {
     cresp_parser_init(client);
   }
+  if (llhttp_get_errno(&client->cresp_parser) == HPE_PAUSED_UPGRADE) {
+    /* After a 101 the backend speaks another protocol. Nothing it sends is
+     * a response head any more: none is framed, and none is edited (its
+     * frames may carry text that reads like one, such as a tunnelled
+     * HTTP response). */
+    creq_block_read_begin(&client->cresp_blk);
+    creq_block_read_end(&client->cresp_blk, 0);
+    return;
+  }
   epp_resp_head_feed(client, msg, len);
   /* Where this read stands in its response, for the one edit made to a
    * backend's header block (sp_resp_strip_api_key). */
@@ -12491,7 +12536,8 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
   rerr = llhttp_execute(&client->cresp_parser, (const char *)msg, len);
   creq_block_read_end(&client->cresp_blk, 1);
   if (rerr == HPE_PAUSED_UPGRADE) {
-    llhttp_resume_after_upgrade(&client->cresp_parser);
+    /* A 101: the framer stays paused for the rest of the connection. That
+     * pause is what sp_h1_switched() reads. */
     return;
   }
   if (rerr != HPE_OK && rerr != HPE_PAUSED) {
@@ -12507,6 +12553,43 @@ cresp_feed(proxy_fd_ent_t *client, const void *msg, size_t len)
      * out until a message is framed to its end. */
     sp_answer_framing_lost(&client->cresp_in_msg);
   }
+}
+
+/* Whether an HTTP/1.1 client's connection has switched protocols (WebSocket
+ * and the like). Asked at each client read, before anything frames it.
+ *
+ * - The request framer stops at an upgrade request: an Upgrade header, with
+ *   "upgrade" among the Connection tokens, both read from the header block
+ *   by llhttp.
+ * - The response framer stops at a 101.
+ * - At the client's next read, a 101 means the connection switched, and it
+ *   stays switched. Its bytes are then relayed as they come: nothing parses,
+ *   frames or edits them in either direction.
+ * - Any other answer means the backend declined the switch. The request
+ *   framer resumes, and the connection goes on as HTTP/1.1 with every
+ *   per-request step it had.
+ *
+ * A client sends nothing before the answer reaches it, and the answer is
+ * framed before it is relayed (proxy_try_epxmit), so the next read finds the
+ * answer framed. Bytes sent before it, against the protocol, are framed as
+ * HTTP: the connection then stays on the per-request path. Runs on the
+ * client's worker, which owns the request framer; the response framer is
+ * read under the entry lock it is written under. */
+static int
+sp_h1_switched(proxy_fd_ent_t *pfe)
+{
+  int sw;
+
+  if (pfe->odir != 0 || pfe->h2_session || !pfe->creq_parser_inited ||
+      llhttp_get_errno(&pfe->creq_parser) != HPE_PAUSED_UPGRADE)
+    return 0;
+  PROXY_ENT_LOCK(pfe);
+  sw = pfe->cresp_parser_inited &&
+       llhttp_get_errno(&pfe->cresp_parser) == HPE_PAUSED_UPGRADE;
+  PROXY_ENT_UNLOCK(pfe);
+  if (!sw)
+    llhttp_resume_after_upgrade(&pfe->creq_parser);
+  return sw;
 }
 
 /* The answer on this HTTP/1 client was delimited by its backend's EOF, and
@@ -14532,6 +14615,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
     int rc = proxy_sock_read(pfe, fd, pfe->rcvbuf + pfe->rcv_off, rd_want);
     int saved_errno = errno;  // Save errno immediately after recv()
+    int h1_switched = 0;      /* this client read belongs to a switched protocol */
     if (rc > 0) {
       pfe_rcv_note_len(pfe, pfe->rcv_off + (size_t)rc);
       pfe->leg_rx_seen = 1;
@@ -14634,6 +14718,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
     if (!pfe->odir) {  // Client → Proxy direction (odir=0)
       const char *phurl = "";
+
+      /* After a 101 the client's bytes are relayed as they come: no gate
+       * re-arm, no parse, no header edit (sp_h1_switched). */
+      h1_switched = rc > 0 && sp_h1_switched(pfe);
+      if (h1_switched && pfe->rfd[0] <= 0)
+        return -1;  /* the backend leg is gone; nothing else can carry them */
 
       /* Count what the client asked for. Fed here, from the read, because the
        * routing parser below runs only in the PARSING PHASE — with a backend leg
@@ -14785,7 +14875,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
        * pass unstripped. So such a service re-enters the parse phase at
        * each boundary too when it is not an AI-gateway service. One that is
        * has the arm above, with its condition on a running stream. */
-      if (pfe->rcv_off == 0 && pfe->n_rfd > 0 &&
+      if (!h1_switched && pfe->rcv_off == 0 && pfe->n_rfd > 0 &&
           pfe->pd_phase == PD_PHASE_NONE) {
         if (pfe->epv && ((proxy_epval_t *)pfe->epv)->pd_disagg_enabled) {
           log_debug("[KA_FIX] fd=%d releasing stale backend leg before next keep-alive "
@@ -14811,7 +14901,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
         }
       }
 
-      if (pfe->rfd[0] <= 0 || pfe->ka_reparse) {  // No backend connection yet, or gate re-arm - PARSING PHASE
+      if (!h1_switched && (pfe->rfd[0] <= 0 || pfe->ka_reparse)) {  // No backend connection yet, or gate re-arm - PARSING PHASE
 #ifdef HAVE_PROXY_EXTRA_DEBUG
         log_debug("[FIRST_DATA] fd=%d: First data received (rfd[0]=%d), rc=%zd, ssl=%p, ktls_enabled=%d",
                   fd, pfe->rfd[0], rc, pfe->ssl, pfe->ktls_enabled);
@@ -14935,6 +15025,22 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           if (end != (const char *)pfe->rcvbuf + pfe->rcv_off)
             return sp_mcp_h1_refuse(pfe, 400); /* pipelining refused before any delivery */
           llhttp_resume(&pfe->parser); err = HPE_OK;
+        }
+
+        /* An upgrade request (WebSocket and the like) is a whole HTTP/1.1
+         * request, routed by its host and path and forwarded as any other.
+         * It used to take the parse-error branch below, which routes without
+         * the host and so missed a host|path rule. The parser pauses after
+         * it. Resume it, so that if the backend declines the switch, the next
+         * request is parsed as usual; sp_h1_switched() decides at the
+         * client's next read. An AI-gateway or MCP service still refuses the
+         * request below, as it refuses any request it cannot gate. */
+        if (err == HPE_PAUSED_UPGRADE && !sp_mcp_enabled(pfe)) {
+          proxy_epval_t *up_pool0 = sp_pool_first((proxy_map_ent_t *)pfe->head);
+          if (!up_pool0 || (!up_pool0->ai_gw_mode && !up_pool0->mcp_stateless)) {
+            llhttp_resume_after_upgrade(&pfe->parser);
+            err = HPE_OK;
+          }
         }
 
         // Update how much we've parsed
@@ -15707,8 +15813,9 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
       // CRITICAL FIX: Inject X-Forwarded-Proto headers for Keep-Alive requests
       // When backend already exists (Keep-Alive), we bypass HTTP parsing above,
       // but we MUST still inject headers for EVERY request on client→backend path.
-      // Only inject for client→backend (odir=0), not backend→client (odir=1)
-      if (!pfe->odir && pfe->ssl) {
+      // Only inject for client→backend (odir=0), not backend→client (odir=1),
+      // and never into the bytes of a protocol the connection switched to.
+      if (!pfe->odir && pfe->ssl && !h1_switched) {
         // P7 FIX: Only inject headers if this packet contains COMPLETE headers
         // Check for header end marker (\r\n\r\n) in current packet
         char *headers_end_check = memmem(pfe->rcvbuf, rc, "\r\n\r\n", 4);
@@ -15778,7 +15885,7 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
  * listeners. Legacy inject_forwarded_headers (above) stays untouched. */
       {
         proxy_map_ent_t *l7node = (proxy_map_ent_t *)pfe->head;
-        if (l7node && l7_policy_on(l7node)) {
+        if (!h1_switched && l7node && l7_policy_on(l7node)) {
           rc = (ssize_t)l7_inject_req_headers_h1(pfe, l7node, pfe->rcvbuf,
                                                  (size_t)rc, SP_SOCK_MSG_LEN, fd);
         }

@@ -75,10 +75,13 @@ feed(conn_t *c, const char *rd, size_t len)
   enum llhttp_errno e;
 
   creq_block_read_begin(&c->blk);
+  if (llhttp_get_errno(&c->parser) == HPE_PAUSED_UPGRADE) {
+    creq_block_read_end(&c->blk, 0);
+    return;
+  }
   e = llhttp_execute(&c->parser, rd, len);
   if (e == HPE_PAUSED_UPGRADE) {
     creq_block_read_end(&c->blk, 1);
-    llhttp_resume_after_upgrade(&c->parser);
     return;
   }
   if (e != HPE_OK && e != HPE_PAUSED) {
@@ -88,6 +91,19 @@ feed(conn_t *c, const char *rd, size_t len)
     return;
   }
   creq_block_read_end(&c->blk, 1);
+}
+
+/* sp_h1_switched's part on the request framer, asked before each client
+ * read: the framer holds an upgrade request, and the backend answered it
+ * with a 101 (switched, from now on) or with something else (resumed). */
+static int
+next_read(conn_t *c, int answered_101)
+{
+  if (llhttp_get_errno(&c->parser) != HPE_PAUSED_UPGRADE)
+    return 0;
+  if (!answered_101)
+    llhttp_resume_after_upgrade(&c->parser);
+  return answered_101;
 }
 
 /* A read in a heap buffer with `room` spare bytes behind it. */
@@ -320,6 +336,54 @@ test_every_cut(void)
   }
 }
 
+#define WSREQ "GET /ws HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+#define KEYREQ "GET /next HTTP/1.1\r\nHost: a\r\nX-Api-Key: sk-client\r\n\r\n"
+
+static void
+feed_str(conn_t *c, const char *rd)
+{
+  feed(c, rd, strlen(rd));
+}
+
+static void
+test_upgrade(void)
+{
+  conn_t c;
+
+  printf("an upgrade request, then the other protocol or HTTP again:\n");
+  conn_init(&c);
+  CHECK(!next_read(&c, 0), "a fresh connection has not switched");
+  feed_str(&c, WSREQ);
+  CHECK(c.blk.hdr_block == 1, "the upgrade request's read is a header block");
+  CHECK(next_read(&c, 1), "answered with a 101: the connection has switched");
+  feed_str(&c, KEYREQ);
+  CHECK(c.blk.hdr_block == 0,
+        "a read after the 101 is not a header block, though it reads like a request");
+  CHECK(next_read(&c, 1), "and the connection stays switched");
+
+  conn_init(&c);
+  feed_str(&c, WSREQ);
+  CHECK(!next_read(&c, 0), "answered otherwise: the connection has not switched");
+  feed_str(&c, KEYREQ);
+  CHECK(c.blk.hdr_block == 1,
+        "the next request is a header block again, so its strips still run");
+
+  conn_init(&c);
+  feed_str(&c, "GET / HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\n\r\n");
+  CHECK(llhttp_get_errno(&c.parser) == HPE_OK,
+        "Connection: Upgrade without an Upgrade header: an ordinary request");
+  conn_init(&c);
+  feed_str(&c, "GET / HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\n"
+               "Connection: keep-alive, upgrade\r\n\r\n");
+  CHECK(llhttp_get_errno(&c.parser) == HPE_PAUSED_UPGRADE,
+        "upgrade among the Connection tokens, in any case: an upgrade request");
+  conn_init(&c);
+  feed_str(&c, "POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 19\r\n\r\n"
+               "Connection: Upgrade");
+  CHECK(llhttp_get_errno(&c.parser) == HPE_OK,
+        "a body that says Connection: Upgrade: no upgrade");
+}
+
 int
 main(void)
 {
@@ -328,6 +392,7 @@ main(void)
   test_body_reads();
   test_recovers_after_garbage();
   test_every_cut();
+  test_upgrade();
   printf("%d checks, %d failed\n", checks, failures);
   return failures ? 1 : 0;
 }
