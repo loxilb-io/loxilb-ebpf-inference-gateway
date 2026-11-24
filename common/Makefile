@@ -1369,6 +1369,14 @@ test_stripinterim: sockproxy_http.c test_resp_strip_interim.py sockproxy_h1_hdr.
 test_stripapikey: sockproxy_http.c sockproxy_ai_security.c test_resp_strip_api_key_interim.py sockproxy_h1_hdr.h sockproxy_l7hdr_guard.h
 	python3 test_resp_strip_api_key_interim.py
 
+# X-Forwarded-Proto and X-Forwarded-Host on an HTTPS request, upgrade requests
+# included: inject_forwarded_headers from the source, ASan + UBSan. A body that
+# says "Connection: Upgrade" or "Transfer-Encoding: chunked" changes nothing,
+# and nothing past the bytes of the read is looked at.
+.PHONY: test_fwdinject
+test_fwdinject: sockproxy_http.c test_forwarded_inject.py
+	python3 test_forwarded_inject.py
+
 # The SGLang oversize refusal (503 pd_sg_oversize_unroutable) carries the
 # refusal mark: pd_sg_oversize_reject from the source, ASan + UBSan.
 .PHONY: test_pdsgmark
