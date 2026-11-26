@@ -339,12 +339,67 @@ test_replace_under_dispatch(void)
   listener_fini();
 }
 
+/* A route whose one condition is on the HOST, forwarding to members refs[]. */
+static void
+route_host(l7_route_t *r, int position, l7_op_t op, const char *value,
+           int n, const int *refs)
+{
+  route_fwd(r, position, "/", n, refs, NULL);
+  r->sets[0].conds[0].field = L7F_HOST;
+  r->sets[0].conds[0].op = op;
+  snprintf(r->sets[0].conds[0].value, sizeof(r->sets[0].conds[0].value), "%s", value);
+}
+
+static int
+dispatch_host(proxy_fd_ent_t *pfe, const char *host, proxy_epval_t **out)
+{
+  memset(pfe, 0, sizeof(*pfe));
+  snprintf(pfe->request_path, sizeof(pfe->request_path), "/");
+  snprintf(pfe->host_url, sizeof(pfe->host_url), "%s", host);
+  *out = (proxy_epval_t *)0x1;
+  return l7_route_dispatch(pfe, &ent, out);
+}
+
+/* HOST conditions compare without regard to case, as host routing does: the
+ * value of EQUAL/PREFIX/SUFFIX/CONTAINS and the request host are both folded,
+ * and a HOST REGEX matches either case while its pattern keeps its own. */
+static void
+test_host_conditions_ignore_case(void)
+{
+  static const int m0[] = { 0 }, m1[] = { 1 }, m01[] = { 0, 1 }, m2[] = { 2 };
+  l7_route_t r[4];
+  proxy_fd_ent_t pfe;
+  proxy_epval_t *out;
+
+  listener_init();
+  route_host(&r[0], 1, L7OP_EQUAL, "API.Example.com", 1, m0);
+  route_host(&r[1], 2, L7OP_REGEX, "^[A-Z]+\\.Re\\.Example$", 1, m1);
+  route_host(&r[2], 3, L7OP_SUFFIX, ".Suffix.Example", 2, m01);
+  route_fwd(&r[3], 4, "/", 1, m2, NULL);
+  CHECK(proxy_attach_l7_policy(&ent.key, r, 4) == 0, "a four-route HOST policy attaches");
+
+  CHECK(dispatch_host(&pfe, "api.example.com", &out) == L7_DISPATCH_FORWARD &&
+        pfe.mcp_route_mask == 0x1, "EQUAL matches a lower-case host");
+  CHECK(dispatch_host(&pfe, "API.EXAMPLE.COM", &out) == L7_DISPATCH_FORWARD &&
+        pfe.mcp_route_mask == 0x1, "EQUAL matches an upper-case host");
+  CHECK(dispatch_host(&pfe, "SVC.re.Example", &out) == L7_DISPATCH_FORWARD &&
+        pfe.mcp_route_mask == 0x2, "a HOST REGEX written in upper case matches any case");
+  CHECK(dispatch_host(&pfe, "x.SUFFIX.example", &out) == L7_DISPATCH_FORWARD &&
+        pfe.mcp_route_mask == 0x3, "SUFFIX compares without case");
+  CHECK(dispatch_host(&pfe, "api.example.org", &out) == L7_DISPATCH_FORWARD &&
+        pfe.mcp_route_mask == 0x4, "another host falls to the catch-all route");
+
+  CHECK(proxy_detach_l7_policy(&ent.key) == 0, "the HOST policy detaches");
+  listener_fini();
+}
+
 int
 main(void)
 {
   setvbuf(stdout, NULL, _IONBF, 0);
   sp_pool_init(NULL);
   test_route_marks_the_pool();
+  test_host_conditions_ignore_case();
   test_selection_follows_the_pool();
   test_replace_under_dispatch();
   {

@@ -45,6 +45,11 @@
  * @param host Hostname (e.g., "api.example.com")
  * @param path_prefix Path prefix (e.g., "/v1/users") or NULL/empty for hostname-only
  * @param model_name AI model name (e.g., "llama-70b") or NULL/empty for wildcard pool
+ *
+ * Host names compare without regard to case (RFC 9110 section 4.2.3), so the
+ * host part of the key is folded to lower case. Rules and requests build their
+ * keys here alike, so "API.Example.com" in either one finds the other. The path
+ * and the model name keep their case.
  */
 void
 build_ephash_key(char *key_buf, size_t buf_size,
@@ -53,6 +58,7 @@ build_ephash_key(char *key_buf, size_t buf_size,
 {
   int has_path = (path_prefix && path_prefix[0] != '\0');
   int has_model = (model_name && model_name[0] != '\0');
+  char *c;
 
   if (has_path && has_model) {
     // Composite key: "host|path|model"
@@ -66,6 +72,12 @@ build_ephash_key(char *key_buf, size_t buf_size,
   } else {
     // Backward compatibility: hostname-only
     snprintf(key_buf, buf_size, "%s", host);
+  }
+
+  /* A host never holds '|': everything before the first one is the host. */
+  for (c = key_buf; buf_size && *c && *c != '|'; c++) {
+    if (*c >= 'A' && *c <= 'Z')
+      *c = (char)(*c - 'A' + 'a');
   }
 }
 
@@ -222,6 +234,36 @@ find_endpoint_for_host(const sp_pool_index_t *ix, const char *host,
   return best_match;
 }
 
+/* Wildcard host rules, Gateway API (v1.5.1) hostname semantics: "*.example.com"
+ * matches a host with one or more labels in front of "example.com", and never
+ * "example.com" itself. For a request host l1.l2...ln the candidates are
+ * "*.l2...ln", "*.l3...ln", ... "*.ln", longest suffix first, so a more
+ * specific wildcard wins. Each candidate is looked up the way an exact host is
+ * (find_endpoint_for_host: Exact path, then longest prefix, then the model
+ * stages). A candidate with rules but no matching path does not end the search:
+ * the next candidate is tried, as Gateway API ranks rules on host and path
+ * together. The first candidate that yields a pool answers, an endpoint-less
+ * pool included. */
+static proxy_epval_t *
+find_endpoint_wildcard(const sp_pool_index_t *ix, const char *host,
+                       const char *request_path, const char *model_name)
+{
+  char candidate[260];
+  const char *dot;
+
+  for (dot = strchr(host, '.'); dot && dot[1] != '\0'; dot = strchr(dot + 1, '.')) {
+    int n = snprintf(candidate, sizeof(candidate), "*%s", dot);
+
+    if (n < 0 || (size_t)n >= sizeof(candidate))
+      continue;  /* longer than any host a rule can hold */
+    proxy_epval_t *ep = find_endpoint_for_host(ix, candidate, request_path,
+                                               model_name);
+    if (ep)
+      return ep;
+  }
+  return NULL;
+}
+
 proxy_epval_t*
 find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_path,
                   const char *model_name)
@@ -237,6 +279,16 @@ find_endpoint_lpm(proxy_map_ent_t *ent, const char *host, const char *request_pa
                                                    model_name);
   if (best_match) {
     return best_match;
+  }
+
+  /* Then the wildcard host rules, between the exact host and the listener's
+   * host-less rules. Skipped on a listener without one: the candidates cost a
+   * lookup per path level each, and most listeners have none. */
+  if (ix && ix->n_wildcard) {
+    best_match = find_endpoint_wildcard(ix, host, request_path, model_name);
+    if (best_match) {
+      return best_match;
+    }
   }
   proxy_epval_t *tepval = NULL;
   char search_key[512];
