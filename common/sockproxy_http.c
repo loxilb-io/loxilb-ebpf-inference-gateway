@@ -11465,13 +11465,15 @@ handle_on_message_complete(llhttp_t* parser)
   }
   pfe->http_pok = 1;
   pfe->http_body_complete = 1;
-  if (pfe->json_guard_active) {
-    if (sp_h1_json_scan_result(pfe, sp_json_scan_finish(&pfe->json_scan)))
-      return -1;
-    if (pfe->json_guard_streaming) {
-      return HPE_PAUSED; /* already admitted; release the tail after this callback */
-    }
-  }
+  if (pfe->json_guard_active &&
+      sp_h1_json_scan_result(pfe, sp_json_scan_finish(&pfe->json_scan)))
+    return -1;
+  /* A streamed body (a JSON body under the guard, or a chunked body that
+   * needs no inspection) was admitted and dispatched at its headers. Its end
+   * is found here; the read path relays up to it and parses what follows as
+   * the next request. */
+  if (pfe->json_guard_streaming)
+    return HPE_PAUSED;
   if (sp_mcp_enabled(pfe) && sp_mcp_h1_complete(pfe, parser)) return -1;
   // L7 Metrics: capture request start timestamp for TTFB. Kept independent of
   // HAVE_HTTP_TRACE — the metric_* fields and record_latency_sample() are always
@@ -14449,8 +14451,12 @@ proxy_backend_connect_event(int fd, proxy_fd_ent_t *pfe, int type)
  *
  * Returns: 0 on success, -1 to restart
  */
-/* Scan before relaying this read. A fixed suffix from the previous read is
- * retained until the HTTP framing and the JSON scanner both complete. */
+/* Relay a read of a streamed request body (json_guard_streaming). The parser
+ * keeps reading it, to find where the request ends and, under the JSON guard,
+ * to scan it. Under the guard a fixed suffix from the previous read is
+ * retained until the HTTP framing and the JSON scanner both complete, so a
+ * backend never holds a whole request the scan would refuse. A chunked body
+ * that needs no inspection retains nothing. */
 static int
 sp_h1_json_stream_read(proxy_fd_ent_t *pfe, const uint8_t *data, size_t len,
                        size_t *consumed)
@@ -14460,21 +14466,30 @@ sp_h1_json_stream_read(proxy_fd_ent_t *pfe, const uint8_t *data, size_t len,
   enum llhttp_errno err = llhttp_execute(&pfe->parser, (const char *)data, len);
   int complete = err == HPE_PAUSED;
   if (err != HPE_OK && !complete) {
-    if (!pfe->ai_gw_denied)
+    if (pfe->json_guard_active && !pfe->ai_gw_denied)
       sp_h1_json_refuse(pfe, "invalid_json_framing");
+    else if (!pfe->json_guard_active)
+      log_debug("[H1_CHUNK_STREAM] fd=%d invalid chunked framing in a streamed "
+                "body (%s) - closing", pfe->fd, llhttp_errno_name(err));
     return -1;
   }
   *consumed = complete ?
       (size_t)(llhttp_get_error_pos(&pfe->parser) - (const char *)data) : len;
   assert(*consumed <= len);
   size_t old = pfe->json_guard_tail_len;
-  size_t keep = complete ? 0 : pfe->json_guard_chunked ? 5 : 1;
+  size_t keep = complete || !pfe->json_guard_active ? 0 :
+                pfe->json_guard_chunked ? 5 : 1;
   size_t total = old + *consumed;
   if (keep > total)
     keep = total;
   size_t forward = total - keep;
   size_t send_old = forward < old ? forward : old;
   size_t send_new = forward - send_old;
+  if (forward) {
+    PROXY_ENT_LOCK(pfe);
+    pfe_ent_accouting(pfe, forward, 0);
+    PROXY_ENT_UNLOCK(pfe);
+  }
   if ((send_old && proxy_multiplexor(pfe, pfe->json_guard_tail, send_old)) ||
       (send_new && proxy_multiplexor(pfe, (uint8_t *)data, send_new)))
     return -1;
@@ -15147,9 +15162,22 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
 
           int is_streamable = !needs_body_inspection;
 
+          /* A chunked body that needs no inspection (not JSON, not a form,
+           * not MCP) streams from its headers on, as a Content-Length upload
+           * above 64 KiB does. Its length is unknown, so buffering it meant
+           * holding it whole, and one larger than the request buffer was cut
+           * at 95% of it: a reset without an answer, or a 413 on an
+           * AI-gateway service. The parser keeps reading the streamed bytes
+           * to find where the request ends (sp_h1_json_stream_read). A
+           * request whose last chunk is already in the buffer is complete
+           * (http_pok) and is forwarded whole, as before. */
+          int chunked_stream = is_streamable && pfe->json_guard_chunked &&
+                               !pfe->json_guard_active && !pfe->http_pok;
+
           if (pfe->http_hdrs_done && is_streamable &&
               (pfe->http_content_length > (64 * 1024) ||
-               (pfe->json_guard_active && pfe->json_guard_chunked))) {
+               (pfe->json_guard_active && pfe->json_guard_chunked) ||
+               chunked_stream)) {
             if (json_stream_fallback) {
               const uint8_t *route_body = NULL;
               size_t route_body_len = 0;
@@ -15433,6 +15461,17 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
             }
 #endif
 
+            /* The streamed chunked body: from here every read is relayed
+             * through the parser until its last chunk (and trailer). Nothing
+             * is held back: there is no scan to wait for. */
+            if (chunked_stream && !pfe->json_guard_streaming) {
+              pfe->json_guard_streaming = 1;
+              pfe->json_guard_tail_len = 0;
+              log_debug("[H1_CHUNK_STREAM] fd=%d request_id=%s chunked body "
+                        "streams from its headers (%zu bytes buffered)",
+                        fd, proxy_request_id(pfe), pfe->rcv_off);
+            }
+
             if (pfe->json_guard_active && !pfe->http_pok &&
                 !pfe->json_guard_streaming) {
               size_t hold = pfe->json_guard_chunked ? 5 : 1;
@@ -15470,8 +15509,12 @@ handle_client_data(int fd, proxy_fd_ent_t *pfe,
           } else {
             // Partial request - check buffer overflow
             // Threshold at 95% to allow some headroom for final chunks
-            // With 1MB buffer, this gives 972KB usable space before overflow protection
-            // Early backend connection (at 512KB) should prevent reaching this threshold
+            // With 1MB buffer, this gives 972KB usable space before overflow protection.
+            // Only a body that is buffered whole gets here: one that needs
+            // inspection (JSON outside the guard, a form, MCP) without a
+            // streamable Content-Length. A streamable body, with a
+            // Content-Length above 64 KiB or chunked, is dispatched at its
+            // headers above.
             if (pfe->rcv_off >= (SP_SOCK_MSG_LEN * 95 / 100)) {
               if (sp_mcp_enabled(pfe)) return sp_mcp_h1_refuse(pfe,413);
               /* On an AI-gateway service the client gets a deterministic
