@@ -147,7 +147,21 @@ l7_op_matches(l7_op_t op, const char *operand, const char *value,
  * l7_policy_evaluate, keeping this engine protocol-neutral and pfe-only. The
  * HEADER/COOKIE store (pfe->l7_headers) is already populated for BOTH protocols
  * by Plan (handle_header_val + proxy_h2_on_header_callback).
+ *
+ * HOST compares without regard to case, as routing does: the operand is folded
+ * to lower case here, the value of a non-REGEX HOST condition at attach, and a
+ * HOST REGEX is compiled with REG_ICASE (its pattern keeps its case, so a class
+ * such as [A-Z] still means what it says).
  * ------------------------------------------------------------------------- */
+static void
+l7_ascii_lower(char *s)
+{
+  for (; *s; s++) {
+    if (*s >= 'A' && *s <= 'Z')
+      *s = (char)(*s - 'A' + 'a');
+  }
+}
+
 static const char *
 l7_resolve_operand(struct proxy_fd_ent *pfe, const l7_condition_t *cond,
                    char *buf, size_t buflen)
@@ -162,6 +176,7 @@ l7_resolve_operand(struct proxy_fd_ent *pfe, const l7_condition_t *cond,
     if (pfe->host_url[0] == '\0')
       return NULL;
     strip_port_from_hostname(pfe->host_url, buf, buflen);
+    l7_ascii_lower(buf);
     return buf;
 
   case L7F_PATH:
@@ -1226,8 +1241,15 @@ int proxy_attach_l7_policy(struct proxy_ent *key, const l7_route_t *routes,
         l7_condition_t *cond = &set->conds[ci];
         /* Never trust an inbound re_valid — recompile authoritatively here. */
         cond->re_valid = 0;
+        cond->value[sizeof(cond->value) - 1] = '\0';
+        if (cond->field == L7F_HOST && cond->op != L7OP_REGEX)
+          l7_ascii_lower(cond->value);
         if (cond->op == L7OP_REGEX) {
-          if (regcomp(&cond->re, cond->value, REG_EXTENDED | REG_NOSUB) != 0) {
+          int cflags = REG_EXTENDED | REG_NOSUB;
+
+          if (cond->field == L7F_HOST)
+            cflags |= REG_ICASE;
+          if (regcomp(&cond->re, cond->value, cflags) != 0) {
             /* Bad pattern: roll back the partial compile + abort. */
             log_error("l7policy attach: regcomp FAILED for pattern \"%s\"", cond->value);
             cond->re_valid = 0; /* this one is NOT compiled */

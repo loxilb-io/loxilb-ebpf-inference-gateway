@@ -266,6 +266,10 @@ sp_pool_index_publish(proxy_map_ent_t *ent)
       ix->slot[i].h = h;
       ix->slot[i].ep = p;
       ix->order[ix->n++] = p;
+      /* Routing tries wildcard host candidates only on a listener that has
+       * a wildcard rule, so count them here, once per change. */
+      if (p->ephash_key[0] == '*' && p->ephash_key[1] == '.')
+        ix->n_wildcard++;
     }
     ix->first = ix->order[0];
   }

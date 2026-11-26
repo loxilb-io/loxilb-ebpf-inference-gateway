@@ -47,6 +47,7 @@ struct fc_state;
 typedef struct sp_pool_index {
   uint32_t n;                          /* pools, in the table's insertion order */
   uint32_t mask;                       /* key slots - 1 (a power of two) */
+  uint32_t n_wildcard;                 /* pools whose host is "*.<suffix>" */
   struct proxy_epval *first;           /* the table's head: order[0] */
   struct proxy_epval **order;
   struct sp_pool_index_slot {

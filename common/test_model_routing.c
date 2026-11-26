@@ -276,6 +276,96 @@ test_hostless_route(void)
   assert(sp_pool_index_publish(&plain) == 0);
 }
 
+/* Wildcard hosts, Gateway API semantics: exact host, then the longer wildcard
+ * suffix, then the shorter, then the listener's host-less rules. A candidate
+ * whose rules match no path passes the request on to the next candidate. */
+static void
+test_wildcard_host_precedence(void)
+{
+  proxy_map_ent_t service = {0};
+  proxy_epval_t exact, wide, narrow, hostless;
+
+  set_listener(&service);
+  add_pool(&service, &exact, "a.example.com|/api", 1201);
+  add_pool(&service, &wide, "*.example.com|/", 1202);
+  add_pool(&service, &narrow, "*.b.example.com|/x", 1203);
+  add_pool(&service, &hostless, "127.0.0.1:2086|/", 1204);
+  assert(sp_pool_index(&service)->n_wildcard == 2);
+
+  assert(find_endpoint_lpm(&service, "a.example.com", "/api/1", NULL) == &exact);
+  /* the exact host has no rule for this path: the next candidate answers */
+  assert(find_endpoint_lpm(&service, "a.example.com", "/other", NULL) == &wide);
+  assert(find_endpoint_lpm(&service, "c.b.example.com", "/x/1", NULL) == &narrow);
+  assert(find_endpoint_lpm(&service, "c.b.example.com", "/y", NULL) == &wide);
+  /* a wildcard never matches its own suffix */
+  assert(find_endpoint_lpm(&service, "example.com", "/", NULL) == &hostless);
+  /* more than one label in front still matches */
+  assert(find_endpoint_lpm(&service, "x.y.example.com", "/z", NULL) == &wide);
+  assert(find_endpoint_lpm(&service, "x.y.b.example.com", "/x", NULL) == &narrow);
+  /* a host that only shares a tail, not a label boundary, does not match */
+  assert(find_endpoint_lpm(&service, "aexample.com", "/", NULL) == &hostless);
+
+  /* deleting a wildcard rule hands its requests to the next candidate */
+  del_pool(&service, &narrow);
+  assert(sp_pool_index(&service)->n_wildcard == 1);
+  assert(find_endpoint_lpm(&service, "c.b.example.com", "/x/1", NULL) == &wide);
+  del_pool(&service, &wide);
+  assert(sp_pool_index(&service)->n_wildcard == 0);
+  assert(find_endpoint_lpm(&service, "a.example.com", "/other", NULL) == &hostless);
+  del_pool(&service, &hostless);
+  assert(find_endpoint_lpm(&service, "a.example.com", "/other", NULL) == NULL);
+  del_pool(&service, &exact);
+}
+
+/* Inside a wildcard candidate, path and model rank as for an exact host. */
+static void
+test_wildcard_host_path_and_model(void)
+{
+  proxy_map_ent_t service = {0};
+  proxy_epval_t model, path, root;
+
+  add_pool(&service, &model, "*.inf.example|/v1|model-a", 1301);
+  add_pool(&service, &path, "*.inf.example|/v1", 1302);
+  add_pool(&service, &root, "*.inf.example|/", 1303);
+
+  assert(find_endpoint_lpm(&service, "svc-ns.inf.example", "/v1/chat", "model-a") == &model);
+  assert(find_endpoint_lpm(&service, "svc-ns.inf.example", "/v1/chat", "model-b") == &path);
+  assert(find_endpoint_lpm(&service, "svc-ns.inf.example", "/v2", NULL) == &root);
+  /* no host-less rule on this listener: nothing else answers */
+  assert(find_endpoint_lpm(&service, "svc.other.example", "/v1", NULL) == NULL);
+  del_pool(&service, &root);
+  del_pool(&service, &path);
+  del_pool(&service, &model);
+}
+
+/* Hosts compare without regard to case; paths and model names keep theirs. */
+static void
+test_host_case_folding(void)
+{
+  proxy_map_ent_t service = {0};
+  proxy_epval_t lower, mixed, wild;
+  char key[512];
+
+  build_ephash_key(key, sizeof(key), "API.Example.com", "/V1", "Model-A");
+  assert(strcmp(key, "api.example.com|/V1|Model-A") == 0);
+  build_ephash_key(key, sizeof(key), "API.Example.com", "", "");
+  assert(strcmp(key, "api.example.com") == 0);
+
+  add_pool(&service, &lower, "api.example.com|/", 1401);
+  build_ephash_key(key, sizeof(key), "Mixed.Example.com", "/Path", "");
+  add_pool(&service, &mixed, key, 1402);
+  add_pool(&service, &wild, "*.wild.example.com|/", 1403);
+
+  assert(find_endpoint_lpm(&service, "API.EXAMPLE.COM", "/", NULL) == &lower);
+  assert(find_endpoint_lpm(&service, "mixed.example.com", "/Path/x", NULL) == &mixed);
+  /* the path still compares with its case */
+  assert(find_endpoint_lpm(&service, "mixed.example.com", "/path/x", NULL) == NULL);
+  assert(find_endpoint_lpm(&service, "Svc.WILD.Example.Com", "/", NULL) == &wild);
+  del_pool(&service, &wild);
+  del_pool(&service, &mixed);
+  del_pool(&service, &lower);
+}
+
 int
 main(void)
 {
@@ -290,6 +380,9 @@ main(void)
   test_listener_wildcard_path_and_host_precedence();
   test_listener_without_path_remains_supported();
   test_default_reservation_is_the_routed_pools();
+  test_wildcard_host_precedence();
+  test_wildcard_host_path_and_model();
+  test_host_case_folding();
   puts("test_model_routing: ALL PASS");
   return 0;
 }
